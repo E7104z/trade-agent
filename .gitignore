@@ -19,3 +19,6 @@ logs/
 Thumbs.db
 .DS_Store
 .vercel
+
+data/*.duckdb
+deploy_log.txt
