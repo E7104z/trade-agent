@@ -123,24 +123,24 @@ def logout():
 _PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Trade Agent</title>
 <style>
-body{{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:24px}}
-h1,h2,h3{{color:#58a6ff}}
-.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;margin-bottom:20px}}
-table{{border-collapse:collapse;width:100%;font-size:13px}}
-th,td{{border:1px solid #30363d;padding:6px 10px;text-align:left}}
-th{{background:#21262d}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}}
-.stat{{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;text-align:center}}
-.stat .v{{font-size:22px;font-weight:700}}
-button{{padding:10px 18px;background:#238636;border:none;border-radius:6px;color:white;
-        font-weight:600;cursor:pointer;margin-right:10px}}
-button:disabled{{background:#30363d;cursor:not-allowed}}
-button.secondary{{background:#30363d}}
-label{{font-size:13px;color:#8b949e;margin-right:14px}}
-pre{{white-space:pre-wrap;font-size:12px;background:#0d1117;border:1px solid #30363d;
-     border-radius:6px;padding:12px;max-height:400px;overflow:auto}}
-a{{color:#58a6ff}}
-.top{{display:flex;justify-content:space-between;align-items:center}}
+body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:24px}
+h1,h2,h3{color:#58a6ff}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;margin-bottom:20px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #30363d;padding:6px 10px;text-align:left}
+th{background:#21262d}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.stat{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;text-align:center}
+.stat .v{font-size:22px;font-weight:700}
+button{padding:10px 18px;background:#238636;border:none;border-radius:6px;color:white;
+        font-weight:600;cursor:pointer;margin-right:10px}
+button:disabled{background:#30363d;cursor:not-allowed}
+button.secondary{background:#30363d}
+label{font-size:13px;color:#8b949e;margin-right:14px}
+pre{white-space:pre-wrap;font-size:12px;background:#0d1117;border:1px solid #30363d;
+     border-radius:6px;padding:12px;max-height:400px;overflow:auto}
+a{color:#58a6ff}
+.top{display:flex;justify-content:space-between;align-items:center}
 </style></head><body>
 <div class="top">
   <h1>Trade Agent — Live Dashboard</h1>
@@ -165,76 +165,76 @@ a{{color:#58a6ff}}
 <div id="app"></div>
 
 <script>
-async function loadData() {{
+async function loadData() {
   const r = await fetch('/api/status');
   const d = await r.json();
   render(d);
-}}
+}
 
-function render(d) {{
+function render(d) {
   const el = document.getElementById('app');
-  const overall = d.overall || {{}};
+  const overall = d.overall || {};
   const plan = d.plan;
   let planHtml = "<p class='neutral'>No plan yet today.</p>";
-  if (plan) {{
-    if (plan.no_trade) {{
-      planHtml = `<p><b>NO TRADE.</b> ${{plan.no_trade_reason || ''}}</p><p>${{plan.market_stance || ''}}</p>`;
-    }} else {{
-      let rows = (plan.picks || []).map(p => `<tr><td>${{p.ticker}}</td><td>${{p.direction}}</td>
-        <td>${{p.setup_type||''}}</td><td>${{p.entry_price}}</td><td>${{p.stop_price}}</td>
-        <td>${{p.target_price}}</td><td>${{p.size_r}}R</td><td>${{p.conviction}}</td>
-        <td>${{p.thesis_final||''}}</td></tr>`).join('');
-      planHtml = `<p>${{plan.market_stance||''}}</p><table><tr><th>Ticker</th><th>Dir</th><th>Setup</th>
-        <th>Entry</th><th>Stop</th><th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr>${{rows}}</table>`;
-    }}
-  }}
-  let setupRows = (d.by_setup || []).map(s => `<tr><td>${{s.dim}}</td><td>${{s.n}}</td><td>${{s.triggered}}</td>
-    <td>${{s.win_rate!=null ? Math.round(s.win_rate*100)+'%' : '-'}}</td><td>${{s.avg_r ?? '-'}}</td>
-    <td>${{s.total_weighted_r}}</td></tr>`).join('');
-  let runsRows = (d.runs || []).map(r => `<tr><td>${{r.loop}}</td><td>${{r.run_date}}</td><td>${{r.status}}</td>
-    <td>${{r.model||''}}</td><td>$${{(r.cost_usd||0).toFixed(3)}}</td></tr>`).join('');
+  if (plan) {
+    if (plan.no_trade) {
+      planHtml = `<p><b>NO TRADE.</b> ${plan.no_trade_reason || ''}</p><p>${plan.market_stance || ''}</p>`;
+    } else {
+      let rows = (plan.picks || []).map(p => `<tr><td>${p.ticker}</td><td>${p.direction}</td>
+        <td>${p.setup_type||''}</td><td>${p.entry_price}</td><td>${p.stop_price}</td>
+        <td>${p.target_price}</td><td>${p.size_r}R</td><td>${p.conviction}</td>
+        <td>${p.thesis_final||''}</td></tr>`).join('');
+      planHtml = `<p>${plan.market_stance||''}</p><table><tr><th>Ticker</th><th>Dir</th><th>Setup</th>
+        <th>Entry</th><th>Stop</th><th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr>${rows}</table>`;
+    }
+  }
+  let setupRows = (d.by_setup || []).map(s => `<tr><td>${s.dim}</td><td>${s.n}</td><td>${s.triggered}</td>
+    <td>${s.win_rate!=null ? Math.round(s.win_rate*100)+'%' : '-'}</td><td>${s.avg_r ?? '-'}</td>
+    <td>${s.total_weighted_r}</td></tr>`).join('');
+  let runsRows = (d.runs || []).map(r => `<tr><td>${r.loop}</td><td>${r.run_date}</td><td>${r.status}</td>
+    <td>${r.model||''}</td><td>$${(r.cost_usd||0).toFixed(3)}</td></tr>`).join('');
 
   el.innerHTML = `
-  <div class="card"><h2>Today's Plan — ${{d.today}}</h2>${{planHtml}}</div>
+  <div class="card"><h2>Today's Plan — ${d.today}</h2>${planHtml}</div>
   <div class="card"><h2>Performance</h2>
     <div class="grid">
-      <div class="stat"><div class="v">${{overall.picks_graded ?? 0}}</div>Graded trades</div>
-      <div class="stat"><div class="v">${{overall.win_rate!=null ? Math.round(overall.win_rate*100)+'%' : '—'}}</div>Win rate</div>
-      <div class="stat"><div class="v">${{overall.avg_r ?? '—'}}</div>Avg R</div>
-      <div class="stat"><div class="v">${{overall.total_weighted_r ?? 0}}</div>Total weighted R</div>
-      <div class="stat"><div class="v">$${{(d.equity||0).toLocaleString()}}</div>Paper equity</div>
-      <div class="stat"><div class="v">${{d.streak||'—'}}</div>Streak</div>
+      <div class="stat"><div class="v">${overall.picks_graded ?? 0}</div>Graded trades</div>
+      <div class="stat"><div class="v">${overall.win_rate!=null ? Math.round(overall.win_rate*100)+'%' : '—'}</div>Win rate</div>
+      <div class="stat"><div class="v">${overall.avg_r ?? '—'}</div>Avg R</div>
+      <div class="stat"><div class="v">${overall.total_weighted_r ?? 0}</div>Total weighted R</div>
+      <div class="stat"><div class="v">$${(d.equity||0).toLocaleString()}</div>Paper equity</div>
+      <div class="stat"><div class="v">${d.streak||'—'}</div>Streak</div>
     </div></div>
   <div class="card"><h2>By Setup</h2><table><tr><th>Setup</th><th>N</th><th>Triggered</th>
-    <th>Win rate</th><th>Avg R</th><th>Total wR</th></tr>${{setupRows}}</table></div>
-  <div class="card"><h2>Playbook v${{d.playbook_version}}</h2><pre>${{d.playbook.replace(/</g,'&lt;')}}</pre></div>
+    <th>Win rate</th><th>Avg R</th><th>Total wR</th></tr>${setupRows}</table></div>
+  <div class="card"><h2>Playbook v${d.playbook_version}</h2><pre>${d.playbook.replace(/</g,'&lt;')}</pre></div>
   <div class="card"><h2>Recent Runs</h2><table><tr><th>Loop</th><th>Date</th><th>Status</th>
-    <th>Model</th><th>Cost</th></tr>${{runsRows}}</table></div>
+    <th>Model</th><th>Cost</th></tr>${runsRows}</table></div>
   `;
-}}
+}
 
-async function runLoop(name) {{
+async function runLoop(name) {
   document.getElementById('running').style.display = 'block';
   document.getElementById('log').style.display = 'block';
   document.getElementById('log').textContent = 'Starting ' + name + ' loop...';
   document.querySelectorAll('button').forEach(b => b.disabled = true);
-  const params = new URLSearchParams({{
+  const params = new URLSearchParams({
     mock: document.getElementById('mock').checked ? '1' : '0',
     offline: document.getElementById('offline').checked ? '1' : '0',
     force: document.getElementById('force').checked ? '1' : '0',
-  }});
-  try {{
-    const r = await fetch('/run/' + name + '?' + params.toString(), {{method: 'POST'}});
+  });
+  try {
+    const r = await fetch('/run/' + name + '?' + params.toString(), {method: 'POST'});
     const d = await r.json();
     document.getElementById('log').textContent = (d.log || '') + (d.error ? '\\n\\nERROR: ' + d.error : '');
-  }} catch (e) {{
+  } catch (e) {
     document.getElementById('log').textContent = 'Request failed: ' + e;
-  }} finally {{
+  } finally {
     document.querySelectorAll('button').forEach(b => b.disabled = false);
     document.getElementById('running').style.display = 'none';
     loadData();
-  }}
-}}
+  }
+}
 
 loadData();
 </script>
