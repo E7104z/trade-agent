@@ -1,0 +1,20 @@
+# Secrets — never commit
+credentials.json
+.env
+
+# Data & generated artifacts
+data/ledger.duckdb
+data/ledger.duckdb.wal
+reports/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db
+.DS_Store

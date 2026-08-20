@@ -1,0 +1,35 @@
+{
+  "models": {
+    "morning": "claude-opus-4-5",
+    "evening": "claude-sonnet-4-5",
+    "weekly": "claude-opus-4-5"
+  },
+  "extended_thinking": true,
+  "thinking_budget_tokens": 8000,
+  "max_output_tokens": 16000,
+  "enable_web_search": true,
+  "web_search_max_uses": 6,
+
+  "account_size": 100000,
+  "dollars_per_r": 500,
+  "max_picks": 4,
+  "max_size_r": 1.5,
+  "min_size_r": 0.25,
+  "max_total_open_risk_r": 3.0,
+
+  "timezone": "America/New_York",
+  "email_enabled": false,
+
+  "data": {
+    "alpaca_feed": "iex",
+    "movers_top": 18,
+    "news_limit": 40,
+    "gap_scan_min_pct": 3.0,
+    "edgar_user_agent": "TradeAgent research bot (contact: user@example.com)"
+  },
+
+  "memory": {
+    "recent_trades_in_context": 20,
+    "max_active_lessons_in_context": 25
+  }
+}

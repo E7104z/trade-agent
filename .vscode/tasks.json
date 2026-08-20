@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Morning Loop",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["run.py", "morning"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Evening Loop",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["run.py", "evening"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Weekly Loop",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["run.py", "weekly"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Status",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["run.py", "status"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Smoke Test (mock + offline)",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe run.py morning --mock --offline --force; ${workspaceFolder}/.venv/Scripts/python.exe run.py evening --mock --offline --force; ${workspaceFolder}/.venv/Scripts/python.exe run.py weekly --mock; ${workspaceFolder}/.venv/Scripts/python.exe run.py status",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

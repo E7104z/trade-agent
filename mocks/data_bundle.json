@@ -1,0 +1,59 @@
+{
+  "date": "2026-08-19",
+  "generated_at": "2026-08-19T06:45:00-04:00",
+  "missing": [],
+  "futures": [
+    {"symbol": "ES=F", "label": "S&P 500 fut", "last": 6412.5, "pct": 0.34},
+    {"symbol": "NQ=F", "label": "Nasdaq fut", "last": 23310.0, "pct": 0.52},
+    {"symbol": "RTY=F", "label": "Russell fut", "last": 2287.4, "pct": -0.18},
+    {"symbol": "CL=F", "label": "Crude oil", "last": 71.22, "pct": 1.05},
+    {"symbol": "GC=F", "label": "Gold", "last": 2688.3, "pct": -0.21},
+    {"symbol": "DX-Y.NYB", "label": "Dollar index", "last": 102.9, "pct": 0.11},
+    {"symbol": "^TNX", "label": "10Y yield", "last": 4.21, "pct": 0.4}
+  ],
+  "international": [
+    {"symbol": "^N225", "label": "Nikkei", "last": 42110.0, "pct": 0.9},
+    {"symbol": "^HSI", "label": "Hang Seng", "last": 19882.0, "pct": -0.4},
+    {"symbol": "^GDAXI", "label": "DAX", "last": 19560.0, "pct": 0.3},
+    {"symbol": "^FTSE", "label": "FTSE", "last": 8322.0, "pct": 0.1}
+  ],
+  "vix": {"level": 14.2, "chg_5d_pct": -4.1},
+  "yesterday_recap": {
+    "date": "2026-08-18",
+    "pct_change": {"SPY": 0.45, "QQQ": 0.71, "IWM": -0.22, "XLK": 0.9, "XLF": 0.2, "XLE": 1.1, "XLV": -0.3, "XLI": 0.4, "XLY": 0.5, "XLP": -0.1, "XLU": -0.4, "XLB": 0.3, "XLC": 0.6, "XLRE": -0.2}
+  },
+  "premarket_gappers": [
+    {"symbol": "NVDA", "last": 99.8, "gap_pct": 4.2, "prev_close": 95.8},
+    {"symbol": "AMD", "last": 100.9, "gap_pct": 3.8, "prev_close": 97.2},
+    {"symbol": "MRNA", "last": 101.5, "gap_pct": 11.4, "prev_close": 91.1},
+    {"symbol": "CVNA", "last": 102.4, "gap_pct": -6.2, "prev_close": 109.2},
+    {"symbol": "XOM", "last": 101.2, "gap_pct": 2.1, "prev_close": 99.1},
+    {"symbol": "SPY", "last": 640.1, "gap_pct": 0.3, "prev_close": 638.2},
+    {"symbol": "QQQ", "last": 561.0, "gap_pct": 0.5, "prev_close": 558.2},
+    {"symbol": "IWM", "last": 226.8, "gap_pct": -0.2, "prev_close": 227.3}
+  ],
+  "movers": {
+    "gainers": [
+      {"symbol": "MRNA", "pct": 11.4, "price": 101.5},
+      {"symbol": "NVDA", "pct": 4.2, "price": 99.8},
+      {"symbol": "AMD", "pct": 3.8, "price": 100.9}
+    ],
+    "losers": [
+      {"symbol": "CVNA", "pct": -6.2, "price": 102.4},
+      {"symbol": "UPST", "pct": -4.8, "price": 55.1}
+    ],
+    "most_active": ["NVDA", "TSLA", "AMD", "SPY", "MRNA", "CVNA"]
+  },
+  "news": [
+    {"headline": "NVIDIA announces next-gen data center GPU ahead of schedule; raises guidance", "symbols": ["NVDA"], "source": "benzinga", "at": "2026-08-19T05:10:00Z"},
+    {"headline": "Moderna flu-combo vaccine hits primary endpoint in phase 3", "symbols": ["MRNA"], "source": "benzinga", "at": "2026-08-19T04:40:00Z"},
+    {"headline": "Carvana announces $1B secondary offering priced at discount", "symbols": ["CVNA"], "source": "benzinga", "at": "2026-08-19T04:05:00Z"},
+    {"headline": "AMD sympathy bid follows NVDA guidance raise", "symbols": ["AMD"], "source": "benzinga", "at": "2026-08-19T05:30:00Z"},
+    {"headline": "Crude climbs 1% as inventory draw exceeds estimates", "symbols": ["XOM", "CVX"], "source": "benzinga", "at": "2026-08-19T05:00:00Z"}
+  ],
+  "filings_8k": [
+    {"title": "8-K - NVIDIA CORP (0001045810) (Filer)", "filed_at": "2026-08-19T05:05:00-04:00"},
+    {"title": "8-K - CARVANA CO. (0001690820) (Filer)", "filed_at": "2026-08-19T04:02:00-04:00"},
+    {"title": "8-K - MODERNA, INC. (0001682852) (Filer)", "filed_at": "2026-08-19T04:35:00-04:00"}
+  ]
+}

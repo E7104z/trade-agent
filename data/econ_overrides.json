@@ -1,0 +1,6 @@
+{
+  "_comment": "User-maintained econ events the rule-based calendar can't know (CPI, PPI, GDP, big earnings). Keyed by date. The morning web search also verifies the calendar.",
+  "_example_format": [
+    {"time": "08:30", "name": "CPI (July)", "importance": "critical"}
+  ]
+}

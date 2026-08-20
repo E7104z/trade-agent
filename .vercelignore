@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+data/ledger.duckdb
+data/ledger.duckdb.wal
+reports/
+playbook_history/
+.git/
+credentials.json
+.env
