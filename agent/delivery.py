@@ -99,10 +99,13 @@ def evening_email_html(plan_date: date, review: dict, outcomes_summary: str) -> 
 
 def weekly_email_html(result: dict) -> str:
     findings = "".join(f"<li>{f['finding']} (n={f['n']}, {f['strength']})</li>" for f in result.get("key_findings", []))
+    edge = result.get("current_best_edge", "")
+    edge_html = f'<h3>Current best edge</h3><p style="font-weight:bold">{edge}</p>' if edge else ""
     return f"""
     <html><body style="font-family:sans-serif">
       <h2>Trade Agent — Weekly Review</h2>
       <p>{result.get('summary_for_email','')}</p>
+      {edge_html}
       <h3>Key findings</h3><ul>{findings}</ul>
       <h3>Changelog</h3><pre style="white-space:pre-wrap">{result.get('changelog','')}</pre>
     </body></html>

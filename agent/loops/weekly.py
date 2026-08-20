@@ -31,9 +31,44 @@ def _fmt_stats(stats: list[dict], label: str) -> str:
     lines = [f"### by {label}"]
     for s in stats:
         wr = f"{s['win_rate']:.0%}" if s["win_rate"] is not None else "-"
+        extra = ""
+        if s.get("t_stat") is not None:
+            extra += f", stdR={s.get('std_r')}, t={s['t_stat']}"
+        if s.get("baseline_avg_r") is not None:
+            extra += f", naiveBaselineAvgR={s['baseline_avg_r']:+.2f}"
         lines.append(f"- {s['dim']}: n={s['n']}, triggered={s['triggered']}, wr={wr}, "
-                     f"avgR={s['avg_r']}, totalWeightedR={s['total_weighted_r']}")
+                     f"avgR={s['avg_r']}, totalWeightedR={s['total_weighted_r']}{extra}")
     return "\n".join(lines)
+
+
+def _counterfactuals_md(mem: dict) -> str:
+    """Null-model, trade-management, and sizing diagnostics — computed in code,
+    never by the LLM. Edge must beat the baseline; management must beat holding."""
+    m = mem.get("management", {})
+    sc = mem.get("sizing_cf", {})
+    stop_rate = (f"{m['stopped_then_target']}/{m['stopped']}"
+                 if m.get("stopped") else "0/0")
+    return (
+        "## DETERMINISTIC COUNTERFACTUALS (computed by the system, not the LLM)\n\n"
+        "### Edge vs null model (naive same-name open->close, planned-risk units)\n"
+        f"- triggered trades: {m.get('triggered', 0)}; avgR={m.get('avg_r')}, "
+        f"naive baseline avgR={m.get('avg_baseline_r')}, "
+        f"EDGE VS BASELINE={m.get('edge_vs_baseline_r')} "
+        "(<= 0 means the plan machinery adds nothing over buying/shorting the same names at the open)\n"
+        f"- untriggered picks with baseline: {m.get('untriggered_with_baseline', 0)}, "
+        f"avg baseline R walked away from: {m.get('avg_baseline_r_untriggered')} "
+        "(large positive = entries too cute)\n\n"
+        "### Trade management quality\n"
+        f"- management edge (actual R minus hold-to-close R, avg): {m.get('management_edge_r')} "
+        "(negative = the stop/target pair is destroying value vs just holding)\n"
+        f"- stopped trades that hit target later same day: {stop_rate} "
+        f"(avg eod R of stopped trades: {m.get('avg_eod_r_on_stopped')}) "
+        "— a high rate means stops sit inside the noise\n\n"
+        "### Sizing counterfactual\n"
+        f"- n={sc.get('n', 0)}: actual size-weighted total {sc.get('actual_weighted_r')}R vs "
+        f"flat-size {sc.get('flat_size_weighted_r')}R -> sizing edge {sc.get('sizing_edge_r')}R "
+        "(negative at n>=20 = sizing decisions are destroying value; feed this into the calibration verdict)"
+    )
 
 
 def _v3_sections(mem: dict) -> str:
@@ -138,6 +173,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_fmt_stats(mem['by_regime'], 'regime_tag')}\n\n"
             f"{_fmt_stats(mem['by_conviction'], 'conviction')}\n\n"
             f"{_fmt_stats(mem['by_direction'], 'direction')}\n\n"
+            f"{_counterfactuals_md(mem)}\n\n"
             f"{_v3_sections(mem)}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"
             f"## LESSON BANK (with IDs for your lesson_actions)\n\n{lessons_md}\n\n"
@@ -185,6 +221,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         ledger.log_run(con, "weekly", d, started, "ok", model, result.usage)
 
         log("weekly", f"Summary: {mined.get('summary_for_email','(none)')}")
+        if mined.get("current_best_edge"):
+            log("weekly", f"Current best edge: {mined['current_best_edge']}")
         for f in mined.get("key_findings", []) or []:
             log("weekly", f"  Finding: {f.get('finding','')} (n={f.get('n','?')}, {f.get('strength','')})")
         for ex in mined.get("experiments", []) or []:

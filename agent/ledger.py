@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS outcomes (
     day_close      DOUBLE,
     day_volume     BIGINT,
     missed_move_r  DOUBLE,         -- for untriggered picks: what was left on the table
+    baseline_r     DOUBLE,         -- null model: open->close in pick's direction / planned risk
+    eod_r          DOUBLE,         -- triggered: R if held fill->close with no stop/target
+    target_hit_after_stop BOOLEAN, -- stopped trades: did price reach target later same day?
     grade          VARCHAR,        -- A..F process grade from evening loop
     grade_notes    VARCHAR,
     graded_at      TIMESTAMP
@@ -180,6 +183,14 @@ CREATE TABLE IF NOT EXISTS open_question_progress (
 );
 """
 
+# Idempotent upgrades for databases created before these columns existed
+# (both DuckDB and Postgres support ADD COLUMN IF NOT EXISTS).
+_MIGRATIONS = [
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS baseline_r DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS eod_r DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS target_hit_after_stop BOOLEAN",
+]
+
 
 def connect() -> Any:
     """
@@ -197,11 +208,15 @@ def connect() -> Any:
         # DOUBLE isn't a valid standalone Postgres type name (DuckDB accepts
         # it as an alias for DOUBLE PRECISION) — translate for Postgres only.
         con.execute(re.sub(r"\bDOUBLE\b", "DOUBLE PRECISION", _SCHEMA))
+        for mig in _MIGRATIONS:
+            con.execute(re.sub(r"\bDOUBLE\b", "DOUBLE PRECISION", mig))
         return con
     import duckdb
     ensure_dirs()
     con = duckdb.connect(str(DB_PATH))
     con.execute(_SCHEMA)
+    for mig in _MIGRATIONS:
+        con.execute(mig)
     return con
 
 
@@ -300,14 +315,16 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
         """INSERT INTO outcomes
            (pick_id, eval_date, triggered, entry_fill, exit_price, exit_reason,
             r_multiple, mfe_r, mae_r, day_open, day_high, day_low, day_close,
-            day_volume, missed_move_r, grade, grade_notes, graded_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            day_volume, missed_move_r, baseline_r, eod_r, target_hit_after_stop,
+            grade, grade_notes, graded_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
             o.get("mfe_r"), o.get("mae_r"), o.get("day_open"), o.get("day_high"),
             o.get("day_low"), o.get("day_close"), o.get("day_volume"),
-            o.get("missed_move_r"), o.get("grade"), o.get("grade_notes"),
+            o.get("missed_move_r"), o.get("baseline_r"), o.get("eod_r"),
+            o.get("target_hit_after_stop"), o.get("grade"), o.get("grade_notes"),
             o.get("graded_at", datetime.now()),
         ],
     )
@@ -429,7 +446,13 @@ def recent_trades(con: duckdb.DuckDBPyConnection, n: int = 20) -> list[dict]:
 
 
 def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
-    """Aggregate performance stats grouped by a picks column (setup_type, regime_tag, direction, conviction)."""
+    """Aggregate performance stats grouped by a picks column (setup_type, regime_tag, direction, conviction).
+
+    Includes dispersion (std_r) and a plain t-statistic (avg_r / std-error) computed
+    HERE, deterministically — the LLM must never be trusted to derive significance
+    from a CSV. |t| < ~1.5 means the average is statistically indistinguishable
+    from zero at that sample size, regardless of how big n looks.
+    """
     assert dim in {"setup_type", "regime_tag", "direction", "conviction"}
     rows = con.execute(
         f"""SELECT COALESCE(CAST(p.{dim} AS VARCHAR),'?') AS dim,
@@ -437,18 +460,28 @@ def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
                    SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END) AS triggered,
                    SUM(CASE WHEN o.triggered AND o.r_multiple > 0 THEN 1 ELSE 0 END) AS wins,
                    ROUND(CAST(AVG(CASE WHEN o.triggered THEN o.r_multiple END) AS NUMERIC), 3) AS avg_r,
-                   ROUND(CAST(SUM(CASE WHEN o.triggered THEN o.r_multiple * p.size_r ELSE 0 END) AS NUMERIC), 3) AS total_weighted_r
+                   ROUND(CAST(SUM(CASE WHEN o.triggered THEN o.r_multiple * p.size_r ELSE 0 END) AS NUMERIC), 3) AS total_weighted_r,
+                   STDDEV_SAMP(CASE WHEN o.triggered THEN o.r_multiple END) AS std_r,
+                   ROUND(CAST(AVG(CASE WHEN o.triggered THEN o.baseline_r END) AS NUMERIC), 3) AS baseline_avg_r
             FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
             GROUP BY 1 ORDER BY n DESC"""
     ).fetchall()
     out = []
     for r in rows:
         n_trig = r[2] or 0
+        avg_r = float(r[4]) if r[4] is not None else None
+        std_r = float(r[6]) if r[6] is not None else None
+        t_stat = None
+        if avg_r is not None and std_r and std_r > 0 and n_trig >= 2:
+            t_stat = round(avg_r / (std_r / (n_trig ** 0.5)), 2)
         out.append({
             "dim": r[0], "n": r[1], "triggered": n_trig, "wins": r[3] or 0,
             "win_rate": round((r[3] or 0) / n_trig, 3) if n_trig else None,
-            "avg_r": float(r[4]) if r[4] is not None else None,
+            "avg_r": avg_r,
             "total_weighted_r": float(r[5]) if r[5] is not None else 0.0,
+            "std_r": round(std_r, 3) if std_r is not None else None,
+            "t_stat": t_stat,
+            "baseline_avg_r": float(r[7]) if r[7] is not None else None,
         })
     return out
 
@@ -509,18 +542,93 @@ def overall_stats(con: duckdb.DuckDBPyConnection) -> dict:
     }
 
 
+def trailing_weighted_r(con: duckdb.DuckDBPyConnection, n: int = 10) -> dict:
+    """Sum of size-weighted R over the last n triggered trades — the drawdown
+    circuit breaker's input. Catches slow bleeds that never form a losing streak."""
+    rows = con.execute(
+        """SELECT o.r_multiple * COALESCE(p.size_r, 1)
+           FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+           WHERE o.triggered AND o.r_multiple IS NOT NULL
+           ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT ?""",
+        [n],
+    ).fetchall()
+    vals = [float(r[0]) for r in rows]
+    return {"n": len(vals), "sum_weighted_r": round(sum(vals), 3)}
+
+
+def management_quality(con: duckdb.DuckDBPyConnection) -> dict:
+    """Deterministic counterfactual aggregates: is the stop/target machinery adding
+    value over just holding, are stops inside the noise, and does the desk beat
+    the naive same-name open->close baseline (the null model)?"""
+    row = con.execute(
+        """SELECT
+             SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END),
+             AVG(CASE WHEN o.triggered THEN o.r_multiple END),
+             AVG(CASE WHEN o.triggered THEN o.baseline_r END),
+             AVG(CASE WHEN o.triggered AND o.eod_r IS NOT NULL
+                      THEN o.r_multiple - o.eod_r END),
+             SUM(CASE WHEN o.exit_reason = 'stop' THEN 1 ELSE 0 END),
+             SUM(CASE WHEN o.exit_reason = 'stop' AND o.target_hit_after_stop
+                      THEN 1 ELSE 0 END),
+             AVG(CASE WHEN o.exit_reason = 'stop' THEN o.eod_r END),
+             AVG(CASE WHEN o.triggered = FALSE AND o.baseline_r IS NOT NULL
+                      THEN o.baseline_r END),
+             SUM(CASE WHEN o.triggered = FALSE AND o.baseline_r IS NOT NULL
+                      THEN 1 ELSE 0 END)
+           FROM outcomes o"""
+    ).fetchone()
+    (n_trig, avg_r, avg_base, mgmt_edge, n_stop, n_stop_then_target,
+     avg_eod_stopped, avg_base_untrig, n_untrig) = row
+    rnd = lambda v: round(float(v), 3) if v is not None else None  # noqa: E731
+    return {
+        "triggered": n_trig or 0,
+        "avg_r": rnd(avg_r),
+        "avg_baseline_r": rnd(avg_base),
+        "edge_vs_baseline_r": rnd((avg_r - avg_base) if avg_r is not None and avg_base is not None else None),
+        "management_edge_r": rnd(mgmt_edge),          # actual R minus hold-to-close R
+        "stopped": n_stop or 0,
+        "stopped_then_target": n_stop_then_target or 0,
+        "avg_eod_r_on_stopped": rnd(avg_eod_stopped), # what stopped trades did by the close
+        "untriggered_with_baseline": n_untrig or 0,
+        "avg_baseline_r_untriggered": rnd(avg_base_untrig),  # what fussy entries walked away from
+    }
+
+
+def sizing_counterfactual(con: duckdb.DuckDBPyConnection) -> dict:
+    """Did size allocation add value? Compares actual size-weighted total R to the
+    same trades at a uniform (average) size. Positive edge = sizing skill is real."""
+    row = con.execute(
+        """SELECT SUM(o.r_multiple * COALESCE(p.size_r, 1)),
+                  SUM(o.r_multiple),
+                  AVG(COALESCE(p.size_r, 1)),
+                  COUNT(*)
+           FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+           WHERE o.triggered AND o.r_multiple IS NOT NULL"""
+    ).fetchone()
+    actual, sum_r, avg_size, n = row
+    if not n:
+        return {"n": 0, "actual_weighted_r": 0.0, "flat_size_weighted_r": 0.0, "sizing_edge_r": 0.0}
+    flat = float(sum_r) * float(avg_size)
+    return {
+        "n": n,
+        "actual_weighted_r": round(float(actual), 3),
+        "flat_size_weighted_r": round(flat, 3),
+        "sizing_edge_r": round(float(actual) - flat, 3),
+    }
+
+
 def all_trades_csv(con: duckdb.DuckDBPyConnection) -> str:
     """Compact CSV of the entire graded ledger for the weekly miner."""
     rows = con.execute(
         """SELECT p.plan_date, p.ticker, p.direction, p.setup_type, p.conviction, p.size_r,
                   p.entry_price, p.stop_price, p.target_price, p.regime_tag,
                   o.triggered, o.exit_reason, o.r_multiple, o.mfe_r, o.mae_r,
-                  o.missed_move_r, o.grade
+                  o.missed_move_r, o.baseline_r, o.eod_r, o.target_hit_after_stop, o.grade
            FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
            ORDER BY p.plan_date, p.pick_id"""
     ).fetchall()
     header = ("date,ticker,dir,setup,conv,size_r,entry,stop,target,regime,"
-              "triggered,exit,r,mfe_r,mae_r,missed_r,grade")
+              "triggered,exit,r,mfe_r,mae_r,missed_r,baseline_r,eod_r,target_after_stop,grade")
     lines = [header]
     for r in rows:
         lines.append(",".join("" if v is None else str(v) for v in r))

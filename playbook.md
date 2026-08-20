@@ -20,6 +20,36 @@
   as edge, and you must not size up on it.
 - Confidence tiers: none (n=0) < provisional (1 <= n < 8) < low (8 <= n < 20)
   < moderate (20 <= n < 40) < established (n >= 40). No rule is "high."
+- **Current Best Edge** is the desk's one-paragraph standing answer to "where is
+  our edge right now" — hunt it first. If it says NO VALIDATED EDGE YET, the
+  hunt is the provisional candidates it names.
+
+## Current Best Edge
+
+> The desk's standing answer to "where is our edge right now?" — rewritten from
+> scratch by the weekly miner every week. Pure synthesis: nothing may appear
+> here that isn't already in Setup Rules / Regime Rules / the ledger. The
+> morning agent hunts THIS first; everything else is exploration.
+
+**NO VALIDATED EDGE YET.** Nothing has reached n >= 8. The track record is too
+young to distinguish edge from variance anywhere — including long vs short,
+where both sides are below the reporting threshold.
+
+The bar for calling anything edge: (a) n >= 8, (b) avgR beats the naive
+same-name open->close baseline, and (c) statistically distinguishable from
+zero (t >= 1.5). Positive R that a monkey holding the same names would also
+have made is NOT edge.
+
+Leading provisional candidates (candidate, not edge):
+
+- catalyst_momentum longs in uptrend/risk_on — n=1 realized plus week-one regime
+  alignment; needs n >= 8 to validate.
+- gap_fade against dilution-driven gaps — n=1 realized; entry mechanics under
+  Open Question #1; needs n >= 8 to validate.
+
+Until a candidate validates, the edge IS the process: defined risk, fresh
+catalysts, regime alignment, and ruthless collection of the evidence that will
+reveal where the real edge lives.
 
 ## Core Principles
 
@@ -31,12 +61,16 @@
 6. The ledger is the referee. When intuition and the ledger disagree, the ledger wins.
 7. Rejected trades are data. What the playbook declines is tracked in the Shadow Ledger and judged as rigorously as what it takes. A filter that never costs anything is untested, not correct.
 8. Edge decays by default. A rule is provisional until re-confirmed, and re-confirmation expires. Silence is not confirmation.
+9. The desk is loyal to edge, not to a market view. Long and short are equally honorable; hunt whichever side the evidence favors. Current Best Edge is the standing statement of where that hunt starts.
 
 ## Sizing Policy
 
 - Base unit: 1R = configured dollars_per_r.
 - Conviction 5 + fresh verifiable catalyst may take max size (1.5R). Conviction <= 3 takes minimum (0.25-0.5R).
 - Losing streak >= 3: cap 0.5R, minimum conviction 4. [UNVALIDATED prior]
+- Drawdown circuit breaker: trailing 10 triggered trades <= -4.0 weighted R ->
+  capital preservation mode (max 1 pick, 0.25R, conviction >= 4). [mechanical —
+  enforced in code, not by judgment]
 - Total open plan risk <= 3R.
 - Correlated picks share a combined 1.5R cap. [n=1 supporting: AMD/NVDA overlap cost -0.5 weighted R; last_confirmed v1]
 - **Thematic exposure cap:** if 2+ picks express the same underlying macro thesis
@@ -108,6 +142,7 @@ and sizing-by-conviction must be suspended until recalibrated.
 3. **conviction calibration** — see Calibration table. Threshold: n >= 20 graded picks. Progress: 0/20.
 4. **gap-size chase threshold** — is 15% the right cutoff? Collecting gap-size buckets on every gap trade. Threshold: n >= 20 gap trades. Progress: 0/20.
 5. **shadow-ledger filter cost** — which rejection reasons forgo the most R? Collecting all rejections. Threshold: 20 sessions of shadow data. Progress: 0/20 sessions.
+6. **stop placement cost** — of stopped-out trades, how often does the target print later the same session (stops inside the noise)? Collecting target_hit_after_stop + eod_r on every stopped trade (deterministic). Threshold: n >= 10 stopped trades. Progress: 0/10.
 
 ## Retired Rules (graveyard — do not re-propose without post-retirement evidence)
 
@@ -128,4 +163,8 @@ _None retired yet._
 - Added **Shadow Ledger Summary** — rejected candidates tracked and judged; feeds a new Open Question on filter cost.
 - Converted **Open Questions** into pre-registered experiments with explicit thresholds and running progress the miner must report against.
 - Added **Retired Rules** graveyard to prevent re-proposal of falsified rules.
+- Added **Current Best Edge** section — the weekly-rewritten standing answer to "where is our edge right now"; declares NO VALIDATED EDGE YET until any rule reaches n >= 8, and names the leading provisional candidates the morning agent should hunt. Added Core Principle 9 (loyal to edge, not to a market view).
+- Added the **null model**: every graded pick now carries baseline_r (naive same-name open->close in planned-risk units). Edge now requires beating the baseline AND t >= 1.5, not just positive R.
+- Added **trade-management counterfactuals** (eod_r hold-to-close, target-hit-after-stop) and pre-registered Open Question #6 on stop placement cost.
+- Added the mechanical **drawdown circuit breaker** to the Sizing Policy (trailing 10 trades <= -4R -> capital preservation mode), enforced in code.
 - No setup-rule edits and no new setup types: existing rules remain sub-threshold; widening the surface before n>=8 spreads thin data thinner.

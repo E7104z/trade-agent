@@ -19,6 +19,15 @@ Simulation rules (documented, conservative):
     mfe_r / mae_r = max favorable / adverse excursion in R while in the trade
     missed_move_r = for UNTRIGGERED picks, what the move from the entry level to the
                     best price would have been worth in R (measures entries that were too cute)
+  Counterfactual diagnostics (deterministic, no LLM cost — the weekly miner eats these):
+    baseline_r = the NULL MODEL: same name, same direction, enter at the session open,
+                 exit at the close, measured in units of the PLANNED risk. Computed for
+                 every pick, triggered or not. Edge = beating this, not raw positive R.
+    eod_r      = for triggered picks: R if the trade had been held from the actual fill
+                 to the close with NO stop and NO target. actual_r - eod_r measures
+                 whether active management (the stop/target pair) added or destroyed value.
+    target_hit_after_stop = for stopped-out trades: did price go on to touch the target
+                 later the same session? A high rate = stops are placed inside the noise.
   Friction (slippage_bps, default 5):
     Fills and exits are worsened by slippage_bps in the adverse direction on BOTH
     sides of the trade. Zero-friction paper fills systematically overstate edge,
@@ -51,6 +60,9 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "mfe_r": None,
         "mae_r": None,
         "missed_move_r": None,
+        "baseline_r": None,
+        "eod_r": None,
+        "target_hit_after_stop": None,
     }
     if daily:
         out.update({
@@ -76,6 +88,15 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     if risk <= 0:
         out["exit_reason"] = "invalid_plan"
         return out
+
+    # ---- null model: open->close in the pick's direction, in planned-risk units.
+    # Computed for EVERY pick (triggered or not) so "edge" always has a benchmark:
+    # a plan that underperforms naively holding the same name is not edge.
+    sess_open = daily["open"] if daily else bars[0]["o"]
+    sess_close = daily["close"] if daily else bars[-1]["c"]
+    if sess_open is not None and sess_close is not None:
+        naive_sign = 1.0 if (pick["direction"] or "long").lower() == "long" else -1.0
+        out["baseline_r"] = round(naive_sign * (sess_close - sess_open) / risk, 3)
 
     # ---- find fill -------------------------------------------------------
     fill_price = None
@@ -137,31 +158,33 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     # ---- walk forward ----------------------------------------------------
     exit_price = None
     exit_reason = "eod"
+    exit_idx = len(bars) - 1
     best_px = fill_price
     worst_px = fill_price
 
-    for b in bars[fill_idx:]:
+    for i in range(fill_idx, len(bars)):
+        b = bars[i]
         if long:
             worst_px = min(worst_px, b["l"])
             best_px = max(best_px, b["h"])
             if b["l"] <= stop:                # conservative: stop first
-                exit_price, exit_reason = stop, "stop"
+                exit_price, exit_reason, exit_idx = stop, "stop", i
                 if b["o"] < stop:             # gapped through the stop
                     exit_price = b["o"]
                 break
             if b["h"] >= target:
-                exit_price, exit_reason = target, "target"
+                exit_price, exit_reason, exit_idx = target, "target", i
                 break
         else:
             worst_px = max(worst_px, b["h"])
             best_px = min(best_px, b["l"])
             if b["h"] >= stop:
-                exit_price, exit_reason = stop, "stop"
+                exit_price, exit_reason, exit_idx = stop, "stop", i
                 if b["o"] > stop:
                     exit_price = b["o"]
                 break
             if b["l"] <= target:
-                exit_price, exit_reason = target, "target"
+                exit_price, exit_reason, exit_idx = target, "target", i
                 break
 
     if exit_price is None:
@@ -175,6 +198,24 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     r_mult = sign * (exit_price - fill_price) / risk
     mfe = sign * (best_px - fill_price) / risk
     mae = sign * (worst_px - fill_price) / risk  # negative or zero
+
+    # ---- management counterfactuals (same risk denominator as r_multiple) ----
+    # eod_r: hold from the actual fill to the close, no stop, no target.
+    eod_exit = bars[-1]["c"]
+    if slip > 0:
+        eod_exit = eod_exit * (1 - slip) if long else eod_exit * (1 + slip)
+    out["eod_r"] = round(sign * (eod_exit - fill_price) / risk, 3)
+
+    # target_hit_after_stop: only meaningful for stopped trades. Scans from the
+    # exit bar onward (the same-bar case counts, consistent with the conservative
+    # stop-first tie rule above).
+    if exit_reason == "stop":
+        hit = False
+        for b in bars[exit_idx:]:
+            if (long and b["h"] >= target) or (not long and b["l"] <= target):
+                hit = True
+                break
+        out["target_hit_after_stop"] = hit
 
     out.update({
         "exit_price": round(float(exit_price), 4),

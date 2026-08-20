@@ -31,6 +31,7 @@ Q_SYMPATHY_STANDALONE = 2
 Q_CONVICTION = 3
 Q_GAP_SIZE = 4
 Q_SHADOW_FILTER_COST = 5
+Q_STOP_PLACEMENT = 6
 
 
 def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0) -> dict:
@@ -161,6 +162,17 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
         ledger.add_question_progress(con, Q_SHADOW_FILTER_COST, d, 1,
                                      f"{shadow['scored']} rejections scored, net forgone {shadow['net_forgone_r']:+.2f}R")
         counts["q_increments"] += 1
+
+    # Q6: stop placement — every stopped trade logs whether the target printed later
+    # (deterministic counterfactual from the outcome sim; high rate = stops in the noise)
+    for p in picks:
+        o = by_id.get(p["pick_id"], {})
+        if o.get("exit_reason") == "stop":
+            ledger.add_question_progress(
+                con, Q_STOP_PLACEMENT, d, 1,
+                f"{p['ticker']} stopped; target_hit_after_stop={o.get('target_hit_after_stop')}, "
+                f"eod_r={o.get('eod_r')}")
+            counts["q_increments"] += 1
 
     counts["q_increments"] += _q1_gap_fade_mechanics(con, md, d, picks, outcomes, shadow,
                                                      slippage_bps=slippage_bps)

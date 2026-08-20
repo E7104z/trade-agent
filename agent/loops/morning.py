@@ -20,18 +20,34 @@ from ..regime import compute_regime, regime_md
 from ..util import is_market_day, log, now_et, today_et
 
 
-def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None) -> tuple[dict, list[str]]:
+def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
+                   drawdown: dict | None = None) -> tuple[dict, list[str]]:
     """Hard-validate and normalize the risk manager's plan. Returns (plan, warnings).
 
     The playbook's losing-streak rule (>=3 losers: cap 0.5R, demand conviction >= 4)
     is enforced MECHANICALLY here — the prompt asks the risk manager to apply it,
     but discipline rules must not depend on an LLM remembering them.
+
+    Same for the DRAWDOWN CIRCUIT BREAKER: if the trailing drawdown_window
+    triggered trades sum to <= drawdown_pause_r weighted R, the desk enters
+    capital-preservation mode — max 1 pick, minimum size, conviction >= 4 —
+    regardless of what the LLMs proposed. Losing streaks catch consecutive
+    losers; this catches the slow bleed that alternating wins/losses hides.
     """
     warnings: list[str] = []
     max_picks = int(cfg.get("max_picks", 4))
     min_r, max_r = float(cfg.get("min_size_r", 0.25)), float(cfg.get("max_size_r", 1.5))
     max_total = float(cfg.get("max_total_open_risk_r", 3.0))
     losing_streak = bool(streak and streak.get("kind") == "losing" and streak.get("length", 0) >= 3)
+
+    dd_pause = float(cfg.get("drawdown_pause_r", -4.0))
+    dd_mode = bool(drawdown and drawdown.get("n", 0) >= 5
+                   and drawdown.get("sum_weighted_r", 0.0) <= dd_pause)
+    if dd_mode:
+        warnings.append(
+            f"CAPITAL PRESERVATION MODE: trailing {drawdown['n']}-trade weighted R "
+            f"{drawdown['sum_weighted_r']:+.2f} <= {dd_pause} — max 1 pick at {min_r}R, conviction >= 4")
+        max_picks = 1
 
     picks = plan.get("picks") or []
     if plan.get("no_trade"):
@@ -78,6 +94,14 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None) -> tuple
             if p["size_r"] > 0.5:
                 warnings.append(f"{t}: size clamped {p['size_r']} -> 0.5R (losing-streak rule)")
                 p["size_r"] = 0.5
+        if dd_mode:
+            if p["conviction"] < 4:
+                warnings.append(f"{t}: dropped — capital preservation mode demands conviction >= 4 "
+                                f"(had {p['conviction']})")
+                continue
+            if p["size_r"] > min_r:
+                warnings.append(f"{t}: size clamped {p['size_r']} -> {min_r}R (capital preservation mode)")
+                p["size_r"] = min_r
         valid.append(p)
 
     if len(valid) > max_picks:
@@ -208,7 +232,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         plan = risk.parsed or {}
 
         # 7. validate + persist
-        plan, warnings = _validate_plan(plan, cfg, ledger.current_streak(con))
+        plan, warnings = _validate_plan(
+            plan, cfg, ledger.current_streak(con),
+            ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10))))
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = reg.get("tag", "")

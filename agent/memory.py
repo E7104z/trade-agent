@@ -139,7 +139,7 @@ def _regime_block(regimes: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _self_awareness(con: duckdb.DuckDBPyConnection) -> str:
+def _self_awareness(con: duckdb.DuckDBPyConnection, cfg: Config | None = None) -> str:
     streak = ledger.current_streak(con)
     overall = ledger.overall_stats(con)
     setup_stats = ledger.stats_by(con, "setup_type")
@@ -165,6 +165,21 @@ def _self_awareness(con: duckdb.DuckDBPyConnection) -> str:
             f"- You are on a {streak['length']}-trade winning streak. Do NOT get euphoric or oversize; "
             "keep process identical."
         )
+    dd_window = int(cfg.get("drawdown_window", 10)) if cfg else 10
+    dd_pause = float(cfg.get("drawdown_pause_r", -4.0)) if cfg else -4.0
+    dd = ledger.trailing_weighted_r(con, dd_window)
+    if dd["n"] >= 5 and dd["sum_weighted_r"] <= dd_pause:
+        lines.append(
+            f"- CAPITAL PRESERVATION MODE IS ACTIVE: your last {dd['n']} triggered trades sum to "
+            f"{dd['sum_weighted_r']:+.2f} weighted R (breaker at {dd_pause}). The system will "
+            "mechanically enforce max 1 pick at minimum size, conviction >= 4. Propose ONLY your "
+            "single best A+ setup, or stand down — protecting capital IS the winning move today."
+        )
+    elif dd["n"] >= 5 and dd["sum_weighted_r"] <= dd_pause + 1.5:
+        lines.append(
+            f"- Drawdown warning: last {dd['n']} triggered trades sum to {dd['sum_weighted_r']:+.2f} "
+            f"weighted R — within 1.5R of the capital-preservation breaker ({dd_pause}). Quality bar up."
+        )
     hot = [s for s in setup_stats if s["triggered"] >= 8 and (s["win_rate"] or 0) >= 0.6]
     cold = [s for s in setup_stats if s["triggered"] >= 8 and (s["win_rate"] or 1) <= 0.35]
     if hot:
@@ -183,6 +198,7 @@ def build_morning_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
     lessons = ledger.active_lessons(con, mem_cfg["max_active_lessons_in_context"])
     regimes = ledger.recent_regimes(con, 5)
     setup_stats = ledger.stats_by(con, "setup_type")
+    direction_stats = ledger.stats_by(con, "direction")
 
     text = f"""## YOUR PLAYBOOK (v{version} — your accumulated, evidence-backed rules)
 
@@ -200,13 +216,17 @@ def build_morning_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
 
 {_stats_table(setup_stats, 'setup')}
 
+## YOUR PERFORMANCE BY DIRECTION (edge may live on one side of the tape)
+
+{_stats_table(direction_stats, 'direction')}
+
 ## MARKET REGIME — RECENT READS (most recent first)
 
 {_regime_block(regimes)}
 
 ## SELF-AWARENESS CHECK (computed from your ledger — obey these)
 
-{_self_awareness(con)}
+{_self_awareness(con, cfg)}
 """
     return {"text": text, "playbook_version": version}
 
@@ -230,4 +250,7 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         "shadow": ledger.shadow_summary(con, 20),
         "rule_staleness": ledger.rule_staleness(con),
         "question_progress": ledger.question_progress_totals(con),
+        # deterministic counterfactuals: null model, trade management, sizing skill
+        "management": ledger.management_quality(con),
+        "sizing_cf": ledger.sizing_counterfactual(con),
     }
