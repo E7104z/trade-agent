@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent import ledger  # noqa: E402
 from agent.config import load_config  # noqa: E402
+from agent.mascot import MASCOT_MARKER, mascot_embed  # noqa: E402
 from agent.memory import read_playbook  # noqa: E402
 from agent.util import today_et  # noqa: E402
 
@@ -146,6 +147,7 @@ a{color:#58a6ff}
   <h1>Trade Agent — Live Dashboard</h1>
   <a href="/logout">Sign out</a>
 </div>
+<!--ARBY-->
 <p style="color:#8b949e">Loading...</p>
 <div class="card">
   <h2>Run a loop</h2>
@@ -240,6 +242,10 @@ loadData();
 </script>
 </body></html>"""
 
+# Arby the desk mascot: a self-contained widget injected at the marker. It only
+# reads /api/status and never touches the run/loop logic above.
+_PAGE = _PAGE.replace(MASCOT_MARKER, mascot_embed())
+
 
 @app.route("/")
 @login_required
@@ -271,7 +277,9 @@ def api_status():
             "overall": overall,
             "by_setup": by_setup,
             "streak": streak_str,
+            "streak_detail": streak,
             "equity": equity,
+            "equity_curve": curve[-120:],
             "runs": runs,
             "playbook": playbook_text,
             "playbook_version": version,

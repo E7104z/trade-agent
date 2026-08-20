@@ -20,6 +20,7 @@ import duckdb
 
 from . import ledger
 from .config import Config, REPORTS_DIR
+from .mascot import MASCOT_MARKER, mascot_embed
 from .memory import read_playbook
 from .util import log
 
@@ -137,6 +138,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 <h1>Trade Agent — Live Dashboard</h1>
 <p class="neutral">Generated {generated_at} ET &middot; Playbook v{playbook_version}</p>
+<!--ARBY-->
 
 <div class="card">
   <h2>Today's Plan — {plan_date}</h2>
@@ -260,6 +262,26 @@ def render_dashboard(con: duckdb.DuckDBPyConnection, cfg: Config, plan_date: dat
         runs_table=runs_table,
         equity_json=json.dumps(curve),
     )
+    # Arby the desk mascot — injected after .format() so its JS braces stay
+    # untouched. The static file can't fetch /api/status, so the data the
+    # widget needs is inlined as boot data.
+    playbook_bullets = [
+        ln.strip().lstrip("-*• ").replace("**", "").strip()
+        for ln in playbook_text.splitlines()
+        if ln.strip().startswith(("- ", "* ", "• "))
+    ][:4]
+    mascot_boot = {
+        "today": plan_date.isoformat() if plan_date else None,
+        "plan": plan_row["plan"] if plan_row else None,
+        "overall": overall,
+        "streak_detail": streak,
+        "equity": equity_now,
+        "equity_curve": curve[-120:],
+        "playbook_version": version,
+        "playbook_bullets": playbook_bullets,
+        "runs": runs[:5],
+    }
+    html = html.replace(MASCOT_MARKER, mascot_embed(mascot_boot))
     out_path = REPORTS_DIR / "dashboard.html"
     if os.environ.get("DATABASE_URL"):
         # Hosted (Vercel) deployment: filesystem is read-only outside /tmp.
