@@ -20,12 +20,18 @@ from ..regime import compute_regime, regime_md
 from ..util import is_market_day, log, now_et, today_et
 
 
-def _validate_plan(plan: dict, cfg: Config) -> tuple[dict, list[str]]:
-    """Hard-validate and normalize the risk manager's plan. Returns (plan, warnings)."""
+def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None) -> tuple[dict, list[str]]:
+    """Hard-validate and normalize the risk manager's plan. Returns (plan, warnings).
+
+    The playbook's losing-streak rule (>=3 losers: cap 0.5R, demand conviction >= 4)
+    is enforced MECHANICALLY here — the prompt asks the risk manager to apply it,
+    but discipline rules must not depend on an LLM remembering them.
+    """
     warnings: list[str] = []
     max_picks = int(cfg.get("max_picks", 4))
     min_r, max_r = float(cfg.get("min_size_r", 0.25)), float(cfg.get("max_size_r", 1.5))
     max_total = float(cfg.get("max_total_open_risk_r", 3.0))
+    losing_streak = bool(streak and streak.get("kind") == "losing" and streak.get("length", 0) >= 3)
 
     picks = plan.get("picks") or []
     if plan.get("no_trade"):
@@ -63,6 +69,15 @@ def _validate_plan(plan: dict, cfg: Config) -> tuple[dict, list[str]]:
 
         conv = p.get("conviction")
         p["conviction"] = int(min(max(int(conv), 1), 5)) if isinstance(conv, (int, float)) else 3
+
+        if losing_streak:
+            if p["conviction"] < 4:
+                warnings.append(f"{t}: dropped — losing streak >= 3 demands conviction >= 4 "
+                                f"(had {p['conviction']})")
+                continue
+            if p["size_r"] > 0.5:
+                warnings.append(f"{t}: size clamped {p['size_r']} -> 0.5R (losing-streak rule)")
+                p["size_r"] = 0.5
         valid.append(p)
 
     if len(valid) > max_picks:
@@ -193,7 +208,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         plan = risk.parsed or {}
 
         # 7. validate + persist
-        plan, warnings = _validate_plan(plan, cfg)
+        plan, warnings = _validate_plan(plan, cfg, ledger.current_streak(con))
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = reg.get("tag", "")

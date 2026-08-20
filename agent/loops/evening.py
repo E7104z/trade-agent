@@ -33,7 +33,7 @@ Q_GAP_SIZE = 4
 Q_SHADOW_FILTER_COST = 5
 
 
-def _grade_rejections(con, md: MarketData, d: date) -> dict:
+def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0) -> dict:
     """Shadow ledger: simulate every rejected candidate; never touches the equity curve."""
     rejections = ledger.ungraded_rejections(con, d)
     summary = {"scored": 0, "net_forgone_r": 0.0, "gap_fade_notes": []}
@@ -45,7 +45,7 @@ def _grade_rejections(con, md: MarketData, d: date) -> dict:
         shim = {"pick_id": r["rejection_id"], "direction": r["direction"],
                 "entry_type": r["entry_type"], "entry_price": r["entry_price"],
                 "stop_price": r["stop_price"], "target_price": r["target_price"]}
-        sim = simulate_pick(shim, bars, None)
+        sim = simulate_pick(shim, bars, None, slippage_bps=slippage_bps)
         eod_outcome, forgone = classify_shadow(sim)
         ledger.save_rejection_outcome(con, r["rejection_id"], eod_outcome, forgone)
         summary["scored"] += 1
@@ -59,7 +59,8 @@ def _grade_rejections(con, md: MarketData, d: date) -> dict:
 
 
 def _q1_gap_fade_mechanics(con, md: MarketData, d: date, picks: list[dict],
-                           outcomes: list[dict], shadow: dict) -> int:
+                           outcomes: list[dict], shadow: dict,
+                           slippage_bps: float = 0.0) -> int:
     """Q1: on every gap_fade candidate, compare planned entry vs open-print entry."""
     n = 0
     candidates: list[tuple[dict, list]] = []
@@ -77,11 +78,13 @@ def _q1_gap_fade_mechanics(con, md: MarketData, d: date, picks: list[dict],
         planned = simulate_pick({"pick_id": 0, "direction": c["direction"],
                                  "entry_type": c.get("entry_type", "limit"),
                                  "entry_price": c["entry_price"], "stop_price": c["stop_price"],
-                                 "target_price": c["target_price"]}, bars, None)
+                                 "target_price": c["target_price"]}, bars, None,
+                                slippage_bps=slippage_bps)
         open_sim = simulate_pick({"pick_id": 0, "direction": c["direction"],
                                   "entry_type": "open", "entry_price": bars[0]["o"],
                                   "stop_price": c["stop_price"],
-                                  "target_price": c["target_price"]}, bars, None)
+                                  "target_price": c["target_price"]}, bars, None,
+                                 slippage_bps=slippage_bps)
         note = (f"{c['ticker']}: planned-entry R="
                 f"{planned.get('r_multiple') if planned.get('triggered') else 'untriggered'}, "
                 f"open-print R={open_sim.get('r_multiple')}")
@@ -91,7 +94,7 @@ def _q1_gap_fade_mechanics(con, md: MarketData, d: date, picks: list[dict],
 
 
 def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[dict],
-               review: dict, shadow: dict) -> dict:
+               review: dict, shadow: dict, slippage_bps: float = 0.0) -> dict:
     """Calibration rows, rule confirmations, open-question progress. DB writes only."""
     counts = {"calibration": 0, "confirmations": 0, "q_increments": 0}
     by_id = {o["pick_id"]: o for o in outcomes}
@@ -159,7 +162,8 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
                                      f"{shadow['scored']} rejections scored, net forgone {shadow['net_forgone_r']:+.2f}R")
         counts["q_increments"] += 1
 
-    counts["q_increments"] += _q1_gap_fade_mechanics(con, md, d, picks, outcomes, shadow)
+    counts["q_increments"] += _q1_gap_fade_mechanics(con, md, d, picks, outcomes, shadow,
+                                                     slippage_bps=slippage_bps)
     return counts
 
 
@@ -183,11 +187,13 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
 
         picks = ledger.picks_for_date(con, d)
         md = MarketData(cfg)
+        slippage = float(cfg.get("slippage_bps", 5))
 
-        # 1. deterministic outcome simulation
+        # 1. deterministic outcome simulation (with friction — see grading.py)
         if picks:
-            log("evening", f"Simulating outcomes for {len(picks)} picks against intraday bars...")
-            outcomes = grade_day(md, picks, d)
+            log("evening", f"Simulating outcomes for {len(picks)} picks against intraday bars "
+                           f"(slippage {slippage:.0f} bps/side)...")
+            outcomes = grade_day(md, picks, d, slippage_bps=slippage)
             for o in outcomes:
                 ledger.save_outcome(con, o)
         else:
@@ -197,7 +203,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # v3: shadow ledger — grade what the desk REJECTED (counterfactual only,
         # never touches the taken-trade equity curve)
         log("evening", "Scoring rejected candidates (shadow ledger)...")
-        shadow = _grade_rejections(con, md, d)
+        shadow = _grade_rejections(con, md, d, slippage_bps=slippage)
 
         out_md = outcomes_md(picks, outcomes) if picks else "(no picks today — no-trade day)"
         recap = md.market_recap(d)
@@ -245,7 +251,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                 ledger.update_lesson_feedback(con, upd["lesson_id"], upd.get("action", ""))
 
         # v3: calibration rows, rule confirmations, open-question progress
-        counts = _v3_events(con, md, d, picks, outcomes, review, shadow)
+        counts = _v3_events(con, md, d, picks, outcomes, review, shadow, slippage_bps=slippage)
 
         ledger.log_run(con, "evening", d, started, "ok", model, result.usage)
 

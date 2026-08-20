@@ -19,6 +19,11 @@ Simulation rules (documented, conservative):
     mfe_r / mae_r = max favorable / adverse excursion in R while in the trade
     missed_move_r = for UNTRIGGERED picks, what the move from the entry level to the
                     best price would have been worth in R (measures entries that were too cute)
+  Friction (slippage_bps, default 5):
+    Fills and exits are worsened by slippage_bps in the adverse direction on BOTH
+    sides of the trade. Zero-friction paper fills systematically overstate edge,
+    and the entire learning loop depends on the ledger being honest. Applied
+    identically to taken picks and shadow-ledger rejections so comparisons stay fair.
 """
 from __future__ import annotations
 
@@ -33,7 +38,8 @@ def _risk_per_share(entry: float, stop: float) -> float:
     return abs(entry - stop)
 
 
-def simulate_pick(pick: dict, bars: list[dict], daily: dict | None) -> dict:
+def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
+                  slippage_bps: float = 0.0) -> dict:
     """Returns an outcome dict ready for ledger.save_outcome (minus grade fields)."""
     out: dict[str, Any] = {
         "pick_id": pick["pick_id"],
@@ -105,6 +111,11 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None) -> dict:
         out["missed_move_r"] = round(move / risk, 2)
         return out
 
+    # Friction: worsen the fill in the adverse direction before computing risk.
+    slip = float(slippage_bps) / 10000.0
+    if slip > 0:
+        fill_price = fill_price * (1 + slip) if long else fill_price * (1 - slip)
+
     # Recompute risk off the actual fill (a limit/breakout order can fill at a
     # more favorable price than requested when the market gaps through it).
     # GUARD: if that gap-through fill lands very close to the stop, the
@@ -156,6 +167,10 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None) -> dict:
     if exit_price is None:
         exit_price = bars[-1]["c"]
 
+    # Friction: worsen the exit in the adverse direction too.
+    if slip > 0:
+        exit_price = exit_price * (1 - slip) if long else exit_price * (1 + slip)
+
     sign = 1.0 if long else -1.0
     r_mult = sign * (exit_price - fill_price) / risk
     mfe = sign * (best_px - fill_price) / risk
@@ -193,7 +208,8 @@ def classify_shadow(outcome: dict) -> tuple[str, float | None]:
     return "scratch", round(r, 3)
 
 
-def grade_day(md: MarketData, picks: list[dict], d: date) -> list[dict]:
+def grade_day(md: MarketData, picks: list[dict], d: date,
+              slippage_bps: float = 0.0) -> list[dict]:
     outcomes = []
     for p in picks:
         try:
@@ -205,7 +221,7 @@ def grade_day(md: MarketData, picks: list[dict], d: date) -> list[dict]:
             daily = md.daily_bar(p["ticker"], d)
         except Exception:
             daily = None
-        o = simulate_pick(p, bars, daily)
+        o = simulate_pick(p, bars, daily, slippage_bps=slippage_bps)
         o["eval_date"] = d
         outcomes.append(o)
         log("grade", f"{p['ticker']} {p['direction']}: triggered={o['triggered']} "

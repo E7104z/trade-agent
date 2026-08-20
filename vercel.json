@@ -9,7 +9,6 @@
   },
   "crons": [
     { "path": "/cron/morning", "schedule": "45 10 * * 1-5" },
-    { "path": "/cron/evening", "schedule": "30 20 * * 1-5" },
-    { "path": "/cron/weekly", "schedule": "0 21 * * 0" }
+    { "path": "/cron/evening", "schedule": "30 20 * * 1-5" }
   ]
 }

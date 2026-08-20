@@ -41,6 +41,7 @@ _DEFAULTS: dict[str, Any] = {
     "max_size_r": 1.5,
     "min_size_r": 0.25,
     "max_total_open_risk_r": 3.0,
+    "slippage_bps": 5,
     "timezone": "America/New_York",
     "email_enabled": False,
     "data": {

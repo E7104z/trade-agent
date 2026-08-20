@@ -335,33 +335,44 @@ def run_loop(loop_name: str):
 # Vercel Cron only sends GET requests, authenticated via the Authorization:
 # Bearer <CRON_SECRET> header it attaches automatically. These always run for
 # real (no mock/offline) and never force — they respect the market-day check.
-# Vercel Cron schedules are fixed UTC with no DST awareness, so as a safety
-# net we also sanity-check the current ET hour before spending API money;
-# a schedule that drifts an hour after a DST change will just no-op and log
-# it instead of silently running at the wrong time of day.
-_CRON_WINDOWS = {"morning": (6, 10), "evening": (15, 19), "weekly": (0, 23)}
+#
+# Vercel Hobby allows max TWO cron jobs (daily schedules only), so there is no
+# separate weekly cron: the evening cron runs the weekly miner after Friday's
+# grading session, which is equivalent (all of the week's data is graded by then).
+#
+# Cron schedules are fixed UTC with no DST awareness, so we sanity-check the
+# current ET hour before spending API money. Windows are wide enough to accept
+# the one-hour EST/EDT drift (morning fires 5:45 ET in winter, 6:45 in summer).
+_CRON_WINDOWS = {"morning": (5, 10), "evening": (15, 19)}
 
 
 @app.route("/cron/<loop_name>", methods=["GET"])
 @login_required
 def cron_loop(loop_name: str):
-    if loop_name not in _VALID_LOOPS:
-        return json_response({"error": f"unknown loop '{loop_name}'"}, 400)
+    if loop_name not in ("morning", "evening"):
+        return json_response({"error": f"unknown cron loop '{loop_name}'"}, 400)
     if not _is_cron_request():
         return json_response({"error": "this endpoint is for Vercel Cron only"}, 403)
 
     from agent.util import now_et
-    hour = now_et().hour
+    now = now_et()
     lo, hi = _CRON_WINDOWS[loop_name]
-    if not (lo <= hour <= hi):
+    if not (lo <= now.hour <= hi):
         return json_response({
             "loop": loop_name, "skipped": True,
-            "reason": f"current ET hour {hour} outside expected window {lo}-{hi} "
+            "reason": f"current ET hour {now.hour} outside expected window {lo}-{hi} "
                       "(likely a DST schedule drift) — refusing to run automatically",
         })
 
     cfg = load_config()
-    return json_response(_execute_loop(loop_name, cfg, force=False))
+    result = _execute_loop(loop_name, cfg, force=False)
+
+    # Friday evening doubles as the weekly mining session.
+    if loop_name == "evening" and now.weekday() == 4 and not result.get("error"):
+        weekly_result = _execute_loop("weekly", load_config(), force=False)
+        result["weekly"] = weekly_result
+
+    return json_response(result)
 
 
 # Local dev convenience: `python api/index.py` runs a normal Flask dev server.
