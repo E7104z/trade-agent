@@ -74,7 +74,7 @@ _SNIPPET = r"""
     <div id="arby-wrap" tabindex="0">
       <div id="arby-bubble"></div>
       <div id="arby-tip"></div>
-      <div id="arby-hint">Click the floor to send him around &middot; scroll/pinch to zoom, dbl-click to reset &middot; bin = paper toss &middot; speakers = beat</div>
+      <div id="arby-hint">Click the floor to send him around &middot; drag to look around, right-drag to pan, scroll/pinch to zoom &middot; dbl-click resets the view</div>
     </div>
     <div id="arby-hud">
       <span id="arby-activity">warming up&hellip;</span>
@@ -437,18 +437,53 @@ _SNIPPET = r"""
     e.preventDefault();
     camDist = clamp(camDist * Math.exp(e.deltaY * 0.0016), CAM_MIN, CAM_MAX);
   }, { passive:false });
+
+  // Sims-style orbit + pan, layered on the existing dolly zoom above:
+  //   - left-drag (or one-finger drag) orbits the camera around cameraTarget
+  //   - right-drag pans cameraTarget across the floor (clamped to the room)
+  //   - two-finger drag also pans, alongside the existing pinch-to-zoom
+  // camDir stays a live unit vector recomputed from yaw/pitch, so the
+  // existing tick()-time dolly math (cameraTarget + camDir*camDist) needs no
+  // changes at all — orbiting just steers where that vector points.
+  var camYaw = Math.atan2(camDir.x, camDir.z);
+  var camPitch = Math.atan2(camDir.y, Math.hypot(camDir.x, camDir.z));
+  var camYaw0 = camYaw, camPitch0 = camPitch;
+  var cameraTarget0 = cameraTarget.clone();
+  var PITCH_MIN = 0.12, PITCH_MAX = 1.45;
+  function camDirFromAngles(){
+    var cp = Math.cos(camPitch);
+    camDir.set(Math.sin(camYaw)*cp, Math.sin(camPitch), Math.cos(camYaw)*cp);
+  }
+  function panCamera(dx, dy){
+    var scale = camDist * 0.0018;
+    var right = Math.cos(camYaw), rightZ = -Math.sin(camYaw);
+    var fwd = Math.sin(camYaw), fwdZ = Math.cos(camYaw);
+    cameraTarget.x = clamp(cameraTarget.x - right*dx*scale - fwd*dy*scale, -(ROOM_X-0.4), ROOM_X-0.4);
+    cameraTarget.z = clamp(cameraTarget.z - rightZ*dx*scale - fwdZ*dy*scale, -(ROOM_Z-0.4), ROOM_Z+0.6);
+  }
+  function resetCamera(){
+    camDist = camBaseDist; camYaw = camYaw0; camPitch = camPitch0;
+    camDirFromAngles(); cameraTarget.copy(cameraTarget0);
+  }
+
   // Pinch-to-zoom (touch): track the two active pointers' on-screen distance.
+  // A single active pointer instead drives orbit/pan (see dragButton below).
   var pinchPointers = {}, pinchDist = 0;
+  var dragMoved = false, dragButton = 0;
   renderer.domElement.addEventListener('pointerdown', function(e){
     pinchPointers[e.pointerId] = {x:e.clientX, y:e.clientY};
     var ids = Object.keys(pinchPointers);
     if (ids.length===2){
       var a=pinchPointers[ids[0]], b=pinchPointers[ids[1]];
       pinchDist = Math.hypot(b.x-a.x, b.y-a.y);
+    } else if (ids.length===1){
+      dragMoved = false; dragButton = e.button;
     }
   });
   renderer.domElement.addEventListener('pointermove', function(e){
     if (!pinchPointers[e.pointerId]) return;
+    var prev = pinchPointers[e.pointerId];
+    var dx = e.clientX - prev.x, dy = e.clientY - prev.y;
     pinchPointers[e.pointerId] = {x:e.clientX, y:e.clientY};
     var ids = Object.keys(pinchPointers);
     if (ids.length===2){
@@ -456,13 +491,24 @@ _SNIPPET = r"""
       var d = Math.hypot(b.x-a.x, b.y-a.y);
       if (pinchDist>10) camDist = clamp(camDist*(pinchDist/d), CAM_MIN, CAM_MAX);
       pinchDist = d;
+      panCamera(dx, dy); // two-finger drag pans
+    } else if (ids.length===1){
+      if (Math.abs(dx)>3 || Math.abs(dy)>3) dragMoved = true;
+      if (dragButton===2) panCamera(dx, dy);
+      else {
+        camYaw -= dx*0.0055;
+        camPitch = clamp(camPitch - dy*0.0045, PITCH_MIN, PITCH_MAX);
+        camDirFromAngles();
+      }
     }
   });
   function endPinchPointer(e){ delete pinchPointers[e.pointerId]; }
   renderer.domElement.addEventListener('pointerup', endPinchPointer);
   renderer.domElement.addEventListener('pointercancel', endPinchPointer);
-  // Double-click/tap resets to the default framing.
-  renderer.domElement.addEventListener('dblclick', function(){ camDist = camBaseDist; });
+  // Right-drag pans instead of opening the browser context menu.
+  renderer.domElement.addEventListener('contextmenu', function(e){ e.preventDefault(); });
+  // Double-click/tap resets to the default framing (position, look direction, and pan).
+  renderer.domElement.addEventListener('dblclick', resetCamera);
 
   var hemi = new THREE.HemisphereLight(0xffffff, 0xcfc2a4, 0.85);
   scene.add(hemi);
@@ -623,11 +669,11 @@ _SNIPPET = r"""
   }
 
   // ---------------------------------------------------------- room shell
-  // NOTE: the walkable/obstacle bounds (ROOM_X/ROOM_Z, OBSTACLES, clampToRoom
-  // below) stay exactly as before — only the COSMETIC floor/wall/ceiling meshes
-  // are enlarged here, well past the camera's max zoom-out distance, so no dark
-  // "void" from outside the scene is ever visible in the corners of the frame.
-  var ROOM_X=2.5, ROOM_Z=2.2;
+  // The walkable room fills the space out to ROOM_X/ROOM_Z; the cosmetic
+  // floor/wall/ceiling meshes below are sized generously larger still (fixed
+  // 16x15), so there's always headroom past the camera's max zoom-out
+  // distance and no dark "void" ever shows in the corners of the frame.
+  var ROOM_X=3.6, ROOM_Z=3.3;
   var WALL_H=5.2;
   var floor = new THREE.Mesh(new THREE.PlaneGeometry(16,15),
     new THREE.MeshStandardMaterial({color:0xdcb98a}));
@@ -1033,6 +1079,71 @@ _SNIPPET = r"""
   fridgeCan.position.set(0,0.57,0); fridgeG.add(fridgeCan);
   shadowify(fridgeG); scene.add(fridgeG);
 
+  // stats shelf (back wall, right end) — a live ledger plaque, redrawn on every sync
+  var shelfCv = mkCanvas(200,140), shelfCtx = shelfCv.getContext('2d');
+  var shelfTex = new THREE.CanvasTexture(shelfCv);
+  function drawShelf(){
+    var o = (state.status && state.status.overall) || {};
+    var st = streakInfo(state.status);
+    shelfCtx.fillStyle='#2b2f36'; shelfCtx.fillRect(0,0,200,140);
+    shelfCtx.strokeStyle='#454b54'; shelfCtx.lineWidth=2;
+    [46,90].forEach(function(y){ shelfCtx.beginPath(); shelfCtx.moveTo(6,y); shelfCtx.lineTo(194,y); shelfCtx.stroke(); });
+    shelfCtx.fillStyle='#e6edf3'; shelfCtx.font='bold 13px sans-serif';
+    shelfCtx.fillText('LEDGER STATS', 10, 20);
+    shelfCtx.font='11px Consolas,monospace'; shelfCtx.fillStyle='#8b949e';
+    shelfCtx.fillText('GRADED  '+(o.picks_graded||0), 10, 55);
+    shelfCtx.fillText('STREAK  '+(st.kind!=='none' ? st.length+' '+st.kind.toUpperCase() : '—'), 10, 99);
+    shelfCtx.fillStyle = (o.total_weighted_r||0)>=0 ? '#3fb950' : '#f85149';
+    shelfCtx.font='bold 12px Consolas,monospace';
+    shelfCtx.fillText('TOTAL   '+((o.total_weighted_r||0)>=0?'+':'')+(o.total_weighted_r||0)+'R', 10, 133);
+    shelfTex.needsUpdate = true;
+  }
+  drawShelf();
+  function shelfQuip(){
+    var o = (state.status && state.status.overall) || {};
+    var st = streakInfo(state.status);
+    if (!o.picks_graded) return 'Empty case so far — first graded trade goes up here.';
+    var streakTxt = st.kind!=='none' ? st.length+' '+st.kind+' in a row' : 'no active streak';
+    return o.picks_graded+' graded, '+streakTxt+', '+((o.total_weighted_r||0)>=0?'+':'')+(o.total_weighted_r||0)+'R total.';
+  }
+  var shelfG = new THREE.Group();
+  var shelfBoard = new THREE.Mesh(new THREE.PlaneGeometry(0.72,0.5), new THREE.MeshBasicMaterial({map:shelfTex}));
+  shelfBoard.position.set(2.9,1.4,-ROOM_Z+0.03); shelfG.add(shelfBoard);
+  var shelfFrame = new THREE.Mesh(new THREE.BoxGeometry(0.8,0.58,0.03), new THREE.MeshStandardMaterial({color:0x14161a}));
+  shelfFrame.position.set(2.9,1.4,-ROOM_Z+0.012); shelfG.add(shelfFrame);
+  shadowify(shelfG); scene.add(shelfG);
+
+  // dartboard (back wall, left end)
+  var dartTex = new THREE.CanvasTexture((function(){
+    var c=mkCanvas(120,120), x=c.getContext('2d');
+    x.fillStyle='#e8dcc3'; x.fillRect(0,0,120,120);
+    [[54,'#1c1f24'],[42,'#e6edf3'],[30,'#1c1f24'],[18,'#e6edf3'],[8,'#d6455a']].forEach(function(r){
+      x.fillStyle=r[1]; x.beginPath(); x.arc(60,60,r[0],0,Math.PI*2); x.fill();
+    });
+    return c;
+  })());
+  var dartboardG = new THREE.Group();
+  var dartboardMesh = new THREE.Mesh(new THREE.CircleGeometry(0.28,24), new THREE.MeshBasicMaterial({map:dartTex}));
+  dartboardMesh.position.set(-2.9,1.35,-ROOM_Z+0.03); dartboardG.add(dartboardMesh);
+  var dartRim = new THREE.Mesh(new THREE.TorusGeometry(0.29,0.02,8,24), new THREE.MeshStandardMaterial({color:0x5a3a24}));
+  dartRim.position.set(-2.9,1.35,-ROOM_Z+0.025); dartboardG.add(dartRim);
+  scene.add(dartboardG);
+
+  // treadmill (new front-left floor space) — an alternate energy-restore station
+  var treadmillG = new THREE.Group(); treadmillG.position.set(-2.9,0,2.2);
+  var tmDeckMat = new THREE.MeshStandardMaterial({color:0x21262d});
+  var tmDeck = new THREE.Mesh(new THREE.BoxGeometry(0.5,0.08,1.1), tmDeckMat); tmDeck.position.y=0.08; treadmillG.add(tmDeck);
+  var tmBelt = new THREE.Mesh(new THREE.BoxGeometry(0.4,0.01,1.0), new THREE.MeshStandardMaterial({color:0x14161a}));
+  tmBelt.position.y=0.125; treadmillG.add(tmBelt);
+  var tmConsoleMat = new THREE.MeshStandardMaterial({color:0x3a4048});
+  var tmConsole = new THREE.Mesh(new THREE.BoxGeometry(0.45,0.35,0.06), tmConsoleMat); tmConsole.position.set(0,0.55,-0.5); treadmillG.add(tmConsole);
+  [-0.2,0.2].forEach(function(x){
+    var rail = new THREE.Mesh(new THREE.CylinderGeometry(0.015,0.015,0.55,6), tmConsoleMat);
+    rail.position.set(x,0.35,-0.45); treadmillG.add(rail);
+  });
+  shadowify(treadmillG); scene.add(treadmillG);
+  addBlob(-2.9,2.2,0.9);
+
   // interactive toys: paper-toss bin, paper ball, pocket phone, whiteboard marker, walk marker
   var binG = new THREE.Group(); binG.position.set(0.98,0,-1.42);
   var binWall = new THREE.Mesh(new THREE.CylinderGeometry(0.09,0.07,0.18,12,1,true),
@@ -1236,17 +1347,17 @@ _SNIPPET = r"""
   var STATIONS = [
     { name:'desk',      label:'trading at the battlestation', pos:new THREE.Vector3(0.15,0,-1.05), yaw:0, sit:true,  minT:9, maxT:16, w:2.2,
       hint:'Charts up. Click a monitor to open it for real.' },
-    { name:'whiteboard',label:'reviewing the playbook', pos:new THREE.Vector3(-1.5,0,-1.5), yaw:0, sit:false, minT:4, maxT:7, w:1,
+    { name:'whiteboard',label:'reviewing the playbook', pos:new THREE.Vector3(-1.5,0,-2.6), yaw:0, sit:false, minT:4, maxT:7, w:1,
       hint:'Playbook rules. Click the board to jump to the full text.' },
-    { name:'tv',        label:'watching the wall TV', pos:new THREE.Vector3(1.3,0,-1.3), yaw:0, sit:false, minT:3, maxT:6, w:0.9,
+    { name:'tv',        label:'watching the wall TV', pos:new THREE.Vector3(1.3,0,-2.4), yaw:0, sit:false, minT:3, maxT:6, w:0.9,
       hint:'Tape\u2019s rolling. Click the TV for CNBC.' },
-    { name:'chartwall', label:'studying the equity curve', pos:new THREE.Vector3(1.95,0,0.35), yaw:-Math.PI/2, sit:false, minT:4, maxT:6, w:1,
+    { name:'chartwall', label:'studying the equity curve', pos:new THREE.Vector3(3.05,0,0.35), yaw:-Math.PI/2, sit:false, minT:4, maxT:6, w:1,
       hint:'The curve tells the truth. Click it to jump to Performance.' },
     { name:'coffee',    label:'coffee + Benzinga break', pos:new THREE.Vector3(1.45,0,1.05), yaw:-2.13, sit:false, minT:4, maxT:6, w:1,
       hint:'Benzinga\u2019s on the table \u2014 tap the paper.' },
-    { name:'window',    label:'staring at the market outside', pos:new THREE.Vector3(-2.0,0,-0.5), yaw:Math.PI/2, sit:false, minT:3, maxT:5, w:0.9,
+    { name:'window',    label:'staring at the market outside', pos:new THREE.Vector3(-3.1,0,-0.5), yaw:Math.PI/2, sit:false, minT:3, maxT:5, w:0.9,
       hint:'Big-picture time. Click the window for the Finviz map.' },
-    { name:'calendar',  label:'checking the econ calendar', pos:new THREE.Vector3(-2.02,0,0.75), yaw:Math.PI/2, sit:false, minT:3, maxT:4, w:0.7,
+    { name:'calendar',  label:'checking the econ calendar', pos:new THREE.Vector3(-3.12,0,0.75), yaw:Math.PI/2, sit:false, minT:3, maxT:4, w:0.7,
       hint:'What\u2019s on deck this week? Click the calendar.' },
     { name:'couch',     label:'decompressing on the couch', pos:new THREE.Vector3(-1.78,0,1.28), yaw:Math.PI, sit:true, minT:5, maxT:8, w:0.9,
       hint:'Even quants rest.' },
@@ -1256,15 +1367,21 @@ _SNIPPET = r"""
       hint:'Posture is risk management.' },
     { name:'fridge',    label:'grabbing a cold one (sparkling water)', pos:new THREE.Vector3(1.9,0,-1.35), yaw:0, sit:false, minT:2, maxT:3, w:0.6,
       hint:'Hydration is alpha.' },
+    { name:'treadmill', label:'a quick cardio reset', pos:new THREE.Vector3(-2.9,0,1.9), yaw:0, sit:false, minT:4, maxT:6, w:0.7,
+      hint:'Cardio between candles. Click for a word of encouragement.' },
+    { name:'shelf',     label:'checking the stats shelf', pos:new THREE.Vector3(2.9,0,-2.7), yaw:0, sit:false, minT:2, maxT:4, w:0.5,
+      hint:'The ledger, in one glance. Click it for the summary.' },
+    { name:'dartboard', label:'throwing darts', pos:new THREE.Vector3(-2.9,0,-2.7), yaw:0, sit:false, minT:2, maxT:4, w:0.5,
+      hint:'Aim small, miss small.' },
   ];
   var OBSTACLES = [
     {x:0.15,z:-1.75,r:0.6}, {x:1.85,z:1.3,r:0.45}, {x:-1.8,z:1.35,r:0.62},
-    {x:1.9,z:-1.82,r:0.35}, {x:-2.2,z:-1.72,r:0.3},
+    {x:1.9,z:-1.82,r:0.35}, {x:-2.2,z:-1.72,r:0.3}, {x:-2.9,z:2.2,r:0.5},
   ];
   var HUB = {x:0, z:0.35};
   function clampToRoom(pos){
-    pos.x = clamp(pos.x, -2.25, 2.25);
-    pos.z = clamp(pos.z, -1.95, 2.0);
+    pos.x = clamp(pos.x, -(ROOM_X-0.25), ROOM_X-0.25);
+    pos.z = clamp(pos.z, -(ROOM_Z-0.25), ROOM_Z-0.2);
     OBSTACLES.forEach(function(o){
       var dx=pos.x-o.x, dz=pos.z-o.z, d=Math.hypot(dx,dz);
       if (d<o.r && d>0.0001){ var push=o.r-d; pos.x+=dx/d*push; pos.z+=dz/d*push; }
@@ -1303,7 +1420,7 @@ _SNIPPET = r"""
       if (m<-0.2 && (st.name==='coffee'||st.name==='window'||st.name==='whiteboard')) w*=1.8;
       if (m>0.4 && (st.name==='desk'||st.name==='chartwall')) w*=1.5;
       // low motives pull him toward the station that restores them, Sims-style
-      if (state.needs.energy<35 && st.name==='couch') w*=3;
+      if (state.needs.energy<35 && (st.name==='couch'||st.name==='treadmill')) w*=3;
       if (state.needs.focus<35 && st.name==='coffee') w*=3;
       return w;
     });
@@ -1530,6 +1647,14 @@ _SNIPPET = r"""
     } else if (name==='free'){
       armL.rotation.x=Math.sin(t*1.3)*0.07; armR.rotation.x=-Math.sin(t*1.3)*0.07;
       headGroup.rotation.y=Math.sin(t*0.6)*0.25;      // idle look-around at the user's spot
+    } else if (name==='treadmill'){
+      var jog = Math.sin(t*8)*0.5;
+      legL.hip.rotation.x=jog; legR.hip.rotation.x=-jog;
+      armL.rotation.x=-jog*0.8; armR.rotation.x=jog*0.8;
+    } else if (name==='shelf'){
+      headGroup.rotation.x=0.08; armL.rotation.x=0.15; armR.rotation.x=0.15;
+    } else if (name==='dartboard'){
+      armR.rotation.x=0.9+Math.sin(t*3)*0.3; armR.rotation.z=-0.1;
     }
   }
 
@@ -1615,6 +1740,12 @@ _SNIPPET = r"""
     act:function(){ shootPaper(); } });
   registerTarget(spkG, { label:function(){ return 'Speakers \u2014 drop a beat'; },
     act:function(){ startDance(); } });
+  registerTarget(treadmillG, { label:function(){ return 'Treadmill \u2014 send him for cardio'; },
+    act:function(){ goTo('treadmill'); say(['Cardio between candles.','Sweat now, size later.'][Math.floor(Math.random()*2)], 1600); } });
+  registerTarget(shelfG, { label:function(){ return 'Stats shelf'; },
+    act:function(){ say(shelfQuip()); } });
+  registerTarget(dartboardG, { label:function(){ return 'Dartboard'; },
+    act:function(){ say(['Aim small, miss small.','Bullseye \u2014 unlike some of my fills.','Darts don\u2019t re-quote.'][Math.floor(Math.random()*3)]); } });
 
   function pickTarget(e){
     var rect = renderer.domElement.getBoundingClientRect();
@@ -1639,6 +1770,7 @@ _SNIPPET = r"""
     return hits.length ? hits[0].point : null;
   }
   renderer.domElement.addEventListener('pointermove', function(e){
+    if (Object.keys(pinchPointers).length>0){ tip.style.display='none'; return; } // mid-drag: no hover tooltip
     var tgt = pickTarget(e);
     var rect, lx, ly;
     if (tgt){
@@ -1664,6 +1796,7 @@ _SNIPPET = r"""
   });
   renderer.domElement.addEventListener('pointerleave', function(){ tip.style.display='none'; });
   renderer.domElement.addEventListener('click', function(e){
+    if (dragMoved){ dragMoved = false; return; } // that was a camera drag, not a click
     wrap.focus();
     wake();
     hint.classList.add('hide');
@@ -1764,6 +1897,7 @@ _SNIPPET = r"""
       postTex.needsUpdate = true;
     }
     drawWhiteboard();
+    drawShelf();
     rebuildTape();
     drawFace();
   };
@@ -1931,6 +2065,7 @@ _SNIPPET = r"""
         poseForStation(st.name, t);
         if (st.name==='couch') state.needs.energy = Math.min(100, state.needs.energy + dt*(sleepActive()?26:14));
         if (st.name==='coffee') state.needs.focus = Math.min(100, state.needs.focus + dt*18);
+        if (st.name==='treadmill') state.needs.energy = Math.min(100, state.needs.energy + dt*16);
         if (sleepActive() && st.name==='couch'){
           hudActivity.textContent = 'Asleep \u2014 market\u2019s closed, so is he';
           zzzAcc += dt;
@@ -2050,7 +2185,7 @@ _SNIPPET = r"""
     fetchCoffee: function(){ goTo('coffee'); },
     zoomIn: function(){ camDist = clamp(camDist*0.85, CAM_MIN, CAM_MAX); },
     zoomOut: function(){ camDist = clamp(camDist*1.18, CAM_MIN, CAM_MAX); },
-    resetView: function(){ camDist = camBaseDist; },
+    resetView: resetCamera,
     _tick: tick, // manual frame driver (testing/debugging)
     _snap: function(){
       return {
