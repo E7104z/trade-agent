@@ -152,7 +152,20 @@ def load_config() -> Config:
     cfg.alpaca_secret_key = (
         os.getenv("ALPACA_SECRET_KEY") or creds.get("alpaca_secret_key", "") or ""
     )
-    cfg.smtp = creds.get("smtp", {}) or {}
+    smtp = dict(creds.get("smtp", {}) or {})
+    if os.getenv("SMTP_HOST"):
+        smtp["host"] = os.environ["SMTP_HOST"]
+    if os.getenv("SMTP_PORT"):
+        smtp["port"] = int(os.environ["SMTP_PORT"])
+    if os.getenv("SMTP_USERNAME"):
+        smtp["username"] = os.environ["SMTP_USERNAME"]
+    if os.getenv("SMTP_PASSWORD"):
+        smtp["password"] = os.environ["SMTP_PASSWORD"]
+    if os.getenv("SMTP_FROM"):
+        smtp["from_addr"] = os.environ["SMTP_FROM"]
+    if os.getenv("SMTP_TO"):
+        smtp["to_addrs"] = [a.strip() for a in os.environ["SMTP_TO"].split(",") if a.strip()]
+    cfg.smtp = smtp
     return cfg
 
 

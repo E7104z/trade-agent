@@ -19,7 +19,7 @@
   "slippage_bps": 5,
 
   "timezone": "America/New_York",
-  "email_enabled": false,
+  "email_enabled": true,
 
   "data": {
     "alpaca_feed": "iex",
