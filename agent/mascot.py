@@ -48,8 +48,13 @@ _SNIPPET = r"""
     transition:opacity .4s ease;pointer-events:none;}
   #arby-hint.hide{opacity:0;}
   #arby-hud{display:flex;justify-content:space-between;align-items:center;max-width:760px;
-    margin:8px auto 0;font-size:12px;color:#8b949e;gap:10px;}
+    margin:8px auto 0;font-size:12px;color:#8b949e;gap:10px;flex-wrap:wrap;}
   #arby-mood{padding:2px 10px;border-radius:12px;font-weight:700;font-size:11px;white-space:nowrap;}
+  #arby-needs{display:flex;align-items:center;gap:8px;}
+  .arby-need{display:flex;align-items:center;gap:4px;}
+  .arby-need-label{font-size:9px;letter-spacing:.04em;color:#8b949e;}
+  .arby-need-bar{width:44px;height:6px;background:#0d1117;border:1px solid #30363d;border-radius:4px;overflow:hidden;}
+  .arby-need-fill{height:100%;width:100%;background:#3fb950;transition:width .4s ease,background .4s ease;}
   #arby-links{display:flex;flex-wrap:wrap;gap:6px;max-width:760px;margin:10px auto 0;}
   #arby-links a{font-size:11px;color:#e6edf3;text-decoration:none;background:#21262d;
     border:1px solid #30363d;border-radius:14px;padding:3px 10px;}
@@ -74,6 +79,10 @@ _SNIPPET = r"""
     <div id="arby-hud">
       <span id="arby-activity">warming up&hellip;</span>
       <span id="arby-mood">NEUTRAL</span>
+      <div id="arby-needs">
+        <div class="arby-need"><span class="arby-need-label">ENERGY</span><div class="arby-need-bar"><div id="arby-need-energy" class="arby-need-fill"></div></div></div>
+        <div class="arby-need"><span class="arby-need-label">FOCUS</span><div class="arby-need-bar"><div id="arby-need-focus" class="arby-need-fill"></div></div></div>
+      </div>
     </div>
     <div id="arby-links"></div>
   </div>
@@ -92,6 +101,8 @@ _SNIPPET = r"""
   var hudActivity = document.getElementById('arby-activity');
   var hudMood = document.getElementById('arby-mood');
   var hudMarket = document.getElementById('arby-market');
+  var needEnergyEl = document.getElementById('arby-need-energy');
+  var needFocusEl = document.getElementById('arby-need-focus');
   var toggleBtn = document.getElementById('arby-toggle');
   var linksRow = document.getElementById('arby-links');
   if (!card || !wrap) return;
@@ -104,7 +115,20 @@ _SNIPPET = r"""
     playbookVersion: null,
     lastGraded: null, lastTotalR: null,
     moodScore: 0,
+    bySetup: [],
+    // Sims-style motives: decay over time, restored by visiting the matching station.
+    needs: { energy: 100, focus: 100 },
   };
+
+  function needColor(v){ return v<30 ? '#f85149' : v<60 ? '#d29922' : '#3fb950'; }
+  function refreshNeeds(){
+    if (!needEnergyEl) return;
+    needEnergyEl.style.width = state.needs.energy+'%';
+    needEnergyEl.style.background = needColor(state.needs.energy);
+    needFocusEl.style.width = state.needs.focus+'%';
+    needFocusEl.style.background = needColor(state.needs.focus);
+  }
+  refreshNeeds();
 
   function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
 
@@ -223,6 +247,22 @@ _SNIPPET = r"""
   }
 
   // ------------------------------------------------------------- quips
+  function setupInsight(){
+    // Pick a real, templated line off by_setup stats \u2014 no LLM call, just the numbers
+    // already synced from /api/status, e.g. "Breakout is lagging -- 31% over 6 triggered."
+    var arr = (state.bySetup||[]).filter(function(s){ return s.triggered>=3 && s.win_rate!=null; });
+    if (!arr.length) return null;
+    arr = arr.slice().sort(function(a,b){ return a.win_rate-b.win_rate; });
+    var worst = arr[0], best = arr[arr.length-1];
+    var goWorst = worst.win_rate<0.45 && Math.random()<0.6;
+    var pick = goWorst ? worst : best;
+    var rTxt = pick.total_weighted_r!=null ? ', '+(pick.total_weighted_r>=0?'+':'')+pick.total_weighted_r+'R' : '';
+    if (goWorst){
+      var bullet = state.bullets[0] ? ' Playbook: '+state.bullets[0]+'.' : '';
+      return (pick.dim||'That setup')+' is lagging \u2014 '+Math.round(pick.win_rate*100)+'% over '+pick.triggered+' triggered'+rTxt+'.'+bullet;
+    }
+    return (pick.dim||'That setup')+' is the edge right now \u2014 '+Math.round(pick.win_rate*100)+'% over '+pick.triggered+' triggered'+rTxt+'.';
+  }
   function factQuips(){
     var d = state.status, out = [];
     if (!d) return ['First sync pending\u2026'];
@@ -234,6 +274,8 @@ _SNIPPET = r"""
     if (st.kind==='winning' && st.length>1) out.push(st.length+' wins in a row. Stay humble.');
     if (st.kind==='losing' && st.length>1) out.push(st.length+' losses straight. Size down, zoom out.');
     if (state.playbookVersion!=null) out.push('Playbook v'+state.playbookVersion+' in force.');
+    var si = setupInsight();
+    if (si) out.push(si);
     var plan = d.plan;
     if (plan){
       if (plan.no_trade) out.push('No trade today \u2014 '+String(plan.no_trade_reason||'no edge').slice(0,70));
@@ -286,6 +328,7 @@ _SNIPPET = r"""
     // playbook bullets
     var bl = d.playbook_bullets || extractBullets(d.playbook);
     if (bl && bl.length) state.bullets = bl;
+    state.bySetup = d.by_setup || [];
     // mood + reactions to newly graded trades
     var prevGraded = state.lastGraded, prevTotal = state.lastTotalR;
     var o = d.overall || {};
@@ -331,12 +374,24 @@ _SNIPPET = r"""
   if (!renderer){
     wrap.innerHTML = '<div id="arby-fallback">Arby needs WebGL (or the Three.js CDN) to appear \u2014 ' +
       'the live-data links below still work.</div>';
+    var needsEl = document.getElementById('arby-needs');
+    if (needsEl) needsEl.style.display = 'none'; // motive bars are tied to the 3D walk-around loop
     hudActivity.textContent = 'off duty (no WebGL)';
+    // No 3D animation to react with, but the mood pill + bubble still carry a real reaction.
     window.Mascot = window.Arby = {
-      registerWin:function(){}, registerLoss:function(){}, reset:function(){},
-      setBlendedMood:function(s){ state.moodScore=clamp(s,-1,1); refreshHud(); },
-      syncFromStatus:applyStatus, tryLiveSync:syncLive,
-      setChartData:function(){}, setChartFromPicks:function(){}, say:say,
+      registerWin: function(fromData){
+        state.moodScore=clamp(state.moodScore+0.25,-1,1); refreshHud();
+        if (fromData) say(['BOOKED. +R in the ledger.','That\u2019s the system working.','Graded green. On to the next.'][Math.floor(Math.random()*3)]);
+      },
+      registerLoss: function(fromData){
+        state.moodScore=clamp(state.moodScore-0.25,-1,1); refreshHud();
+        if (fromData) say(['Stopped. Loss logged, lesson pending.','Paid tuition. Moving on.','That one\u2019s going in the journal.'][Math.floor(Math.random()*3)]);
+      },
+      reset: function(){ state.moodScore=0; refreshHud(); },
+      setBlendedMood: function(s){ state.moodScore=clamp(s,-1,1); refreshHud(); },
+      syncFromStatus: applyStatus, tryLiveSync: syncLive,
+      setChartData:function(){}, setChartFromPicks:function(){}, setNoTrade:function(){},
+      say: say, goTo: function(){},
     };
     return;
   }
@@ -606,6 +661,9 @@ _SNIPPET = r"""
     if (phase==='night'){ hemi.intensity=0.45; amb.intensity=0.16; dirLight.intensity=0.25; }
     else if (phase==='dawn'||phase==='dusk'){ hemi.intensity=0.65; amb.intensity=0.22; dirLight.intensity=0.5; }
     else { hemi.intensity=0.85; amb.intensity=0.28; dirLight.intensity=0.75; }
+    var lampOn = (phase==='night' || phase==='dusk');
+    if (lampLight){ lampLight.intensity = lampOn ? 0.55 : 0; }
+    if (lampHeadMat){ lampHeadMat.emissiveIntensity = lampOn ? 0.9 : 0; }
   }
 
   // whiteboard (live playbook rules)
@@ -689,8 +747,21 @@ _SNIPPET = r"""
   var tapeSegs = [{t:'ARBY TV ONLINE \u2014 WAITING FOR FIRST SYNC', c:'#8b949e'}];
   var tapeW = 0;
   var TAPE_FONT = 'bold 30px Consolas,monospace';
+  var lastTapeSig = null;
+  function tapeSignature(d){
+    if (!d) return 'boot';
+    var o = d.overall||{}, st = streakInfo(d), plan = d.plan;
+    var picksSig = plan && !plan.no_trade
+      ? (plan.picks||[]).map(function(p){ return p.ticker+p.entry_price+p.target_price+p.direction; }).join(',')
+      : (plan && plan.no_trade ? 'NT:'+plan.no_trade_reason : '');
+    return [picksSig, o.win_rate, o.total_weighted_r, d.equity, st.kind, st.length, state.playbookVersion].join('|');
+  }
   function rebuildTape(){
-    var d = state.status, segs = [];
+    var d = state.status;
+    var sig = tapeSignature(d);
+    if (sig === lastTapeSig) return; // nothing changed since the last sync \u2014 skip the full remeasure
+    lastTapeSig = sig;
+    var segs = [];
     var sep = { t:'  \u25C6  ', c:'#30363d' };
     function push(t,c){ segs.push({t:t,c:c}); segs.push(sep); }
     if (d){
@@ -813,6 +884,21 @@ _SNIPPET = r"""
   });
   var deskCan = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.11,10), new THREE.MeshStandardMaterial({color:0xd6455a}));
   deskCan.position.set(0.75,0.705,0.22); deskG.add(deskCan);
+
+  // desk lamp — dark/off by day, glows at dusk/night (see applyPhaseLighting below)
+  var lampG = new THREE.Group(); lampG.position.set(-0.85,0.66,0.22);
+  var lampMat = new THREE.MeshStandardMaterial({color:0x40464f});
+  var lampBase = new THREE.Mesh(new THREE.CylinderGeometry(0.045,0.05,0.015,10), lampMat);
+  lampG.add(lampBase);
+  var lampArm = new THREE.Mesh(new THREE.CylinderGeometry(0.007,0.007,0.19,6), lampMat);
+  lampArm.position.y=0.1; lampG.add(lampArm);
+  var lampHeadMat = new THREE.MeshStandardMaterial({color:0x2b2f36, emissive:0xffdca8, emissiveIntensity:0});
+  var lampHead = new THREE.Mesh(new THREE.ConeGeometry(0.05,0.08,10), lampHeadMat);
+  lampHead.rotation.x=Math.PI; lampHead.position.set(0.02,0.2,0); lampG.add(lampHead);
+  deskG.add(lampG);
+  var lampLight = new THREE.PointLight(0xffdca8, 0, 1.1);
+  lampLight.position.set(-0.7,0.86,-1.63); scene.add(lampLight);
+
   shadowify(deskG);
   scene.add(deskG);
   addBlob(0.15,-1.55,1.5);
@@ -991,6 +1077,12 @@ _SNIPPET = r"""
   });
   var band=new THREE.Mesh(new THREE.BoxGeometry(0.38,0.03,0.08), hsMat);
   band.position.y=0.355; headGroup.add(band);
+
+  // plumbob — a little Sims nod, floating over his head and tinted with his mood color
+  var plumbobMat = new THREE.MeshStandardMaterial({color:0x58a6ff, emissive:0x58a6ff, emissiveIntensity:0.7});
+  var plumbob = new THREE.Mesh(new THREE.OctahedronGeometry(0.065,0), plumbobMat);
+  plumbob.position.y=0.62; headGroup.add(plumbob);
+
   char3.add(headGroup);
   char3.position.set(0.15,0,-1.05);
   shadowify(char3);
@@ -1114,6 +1206,9 @@ _SNIPPET = r"""
       var m = state.moodScore;
       if (m<-0.2 && (st.name==='coffee'||st.name==='window'||st.name==='whiteboard')) w*=1.8;
       if (m>0.4 && (st.name==='desk'||st.name==='chartwall')) w*=1.5;
+      // low motives pull him toward the station that restores them, Sims-style
+      if (state.needs.energy<35 && st.name==='couch') w*=3;
+      if (state.needs.focus<35 && st.name==='coffee') w*=3;
       return w;
     });
     var total = weights.reduce(function(a,b){return a+b;},0);
@@ -1138,6 +1233,8 @@ _SNIPPET = r"""
   var deskSubPose = 'typing';
   var deskSubTimer = 0;
   var SPEED = 1.15;
+  var needsUiAcc = 0;
+  var poseSaveAcc = 0;
 
   function sleepActive(){ return sleepTime() && clock.getElapsedTime() > wakeUntilT; }
   function wake(){ wakeUntilT = clock.getElapsedTime() + 90; }
@@ -1272,6 +1369,8 @@ _SNIPPET = r"""
     act:function(){ say(['Hydration is alpha.','Emergency electrolytes.'][Math.floor(Math.random()*2)]); } });
   registerTarget(plantG, { label:function(){ return 'Desk plant'; },
     act:function(){ say(['Photosynthesis > FOMO.','My only long-term hold.'][Math.floor(Math.random()*2)]); } });
+  registerTarget(lampG, { label:function(){ return 'Desk lamp'; },
+    act:function(){ say((dayPhase()==='night'||dayPhase()==='dusk') ? 'Burning the midnight oil.' : 'Don’t need it yet — plenty of daylight.'); } });
   registerTarget(clockG, { label:function(){ return 'Desk clock'; },
     act:function(){ say('It\u2019s '+etClockStr()+' \u2014 market\u2019s '+(marketOpen()?'open. Lock in.':'closed. Prep time.')); } });
 
@@ -1445,6 +1544,14 @@ _SNIPPET = r"""
     tvAcc += dt;
     if (tvAcc>0.08){ drawTV(t); tvAcc=0; }
 
+    // Sims-style motives: drain steadily, only autonomous station visits refill them.
+    state.needs.energy = clamp(state.needs.energy - dt*(focusMode?1.1:0.55), 0, 100);
+    state.needs.focus = clamp(state.needs.focus - dt*(marketOpen()?1.2:0.6), 0, 100);
+    needsUiAcc += dt;
+    if (needsUiAcc>0.25){ refreshNeeds(); needsUiAcc=0; }
+    poseSaveAcc += dt;
+    if (poseSaveAcc>4){ savePose(); poseSaveAcc=0; }
+
     // mood visuals
     var m = moodFor(state.moodScore);
     displayColor.lerp(new THREE.Color(m.color), dt*2);
@@ -1453,6 +1560,10 @@ _SNIPPET = r"""
     ledLight.color.copy(displayColor);
     ledLight.intensity = 0.55 + (focusMode ? Math.abs(Math.sin(t*7))*0.4 : Math.sin(t*2.2)*0.08);
     if (m.key!==lastMoodBand){ lastMoodBand=m.key; drawFace(); }
+    plumbobMat.color.copy(displayColor);
+    plumbobMat.emissive.copy(displayColor);
+    plumbob.rotation.y += dt*1.4;
+    plumbob.position.y = 0.62 + Math.sin(t*1.6)*0.02;
 
     // blink
     if (t-lastBlinkT > nextBlinkGap){
@@ -1552,6 +1663,8 @@ _SNIPPET = r"""
           }
         }
         poseForStation(st.name, t);
+        if (st.name==='couch') state.needs.energy = Math.min(100, state.needs.energy + dt*(sleepActive()?26:14));
+        if (st.name==='coffee') state.needs.focus = Math.min(100, state.needs.focus + dt*18);
         if (sleepActive() && st.name==='couch'){
           hudActivity.textContent = 'Asleep \u2014 market\u2019s closed, so is he';
           zzzAcc += dt;
@@ -1595,12 +1708,36 @@ _SNIPPET = r"""
 
     renderer.render(scene, camera);
   }
+
+  // ---------------------------------------------------------- session pose persistence
+  // Session-scoped (sessionStorage, not localStorage) so a reload picks up where he left
+  // off mid-visit, but a brand-new tab/day doesn't inherit a stale position.
+  var POSE_KEY = 'arby.pose.v1';
+  (function restorePose(){
+    try {
+      var raw = sessionStorage.getItem(POSE_KEY);
+      if (!raw) return;
+      var p = JSON.parse(raw);
+      if (typeof p.x!=='number' || typeof p.z!=='number') return;
+      char3.position.x = p.x; char3.position.z = p.z;
+      clampToRoom(char3.position);
+      char3.rotation.y = typeof p.yaw==='number' ? p.yaw : 0;
+      sitAmount = 0; // resume standing, not mid-sit-down
+      auto = { phase:'idling', stationIdx:0, timer:0, targetDur:4+Math.random()*3, path:[] };
+    } catch(e){}
+  })();
+  function savePose(){
+    try { sessionStorage.setItem(POSE_KEY, JSON.stringify({x:char3.position.x, z:char3.position.z, yaw:char3.rotation.y})); } catch(e){}
+  }
+  window.addEventListener('pagehide', savePose);
+  document.addEventListener('visibilitychange', function(){ if (document.hidden) savePose(); });
+
   animate();
 
   // ---------------------------------------------------------- public API
   window.Mascot = window.Arby = {
-    registerWin: function(fromData){ state.moodScore=clamp(state.moodScore+0.25,-1,1); refreshHud(); drawFace(); winFx(!!fromData); },
-    registerLoss: function(fromData){ state.moodScore=clamp(state.moodScore-0.25,-1,1); refreshHud(); drawFace(); lossFx(!!fromData); },
+    registerWin: function(fromData){ state.moodScore=clamp(state.moodScore+0.25,-1,1); state.needs.focus=clamp(state.needs.focus+8,0,100); refreshHud(); refreshNeeds(); drawFace(); winFx(!!fromData); },
+    registerLoss: function(fromData){ state.moodScore=clamp(state.moodScore-0.25,-1,1); state.needs.energy=clamp(state.needs.energy-8,0,100); refreshHud(); refreshNeeds(); drawFace(); lossFx(!!fromData); },
     reset: function(){ state.moodScore=0; refreshHud(); drawFace(); },
     setBlendedMood: function(s){ state.moodScore=clamp(s,-1,1); refreshHud(); drawFace(); },
     syncFromStatus: applyStatus,

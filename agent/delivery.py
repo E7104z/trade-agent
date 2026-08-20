@@ -274,6 +274,7 @@ def render_dashboard(con: duckdb.DuckDBPyConnection, cfg: Config, plan_date: dat
         "today": plan_date.isoformat() if plan_date else None,
         "plan": plan_row["plan"] if plan_row else None,
         "overall": overall,
+        "by_setup": setup_stats,
         "streak_detail": streak,
         "equity": equity_now,
         "equity_curve": curve[-120:],
