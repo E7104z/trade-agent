@@ -31,7 +31,7 @@ _SNIPPET = r"""
   #arby-market{font-size:12px;color:#8b949e;margin-right:12px;font-family:Consolas,monospace;}
   #arby-toggle{padding:4px 12px;margin:0;background:#21262d;border:1px solid #30363d;border-radius:6px;
     color:#e6edf3;font-size:12px;font-weight:600;cursor:pointer;}
-  #arby-wrap{position:relative;outline:none;max-width:760px;margin:0 auto;}
+  #arby-wrap{position:relative;outline:none;max-width:1000px;margin:0 auto;}
   #arby-wrap.focused canvas{box-shadow:0 0 0 2px #58a6ff;}
   #arby-bubble{position:absolute;pointer-events:none;opacity:0;transform:translate(-50%,-8px);
     background:#1c2128;border:1px solid #30363d;border-radius:8px;color:#e6edf3;
@@ -47,7 +47,7 @@ _SNIPPET = r"""
     background:rgba(255,255,255,.85);padding:4px 8px;border-radius:6px;z-index:2;
     transition:opacity .4s ease;pointer-events:none;}
   #arby-hint.hide{opacity:0;}
-  #arby-hud{display:flex;justify-content:space-between;align-items:center;max-width:760px;
+  #arby-hud{display:flex;justify-content:space-between;align-items:center;max-width:1000px;
     margin:8px auto 0;font-size:12px;color:#8b949e;gap:10px;flex-wrap:wrap;}
   #arby-mood{padding:2px 10px;border-radius:12px;font-weight:700;font-size:11px;white-space:nowrap;}
   #arby-needs{display:flex;align-items:center;gap:8px;}
@@ -55,7 +55,7 @@ _SNIPPET = r"""
   .arby-need-label{font-size:9px;letter-spacing:.04em;color:#8b949e;}
   .arby-need-bar{width:44px;height:6px;background:#0d1117;border:1px solid #30363d;border-radius:4px;overflow:hidden;}
   .arby-need-fill{height:100%;width:100%;background:#3fb950;transition:width .4s ease,background .4s ease;}
-  #arby-links{display:flex;flex-wrap:wrap;gap:6px;max-width:760px;margin:10px auto 0;}
+  #arby-links{display:flex;flex-wrap:wrap;gap:6px;max-width:1000px;margin:10px auto 0;}
   #arby-links a{font-size:11px;color:#e6edf3;text-decoration:none;background:#21262d;
     border:1px solid #30363d;border-radius:14px;padding:3px 10px;}
   #arby-links a:hover{border-color:#58a6ff;color:#58a6ff;}
@@ -74,7 +74,7 @@ _SNIPPET = r"""
     <div id="arby-wrap" tabindex="0">
       <div id="arby-bubble"></div>
       <div id="arby-tip"></div>
-      <div id="arby-hint">Click Arby to chat &middot; click screens &amp; props to open live data &middot; WASD/arrows to walk him</div>
+      <div id="arby-hint">Click the floor to send him around &middot; scroll/pinch to zoom, dbl-click to reset &middot; bin = paper toss &middot; speakers = beat</div>
     </div>
     <div id="arby-hud">
       <span id="arby-activity">warming up&hellip;</span>
@@ -401,17 +401,27 @@ _SNIPPET = r"""
   var scene = new THREE.Scene();
   scene.background = new THREE.Color(0x161b22); // blend into the dashboard card
   var camera = new THREE.PerspectiveCamera(42, RW/RH, 0.1, 100);
-  camera.position.set(3.6, 2.5, 3.9);
-  camera.lookAt(0, 0.8, -0.6);
+  // Camera dollies toward/away from a fixed look-at point for scroll/pinch zoom;
+  // direction + base distance are derived once from the initial framing so the
+  // "breathing" idle sway and zoom compose cleanly (see tick()'s render tail).
+  var cameraTarget = new THREE.Vector3(0, 0.85, -0.5);
+  var camInitPos = new THREE.Vector3(3.25, 2.3, 3.55);
+  var camDir = camInitPos.clone().sub(cameraTarget).normalize();
+  var camBaseDist = camInitPos.distanceTo(cameraTarget);
+  var camDist = camBaseDist;
+  var CAM_MIN = camBaseDist * 0.55;
+  var CAM_MAX = camBaseDist * 1.7;
+  camera.position.copy(camInitPos);
+  camera.lookAt(cameraTarget);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 2));
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   wrap.insertBefore(renderer.domElement, bubble);
 
   function sizeCanvas(){
-    var w = Math.min(wrap.clientWidth || 480, 760);
+    var w = Math.min(wrap.clientWidth || 480, 1000);
     if (w < 50) w = 480;
-    var h = Math.round(clamp(w*0.56, 250, 420));
+    var h = Math.round(clamp(w*0.6, 300, 560));
     RW = w; RH = h;
     renderer.setSize(w, h);
     camera.aspect = w/h;
@@ -420,6 +430,39 @@ _SNIPPET = r"""
   sizeCanvas();
   if (window.ResizeObserver) new ResizeObserver(sizeCanvas).observe(wrap);
   else window.addEventListener('resize', sizeCanvas);
+
+  // Scroll-wheel zoom (desktop) — multiplicative so both mouse wheels (large,
+  // discrete deltaY) and trackpads (small, continuous deltaY) feel proportional.
+  wrap.addEventListener('wheel', function(e){
+    e.preventDefault();
+    camDist = clamp(camDist * Math.exp(e.deltaY * 0.0016), CAM_MIN, CAM_MAX);
+  }, { passive:false });
+  // Pinch-to-zoom (touch): track the two active pointers' on-screen distance.
+  var pinchPointers = {}, pinchDist = 0;
+  renderer.domElement.addEventListener('pointerdown', function(e){
+    pinchPointers[e.pointerId] = {x:e.clientX, y:e.clientY};
+    var ids = Object.keys(pinchPointers);
+    if (ids.length===2){
+      var a=pinchPointers[ids[0]], b=pinchPointers[ids[1]];
+      pinchDist = Math.hypot(b.x-a.x, b.y-a.y);
+    }
+  });
+  renderer.domElement.addEventListener('pointermove', function(e){
+    if (!pinchPointers[e.pointerId]) return;
+    pinchPointers[e.pointerId] = {x:e.clientX, y:e.clientY};
+    var ids = Object.keys(pinchPointers);
+    if (ids.length===2){
+      var a=pinchPointers[ids[0]], b=pinchPointers[ids[1]];
+      var d = Math.hypot(b.x-a.x, b.y-a.y);
+      if (pinchDist>10) camDist = clamp(camDist*(pinchDist/d), CAM_MIN, CAM_MAX);
+      pinchDist = d;
+    }
+  });
+  function endPinchPointer(e){ delete pinchPointers[e.pointerId]; }
+  renderer.domElement.addEventListener('pointerup', endPinchPointer);
+  renderer.domElement.addEventListener('pointercancel', endPinchPointer);
+  // Double-click/tap resets to the default framing.
+  renderer.domElement.addEventListener('dblclick', function(){ camDist = camBaseDist; });
 
   var hemi = new THREE.HemisphereLight(0xffffff, 0xcfc2a4, 0.85);
   scene.add(hemi);
@@ -580,8 +623,13 @@ _SNIPPET = r"""
   }
 
   // ---------------------------------------------------------- room shell
+  // NOTE: the walkable/obstacle bounds (ROOM_X/ROOM_Z, OBSTACLES, clampToRoom
+  // below) stay exactly as before — only the COSMETIC floor/wall/ceiling meshes
+  // are enlarged here, well past the camera's max zoom-out distance, so no dark
+  // "void" from outside the scene is ever visible in the corners of the frame.
   var ROOM_X=2.5, ROOM_Z=2.2;
-  var floor = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_X*2, ROOM_Z*2),
+  var WALL_H=5.2;
+  var floor = new THREE.Mesh(new THREE.PlaneGeometry(16,15),
     new THREE.MeshStandardMaterial({color:0xdcb98a}));
   floor.rotation.x=-Math.PI/2; floor.receiveShadow=true; scene.add(floor);
   var rug = new THREE.Mesh(new THREE.CircleGeometry(1.2,32),
@@ -589,12 +637,15 @@ _SNIPPET = r"""
   rug.rotation.x=-Math.PI/2; rug.position.set(-0.1,0.004,0.7); rug.receiveShadow=true; scene.add(rug);
 
   var wallMat = new THREE.MeshStandardMaterial({color:0xf3efe4});
-  var backWall = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_X*2,3), wallMat);
-  backWall.position.set(0,1.5,-ROOM_Z); backWall.receiveShadow=true; scene.add(backWall);
-  var leftWall = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_Z*2,3), wallMat);
-  leftWall.rotation.y=Math.PI/2; leftWall.position.set(-ROOM_X,1.5,0); leftWall.receiveShadow=true; scene.add(leftWall);
-  var rightWall = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_Z*2,3), wallMat);
-  rightWall.rotation.y=-Math.PI/2; rightWall.position.set(ROOM_X,1.5,0); rightWall.receiveShadow=true; scene.add(rightWall);
+  var backWall = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_X*2+9,WALL_H), wallMat);
+  backWall.position.set(0,WALL_H/2,-ROOM_Z); backWall.receiveShadow=true; scene.add(backWall);
+  var leftWall = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_Z*2+9,WALL_H), wallMat);
+  leftWall.rotation.y=Math.PI/2; leftWall.position.set(-ROOM_X,WALL_H/2,0); leftWall.receiveShadow=true; scene.add(leftWall);
+  var rightWall = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_Z*2+9,WALL_H), wallMat);
+  rightWall.rotation.y=-Math.PI/2; rightWall.position.set(ROOM_X,WALL_H/2,0); rightWall.receiveShadow=true; scene.add(rightWall);
+  var ceiling = new THREE.Mesh(new THREE.PlaneGeometry(16,15),
+    new THREE.MeshStandardMaterial({color:0xf3efe4, side:THREE.DoubleSide}));
+  ceiling.rotation.x=Math.PI/2; ceiling.position.y=WALL_H; scene.add(ceiling);
 
   var baseMat = new THREE.MeshStandardMaterial({color:0xffffff});
   [[0,0,-ROOM_Z+0.02,0],[-ROOM_X+0.02,0,0,Math.PI/2],[ROOM_X-0.02,0,0,-Math.PI/2]].forEach(function(bp){
@@ -878,10 +929,12 @@ _SNIPPET = r"""
   mousepad.position.set(0.32,0.665,0.16); deskG.add(mousepad);
   var mouseProp = new THREE.Mesh(new THREE.BoxGeometry(0.05,0.03,0.08), new THREE.MeshStandardMaterial({color:0x1c1f24}));
   mouseProp.position.set(0.34,0.685,0.16); deskG.add(mouseProp);
+  var spkG = new THREE.Group();
   [-0.7,0.7].forEach(function(x){
     var spk = new THREE.Mesh(new THREE.BoxGeometry(0.08,0.16,0.08), new THREE.MeshStandardMaterial({color:0x1c1f24}));
-    spk.position.set(x,0.72,-0.2); deskG.add(spk);
+    spk.position.set(x,0.72,-0.2); spkG.add(spk);
   });
+  deskG.add(spkG);
   var deskCan = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.03,0.11,10), new THREE.MeshStandardMaterial({color:0xd6455a}));
   deskCan.position.set(0.75,0.705,0.22); deskG.add(deskCan);
 
@@ -980,6 +1033,38 @@ _SNIPPET = r"""
   fridgeCan.position.set(0,0.57,0); fridgeG.add(fridgeCan);
   shadowify(fridgeG); scene.add(fridgeG);
 
+  // interactive toys: paper-toss bin, paper ball, pocket phone, whiteboard marker, walk marker
+  var binG = new THREE.Group(); binG.position.set(0.98,0,-1.42);
+  var binWall = new THREE.Mesh(new THREE.CylinderGeometry(0.09,0.07,0.18,12,1,true),
+    new THREE.MeshStandardMaterial({color:0x3a4048, side:THREE.DoubleSide}));
+  binWall.position.y = 0.09; binG.add(binWall);
+  var binBase = new THREE.Mesh(new THREE.CircleGeometry(0.07,12), new THREE.MeshStandardMaterial({color:0x2b3036}));
+  binBase.rotation.x = -Math.PI/2; binBase.position.y = 0.006; binG.add(binBase);
+  shadowify(binG); scene.add(binG);
+
+  var paperBall = new THREE.Mesh(new THREE.DodecahedronGeometry(0.035,0),
+    new THREE.MeshStandardMaterial({color:0xf0ede4}));
+  paperBall.castShadow = true; paperBall.visible = false; scene.add(paperBall);
+
+  var phoneProp = new THREE.Group();
+  var phBody = new THREE.Mesh(new THREE.BoxGeometry(0.055,0.1,0.012), new THREE.MeshStandardMaterial({color:0x14161a}));
+  phoneProp.add(phBody);
+  var phScreen = new THREE.Mesh(new THREE.PlaneGeometry(0.045,0.085), new THREE.MeshBasicMaterial({color:0x8fc7ff}));
+  phScreen.position.z = 0.008; // faces +Z, back toward his eyes (he faces -Z)
+  phoneProp.add(phScreen);
+  phoneProp.visible = false; phoneProp.userData.hideAtHome = true;
+  scene.add(phoneProp);
+
+  var markerProp = new THREE.Mesh(new THREE.CylinderGeometry(0.011,0.011,0.09,8),
+    new THREE.MeshStandardMaterial({color:0xd6455a}));
+  markerProp.visible = false; markerProp.userData.hideAtHome = true;
+  scene.add(markerProp);
+
+  var walkMarker = new THREE.Mesh(new THREE.RingGeometry(0.1,0.16,24),
+    new THREE.MeshBasicMaterial({color:0x58a6ff, transparent:true, opacity:0, depthWrite:false, side:THREE.DoubleSide}));
+  walkMarker.rotation.x = -Math.PI/2; walkMarker.position.y = 0.02;
+  scene.add(walkMarker);
+
   // ---------------------------------------------------------- character (Arby)
   var SKIN = 0x6b4a33;
   var shirtMat = new THREE.MeshStandardMaterial({color:0x58a6ff});
@@ -1015,10 +1100,13 @@ _SNIPPET = r"""
     var armSeg=segmentGroup(0.13,0.42,0.13,shirtMat); shoulder.add(armSeg);
     var hand=new THREE.Mesh(new THREE.BoxGeometry(0.11,0.09,0.11), new THREE.MeshStandardMaterial({color:SKIN}));
     hand.position.y=-0.44; shoulder.add(hand);
+    var grip=new THREE.Group(); grip.position.set(0,-0.47,0); shoulder.add(grip); // held-item anchor
     char3.add(shoulder);
-    return shoulder;
+    return {shoulder:shoulder, grip:grip};
   }
-  var armL=buildArm(-0.30), armR=buildArm(0.30);
+  var armLParts=buildArm(-0.30), armRParts=buildArm(0.30);
+  var armL=armLParts.shoulder, armR=armRParts.shoulder;
+  var handL=armLParts.grip, handR=armRParts.grip;
 
   // head with an expressive canvas face (front = -Z)
   var headGroup = new THREE.Group(); headGroup.position.set(0,SHOULDER_Y,0);
@@ -1101,6 +1189,7 @@ _SNIPPET = r"""
   particleTex.loss = textSprite('-R','#f85149');
   particleTex.zzz = textSprite('z','#8b949e');
   particleTex.spark = textSprite('\u2726','#ffd75e');
+  particleTex.note = textSprite('\u266A','#79c0ff');
   var particles = [];
   for (var pi=0; pi<16; pi++){
     var sm = new THREE.SpriteMaterial({map:particleTex.win, transparent:true, depthWrite:false});
@@ -1109,10 +1198,14 @@ _SNIPPET = r"""
     scene.add(sp);
     particles.push({s:sp, vx:0, vy:0, vz:0, life:0, max:1});
   }
-  function spawnBurst(kind, n){
-    var origin = new THREE.Vector3();
-    headGroup.getWorldPosition(origin);
-    origin.y += 0.35;
+  function spawnBurst(kind, n, at){
+    var origin;
+    if (at){ origin = new THREE.Vector3(at.x, at.y, at.z); }
+    else {
+      origin = new THREE.Vector3();
+      headGroup.getWorldPosition(origin);
+      origin.y += 0.35;
+    }
     var count = 0;
     for (var i=0;i<particles.length && count<n;i++){
       var p = particles[i];
@@ -1193,6 +1286,9 @@ _SNIPPET = r"""
     return [{x:HUB.x,z:HUB.z},{x:target.x,z:target.z}];
   }
   function stationIdx(name){ for (var i=0;i<STATIONS.length;i++){ if (STATIONS[i].name===name) return i; } return 0; }
+  // pseudo-station for user click-to-walk destinations
+  var FREE_STATION = { name:'free', label:'posted up where you sent him', yaw:null, sit:false, minT:4, maxT:7, hint:null, w:0 };
+  function curStation(){ return auto.free ? FREE_STATION : STATIONS[auto.stationIdx]; }
   function pickNextStation(excludeIdx){
     var focusOn = focusMode;
     var sleeping = sleepActive();
@@ -1246,8 +1342,116 @@ _SNIPPET = r"""
     armR.rotation.set(0,0,0);
     torso.rotation.x = 0;
   }
+
+  // ---------------------------------------------------------- held props & toys
+  // Reparent a prop into a hand grip; restore it to its home spot on release.
+  var held = { R:null, L:null };
+  function holdProp(side, obj, px, py, pz, rx, ry, rz){
+    if (held[side]===obj) return;
+    releaseProp(side);
+    if (!obj.userData.home){
+      obj.userData.home = { parent: obj.parent, pos: obj.position.clone(), rot: obj.rotation.clone() };
+    }
+    (side==='R'?handR:handL).add(obj);
+    obj.position.set(px,py,pz);
+    obj.rotation.set(rx,ry,rz);
+    obj.visible = true;
+    held[side] = obj;
+  }
+  function releaseProp(side){
+    var obj = held[side];
+    if (!obj) return;
+    var home = obj.userData.home;
+    if (home && home.parent){
+      home.parent.add(obj);
+      obj.position.copy(home.pos);
+      obj.rotation.copy(home.rot);
+    }
+    if (obj.userData.hideAtHome) obj.visible = false;
+    held[side] = null;
+  }
+  function releaseAllProps(){ releaseProp('R'); releaseProp('L'); }
+
+  // speakers -> one-song dance break
+  var danceUntil = 0, danceNoteAcc = 0;
+  function startDance(){
+    wake();
+    danceUntil = clock.getElapsedTime() + 6.5;
+    say(['Volume up.','Market\u2019s closed, floor\u2019s open.','One-song break.'][Math.floor(Math.random()*3)], 2000);
+  }
+
+  // bin -> paper-toss minigame; make-rate rides his mood
+  var paperFlight = null;
+  function shootPaper(){
+    if (paperFlight) return;
+    wake();
+    var t0 = clock.getElapsedTime();
+    var hitChance = clamp(0.7 + 0.25*state.moodScore, 0.35, 0.95);
+    var willHit = Math.random() < hitChance;
+    gesture = { start:t0, dur:0.5, apply:function(p){ armR.rotation.x = 0.6+p*2.0; armR.rotation.z = -0.15*p; } };
+    setTimeout(function(){
+      var from = new THREE.Vector3(); handR.getWorldPosition(from);
+      var to = new THREE.Vector3(binG.position.x, 0.2, binG.position.z);
+      if (!willHit){ to.x += 0.17; to.z += 0.1; }
+      var mid = from.clone().add(to).multiplyScalar(0.5);
+      mid.y = Math.max(from.y, 0.3) + 0.55;
+      paperFlight = { t0: clock.getElapsedTime(), dur:0.75, from:from, mid:mid, to:to, hit:willHit, bounced:false };
+      paperBall.visible = true;
+    }, 380);
+  }
+  function updatePaperFlight(t, dt){
+    if (!paperFlight) return;
+    var pf = paperFlight;
+    var pp = (t-pf.t0)/pf.dur;
+    if (pp>=1){
+      if (pf.hit){
+        paperBall.visible = false; paperFlight = null;
+        spawnBurst('spark', 4, {x:pf.to.x, y:pf.to.y+0.1, z:pf.to.z});
+        say(['Buckets.','Count it.','Three points \u2014 like my R-multiples.'][Math.floor(Math.random()*3)], 2000);
+      } else if (!pf.bounced){
+        pf.bounced = true; pf.t0 = t; pf.dur = 0.4;
+        pf.from = pf.to.clone();
+        pf.to = new THREE.Vector3(pf.to.x+0.22, 0.035, pf.to.z+0.2);
+        pf.mid = pf.from.clone().lerp(pf.to, 0.5); pf.mid.y = 0.22;
+      } else {
+        paperBall.visible = false; paperFlight = null;
+        say(['Rimmed out.','Even paper trades miss sometimes.'][Math.floor(Math.random()*2)], 2000);
+      }
+      return;
+    }
+    var q1 = pf.from.clone().lerp(pf.mid, pp), q2 = pf.mid.clone().lerp(pf.to, pp);
+    paperBall.position.copy(q1.lerp(q2, pp));
+    paperBall.rotation.x += dt*9; paperBall.rotation.z += dt*7;
+  }
+
+  // floor click -> walk order, with a fading target ring
+  var walkMarkerT = -1;
+  function showWalkMarker(x, z){
+    walkMarker.position.x = x; walkMarker.position.z = z;
+    walkMarker.scale.set(1,1,1);
+    walkMarkerT = clock.getElapsedTime();
+  }
+  function updateWalkMarker(t){
+    if (walkMarkerT<0) return;
+    var age = t - walkMarkerT;
+    if (age>1.3){ walkMarker.material.opacity = 0; walkMarkerT = -1; return; }
+    walkMarker.material.opacity = Math.max(0, 0.85 - age*0.65);
+    walkMarker.scale.setScalar(1 + age*0.7);
+  }
+  function walkToPoint(p){
+    releaseAllProps();
+    wake();
+    mode = 'auto';
+    var v = new THREE.Vector3(p.x, 0, p.z);
+    clampToRoom(v);
+    auto = { phase:'walking', free:true, stationIdx:auto.stationIdx, timer:0, targetDur:0, path:routeTo(v) };
+    showWalkMarker(v.x, v.z);
+    say(['On my way.','Roger.','Moving.'][Math.floor(Math.random()*3)], 1400);
+  }
+
   function goTo(name){
     mode = 'auto';
+    releaseAllProps();
     var idx = stationIdx(name);
     var stn = STATIONS[idx];
     var gdx = char3.position.x - stn.pos.x, gdz = char3.position.z - stn.pos.z;
@@ -1258,10 +1462,21 @@ _SNIPPET = r"""
     auto = { phase:'walking', stationIdx:idx, timer:0, targetDur:0, path:routeTo(stn.pos) };
   }
   function arriveAtStation(){
-    var st = STATIONS[auto.stationIdx];
+    var st = curStation();
     auto.phase='idling'; auto.timer=0;
     auto.targetDur = st.minT + Math.random()*(st.maxT-st.minT);
-    if (Math.random()<0.4 && !sleepActive()) say(st.hint, 3200);
+    // pick up the props that belong to this activity (returned on leave)
+    if (st.name==='coffee'){
+      holdProp('R', mug, 0,0.02,-0.03, 0,0,0);
+      holdProp('L', newsG, 0,0.05,-0.08, 0.85,0,0.15);
+    } else if (st.name==='fridge'){
+      holdProp('R', fridgeCan, 0,0.03,-0.02, 0,0,0);
+    } else if (st.name==='phone'){
+      holdProp('R', phoneProp, 0,0.02,-0.04, 0.85,0,0);
+    } else if (st.name==='whiteboard'){
+      holdProp('R', markerProp, 0,-0.01,-0.05, -Math.PI/2,0,0);
+    }
+    if (st.hint && Math.random()<0.4 && !sleepActive()) say(st.hint, 3200);
   }
 
   function poseForStation(name, t){
@@ -1292,7 +1507,9 @@ _SNIPPET = r"""
       headGroup.rotation.x=0.28;                     // looking UP at the wall TV
     } else if (name==='coffee'){
       var cyc=(Math.sin(t*1.1)+1)/2;
-      armR.rotation.x=0.3+cyc*1.6; armR.rotation.z=0.1; armL.rotation.x=0.1;
+      armR.rotation.x=0.3+cyc*1.6; armR.rotation.z=0.1;  // mug in hand, sipping
+      armL.rotation.x=1.25; armL.rotation.z=0.1;         // Benzinga paper held up
+      headGroup.rotation.x=-0.12;                        // reading it
     } else if (name==='window'){
       armL.rotation.x=0.15; armR.rotation.x=0.15; armL.rotation.z=0.35; armR.rotation.z=-0.35;
       headGroup.rotation.y=Math.sin(t*0.7)*0.15;
@@ -1310,6 +1527,9 @@ _SNIPPET = r"""
       armL.rotation.x=-2.6*s; armR.rotation.x=-2.6*s; armL.rotation.z=0.2; armR.rotation.z=-0.2;
     } else if (name==='fridge'){
       armR.rotation.x=1.1; headGroup.rotation.x=-0.2; // reaching in, looking down
+    } else if (name==='free'){
+      armL.rotation.x=Math.sin(t*1.3)*0.07; armR.rotation.x=-Math.sin(t*1.3)*0.07;
+      headGroup.rotation.y=Math.sin(t*0.6)*0.25;      // idle look-around at the user's spot
     }
   }
 
@@ -1322,7 +1542,7 @@ _SNIPPET = r"""
     targets.push(root);
   }
   function stationQuip(){
-    var st = STATIONS[auto.stationIdx];
+    var st = curStation();
     var pool;
     if (mode==='auto' && auto.phase==='idling' && st){
       if (st.name==='desk') pool = ['Charting '+mainTicker()+'.', 'Screens are hot.', 'Logging everything. Always.'];
@@ -1343,8 +1563,24 @@ _SNIPPET = r"""
     var m = moodFor(state.moodScore);
     return m.quips[Math.floor(Math.random()*m.quips.length)];
   }
+  var pokeCount = 0, lastPokeT = 0;
   registerTarget(char3, { label:function(){ return 'Talk to Arby'; },
-    act:function(){ say(charQuip()); } });
+    act:function(){
+      var tn = clock.getElapsedTime();
+      pokeCount = (tn-lastPokeT<1.8) ? pokeCount+1 : 1;
+      lastPokeT = tn;
+      if (pokeCount>=4){
+        pokeCount = 0;
+        say(['Okay, okay \u2014 I\u2019m working here.','Poke the ledger, not me.','Careful \u2014 I bite spreads.'][Math.floor(Math.random()*3)], 2400);
+        gesture = { start:tn, dur:0.9, apply:function(p){ headGroup.rotation.y = Math.sin(p*Math.PI*4)*0.4; } };
+      } else {
+        say(charQuip());
+        gesture = { start:tn, dur:0.8, apply:function(p){
+          var s = Math.sin(p*Math.PI);
+          armL.rotation.x = 2.4*s; armL.rotation.z = 0.3*Math.sin(p*Math.PI*3);
+        }};
+      }
+    } });
   registerTarget(monitorRoots.main, { label:function(){ return 'TradingView \u2014 '+state.slotTickers.main+' chart \u2197'; },
     act:function(){ window.open('https://www.tradingview.com/chart/?symbol='+encodeURIComponent(state.slotTickers.main),'_blank','noopener'); } });
   registerTarget(monitorRoots.left, { label:function(){ return 'Yahoo Finance \u2014 '+state.slotTickers.left+' \u2197'; },
@@ -1373,6 +1609,12 @@ _SNIPPET = r"""
     act:function(){ say((dayPhase()==='night'||dayPhase()==='dusk') ? 'Burning the midnight oil.' : 'Don’t need it yet — plenty of daylight.'); } });
   registerTarget(clockG, { label:function(){ return 'Desk clock'; },
     act:function(){ say('It\u2019s '+etClockStr()+' \u2014 market\u2019s '+(marketOpen()?'open. Lock in.':'closed. Prep time.')); } });
+  registerTarget(mug, { label:function(){ return held.R===mug ? 'He\u2019s got his coffee' : 'Coffee run \u2014 send him'; },
+    act:function(){ goTo('coffee'); say(['Coffee run.','Caffeine protocol engaged.'][Math.floor(Math.random()*2)], 1600); } });
+  registerTarget(binG, { label:function(){ return 'Paper toss \u2014 bet he makes it'; },
+    act:function(){ shootPaper(); } });
+  registerTarget(spkG, { label:function(){ return 'Speakers \u2014 drop a beat'; },
+    act:function(){ startDance(); } });
 
   function pickTarget(e){
     var rect = renderer.domElement.getBoundingClientRect();
@@ -1388,15 +1630,32 @@ _SNIPPET = r"""
     }
     return null;
   }
+  function pickFloorPoint(e){
+    var rect = renderer.domElement.getBoundingClientRect();
+    pointerNDC.x = ((e.clientX-rect.left)/rect.width)*2-1;
+    pointerNDC.y = -((e.clientY-rect.top)/rect.height)*2+1;
+    raycaster.setFromCamera(pointerNDC, camera);
+    var hits = raycaster.intersectObjects([floor, rug]);
+    return hits.length ? hits[0].point : null;
+  }
   renderer.domElement.addEventListener('pointermove', function(e){
     var tgt = pickTarget(e);
+    var rect, lx, ly;
     if (tgt){
       renderer.domElement.style.cursor='pointer';
       tip.textContent = tgt.label();
       tip.style.display='block';
-      var rect = wrap.getBoundingClientRect();
-      var lx = clamp(e.clientX-rect.left+14, 0, rect.width-160);
-      var ly = clamp(e.clientY-rect.top+10, 0, rect.height-30);
+      rect = wrap.getBoundingClientRect();
+      lx = clamp(e.clientX-rect.left+14, 0, rect.width-160);
+      ly = clamp(e.clientY-rect.top+10, 0, rect.height-30);
+      tip.style.left = lx+'px'; tip.style.top = ly+'px';
+    } else if (pickFloorPoint(e)){
+      renderer.domElement.style.cursor='crosshair';
+      tip.textContent = 'Send Arby here';
+      tip.style.display='block';
+      rect = wrap.getBoundingClientRect();
+      lx = clamp(e.clientX-rect.left+14, 0, rect.width-160);
+      ly = clamp(e.clientY-rect.top+10, 0, rect.height-30);
       tip.style.left = lx+'px'; tip.style.top = ly+'px';
     } else {
       renderer.domElement.style.cursor='default';
@@ -1409,7 +1668,9 @@ _SNIPPET = r"""
     wake();
     hint.classList.add('hide');
     var tgt = pickTarget(e);
-    if (tgt) tgt.act();
+    if (tgt){ tgt.act(); return; }
+    var fp = pickFloorPoint(e);
+    if (fp) walkToPoint(fp);
   });
 
   function anchorBubbleToHead(){
@@ -1429,6 +1690,7 @@ _SNIPPET = r"""
     var k = e.key.toLowerCase();
     if (DRIVE_KEYS.indexOf(k)>=0){
       e.preventDefault();
+      if (mode!=='user') releaseAllProps();
       keys[k]=true; mode='user'; userIdleTimer=0;
       wake(); hint.classList.add('hide');
     }
@@ -1529,11 +1791,9 @@ _SNIPPET = r"""
   }
 
   // ---------------------------------------------------------- main loop
-  function animate(){
-    requestAnimationFrame(animate);
-    if (hidden) return;
-    var dt = Math.min(0.05, clock.getDelta());
-    var t = clock.getElapsedTime();
+  // All per-frame logic lives in tick(dt, t) so it can be driven manually
+  // (tests, debugging) as well as by requestAnimationFrame.
+  function tick(dt, t){
 
     // environment
     var phase = dayPhase();
@@ -1577,7 +1837,7 @@ _SNIPPET = r"""
     charBlob.position.x = char3.position.x;
     charBlob.position.z = char3.position.z;
 
-    var st = STATIONS[auto.stationIdx];
+    var st = curStation();
 
     if (mode==='user'){
       var vx=0, vz=0;
@@ -1608,6 +1868,7 @@ _SNIPPET = r"""
         userIdleTimer += dt;
         if (userIdleTimer>3){
           mode='auto';
+          releaseAllProps();
           var idx = pickNextStation(auto.stationIdx);
           auto = { phase:'walking', stationIdx:idx, timer:0, targetDur:0, path:routeTo(STATIONS[idx].pos) };
         }
@@ -1642,24 +1903,29 @@ _SNIPPET = r"""
               legL.hip.rotation.x=wsw; legR.hip.rotation.x=-wsw;
               armL.rotation.x=-wsw*0.7; armR.rotation.x=wsw*0.7;
             }
-            hudActivity.textContent = (focusMode?'Priority: ':'Auto \u00B7 walking to ')+st.name;
+            hudActivity.textContent = focusMode ? 'Priority: desk'
+              : 'Auto \u00B7 walking to '+(auto.free?'your spot':st.name);
           }
         }
       } else { // idling
-        // settle yaw toward the station facing
-        var sy = st.yaw - char3.rotation.y;
-        while (sy>Math.PI) sy-=Math.PI*2; while (sy<-Math.PI) sy+=Math.PI*2;
-        char3.rotation.y += sy*0.12;
+        // settle yaw toward the station facing (free spots keep their arrival yaw)
+        if (st.yaw!=null){
+          var sy = st.yaw - char3.rotation.y;
+          while (sy>Math.PI) sy-=Math.PI*2; while (sy<-Math.PI) sy+=Math.PI*2;
+          char3.rotation.y += sy*0.12;
+        }
         if (st.sit) sitAmount = Math.min(1, sitAmount+dt*3.5);
         else sitAmount = Math.max(0, sitAmount-dt*3.5);
         setLegPose(legL, sitAmount); setLegPose(legR, sitAmount);
-        // desk sub-pose cycling
+        // desk sub-pose cycling (the energy can physically comes along for 'sip')
         if (st.name==='desk'){
           deskSubTimer -= dt;
           if (deskSubTimer<=0){
             var poses = focusMode ? ['typing'] : ['typing','typing','typing','glance','sip','lean'];
             deskSubPose = poses[Math.floor(Math.random()*poses.length)];
             deskSubTimer = 5+Math.random()*6;
+            if (deskSubPose==='sip') holdProp('R', deskCan, 0,0.03,-0.02, 0,0,0);
+            else if (held.R===deskCan) releaseProp('R');
           }
         }
         poseForStation(st.name, t);
@@ -1672,6 +1938,7 @@ _SNIPPET = r"""
         } else {
           hudActivity.textContent = (focusMode?'Focused \u00B7 ':'Auto \u00B7 ')+st.label;
           if (auto.timer>auto.targetDur && !focusMode){
+            releaseAllProps();
             var nidx = pickNextStation(auto.stationIdx);
             auto = { phase:'walking', stationIdx:nidx, timer:0, targetDur:0, path:routeTo(STATIONS[nidx].pos) };
           } else if (focusMode && st.name!=='desk' && auto.timer>1){
@@ -1687,6 +1954,21 @@ _SNIPPET = r"""
       }
     }
 
+    // one-song dance break (overrides arms/head; skipped mid-walk so pathing stays clean)
+    if (t < danceUntil && !(mode==='auto' && auto.phase==='walking')){
+      var db = t*7;
+      armL.rotation.x = 1.2+Math.sin(db)*1.2; armR.rotation.x = 1.2+Math.sin(db+Math.PI)*1.2;
+      armL.rotation.z = 0.4; armR.rotation.z = -0.4;
+      headGroup.rotation.y = Math.sin(db*0.5)*0.3;
+      headGroup.rotation.x = 0.08*Math.sin(db);
+      char3.position.y = sitAmount>0.5 ? 0 : Math.abs(Math.sin(db))*0.045;
+      danceNoteAcc += dt;
+      if (danceNoteAcc>0.5){ spawnBurst('note',1); danceNoteAcc=0; }
+      hudActivity.textContent = 'One-song dance break';
+    } else {
+      char3.position.y = 0;
+    }
+
     // posture slump on cold streaks (applied over whatever pose is active):
     // negative X pitch hunches the torso and hangs the head forward
     var slump = state.moodScore<-0.2 ? Math.min(1,(-state.moodScore-0.2)/0.8) : 0;
@@ -1700,13 +1982,28 @@ _SNIPPET = r"""
     }
 
     updateParticles(dt);
+    updatePaperFlight(t, dt);
+    updateWalkMarker(t);
 
-    // subtle camera breathing
-    camera.position.x = 3.6 + Math.sin(t*0.11)*0.05;
-    camera.position.y = 2.5 + Math.sin(t*0.07)*0.03;
-    camera.lookAt(0, 0.8, -0.6);
+    // camera: dolly along the fixed view direction for zoom, plus a subtle
+    // idle sway (scaled with distance so it stays proportionally subtle at
+    // any zoom level)
+    var breatheScale = camDist/camBaseDist;
+    var camBase = cameraTarget.clone().addScaledVector(camDir, camDist);
+    camera.position.set(
+      camBase.x + Math.sin(t*0.11)*0.05*breatheScale,
+      camBase.y + Math.sin(t*0.07)*0.03*breatheScale,
+      camBase.z
+    );
+    camera.lookAt(cameraTarget);
 
     renderer.render(scene, camera);
+  }
+
+  function animate(){
+    requestAnimationFrame(animate);
+    if (hidden) return;
+    tick(Math.min(0.05, clock.getDelta()), clock.getElapsedTime());
   }
 
   // ---------------------------------------------------------- session pose persistence
@@ -1747,6 +2044,29 @@ _SNIPPET = r"""
     setNoTrade: setNoTrade,
     say: say,
     goTo: goTo,
+    walkTo: function(x,z){ walkToPoint({x:x, z:z}); },
+    shootPaper: shootPaper,
+    dance: startDance,
+    fetchCoffee: function(){ goTo('coffee'); },
+    zoomIn: function(){ camDist = clamp(camDist*0.85, CAM_MIN, CAM_MAX); },
+    zoomOut: function(){ camDist = clamp(camDist*1.18, CAM_MIN, CAM_MAX); },
+    resetView: function(){ camDist = camBaseDist; },
+    _tick: tick, // manual frame driver (testing/debugging)
+    _snap: function(){
+      return {
+        pos: [char3.position.x, char3.position.y, char3.position.z],
+        yaw: char3.rotation.y,
+        station: curStation().name, phase: auto.phase, free: !!auto.free,
+        sitAmount: sitAmount, focus: focusMode,
+        heldR: held.R===mug?'mug':held.R===deskCan?'deskCan':held.R===fridgeCan?'fridgeCan'
+              :held.R===phoneProp?'phone':held.R===markerProp?'marker':held.R?'other':null,
+        heldL: held.L===newsG?'news':held.L?'other':null,
+        paperFlying: !!paperFlight, dancing: clock.getElapsedTime()<danceUntil,
+        mugWorld: (function(){ var v=new THREE.Vector3(); mug.getWorldPosition(v); return [v.x,v.y,v.z]; })(),
+        camDist: camDist, camBaseDist: camBaseDist, camMin: CAM_MIN, camMax: CAM_MAX,
+        camPos: [camera.position.x, camera.position.y, camera.position.z],
+      };
+    },
   };
 })();
 </script>
