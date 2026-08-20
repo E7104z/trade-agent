@@ -33,6 +33,14 @@ _SNIPPET = r"""
     color:#e6edf3;font-size:12px;font-weight:600;cursor:pointer;}
   #arby-wrap{position:relative;outline:none;max-width:1000px;margin:0 auto;}
   #arby-wrap.focused canvas{box-shadow:0 0 0 2px #58a6ff;}
+  #arby-wrap:fullscreen{max-width:none;width:100%;height:100%;background:#0d1117;
+    display:flex;align-items:center;justify-content:center;}
+  #arby-wrap:-webkit-full-screen{max-width:none;width:100%;height:100%;background:#0d1117;
+    display:flex;align-items:center;justify-content:center;}
+  #arby-fullscreen{position:absolute;right:10px;top:10px;z-index:3;
+    background:rgba(13,17,23,.75);border:1px solid #30363d;border-radius:6px;
+    color:#e6edf3;font-size:14px;line-height:1;padding:6px 9px;cursor:pointer;}
+  #arby-fullscreen:hover{border-color:#58a6ff;color:#58a6ff;}
   #arby-bubble{position:absolute;pointer-events:none;opacity:0;transform:translate(-50%,-8px);
     background:#1c2128;border:1px solid #30363d;border-radius:8px;color:#e6edf3;
     padding:6px 10px;font-size:12px;max-width:200px;text-align:center;z-index:3;
@@ -75,6 +83,7 @@ _SNIPPET = r"""
       <div id="arby-bubble"></div>
       <div id="arby-tip"></div>
       <div id="arby-hint">Click the floor to send him around &middot; drag to look around, right-drag to pan, scroll/pinch to zoom &middot; dbl-click resets the view</div>
+      <button id="arby-fullscreen" type="button" title="Fullscreen">&#9974;</button>
     </div>
     <div id="arby-hud">
       <span id="arby-activity">warming up&hellip;</span>
@@ -103,6 +112,7 @@ _SNIPPET = r"""
   var hudMarket = document.getElementById('arby-market');
   var needEnergyEl = document.getElementById('arby-need-energy');
   var needFocusEl = document.getElementById('arby-need-focus');
+  var fsBtn = document.getElementById('arby-fullscreen');
   var toggleBtn = document.getElementById('arby-toggle');
   var linksRow = document.getElementById('arby-links');
   if (!card || !wrap) return;
@@ -376,6 +386,7 @@ _SNIPPET = r"""
       'the live-data links below still work.</div>';
     var needsEl = document.getElementById('arby-needs');
     if (needsEl) needsEl.style.display = 'none'; // motive bars are tied to the 3D walk-around loop
+    if (fsBtn) fsBtn.style.display = 'none'; // nothing to fullscreen without the 3D room
     hudActivity.textContent = 'off duty (no WebGL)';
     // No 3D animation to react with, but the mood pill + bubble still carry a real reaction.
     window.Mascot = window.Arby = {
@@ -418,10 +429,18 @@ _SNIPPET = r"""
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   wrap.insertBefore(renderer.domElement, bubble);
 
+  function fsElement(){ return document.fullscreenElement || document.webkitFullscreenElement || null; }
   function sizeCanvas(){
-    var w = Math.min(wrap.clientWidth || 480, 1000);
-    if (w < 50) w = 480;
-    var h = Math.round(clamp(w*0.6, 300, 560));
+    var fs = fsElement() === wrap;
+    var w, h;
+    if (fs){
+      w = wrap.clientWidth || window.innerWidth;
+      h = wrap.clientHeight || window.innerHeight;
+    } else {
+      w = Math.min(wrap.clientWidth || 480, 1000);
+      if (w < 50) w = 480;
+      h = Math.round(clamp(w*0.6, 300, 560));
+    }
     RW = w; RH = h;
     renderer.setSize(w, h);
     camera.aspect = w/h;
@@ -430,6 +449,30 @@ _SNIPPET = r"""
   sizeCanvas();
   if (window.ResizeObserver) new ResizeObserver(sizeCanvas).observe(wrap);
   else window.addEventListener('resize', sizeCanvas);
+
+  // Fullscreen toggle: expands #arby-wrap itself via the Fullscreen API (with
+  // the -webkit- prefix for older Safari), so bubble/tip/hint stay correctly
+  // positioned since they're already absolute-positioned relative to it.
+  if (fsBtn){
+    if (!(wrap.requestFullscreen || wrap.webkitRequestFullscreen)) fsBtn.style.display = 'none';
+    fsBtn.addEventListener('click', function(e){
+      e.stopPropagation();
+      if (fsElement() === wrap){
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      } else {
+        (wrap.requestFullscreen || wrap.webkitRequestFullscreen).call(wrap);
+        wrap.focus();
+      }
+    });
+    var syncFsBtn = function(){
+      var on = fsElement() === wrap;
+      fsBtn.innerHTML = on ? '&#10005;' : '&#9974;';
+      fsBtn.title = on ? 'Exit fullscreen' : 'Fullscreen';
+      sizeCanvas();
+    };
+    document.addEventListener('fullscreenchange', syncFsBtn);
+    document.addEventListener('webkitfullscreenchange', syncFsBtn);
+  }
 
   // Scroll-wheel zoom (desktop) — multiplicative so both mouse wheels (large,
   // discrete deltaY) and trackpads (small, continuous deltaY) feel proportional.
