@@ -18,6 +18,7 @@ from datetime import date, datetime
 from typing import Any
 
 from .config import DB_PATH, ensure_dirs
+from .providers import INDEX_ETFS, SCAN_UNIVERSE
 
 _SCHEMA = """
 CREATE SEQUENCE IF NOT EXISTS seq_pick_id START 1;
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS picks (
     regime_tag       VARCHAR,
     prompt_version   VARCHAR,
     playbook_version VARCHAR,
+    in_scan_universe BOOLEAN,                  -- was ticker in the fixed premarket scan list at pick time?
     created_at       TIMESTAMP DEFAULT current_timestamp
 );
 
@@ -213,6 +215,11 @@ _MIGRATIONS = [
     # their creation date (idempotent -- only touches rows still NULL).
     "ALTER TABLE lessons ADD COLUMN IF NOT EXISTS promoted_at DATE",
     "UPDATE lessons SET promoted_at = created_date WHERE promoted_at IS NULL",
+    # Off-universe provenance: was this ticker inside the fixed premarket scan
+    # list, or did it only surface via the unrestricted movers/actives
+    # screeners (or news/EDGAR)? Lets the weekly miner check whether
+    # SCAN_UNIVERSE's coverage gap is actually biasing which setups confirm.
+    "ALTER TABLE picks ADD COLUMN IF NOT EXISTS in_scan_universe BOOLEAN",
 ]
 
 
@@ -275,16 +282,18 @@ def save_daily_plan(
 
     ids: list[int] = []
     for p in plan.get("picks", []):
+        ticker = p["ticker"].upper()
         row = con.execute(
             """INSERT INTO picks
                (plan_date, ticker, direction, setup_type, catalyst, thesis, conviction,
                 size_r, entry_type, entry_price, stop_price, target_price, target2_price,
-                time_stop, invalidation, regime_tag, prompt_version, playbook_version)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                time_stop, invalidation, regime_tag, prompt_version, playbook_version,
+                in_scan_universe)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                RETURNING pick_id""",
             [
                 plan_date,
-                p["ticker"].upper(),
+                ticker,
                 p["direction"],
                 p.get("setup_type"),
                 p.get("catalyst"),
@@ -301,6 +310,7 @@ def save_daily_plan(
                 plan.get("regime_tag", ""),
                 plan.get("prompt_version", ""),
                 plan.get("playbook_version", ""),
+                ticker in SCAN_UNIVERSE or ticker in INDEX_ETFS,
             ],
         ).fetchone()
         ids.append(row[0])
@@ -556,7 +566,9 @@ def recent_trades(con: duckdb.DuckDBPyConnection, n: int = 20) -> list[dict]:
     return [dict(zip(keys, r)) for r in rows]
 
 
-STATS_DIMENSIONS: frozenset[str] = frozenset({"setup_type", "regime_tag", "direction", "conviction"})
+STATS_DIMENSIONS: frozenset[str] = frozenset(
+    {"setup_type", "regime_tag", "direction", "conviction", "in_scan_universe"}
+)
 
 
 def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:

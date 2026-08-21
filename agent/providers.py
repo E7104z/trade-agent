@@ -310,8 +310,26 @@ class MarketData:
     def _gappers(self) -> list[dict]:
         if not self.alpaca:
             raise RuntimeError("Alpaca not configured — premarket gap scan unavailable")
-        snaps = self.alpaca.snapshots(SCAN_UNIVERSE + INDEX_ETFS)
         min_gap = float(self.cfg.data_cfg.get("gap_scan_min_pct", 3.0))
+        base = set(SCAN_UNIVERSE) | set(INDEX_ETFS)
+
+        # Movers/most-actives aren't restricted to SCAN_UNIVERSE, so folding
+        # them in surfaces small-float/low-price gappers the fixed list
+        # structurally can't see (dilution gaps, squeezes, etc).
+        screener_symbols: set[str] = set()
+        try:
+            mv = self.alpaca.movers(int(self.cfg.data_cfg.get("movers_top", 18)))
+            screener_symbols |= {m["symbol"] for m in mv.get("gainers", []) + mv.get("losers", []) if m.get("symbol")}
+        except Exception as e:
+            log("data", f"WARN movers fetch inside _gappers failed: {e}")
+        try:
+            act = self.alpaca.most_actives(int(self.cfg.data_cfg.get("actives_top", 15)))
+            screener_symbols |= {m["symbol"] for m in act.get("most_actives", []) if m.get("symbol")}
+        except Exception as e:
+            log("data", f"WARN most_actives fetch inside _gappers failed: {e}")
+
+        scan_symbols = base | screener_symbols
+        snaps = self.alpaca.snapshots(list(scan_symbols))
         out = []
         for sym, s in snaps.items():
             if not isinstance(s, dict):
@@ -324,7 +342,8 @@ class MarketData:
                 gap = (last - prev_close) / prev_close * 100
                 if sym in INDEX_ETFS or abs(gap) >= min_gap:
                     out.append({"symbol": sym, "last": round(float(last), 2),
-                                "gap_pct": round(gap, 2), "prev_close": round(float(prev_close), 2)})
+                                "gap_pct": round(gap, 2), "prev_close": round(float(prev_close), 2),
+                                "in_scan_universe": sym in base})
             except (KeyError, TypeError):
                 continue
         out.sort(key=lambda x: -abs(x["gap_pct"]))
@@ -471,9 +490,10 @@ def render_bundle_md(b: dict) -> str:
 
     gappers = b.get("premarket_gappers")
     if gappers:
-        parts.append("**Premarket gap scan (liquid universe):**")
+        parts.append("**Premarket gap scan (curated universe + live movers/actives):**")
         for g in gappers[:25]:
-            parts.append(f"- {g['symbol']}: {g['gap_pct']:+.2f}% (last {g['last']}, prev close {g['prev_close']})")
+            tag = "" if g.get("in_scan_universe", True) else " [off-universe]"
+            parts.append(f"- {g['symbol']}{tag}: {g['gap_pct']:+.2f}% (last {g['last']}, prev close {g['prev_close']})")
 
     movers = b.get("movers")
     if movers:
