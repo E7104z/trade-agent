@@ -20,8 +20,30 @@ from ..regime import compute_regime, regime_md
 from ..util import is_market_day, log, now_et, today_et
 
 
+def _reference_prices(bundle: dict) -> dict[str, float]:
+    """Best-known last/current price per ticker from the morning data bundle.
+
+    Used only by _validate_plan's entry_type sanity gate — NOT for grading or
+    sizing. Coverage is whatever the bundle happened to snapshot (scan
+    universe, movers, most actives, premarket gappers); tickers outside that
+    are simply left unchecked rather than guessed at.
+    """
+    out: dict[str, float] = {}
+    for g in (bundle.get("premarket_gappers") or []):
+        sym, last = g.get("symbol"), g.get("last")
+        if sym and last:
+            out[str(sym).upper()] = float(last)
+    movers = bundle.get("movers") or {}
+    for m in (movers.get("gainers") or []) + (movers.get("losers") or []):
+        sym, px = m.get("symbol"), m.get("price")
+        if sym and px and str(sym).upper() not in out:
+            out[str(sym).upper()] = float(px)
+    return out
+
+
 def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
-                   drawdown: dict | None = None) -> tuple[dict, list[str]]:
+                   drawdown: dict | None = None,
+                   ref_prices: dict[str, float] | None = None) -> tuple[dict, list[str]]:
     """Hard-validate and normalize the risk manager's plan. Returns (plan, warnings).
 
     The playbook's losing-streak rule (>=3 losers: cap 0.5R, demand conviction >= 4)
@@ -33,6 +55,19 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     capital-preservation mode — max 1 pick, minimum size, conviction >= 4 —
     regardless of what the LLMs proposed. Losing streaks catch consecutive
     losers; this catches the slow bleed that alternating wins/losses hides.
+
+    ENTRY-TYPE SANITY GATE: "limit" means buy at this price or better (so a
+    long limit only makes sense at/below the current price — you're buying
+    weakness); "breakout" means buy as price reaches this level from below
+    (only makes sense at/above current — you're buying strength as it's
+    earned). A long limit order priced ABOVE the market is not a limit order
+    at all — it fills immediately at whatever the market is, i.e. a disguised
+    market order, with the "entry price" purely decorative. Left unchecked,
+    that mistype can fill on a gap-through at a price already past the
+    trade's own stop (see grading.py's invalid_fill gate, which catches the
+    resulting fill but can't fix the mistyped plan). Where a reference price
+    is available, mistyped picks are dropped rather than silently executed
+    as market orders.
     """
     warnings: list[str] = []
     max_picks = int(cfg.get("max_picks", 4))
@@ -76,6 +111,28 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
         if p["direction"] == "short" and not (target < entry < stop):
             warnings.append(f"{t}: short levels inconsistent (need target<entry<stop) — dropped")
             continue
+
+        ref = (ref_prices or {}).get(t)
+        if ref:
+            entry_type = str((p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open").lower()
+            tol = 1.01  # 1% buffer for reference-price staleness, not a chase threshold
+            mistyped_as = None
+            if entry_type == "limit":
+                if p["direction"] == "long" and entry > ref * tol:
+                    mistyped_as = "breakout"
+                elif p["direction"] == "short" and entry < ref / tol:
+                    mistyped_as = "breakout"
+            elif entry_type == "breakout":
+                if p["direction"] == "long" and entry < ref / tol:
+                    mistyped_as = "limit"
+                elif p["direction"] == "short" and entry > ref * tol:
+                    mistyped_as = "limit"
+            if mistyped_as:
+                warnings.append(
+                    f"{t}: entry_type={entry_type} but entry {entry} is on the wrong side of "
+                    f"last price {ref} for a {p['direction']} (reads as {mistyped_as}) — dropped "
+                    f"rather than let it fill as a disguised market order")
+                continue
 
         size = p.get("size_r")
         if not isinstance(size, (int, float)):
@@ -234,7 +291,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # 7. validate + persist
         plan, warnings = _validate_plan(
             plan, cfg, ledger.current_streak(con),
-            ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10))))
+            ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10))),
+            ref_prices=_reference_prices(bundle))
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = reg.get("tag", "")

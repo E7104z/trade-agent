@@ -510,3 +510,78 @@ def test_simulate_pick_stamps_sim_version_even_on_short_circuit_exits():
     assert simulate_pick(_pick(target=None), [_bar(100, 100.5, 99.5, 100.2)], None)["sim_version"] == CURRENT_SIM_VERSION
 
 
+# ------------------------------------------------------- fill validity gate (v3)
+# Reproduces the class of bug where a long "limit" order priced above the
+# market (should have been typed "breakout") gaps through on the open and
+# fills BELOW its own stop -- structurally not a trade.
+
+def test_long_limit_priced_above_market_rejects_fill_below_stop():
+    # entry 12.80 (should've been a breakout order), stop 11.90. The session
+    # opens at 11.75 -- already under the stop -- so the "limit" fills there.
+    pick = _pick(direction="long", entry_type="limit", entry=12.80, stop=11.90,
+                 target=14.60, pick_id=4)
+    bars = [_bar(11.75, 12.46, 11.70, 12.10)]
+    out = simulate_pick(pick, bars, None, slippage_bps=5.0)
+    assert out["triggered"] is False
+    assert out["exit_reason"] == "invalid_fill"
+    assert out["r_multiple"] is None
+    assert out["entry_fill"] == pytest.approx(11.75 * 1.0005, abs=1e-4)
+    assert "wrong side of" in out["invalid_fill_detail"]
+
+
+def test_short_limit_priced_below_market_rejects_fill_above_stop():
+    # mirror: short limit entry 90, stop 92, but the open gaps up to 93 --
+    # already past the stop for a short.
+    pick = _pick(direction="short", entry_type="limit", entry=90.0, stop=92.0, target=80.0)
+    bars = [_bar(93.0, 93.5, 92.5, 93.2)]
+    out = simulate_pick(pick, bars, None)
+    assert out["triggered"] is False
+    assert out["exit_reason"] == "invalid_fill"
+    assert out["r_multiple"] is None
+
+
+def test_invalid_fill_is_excluded_from_shadow_ledger_stats():
+    out = simulate_pick(_pick(direction="long", entry_type="limit", entry=12.80,
+                              stop=11.90, target=14.60),
+                        [_bar(11.75, 12.46, 11.70, 12.10)], None)
+    assert out["exit_reason"] == "invalid_fill"
+    kind, forgone = classify_shadow(out)
+    assert kind == "unmeasurable"
+    assert forgone is None
+
+
+def test_valid_fill_far_from_plan_is_flagged_execution_anomaly_not_rejected():
+    # breakout long: entry 100, stop 98 (planned risk 2.0). Price gaps to open
+    # at 110 -- a real, valid fill (well clear of the stop) but 5R away from
+    # the planned entry level, so the "thesis at 100" was never actually tested.
+    pick = _pick(direction="long", entry_type="breakout", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(110.0, 112.0, 109.5, 111.0)]
+    out = simulate_pick(pick, bars, None)
+    assert out["triggered"] is True
+    assert out["exit_reason"] != "invalid_fill"
+    assert out["execution_anomaly"] is True
+    assert out["fill_vs_plan_r"] == pytest.approx(5.0, abs=1e-3)
+    assert out["r_multiple"] is not None  # still graded -- it's a real trade
+
+
+def test_fill_close_to_plan_is_not_flagged_anomalous():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    out = simulate_pick(pick, bars, None)
+    assert out["execution_anomaly"] is False
+
+
+def test_invalid_fill_outcome_renders_in_outcomes_md_without_a_narrative():
+    picks = [{
+        "pick_id": 4, "ticker": "MARA", "direction": "long", "setup_type": "catalyst_momentum",
+        "entry_type": "limit", "entry_price": 12.80, "stop_price": 11.90,
+        "target_price": 14.60, "size_r": 0.5, "conviction": 4,
+        "time_stop": None, "thesis": "test thesis", "invalidation": "test invalidation",
+    }]
+    outcomes = [simulate_pick(picks[0], [_bar(11.75, 12.46, 11.70, 12.10)], None, slippage_bps=5.0)]
+    outcomes[0]["eval_date"] = None
+    md_text = outcomes_md(picks, outcomes)
+    assert "INVALID FILL" in md_text
+    assert "do not construct a narrative" in md_text
+
+

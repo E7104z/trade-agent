@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
     baseline_r     DOUBLE,         -- null model: open->close in pick's direction / planned risk
     eod_r          DOUBLE,         -- triggered: R if held fill->close with no stop/target
     target_hit_after_stop BOOLEAN, -- stopped trades: did price reach target later same day?
+    execution_anomaly BOOLEAN,     -- fill landed >0.5 planned-R from the plan; grade execution only
+    fill_vs_plan_r DOUBLE,         -- |fill - planned entry| / planned risk
     grade          VARCHAR,        -- A..F process grade from evening loop
     grade_notes    VARCHAR,
     graded_at      TIMESTAMP
@@ -203,6 +205,12 @@ _MIGRATIONS = [
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS baseline_r DOUBLE",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS eod_r DOUBLE",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS target_hit_after_stop BOOLEAN",
+    # v3 fill-validity gate (agent/grading.py): invalid_fill trades are hard-rejected
+    # before grading; surviving fills far from the planned entry are flagged here so
+    # the evening grader (and weekly miner) can exclude them from thesis lessons and
+    # rule confirmations instead of narrating a test that never actually happened.
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS execution_anomaly BOOLEAN",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS fill_vs_plan_r DOUBLE",
     # Task 4: version the simulation semantics. Existing rows (graded before
     # this migration ran) default to 1; everything graded from here on writes
     # CURRENT_SIM_VERSION explicitly (see agent/grading.py). Never backfilled
@@ -354,15 +362,17 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
            (pick_id, eval_date, triggered, entry_fill, exit_price, exit_reason,
             r_multiple, mfe_r, mae_r, day_open, day_high, day_low, day_close,
             day_volume, missed_move_r, baseline_r, eod_r, target_hit_after_stop,
+            execution_anomaly, fill_vs_plan_r,
             grade, grade_notes, graded_at, sim_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
             o.get("mfe_r"), o.get("mae_r"), o.get("day_open"), o.get("day_high"),
             o.get("day_low"), o.get("day_close"), o.get("day_volume"),
             o.get("missed_move_r"), o.get("baseline_r"), o.get("eod_r"),
-            o.get("target_hit_after_stop"), o.get("grade"), o.get("grade_notes"),
+            o.get("target_hit_after_stop"), o.get("execution_anomaly"), o.get("fill_vs_plan_r"),
+            o.get("grade"), o.get("grade_notes"),
             o.get("graded_at", datetime.now()), sim_version,
         ],
     )

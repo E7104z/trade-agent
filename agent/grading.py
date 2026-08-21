@@ -36,11 +36,24 @@ Simulation rules (documented, conservative):
   series for indexing and for the eod close — they are not deleted, just
   untrusted for level-touch decisions. Open-type fills are unconditional
   (there is no "trigger" to distrust) and are unaffected by this filter.
+  Fill validity (v3): a gap-through fill can land on the WRONG side of its own
+  stop -- e.g. a long "limit" order effectively bought at the open because price
+  gapped below the limit price, with that open already under the stop. That is
+  not a trade, it's a data artifact of the entry_type being mismatched to how
+  the level was meant to be approached. Such fills are hard-rejected before any
+  risk math: triggered stays False, exit_reason is "invalid_fill", and nothing
+  is graded. A softer case -- fill lands on the correct side of the stop but far
+  from the planned entry -- still grades normally but is flagged
+  execution_anomaly so the evening grader doesn't narrate a thesis test that
+  never actually happened at the intended level.
   Metrics:
     r_multiple = signed P&L / initial risk per share
     mfe_r / mae_r = max favorable / adverse excursion in R while in the trade
     missed_move_r = for UNTRIGGERED picks, what the move from the entry level to the
                     best price would have been worth in R (measures entries that were too cute)
+    fill_vs_plan_r = |actual fill - planned entry| / planned risk. execution_anomaly
+                    is True when this exceeds 0.5 -- flags fills far enough from plan
+                    that grading them as a thesis test would be misleading.
   Counterfactual diagnostics (deterministic, no LLM cost — the weekly miner eats these):
     baseline_r = the NULL MODEL: same name, same direction, enter at the session open,
                  exit at the close, measured in units of the PLANNED risk. Computed for
@@ -74,7 +87,10 @@ _CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 # cross-session comparison) can tell rows graded under different rules apart
 # instead of silently averaging them together. v1 = pre-Task-3 semantics
 # (no time_stop enforcement). v2 = time_stop enforced as a hard exit.
-CURRENT_SIM_VERSION = 2
+# v3 = fills on the wrong side of their own stop are rejected as
+# "invalid_fill" instead of being graded through the risk floor, and
+# surviving fills far from the planned entry are flagged execution_anomaly.
+CURRENT_SIM_VERSION = 3
 
 
 def _risk_per_share(entry: float, stop: float) -> float:
@@ -155,6 +171,8 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "baseline_r": None,
         "eod_r": None,
         "target_hit_after_stop": None,
+        "execution_anomaly": False,
+        "fill_vs_plan_r": None,
         "sim_version": CURRENT_SIM_VERSION,
     }
     if daily:
@@ -227,10 +245,39 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         out["missed_move_r"] = round(move / risk, 2)
         return out
 
+    fill_time = bars[fill_idx].get("t")
+
     # Friction: worsen the fill in the adverse direction before computing risk.
     slip = float(slippage_bps) / 10000.0
     if slip > 0:
         fill_price = fill_price * (1 + slip) if long else fill_price * (1 - slip)
+
+    # ---- hard validity gate ------------------------------------------------
+    # A gap-through fill can land on the WRONG side of its own stop (e.g. a
+    # long "limit" order effectively bought at the open because price gapped
+    # below the limit price, with the open itself already under the stop).
+    # abs(entry - stop) below only measures DISTANCE, not direction, so it
+    # cannot catch this -- it must be checked explicitly, before any risk
+    # math, or a structurally impossible trade slips through as a small,
+    # plausible-looking loss (see the risk-floor guard's history below).
+    if (long and fill_price <= stop) or (not long and fill_price >= stop):
+        out["entry_fill"] = round(fill_price, 4)
+        out["exit_reason"] = "invalid_fill"
+        out["invalid_fill_detail"] = (
+            f"{'long' if long else 'short'} fill {fill_price:.4f} landed on the wrong side of "
+            f"stop {stop:.4f} (planned entry {entry:.4f}, type {entry_type}) -- not a real trade"
+        )
+        log("grade", f"pick {pick.get('pick_id')}: INVALID FILL -- {out['invalid_fill_detail']}")
+        return out
+
+    # Flag (but don't reject) a fill that landed far from the planned entry,
+    # in units of the ORIGINALLY PLANNED risk. Still a real, valid trade --
+    # the stop wasn't breached -- but the evening grader must not narrate a
+    # thesis test at a level the trade never actually filled near.
+    planned_risk = _risk_per_share(entry, stop)
+    if planned_risk > 0:
+        out["fill_vs_plan_r"] = round(abs(fill_price - entry) / planned_risk, 2)
+        out["execution_anomaly"] = out["fill_vs_plan_r"] > 0.5
 
     # Recompute risk off the actual fill (a limit/breakout order can fill at a
     # more favorable price than requested when the market gaps through it).
@@ -239,8 +286,9 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     # fantasy R-multiples (e.g. a 3-cent risk against a $12 move -> 300+R).
     # Floor the effective risk at 25% of the ORIGINALLY PLANNED risk so a
     # favorable fill still gets credit (smaller effective risk = bigger R)
-    # without letting the denominator run away to near-zero.
-    planned_risk = _risk_per_share(entry, stop)
+    # without letting the denominator run away to near-zero. The hard gate
+    # above already ruled out the case where this fill is on the wrong side
+    # of the stop entirely, so what's left here is always a genuine trade.
     risk = _risk_per_share(fill_price, stop)
     if risk <= 0:
         risk = planned_risk
@@ -249,6 +297,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
 
     out["triggered"] = True
     out["entry_fill"] = round(fill_price, 4)
+    out["fill_time"] = fill_time
 
     # ---- map time_stop / flatten_at to bar indices, once, before the walk ----
     time_stop_idx = None
@@ -318,6 +367,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
 
     if exit_price is None:
         exit_price = bars[-1]["c"]
+    exit_time = bars[exit_idx].get("t")
 
     # Friction: worsen the exit in the adverse direction too.
     if slip > 0:
@@ -349,6 +399,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     out.update({
         "exit_price": round(float(exit_price), 4),
         "exit_reason": exit_reason,
+        "exit_time": exit_time,
         "r_multiple": round(float(r_mult), 3),
         "mfe_r": round(float(mfe), 3),
         "mae_r": round(float(mae), 3),
@@ -360,13 +411,16 @@ def classify_shadow(outcome: dict) -> tuple[str, float | None]:
     """
     Map a simulated rejection outcome to (eod_outcome, forgone_r).
 
-    unmeasurable  -> no intraday data (halt/gap); contributes 0, increments nothing
+    unmeasurable  -> no intraday data (halt/gap) or an invalid_fill artifact
+                     (fill landed on the wrong side of its own stop -- not a
+                     real trade the filter could have avoided or caused);
+                     contributes 0, increments nothing
     scratch       -> untriggered (the trade would not have filled; the filter cost
                      nothing) or |R| <= 0.2 noise
     would_have_won / would_have_lost -> triggered with meaningful signed R
     forgone_r: positive = the filter cost us; negative = the filter saved us.
     """
-    if outcome.get("exit_reason") in ("no_data", "invalid_plan"):
+    if outcome.get("exit_reason") in ("no_data", "invalid_plan", "invalid_fill"):
         return "unmeasurable", None
     if not outcome.get("triggered"):
         return "scratch", 0.0
@@ -414,9 +468,21 @@ def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
         lines.append(f"- Thesis: {p['thesis']}")
         lines.append(f"- Invalidation: {p['invalidation']}")
         if o.get("triggered"):
+            times = f" [{o['fill_time']} -> {o['exit_time']}]" if o.get("fill_time") and o.get("exit_time") else ""
             lines.append(f"- OUTCOME: filled @ {o['entry_fill']}, exit @ {o['exit_price']} "
                          f"({o['exit_reason']}), R = {o['r_multiple']:+.2f}, "
-                         f"MFE {o['mfe_r']:+.2f}R, MAE {o['mae_r']:+.2f}R")
+                         f"MFE {o['mfe_r']:+.2f}R, MAE {o['mae_r']:+.2f}R{times}")
+            if o.get("execution_anomaly"):
+                lines.append(
+                    f"  ⚠ EXECUTION ANOMALY: fill landed {o['fill_vs_plan_r']:.2f}R away from the "
+                    f"planned entry ({p['entry_price']}) — the thesis was never actually tested at "
+                    f"the intended level. Grade EXECUTION ONLY for this pick; do not extract a "
+                    f"thesis lesson or confirm/contradict a setup rule from it.")
+        elif o.get("exit_reason") == "invalid_fill":
+            lines.append(
+                f"- OUTCOME: INVALID FILL — {o.get('invalid_fill_detail', 'fill landed on the wrong side of the stop; not a real trade.')} "
+                f"This is an execution-simulation artifact, not a trade outcome. Do not grade it, "
+                f"do not construct a narrative to explain it, and do not extract a lesson from it.")
         else:
             mm = o.get("missed_move_r")
             extra = f" — untriggered; the move from entry level would have been {mm:+.2f}R" if mm is not None else ""

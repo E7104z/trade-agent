@@ -121,7 +121,11 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
             counts["q_increments"] += 1
 
     # rule confirmations: process-pass (A/B) confirms the setup's rule — regardless of P&L.
-    # A process-FAIL does not confirm a rule even if it made money.
+    # A process-FAIL does not confirm a rule even if it made money. An
+    # execution_anomaly pick never confirms a rule either, no matter what grade
+    # the LLM assigned — the fill landed far enough from the planned entry that
+    # the thesis at the intended level was never actually tested (enforced here
+    # in code rather than trusted to prompt compliance; see grading.py).
     graded = {}
     tick_to_pick = {p["ticker"].upper(): p for p in picks}
     for r in review.get("pick_reviews", []) or []:
@@ -130,7 +134,9 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
             p = next((x for x in picks if x["pick_id"] == r["pick_id"]), None)
         if p is None:
             p = tick_to_pick.get(str(r.get("ticker", "")).upper())
-        if p and str(r.get("grade", "")).upper() in ("A", "B") and p.get("setup_type"):
+        o = by_id.get(p["pick_id"], {}) if p else {}
+        if (p and str(r.get("grade", "")).upper() in ("A", "B") and p.get("setup_type")
+                and not o.get("execution_anomaly")):
             ledger.add_rule_confirmation(con, p["setup_type"], d, p["pick_id"])
             counts["confirmations"] += 1
 
