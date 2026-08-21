@@ -82,7 +82,7 @@ _SNIPPET = r"""
     <div id="arby-wrap" tabindex="0">
       <div id="arby-bubble"></div>
       <div id="arby-tip"></div>
-      <div id="arby-hint">Click the floor to send him around &middot; drag to look around, right-drag to pan, scroll/pinch to zoom &middot; dbl-click resets the view</div>
+      <div id="arby-hint">Click the floor to send him around &middot; click anything in the room to interact &middot; drag to look around, right-drag to pan, scroll/pinch to zoom &middot; dbl-click resets the view</div>
       <button id="arby-fullscreen" type="button" title="Fullscreen">&#9974;</button>
     </div>
     <div id="arby-hud">
@@ -873,16 +873,16 @@ _SNIPPET = r"""
     calTex.needsUpdate=true;
   })();
   var calMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.42,0.5), new THREE.MeshBasicMaterial({map:calTex}));
-  calMesh.rotation.y=Math.PI/2; calMesh.position.set(-ROOM_X+0.03,1.5,0.75); scene.add(calMesh);
+  calMesh.rotation.y=Math.PI/2; calMesh.position.set(-ROOM_X+0.03,1.5,-0.9); scene.add(calMesh);
 
   // wall TV — live ticker tape + headlines (back wall, above desk)
   var tvG = new THREE.Group();
-  var tvFrame = new THREE.Mesh(new THREE.BoxGeometry(1.56,0.5,0.04), new THREE.MeshStandardMaterial({color:0x14161a}));
-  tvFrame.position.set(1.3,1.95,-ROOM_Z+0.03); tvG.add(tvFrame);
+  var tvFrame = new THREE.Mesh(new THREE.BoxGeometry(1.9,0.68,0.04), new THREE.MeshStandardMaterial({color:0x14161a}));
+  tvFrame.position.set(1.3,2.0,-ROOM_Z+0.03); tvG.add(tvFrame);
   var tvCv = mkCanvas(512,144), tvCtx = tvCv.getContext('2d');
   var tvTex = new THREE.CanvasTexture(tvCv);
-  var tvScreen = new THREE.Mesh(new THREE.PlaneGeometry(1.5,0.42), new THREE.MeshBasicMaterial({map:tvTex}));
-  tvScreen.position.set(1.3,1.95,-ROOM_Z+0.055); tvG.add(tvScreen);
+  var tvScreen = new THREE.Mesh(new THREE.PlaneGeometry(1.84,0.6), new THREE.MeshBasicMaterial({map:tvTex}));
+  tvScreen.position.set(1.3,2.0,-ROOM_Z+0.055); tvG.add(tvScreen);
   shadowify(tvG); scene.add(tvG);
   var tapeSegs = [{t:'ARBY TV ONLINE \u2014 WAITING FOR FIRST SYNC', c:'#8b949e'}];
   var tapeW = 0;
@@ -953,6 +953,41 @@ _SNIPPET = r"""
     tvCtx.fillText(state.status && state.status.today ? 'SESSION '+state.status.today : 'PAPER DESK', 10, 132);
     tvTex.needsUpdate = true;
   }
+
+  // media console + gaming setup under the wall TV
+  var consoleG = new THREE.Group(); consoleG.position.set(1.3,0,-2.95);
+  var mcTop = new THREE.Mesh(new THREE.BoxGeometry(1.5,0.06,0.46), new THREE.MeshStandardMaterial({color:0x14161a}));
+  mcTop.position.y=0.5; consoleG.add(mcTop);
+  var mcBase = new THREE.Mesh(new THREE.BoxGeometry(1.42,0.5,0.4), new THREE.MeshStandardMaterial({color:0x22262c}));
+  mcBase.position.y=0.25; consoleG.add(mcBase);
+  var soundbar = new THREE.Mesh(new THREE.BoxGeometry(1.1,0.07,0.09), new THREE.MeshStandardMaterial({color:0x2b3036}));
+  soundbar.position.set(0,0.56,-0.16); consoleG.add(soundbar);
+  var gameBox = new THREE.Mesh(new THREE.BoxGeometry(0.4,0.09,0.26), new THREE.MeshStandardMaterial({color:0x3a4048}));
+  gameBox.position.set(-0.35,0.575,0.08); consoleG.add(gameBox);
+  var gamePad = new THREE.Mesh(new THREE.BoxGeometry(0.16,0.035,0.09), new THREE.MeshStandardMaterial({color:0x58a6ff}));
+  gamePad.position.set(0.22,0.56,0.14); consoleG.add(gamePad);
+  var bowlPop = new THREE.Mesh(new THREE.CylinderGeometry(0.1,0.07,0.08,12), new THREE.MeshStandardMaterial({color:0xd6455a}));
+  bowlPop.position.set(0.5,0.56,-0.1); consoleG.add(bowlPop);
+  var ctrlProp = new THREE.Mesh(new THREE.BoxGeometry(0.16,0.035,0.09), new THREE.MeshStandardMaterial({color:0x58a6ff}));
+  ctrlProp.castShadow=true; ctrlProp.visible=false; ctrlProp.userData.hideAtHome=true; scene.add(ctrlProp);
+  shadowify(consoleG); scene.add(consoleG);
+  addBlob(1.3,-2.95,1.0);
+
+  // neon sign on the back wall
+  var neonTex = new THREE.CanvasTexture((function(){
+    var c=mkCanvas(256,96), nctx=c.getContext('2d');
+    nctx.clearRect(0,0,256,96);
+    nctx.font='bold 62px Consolas,monospace'; nctx.textAlign='left'; nctx.textBaseline='middle';
+    nctx.strokeStyle='#58a6ff'; nctx.lineWidth=9; nctx.lineJoin='round';
+    nctx.strokeText('ARBY\u2019S', 12, 52);
+    nctx.fillStyle='#bfe0ff';
+    nctx.fillText('ARBY\u2019S', 12, 52);
+    return c;
+  })());
+  var neonSign = new THREE.Mesh(new THREE.PlaneGeometry(0.66,0.25), new THREE.MeshBasicMaterial({map:neonTex, transparent:true, side:THREE.DoubleSide}));
+  neonSign.position.set(-0.1,2.5,-ROOM_Z+0.035); scene.add(neonSign);
+  var neonLight = new THREE.PointLight(0x58a6ff, 0.35, 1.6);
+  neonLight.position.set(-0.1,2.5,-ROOM_Z+0.25); scene.add(neonLight);
 
   // wall clock (real ET time)
   var clockG = new THREE.Group();
@@ -1091,16 +1126,94 @@ _SNIPPET = r"""
   paper.rotation.y=0.4;
   shadowify(newsG); scene.add(newsG);
 
-  // couch
-  var couchMat = new THREE.MeshStandardMaterial({color:0xd88b6a});
-  var couchG = new THREE.Group(); couchG.position.set(-1.8,0,1.35);
-  var cSeat = new THREE.Mesh(new THREE.BoxGeometry(0.95,0.28,0.55), couchMat); cSeat.position.y=0.22; couchG.add(cSeat);
-  var cBack = new THREE.Mesh(new THREE.BoxGeometry(0.95,0.4,0.14), couchMat); cBack.position.set(0,0.42,-0.24); couchG.add(cBack);
-  [-0.42,0.42].forEach(function(x){
-    var carm=new THREE.Mesh(new THREE.BoxGeometry(0.12,0.32,0.55), couchMat); carm.position.set(x,0.3,0); couchG.add(carm);
+  // ---- bed (sleep corner, front-left, headboard against the left wall) ----
+  var bedFrameMat = new THREE.MeshStandardMaterial({color:0x3c2f24});
+  var bedG = new THREE.Group(); bedG.position.set(-2.35,0,0.85);
+  var bedFrame = new THREE.Mesh(new THREE.BoxGeometry(1.7,0.18,1.4), bedFrameMat); bedFrame.position.y=0.09; bedG.add(bedFrame);
+  var mattress = new THREE.Mesh(new THREE.BoxGeometry(1.62,0.14,1.32), new THREE.MeshStandardMaterial({color:0xf0ead8}));
+  mattress.position.y=0.25; bedG.add(mattress);
+  var headboard = new THREE.Mesh(new THREE.BoxGeometry(0.08,0.55,1.4), bedFrameMat);
+  headboard.position.set(-0.83,0.44,0); bedG.add(headboard);
+  var blanket = new THREE.Mesh(new THREE.BoxGeometry(0.95,0.07,1.34), new THREE.MeshStandardMaterial({color:0x8fb9e8}));
+  blanket.position.set(0.28,0.34,0); bedG.add(blanket);
+  [-0.38,0.38].forEach(function(pz){
+    var pillow = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.1,0.34), new THREE.MeshStandardMaterial({color:0xf5f0e6}));
+    pillow.position.set(-0.62,0.36,pz); bedG.add(pillow);
   });
-  shadowify(couchG); scene.add(couchG);
-  addBlob(-1.8,1.35,1.4);
+  shadowify(bedG); scene.add(bedG);
+  addBlob(-2.35,0.85,1.4);
+
+  // nightstand + reading lamp + paperback (beside the bed)
+  var nightG = new THREE.Group(); nightG.position.set(-1.62,0,1.45);
+  var ntTop = new THREE.Mesh(new THREE.BoxGeometry(0.42,0.04,0.36), new THREE.MeshStandardMaterial({color:0xc79a6b}));
+  ntTop.position.y=0.44; nightG.add(ntTop);
+  var ntLeg = new THREE.Mesh(new THREE.BoxGeometry(0.34,0.44,0.28), new THREE.MeshStandardMaterial({color:0x8a5a3b}));
+  ntLeg.position.y=0.22; nightG.add(ntLeg);
+  var ntLamp = new THREE.Mesh(new THREE.CylinderGeometry(0.02,0.03,0.16,10), new THREE.MeshStandardMaterial({color:0x22262c}));
+  ntLamp.position.set(-0.1,0.54,0); nightG.add(ntLamp);
+  var ntLampGlow = new THREE.Mesh(new THREE.SphereGeometry(0.045,10,8), new THREE.MeshBasicMaterial({color:0xffdca8}));
+  ntLampGlow.position.set(-0.1,0.64,0); nightG.add(ntLampGlow);
+  var ntBook = new THREE.Mesh(new THREE.BoxGeometry(0.22,0.02,0.16), new THREE.MeshStandardMaterial({color:0xd6455a}));
+  ntBook.position.set(0.08,0.47,0.04); nightG.add(ntBook);
+  shadowify(nightG); scene.add(nightG);
+
+  // acoustic guitar on a stand (leisure corner)
+  var guitarG = new THREE.Group(); guitarG.position.set(-1.1,0,2.35);
+  var gtrStand = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.09,0.55,8), new THREE.MeshStandardMaterial({color:0x40464f}));
+  gtrStand.position.y=0.27; guitarG.add(gtrStand);
+  var gtrBody = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.34,0.12), new THREE.MeshStandardMaterial({color:0xc98a4b}));
+  gtrBody.position.y=0.82; guitarG.add(gtrBody);
+  var gtrHole = new THREE.Mesh(new THREE.CircleGeometry(0.07,16), new THREE.MeshBasicMaterial({color:0x24160a}));
+  gtrHole.position.set(0,0.88,0.062); guitarG.add(gtrHole);
+  var gtrNeck = new THREE.Mesh(new THREE.BoxGeometry(0.06,0.5,0.05), new THREE.MeshStandardMaterial({color:0x5a3a24}));
+  gtrNeck.position.set(0.18,1.2,0); gtrNeck.rotation.z=-0.55; guitarG.add(gtrNeck);
+  var gtrHead = new THREE.Mesh(new THREE.BoxGeometry(0.08,0.14,0.05), new THREE.MeshStandardMaterial({color:0x3a2817}));
+  gtrHead.position.set(0.35,1.46,0); gtrHead.rotation.z=-0.55; guitarG.add(gtrHead);
+  shadowify(guitarG); scene.add(guitarG);
+
+  // mini basketball hoop (right-wall gym corner) + ball
+  var hoopG = new THREE.Group(); hoopG.position.set(3.0,0,-0.85);
+  var hoopPole = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.045,1.7,10), new THREE.MeshStandardMaterial({color:0x40464f}));
+  hoopPole.position.y=0.85; hoopG.add(hoopPole);
+  var hoopBack = new THREE.Mesh(new THREE.BoxGeometry(0.04,0.42,0.42), new THREE.MeshStandardMaterial({color:0xffffff}));
+  hoopBack.position.set(-0.18,1.45,0); hoopG.add(hoopBack);
+  var hoopRim = new THREE.Mesh(new THREE.TorusGeometry(0.17,0.014,8,20), new THREE.MeshStandardMaterial({color:0xe8751a}));
+  hoopRim.rotation.x=Math.PI/2; hoopRim.position.set(-0.19,1.38,0); hoopG.add(hoopRim);
+  shadowify(hoopG); scene.add(hoopG);
+
+  var basketBall = new THREE.Mesh(new THREE.SphereGeometry(0.08,16,12), new THREE.MeshStandardMaterial({color:0xe8751a}));
+  basketBall.castShadow=true; basketBall.visible=false; scene.add(basketBall);
+
+  // weight rack + two dumbbells (right-wall gym corner)
+  var weightsG = new THREE.Group(); weightsG.position.set(3.15,0,-1.7);
+  var wrFrame = new THREE.Mesh(new THREE.BoxGeometry(0.5,0.55,0.28), new THREE.MeshStandardMaterial({color:0x22262c}));
+  wrFrame.position.y=0.28; weightsG.add(wrFrame);
+  var wrShelf = new THREE.Mesh(new THREE.BoxGeometry(0.44,0.03,0.24), new THREE.MeshStandardMaterial({color:0x40464f}));
+  wrShelf.position.set(0,0.2,0); weightsG.add(wrShelf);
+  function addDumbbellVisual(zc, color){
+    var g = new THREE.Group(); g.position.set(0,0.52,zc);
+    var bar = new THREE.Mesh(new THREE.CylinderGeometry(0.016,0.016,0.2,8), new THREE.MeshStandardMaterial({color:0x8b949e}));
+    bar.rotation.z=Math.PI/2; g.add(bar);
+    [-0.1,0.1].forEach(function(px){
+      var pl=new THREE.Mesh(new THREE.SphereGeometry(0.05,10,8), new THREE.MeshStandardMaterial({color:color}));
+      pl.position.x=px; g.add(pl);
+    });
+    return g;
+  }
+  weightsG.add(addDumbbellVisual(-0.06, 0x3fb950));
+  weightsG.add(addDumbbellVisual(0.06, 0xd6455a));
+  shadowify(weightsG); scene.add(weightsG);
+
+  // handheld dumbbell prop (picked up for a lift)
+  var dumbbell = new THREE.Group();
+  var dbBar = new THREE.Mesh(new THREE.CylinderGeometry(0.016,0.016,0.18,8), new THREE.MeshStandardMaterial({color:0x8b949e}));
+  dbBar.rotation.z=Math.PI/2; dumbbell.add(dbBar);
+  [-0.09,0.09].forEach(function(x){
+    var dp=new THREE.Mesh(new THREE.SphereGeometry(0.045,10,8), new THREE.MeshStandardMaterial({color:0x3fb950}));
+    dp.position.x=x; dumbbell.add(dp);
+  });
+  shadowify(dumbbell); dumbbell.visible=false; dumbbell.userData.hideAtHome=true;
+  scene.add(dumbbell);
 
   // plant + mini fridge (flavor props)
   var plantG = new THREE.Group(); plantG.position.set(-2.2,0,-1.72);
@@ -1392,7 +1505,7 @@ _SNIPPET = r"""
       hint:'Charts up. Click a monitor to open it for real.' },
     { name:'whiteboard',label:'reviewing the playbook', pos:new THREE.Vector3(-1.5,0,-2.6), yaw:0, sit:false, minT:4, maxT:7, w:1,
       hint:'Playbook rules. Click the board to jump to the full text.' },
-    { name:'tv',        label:'watching the wall TV', pos:new THREE.Vector3(1.3,0,-2.4), yaw:0, sit:false, minT:3, maxT:6, w:0.9,
+    { name:'tv',        label:'watching the big-screen TV', pos:new THREE.Vector3(1.3,0,-2.25), yaw:0, sit:false, minT:3, maxT:6, w:0.9,
       hint:'Tape\u2019s rolling. Click the TV for CNBC.' },
     { name:'chartwall', label:'studying the equity curve', pos:new THREE.Vector3(3.05,0,0.35), yaw:-Math.PI/2, sit:false, minT:4, maxT:6, w:1,
       hint:'The curve tells the truth. Click it to jump to Performance.' },
@@ -1400,10 +1513,14 @@ _SNIPPET = r"""
       hint:'Benzinga\u2019s on the table \u2014 tap the paper.' },
     { name:'window',    label:'staring at the market outside', pos:new THREE.Vector3(-3.1,0,-0.5), yaw:Math.PI/2, sit:false, minT:3, maxT:5, w:0.9,
       hint:'Big-picture time. Click the window for the Finviz map.' },
-    { name:'calendar',  label:'checking the econ calendar', pos:new THREE.Vector3(-3.12,0,0.75), yaw:Math.PI/2, sit:false, minT:3, maxT:4, w:0.7,
+    { name:'calendar',  label:'checking the econ calendar', pos:new THREE.Vector3(-3.12,0,-0.9), yaw:Math.PI/2, sit:false, minT:3, maxT:4, w:0.7,
       hint:'What\u2019s on deck this week? Click the calendar.' },
-    { name:'couch',     label:'decompressing on the couch', pos:new THREE.Vector3(-1.78,0,1.28), yaw:Math.PI, sit:true, minT:5, maxT:8, w:0.9,
-      hint:'Even quants rest.' },
+    { name:'bed',       label:'crashing in the sleep corner', pos:new THREE.Vector3(-2.35,0,0.35), yaw:0, sit:true, minT:5, maxT:9, w:0.9,
+      hint:'Rest is a position.' },
+    { name:'weights',   label:'a quick pump', pos:new THREE.Vector3(2.78,0,-1.5), yaw:-Math.PI/2, sit:false, minT:3, maxT:5, w:0.6,
+      hint:'Strong body, steady hands.' },
+    { name:'console',   label:'gaming on the console', pos:new THREE.Vector3(1.3,0,-2.5), yaw:0, sit:false, minT:3, maxT:6, w:0.7,
+      hint:'One more run. Click the console.' },
     { name:'phone',     label:'scrolling StockTwits', pos:new THREE.Vector3(-0.2,0,1.6), yaw:Math.PI, sit:false, minT:3, maxT:5, w:0.8,
       hint:'Sentiment check \u2014 click the corkboard for StockTwits.' },
     { name:'stretch',   label:'stretch break', pos:new THREE.Vector3(0.6,0,0.5), yaw:Math.PI, sit:false, minT:3, maxT:4, w:0.7,
@@ -1418,8 +1535,10 @@ _SNIPPET = r"""
       hint:'Aim small, miss small.' },
   ];
   var OBSTACLES = [
-    {x:0.15,z:-1.75,r:0.6}, {x:1.85,z:1.3,r:0.45}, {x:-1.8,z:1.35,r:0.62},
+    {x:0.15,z:-1.75,r:0.6}, {x:1.85,z:1.3,r:0.45}, {x:-2.35,z:0.85,r:0.9},
+    {x:-1.62,z:1.45,r:0.26}, {x:-1.1,z:2.35,r:0.3},
     {x:1.9,z:-1.82,r:0.35}, {x:-2.2,z:-1.72,r:0.3}, {x:-2.9,z:2.2,r:0.5},
+    {x:1.3,z:-2.95,r:0.55}, {x:3.0,z:-0.85,r:0.35}, {x:3.15,z:-1.7,r:0.35},
   ];
   var HUB = {x:0, z:0.35};
   function clampToRoom(pos){
@@ -1454,16 +1573,16 @@ _SNIPPET = r"""
     var sleeping = sleepActive();
     var weights = STATIONS.map(function(st,i){
       if (i===excludeIdx) return 0.0001;
-      if (sleeping) return st.name==='couch' ? 100 : 0.0001;
+      if (sleeping) return st.name==='bed' ? 100 : 0.0001;
       if (focusOn) return st.name==='desk' ? 100 : 0.0001;
       var w = st.w||1;
       if (marketOpen()){ if (st.name==='desk') w*=3.2; if (st.name==='tv') w*=1.5; }
-      else { if (st.name==='couch'||st.name==='coffee') w*=1.6; }
+      else { if (st.name==='bed'||st.name==='coffee') w*=1.6; }
       var m = state.moodScore;
       if (m<-0.2 && (st.name==='coffee'||st.name==='window'||st.name==='whiteboard')) w*=1.8;
       if (m>0.4 && (st.name==='desk'||st.name==='chartwall')) w*=1.5;
       // low motives pull him toward the station that restores them, Sims-style
-      if (state.needs.energy<35 && (st.name==='couch'||st.name==='treadmill')) w*=3;
+      if (state.needs.energy<35 && (st.name==='bed'||st.name==='treadmill'||st.name==='weights')) w*=3;
       if (state.needs.focus<35 && st.name==='coffee') w*=3;
       return w;
     });
@@ -1540,6 +1659,15 @@ _SNIPPET = r"""
     say(['Volume up.','Market\u2019s closed, floor\u2019s open.','One-song break.'][Math.floor(Math.random()*3)], 2000);
   }
 
+  // guitar -> a quick strum
+  function strumGuitar(){
+    wake();
+    spawnBurst('note', 5);
+    var t0 = clock.getElapsedTime();
+    gesture = { start:t0, dur:0.9, apply:function(p){ armR.rotation.x=0.8+Math.sin(p*Math.PI*5)*0.35; armR.rotation.z=-0.1; } };
+    say(['Still got the chords.','Acoustic alpha.'][Math.floor(Math.random()*2)], 2000);
+  }
+
   // bin -> paper-toss minigame; make-rate rides his mood
   var paperFlight = null;
   function shootPaper(){
@@ -1582,6 +1710,51 @@ _SNIPPET = r"""
     var q1 = pf.from.clone().lerp(pf.mid, pp), q2 = pf.mid.clone().lerp(pf.to, pp);
     paperBall.position.copy(q1.lerp(q2, pp));
     paperBall.rotation.x += dt*9; paperBall.rotation.z += dt*7;
+  }
+
+  // mini hoop -> basketball shot; make-rate rides his mood
+  var hoopFlight = null;
+  function hoopRimPoint(){ return new THREE.Vector3(hoopG.position.x-0.19, 1.38, hoopG.position.z); }
+  function shootHoop(){
+    if (hoopFlight) return;
+    wake();
+    var t0 = clock.getElapsedTime();
+    var hitChance = clamp(0.72 + 0.20*state.moodScore, 0.4, 0.92);
+    var willHit = Math.random() < hitChance;
+    gesture = { start:t0, dur:0.5, apply:function(p){ armR.rotation.x = 0.4+p*2.1; armR.rotation.z = -0.12*p; } };
+    setTimeout(function(){
+      var from = new THREE.Vector3(); handR.getWorldPosition(from);
+      var to = hoopRimPoint();
+      if (!willHit){ to.x += 0.13; to.z += 0.1; to.y += 0.05; }
+      var mid = from.clone().add(to).multiplyScalar(0.5);
+      mid.y = Math.max(from.y, 1.1) + 0.7;
+      hoopFlight = { t0: clock.getElapsedTime(), dur:0.8, from:from, mid:mid, to:to, hit:willHit, bounced:false };
+      basketBall.visible = true;
+    }, 380);
+  }
+  function updateHoopFlight(t, dt){
+    if (!hoopFlight) return;
+    var hf = hoopFlight;
+    var pp = (t-hf.t0)/hf.dur;
+    if (pp>=1){
+      if (hf.hit){
+        basketBall.visible = false; hoopFlight = null;
+        spawnBurst('spark', 4, {x:hf.to.x, y:hf.to.y+0.12, z:hf.to.z});
+        say(['Bucket.','Nothing but net.','From downtown.'][Math.floor(Math.random()*3)], 2000);
+      } else if (!hf.bounced){
+        hf.bounced = true; hf.t0 = t; hf.dur = 0.45;
+        hf.from = hf.to.clone();
+        hf.to = new THREE.Vector3(hf.to.x+0.2, 0.08, hf.to.z+0.25);
+        hf.mid = hf.from.clone().lerp(hf.to, 0.5); hf.mid.y = hf.from.y;
+      } else {
+        basketBall.visible = false; hoopFlight = null;
+        say(['Rimmed out.','No good.'][Math.floor(Math.random()*2)], 2000);
+      }
+      return;
+    }
+    var q1 = hf.from.clone().lerp(hf.mid, pp), q2 = hf.mid.clone().lerp(hf.to, pp);
+    basketBall.position.copy(q1.lerp(q2, pp));
+    basketBall.rotation.x += dt*9; basketBall.rotation.z += dt*7;
   }
 
   // floor click -> walk order, with a fading target ring
@@ -1635,6 +1808,10 @@ _SNIPPET = r"""
       holdProp('R', phoneProp, 0,0.02,-0.04, 0.85,0,0);
     } else if (st.name==='whiteboard'){
       holdProp('R', markerProp, 0,-0.01,-0.05, -Math.PI/2,0,0);
+    } else if (st.name==='console'){
+      holdProp('R', ctrlProp, 0,0.02,-0.04, 1.1,0,0);
+    } else if (st.name==='weights'){
+      holdProp('R', dumbbell, 0,0.02,-0.03, 0,0,0);
     }
     if (st.hint && Math.random()<0.4 && !sleepActive()) say(st.hint, 3200);
   }
@@ -1676,9 +1853,15 @@ _SNIPPET = r"""
     } else if (name==='calendar'){
       armR.rotation.x=1.5; armR.rotation.z=0.1;      // pointing at the calendar
       headGroup.rotation.x=0.1;
-    } else if (name==='couch'){
-      if (sleepActive()){ headGroup.rotation.x=0.45; armL.rotation.x=0.05; armR.rotation.x=0.05; }
-      else { armL.rotation.z=0.1; armR.rotation.z=-0.1; headGroup.rotation.x=0.08+Math.sin(t*0.8)*0.03; }
+    } else if (name==='bed'){
+      if (sleepActive()){ headGroup.rotation.x=0.5; armL.rotation.x=0.05; armR.rotation.x=0.05; }
+      else { armL.rotation.z=0.15; armR.rotation.z=-0.15; headGroup.rotation.x=0.14+Math.sin(t*0.8)*0.03; }
+    } else if (name==='weights'){
+      var curl=(Math.sin(t*4)+1)/2;
+      armR.rotation.x=0.3+curl*1.3; armL.rotation.x=0.3+curl*1.1;
+    } else if (name==='console'){
+      armR.rotation.x=1.0; armR.rotation.z=0.1; armL.rotation.x=1.0; armL.rotation.z=-0.1;
+      headGroup.rotation.x=0.12;
     } else if (name==='phone'){
       armR.rotation.x=1.4; armR.rotation.z=0.15;     // phone held up in front
       headGroup.rotation.x=-0.25;                    // eyes down at the phone
@@ -1716,7 +1899,9 @@ _SNIPPET = r"""
       if (st.name==='desk') pool = ['Charting '+mainTicker()+'.', 'Screens are hot.', 'Logging everything. Always.'];
       else if (st.name==='whiteboard') pool = ['Playbook v'+(state.playbookVersion!=null?state.playbookVersion:'?')+'. Rule one: '+(state.bullets[0]||'survive').toLowerCase()+'.'];
       else if (st.name==='coffee') pool = ['Refuel, then re-attack.','Coffee first. Entries second.'];
-      else if (st.name==='couch') pool = sleepActive() ? ['zzz\u2026'] : ['Even quants rest.','Recovery is part of the system.'];
+      else if (st.name==='bed') pool = sleepActive() ? ['zzz\u2026'] : ['Rest is a position.','Recovery is part of the system.'];
+      else if (st.name==='weights') pool = ['One more set.','Strong body, steady hands.'];
+      else if (st.name==='console') pool = ['One more run.','High score, then back to the tape.'];
       else if (st.name==='phone') pool = ['Scrolling $'+mainTicker()+' chatter.','Sentiment is a contrarian indicator.'];
       else if (st.name==='fridge') pool = ['Hydration is alpha.','Zero-sugar, zero-slippage.'];
       else if (st.name==='stretch') pool = ['Posture is risk management.'];
@@ -1789,6 +1974,28 @@ _SNIPPET = r"""
     act:function(){ say(shelfQuip()); } });
   registerTarget(dartboardG, { label:function(){ return 'Dartboard'; },
     act:function(){ say(['Aim small, miss small.','Bullseye \u2014 unlike some of my fills.','Darts don\u2019t re-quote.'][Math.floor(Math.random()*3)]); } });
+  registerTarget(bedG, { label:function(){ return 'Bed \u2014 send him to rest'; },
+    act:function(){ goTo('bed'); say(['Time to rack out.','Sleep corner calling.'][Math.floor(Math.random()*2)], 1600); } });
+  registerTarget(nightG, { label:function(){ return 'Nightstand lamp'; },
+    act:function(){ say('Reading lamp. The only book I read is the playbook.'); } });
+  registerTarget(guitarG, { label:function(){ return 'Guitar \u2014 he\u2019ll strum'; },
+    act:function(){ strumGuitar(); } });
+  registerTarget(hoopG, { label:function(){ return 'Mini hoop \u2014 shoot'; },
+    act:function(){ shootHoop(); } });
+  registerTarget(weightsG, { label:function(){ return 'Weight rack \u2014 send him to lift'; },
+    act:function(){ goTo('weights'); say(['Pump it.','Lightweight, heavy conviction.'][Math.floor(Math.random()*2)], 1600); } });
+  registerTarget(consoleG, { label:function(){ return 'Game console \u2014 fire it up'; },
+    act:function(){ goTo('console'); say(['GG.','One more run, then back to the tape.'][Math.floor(Math.random()*2)], 1600); } });
+  registerTarget(soundbar, { label:function(){ return 'Soundbar \u2014 drop a beat'; },
+    act:function(){ startDance(); } });
+  registerTarget(neonSign, { label:function(){ return 'Neon \u2014 the vibe'; },
+    act:function(){ say(['This room has range.','Man cave, maximum gains.'][Math.floor(Math.random()*2)]); } });
+  registerTarget(deskG, { label:function(){ return 'Battlestation \u2014 back to the screens'; },
+    act:function(){ goTo('desk'); say(['Deep in the tape.','Monitors up.','One more scan pass.'][Math.floor(Math.random()*3)], 1600); } });
+  registerTarget(chairG, { label:function(){ return 'Gaming chair \u2014 take a seat'; },
+    act:function(){ goTo('desk'); say(['Best seat in the cave.','Lumbar support is alpha.'][Math.floor(Math.random()*2)], 1600); } });
+  registerTarget(coffeeG, { label:function(){ return 'Coffee table \u2014 fuel up'; },
+    act:function(){ goTo('coffee'); say(['Coffee + Benzinga.','Refuel, re-attack.'][Math.floor(Math.random()*2)], 1600); } });
 
   function pickTarget(e){
     var rect = renderer.domElement.getBoundingClientRect();
@@ -2106,10 +2313,11 @@ _SNIPPET = r"""
           }
         }
         poseForStation(st.name, t);
-        if (st.name==='couch') state.needs.energy = Math.min(100, state.needs.energy + dt*(sleepActive()?26:14));
+        if (st.name==='bed') state.needs.energy = Math.min(100, state.needs.energy + dt*(sleepActive()?26:14));
         if (st.name==='coffee') state.needs.focus = Math.min(100, state.needs.focus + dt*18);
         if (st.name==='treadmill') state.needs.energy = Math.min(100, state.needs.energy + dt*16);
-        if (sleepActive() && st.name==='couch'){
+        if (st.name==='weights') state.needs.energy = Math.min(100, state.needs.energy + dt*14);
+        if (sleepActive() && st.name==='bed'){
           hudActivity.textContent = 'Asleep \u2014 market\u2019s closed, so is he';
           zzzAcc += dt;
           if (zzzAcc>3.5){ spawnBurst('zzz',1); zzzAcc=0; }
@@ -2161,6 +2369,7 @@ _SNIPPET = r"""
 
     updateParticles(dt);
     updatePaperFlight(t, dt);
+    updateHoopFlight(t, dt);
     updateWalkMarker(t);
 
     // camera: dolly along the fixed view direction for zoom, plus a subtle
@@ -2237,7 +2446,8 @@ _SNIPPET = r"""
         station: curStation().name, phase: auto.phase, free: !!auto.free,
         sitAmount: sitAmount, focus: focusMode,
         heldR: held.R===mug?'mug':held.R===deskCan?'deskCan':held.R===fridgeCan?'fridgeCan'
-              :held.R===phoneProp?'phone':held.R===markerProp?'marker':held.R?'other':null,
+              :held.R===phoneProp?'phone':held.R===markerProp?'marker':held.R===ctrlProp?'controller'
+              :held.R===dumbbell?'dumbbell':held.R?'other':null,
         heldL: held.L===newsG?'news':held.L?'other':null,
         paperFlying: !!paperFlight, dancing: clock.getElapsedTime()<danceUntil,
         mugWorld: (function(){ var v=new THREE.Vector3(); mug.getWorldPosition(v); return [v.x,v.y,v.z]; })(),

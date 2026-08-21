@@ -225,6 +225,23 @@ def render_dashboard(con: duckdb.DuckDBPyConnection, cfg: Config, plan_date: dat
     curve = ledger.equity_curve(con, cfg.get("account_size", 100000), cfg.get("dollars_per_r", 500))
     runs = ledger.recent_runs(con, 12)
 
+    # Room dressing: live wires from the ledger so Arby's man cave reflects the
+    # desk's actual state (not decorative fixtures). All deterministic.
+    regimes = ledger.recent_regimes(con, 5)
+    regime = regimes[0] if regimes else None
+    drawdown = ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10)))
+    shadow = ledger.shadow_summary(con, 20)
+    calibration = ledger.calibration_aggregate(con)
+    management = ledger.management_quality(con)
+
+    # Deterministic "current best edge": the setup with the best realized avg R
+    # over at least 3 triggered trades. The LLM never derives this number.
+    best_edge = ""
+    candidates = [s for s in setup_stats if (s.get("triggered") or 0) >= 3 and s.get("avg_r") is not None]
+    if candidates:
+        top = max(candidates, key=lambda s: s["avg_r"])
+        best_edge = f"{top['dim']} · avg {top['avg_r']}R over {top['triggered']} triggered"
+
     setup_rows = "".join(
         f"<tr><td>{s['dim']}</td><td>{s['n']}</td><td>{s['triggered']}</td>"
         f"<td>{f'{s['win_rate']:.0%}' if s['win_rate'] is not None else '-'}</td>"
@@ -281,6 +298,13 @@ def render_dashboard(con: duckdb.DuckDBPyConnection, cfg: Config, plan_date: dat
         "playbook_version": version,
         "playbook_bullets": playbook_bullets,
         "runs": runs[:5],
+        "regime": regime,
+        "regimes": regimes,
+        "drawdown": drawdown,
+        "shadow": shadow,
+        "calibration": calibration,
+        "management": management,
+        "best_edge": best_edge,
     }
     html = html.replace(MASCOT_MARKER, mascot_embed(mascot_boot))
     out_path = REPORTS_DIR / "dashboard.html"
