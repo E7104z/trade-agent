@@ -445,6 +445,9 @@ def recent_trades(con: duckdb.DuckDBPyConnection, n: int = 20) -> list[dict]:
     return [dict(zip(keys, r)) for r in rows]
 
 
+STATS_DIMENSIONS: frozenset[str] = frozenset({"setup_type", "regime_tag", "direction", "conviction"})
+
+
 def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
     """Aggregate performance stats grouped by a picks column (setup_type, regime_tag, direction, conviction).
 
@@ -453,14 +456,20 @@ def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
     from a CSV. |t| < ~1.5 means the average is statistically indistinguishable
     from zero at that sample size, regardless of how big n looks.
     """
-    assert dim in {"setup_type", "regime_tag", "direction", "conviction"}
+    if dim not in STATS_DIMENSIONS:
+        raise ValueError(
+            f"stats_by: unsupported dimension {dim!r}; expected one of {sorted(STATS_DIMENSIONS)}"
+        )
+    # dim is now guaranteed to be one of the whitelisted identifiers above, so
+    # f-string interpolation of a column name here is safe — DuckDB has no way
+    # to bind a column/table identifier as a query parameter.
     rows = con.execute(
         f"""SELECT COALESCE(CAST(p.{dim} AS VARCHAR),'?') AS dim,
                    COUNT(*) AS n,
                    SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END) AS triggered,
                    SUM(CASE WHEN o.triggered AND o.r_multiple > 0 THEN 1 ELSE 0 END) AS wins,
                    ROUND(CAST(AVG(CASE WHEN o.triggered THEN o.r_multiple END) AS NUMERIC), 3) AS avg_r,
-                   ROUND(CAST(SUM(CASE WHEN o.triggered THEN o.r_multiple * p.size_r ELSE 0 END) AS NUMERIC), 3) AS total_weighted_r,
+                   ROUND(CAST(SUM(CASE WHEN o.triggered THEN o.r_multiple * COALESCE(p.size_r, 1) ELSE 0 END) AS NUMERIC), 3) AS total_weighted_r,
                    STDDEV_SAMP(CASE WHEN o.triggered THEN o.r_multiple END) AS std_r,
                    ROUND(CAST(AVG(CASE WHEN o.triggered THEN o.baseline_r END) AS NUMERIC), 3) AS baseline_avg_r
             FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
