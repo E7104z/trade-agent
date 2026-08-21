@@ -835,6 +835,20 @@ _SNIPPET = r"""
   var posterMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.85,0.6), new THREE.MeshBasicMaterial({map:postTex}));
   posterMesh.rotation.y=-Math.PI/2; posterMesh.position.set(ROOM_X-0.03,1.75,0.4); scene.add(posterMesh);
 
+  // "RISK FIRST" poster (right wall, above the equity poster)
+  var riskTex = new THREE.CanvasTexture((function(){
+    var c=mkCanvas(180,120), x=c.getContext('2d');
+    x.fillStyle='#101418'; x.fillRect(0,0,180,120);
+    x.strokeStyle='#f85149'; x.lineWidth=4; x.strokeRect(8,8,164,104);
+    x.fillStyle='#f85149'; x.font='bold 34px Consolas,monospace'; x.textAlign='center';
+    x.fillText('RISK', 90, 52);
+    x.fillStyle='#e6edf3'; x.font='bold 30px Consolas,monospace';
+    x.fillText('FIRST', 90, 86);
+    return c;
+  })());
+  var riskPoster = new THREE.Mesh(new THREE.PlaneGeometry(0.62,0.42), new THREE.MeshBasicMaterial({map:riskTex}));
+  riskPoster.rotation.y=-Math.PI/2; riskPoster.position.set(ROOM_X-0.03,2.35,0.4); scene.add(riskPoster);
+
   // corkboard -> StockTwits
   var corkTex = new THREE.CanvasTexture((function(){
     var c=mkCanvas(160,160), x=c.getContext('2d');
@@ -973,6 +987,24 @@ _SNIPPET = r"""
   shadowify(consoleG); scene.add(consoleG);
   addBlob(1.3,-2.95,1.0);
 
+  // couch (media lounge) — pulled forward off the back wall so it doesn't
+  // crowd the battlestation and actually occupies the room's open center.
+  var couchG = new THREE.Group(); couchG.position.set(1.1,0,-0.3);
+  var couchMat = new THREE.MeshStandardMaterial({color:0x2f3a46});
+  var couchCush = new THREE.MeshStandardMaterial({color:0x3f5165});
+  var couchBase = new THREE.Mesh(new THREE.BoxGeometry(1.7,0.3,0.62), couchMat); couchBase.position.y=0.22; couchG.add(couchBase);
+  var couchSeat = new THREE.Mesh(new THREE.BoxGeometry(1.62,0.14,0.6), couchCush); couchSeat.position.set(0,0.44,0); couchG.add(couchSeat);
+  var couchBack = new THREE.Mesh(new THREE.BoxGeometry(1.7,0.5,0.18), couchMat); couchBack.position.set(0,0.72,0.3); couchG.add(couchBack);
+  [-0.83,0.83].forEach(function(ax){
+    var arm = new THREE.Mesh(new THREE.BoxGeometry(0.14,0.42,0.62), couchMat); arm.position.set(ax,0.5,0); couchG.add(arm);
+  });
+  [-0.38,0.38].forEach(function(px){
+    var pillow = new THREE.Mesh(new THREE.BoxGeometry(0.42,0.3,0.12), new THREE.MeshStandardMaterial({color:0xd6455a}));
+    pillow.position.set(px,0.6,0.36); pillow.rotation.x=-0.2; couchG.add(pillow);
+  });
+  shadowify(couchG); scene.add(couchG);
+  addBlob(1.1,-0.3,1.1);
+
   // neon sign on the back wall
   var neonTex = new THREE.CanvasTexture((function(){
     var c=mkCanvas(256,96), nctx=c.getContext('2d');
@@ -1107,6 +1139,10 @@ _SNIPPET = r"""
   ctLeg.position.y=0.21; coffeeG.add(ctLeg);
   var mug = new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.05,0.08,10), new THREE.MeshStandardMaterial({color:0xffffff}));
   mug.position.set(-0.12,0.49,0.02); coffeeG.add(mug);
+  var snackBowl = new THREE.Mesh(new THREE.CylinderGeometry(0.07,0.05,0.05,12), new THREE.MeshStandardMaterial({color:0xe8e4da}));
+  snackBowl.position.set(0.1,0.49,0.1); coffeeG.add(snackBowl);
+  var chipsBag = new THREE.Mesh(new THREE.BoxGeometry(0.1,0.14,0.05), new THREE.MeshStandardMaterial({color:0xd6455a}));
+  chipsBag.position.set(-0.16,0.47,-0.08); coffeeG.add(chipsBag);
   shadowify(coffeeG); scene.add(coffeeG);
   addBlob(1.85,1.3,1.0);
 
@@ -1284,6 +1320,35 @@ _SNIPPET = r"""
   var dartRim = new THREE.Mesh(new THREE.TorusGeometry(0.29,0.02,8,24), new THREE.MeshStandardMaterial({color:0x5a3a24}));
   dartRim.position.set(-2.9,1.35,-ROOM_Z+0.025); dartboardG.add(dartRim);
   scene.add(dartboardG);
+
+  // bookshelf (right wall, front) — trading library + knickknacks
+  var shelfWood = new THREE.MeshStandardMaterial({color:0x6b4a33});
+  var bookshelfG = new THREE.Group(); bookshelfG.position.set(3.45,0,1.5);
+  // (no separate interior back-panel: bsCase is a solid box, so a panel
+  // flush with its own front face just z-fights with it — this IS the back.)
+  var bsCase = new THREE.Mesh(new THREE.BoxGeometry(0.26,1.7,1.0), shelfWood); bsCase.position.y=0.85; bookshelfG.add(bsCase);
+  var BOOK_COLORS = [0xd6455a,0x3fb950,0x58a6ff,0xd29922,0xe6edf3,0x8b949e];
+  var bsRand = seeded(77);
+  [0.5,0.95,1.4].forEach(function(sy){
+    var board = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.04,0.98), shelfWood);
+    board.position.set(0,sy,0); bookshelfG.add(board);
+    var xpos = -0.4;
+    while (xpos < 0.42){
+      var bw = 0.1+bsRand()*0.08;
+      if (bsRand()>0.3){
+        var book = new THREE.Mesh(new THREE.BoxGeometry(0.12,0.3,bw),
+          new THREE.MeshStandardMaterial({color: BOOK_COLORS[Math.floor(bsRand()*BOOK_COLORS.length)]}));
+        book.position.set(0, sy+0.04+0.15, xpos);
+        book.rotation.x = (bsRand()-0.5)*0.05;
+        bookshelfG.add(book);
+      }
+      xpos += bw+0.02;
+    }
+  });
+  var bsTrophy = new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.05,0.12,12), new THREE.MeshStandardMaterial({color:0xd29922}));
+  bsTrophy.position.set(0,1.72,0.28); bookshelfG.add(bsTrophy);
+  shadowify(bookshelfG); scene.add(bookshelfG);
+  addBlob(3.45,1.5,0.7);
 
   // treadmill (new front-left floor space) — an alternate energy-restore station
   var treadmillG = new THREE.Group(); treadmillG.position.set(-2.9,0,2.2);
@@ -1505,7 +1570,7 @@ _SNIPPET = r"""
       hint:'Charts up. Click a monitor to open it for real.' },
     { name:'whiteboard',label:'reviewing the playbook', pos:new THREE.Vector3(-1.5,0,-2.6), yaw:0, sit:false, minT:4, maxT:7, w:1,
       hint:'Playbook rules. Click the board to jump to the full text.' },
-    { name:'tv',        label:'watching the big-screen TV', pos:new THREE.Vector3(1.3,0,-2.25), yaw:0, sit:false, minT:3, maxT:6, w:0.9,
+    { name:'tv',        label:'watching the big-screen TV', pos:new THREE.Vector3(0.75,0,-0.3), yaw:0, sit:true, minT:3, maxT:6, w:0.9,
       hint:'Tape\u2019s rolling. Click the TV for CNBC.' },
     { name:'chartwall', label:'studying the equity curve', pos:new THREE.Vector3(3.05,0,0.35), yaw:-Math.PI/2, sit:false, minT:4, maxT:6, w:1,
       hint:'The curve tells the truth. Click it to jump to Performance.' },
@@ -1519,7 +1584,7 @@ _SNIPPET = r"""
       hint:'Rest is a position.' },
     { name:'weights',   label:'a quick pump', pos:new THREE.Vector3(2.78,0,-1.5), yaw:-Math.PI/2, sit:false, minT:3, maxT:5, w:0.6,
       hint:'Strong body, steady hands.' },
-    { name:'console',   label:'gaming on the console', pos:new THREE.Vector3(1.3,0,-2.5), yaw:0, sit:false, minT:3, maxT:6, w:0.7,
+    { name:'console',   label:'gaming on the console', pos:new THREE.Vector3(1.45,0,-0.3), yaw:0, sit:true, minT:3, maxT:6, w:0.7,
       hint:'One more run. Click the console.' },
     { name:'phone',     label:'scrolling StockTwits', pos:new THREE.Vector3(-0.2,0,1.6), yaw:Math.PI, sit:false, minT:3, maxT:5, w:0.8,
       hint:'Sentiment check \u2014 click the corkboard for StockTwits.' },
@@ -1533,12 +1598,15 @@ _SNIPPET = r"""
       hint:'The ledger, in one glance. Click it for the summary.' },
     { name:'dartboard', label:'throwing darts', pos:new THREE.Vector3(-2.9,0,-2.7), yaw:0, sit:false, minT:2, maxT:4, w:0.5,
       hint:'Aim small, miss small.' },
+    { name:'bookshelf', label:'browsing the trading library', pos:new THREE.Vector3(3.05,0,1.5), yaw:-Math.PI/2, sit:false, minT:3, maxT:5, w:0.7,
+      hint:'A shelf of market wisdom. Click it for a tip.' },
   ];
   var OBSTACLES = [
     {x:0.15,z:-1.75,r:0.6}, {x:1.85,z:1.3,r:0.45}, {x:-2.35,z:0.85,r:0.9},
     {x:-1.62,z:1.45,r:0.26}, {x:-1.1,z:2.35,r:0.3},
     {x:1.9,z:-1.82,r:0.35}, {x:-2.2,z:-1.72,r:0.3}, {x:-2.9,z:2.2,r:0.5},
     {x:1.3,z:-2.95,r:0.55}, {x:3.0,z:-0.85,r:0.35}, {x:3.15,z:-1.7,r:0.35},
+    {x:1.1,z:-0.3,r:0.65}, {x:3.45,z:1.5,r:0.5},
   ];
   var HUB = {x:0, z:0.35};
   function clampToRoom(pos){
@@ -1881,6 +1949,9 @@ _SNIPPET = r"""
       headGroup.rotation.x=0.08; armL.rotation.x=0.15; armR.rotation.x=0.15;
     } else if (name==='dartboard'){
       armR.rotation.x=0.9+Math.sin(t*3)*0.3; armR.rotation.z=-0.1;
+    } else if (name==='bookshelf'){
+      armR.rotation.x=1.1+Math.sin(t*2.2)*0.15; armR.rotation.z=0.1; armL.rotation.x=0.2;
+      headGroup.rotation.x=0.1; headGroup.rotation.y=Math.sin(t*0.8)*0.12;
     }
   }
 
@@ -1905,6 +1976,7 @@ _SNIPPET = r"""
       else if (st.name==='phone') pool = ['Scrolling $'+mainTicker()+' chatter.','Sentiment is a contrarian indicator.'];
       else if (st.name==='fridge') pool = ['Hydration is alpha.','Zero-sugar, zero-slippage.'];
       else if (st.name==='stretch') pool = ['Posture is risk management.'];
+      else if (st.name==='bookshelf') pool = ['Rereading my margin notes.','Fewer trades, fewer pages.'];
     }
     return pool && pool.length ? pool[Math.floor(Math.random()*pool.length)] : null;
   }
@@ -1996,6 +2068,14 @@ _SNIPPET = r"""
     act:function(){ goTo('desk'); say(['Best seat in the cave.','Lumbar support is alpha.'][Math.floor(Math.random()*2)], 1600); } });
   registerTarget(coffeeG, { label:function(){ return 'Coffee table \u2014 fuel up'; },
     act:function(){ goTo('coffee'); say(['Coffee + Benzinga.','Refuel, re-attack.'][Math.floor(Math.random()*2)], 1600); } });
+  registerTarget(couchG, { label:function(){ return 'Couch \u2014 kick back & watch the game'; },
+    act:function(){ goTo('tv'); say(['Movie night is market research.','Kick back. The tape can wait a minute.'][Math.floor(Math.random()*2)], 1600); } });
+  registerTarget(bookshelfG, { label:function(){ return 'Bookshelf \u2014 trading reads'; },
+    act:function(){ say(['Shelf full of market classics.','Best returns come from the pages first.'][Math.floor(Math.random()*2)]); } });
+  registerTarget(riskPoster, { label:function(){ return 'RISK FIRST \u2014 house rule'; },
+    act:function(){ say(['Rule one: don\u2019t blow up.','Risk first. Returns second.'][Math.floor(Math.random()*2)]); } });
+  registerTarget(snackBowl, { label:function(){ return 'Snack bowl \u2014 grab a chip'; },
+    act:function(){ say(['Carbs before candles.','Snack position: full.'][Math.floor(Math.random()*2)]); } });
 
   function pickTarget(e){
     var rect = renderer.domElement.getBoundingClientRect();
