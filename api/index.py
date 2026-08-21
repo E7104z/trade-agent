@@ -32,7 +32,7 @@ from agent import ledger  # noqa: E402
 from agent.config import load_config  # noqa: E402
 from agent.mascot import MASCOT_MARKER, mascot_embed  # noqa: E402
 from agent.memory import read_playbook  # noqa: E402
-from agent.util import today_et  # noqa: E402
+from agent.util import parse_date, today_et  # noqa: E402
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or "dev-only-insecure-key-set-SECRET_KEY-env-var"
@@ -182,12 +182,19 @@ function render(d) {
     if (plan.no_trade) {
       planHtml = `<p><b>NO TRADE.</b> ${plan.no_trade_reason || ''}</p><p>${plan.market_stance || ''}</p>`;
     } else {
-      let rows = (plan.picks || []).map(p => `<tr><td>${p.ticker}</td><td>${p.direction}</td>
-        <td>${p.setup_type||''}</td><td>${p.entry_price}</td><td>${p.stop_price}</td>
+      // prefer the authoritative picks table rows (flat entry_type, always
+      // resolved) over the raw plan JSON, which may only carry a nested
+      // entry_plan.type
+      const source = (d.picks_today && d.picks_today.length) ? d.picks_today : (plan.picks || []);
+      let rows = source.map(p => {
+        const entryType = p.entry_type || (p.entry_plan && p.entry_plan.type) || 'open';
+        return `<tr><td>${p.ticker}</td><td>${p.direction}</td>
+        <td>${p.setup_type||''}</td><td>${entryType} @ ${p.entry_price}</td><td>${p.stop_price}</td>
         <td>${p.target_price}</td><td>${p.size_r}R</td><td>${p.conviction}</td>
-        <td>${p.thesis_final||''}</td></tr>`).join('');
+        <td>${p.thesis_final||p.thesis||''}</td></tr>`;
+      }).join('');
       planHtml = `<p>${plan.market_stance||''}</p><table><tr><th>Ticker</th><th>Dir</th><th>Setup</th>
-        <th>Entry</th><th>Stop</th><th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr>${rows}</table>`;
+        <th>Entry (type @ price)</th><th>Stop</th><th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr>${rows}</table>`;
     }
   }
   let setupRows = (d.by_setup || []).map(s => `<tr><td>${s.dim}</td><td>${s.n}</td><td>${s.triggered}</td>
@@ -274,6 +281,10 @@ def api_status():
         return json_response({
             "today": d.isoformat(),
             "plan": plan_row["plan"] if plan_row else None,
+            # the DEFINITIVE, resolved pick rows (entry_type always a single flat
+            # field here, unlike plan.picks[] which may only carry a nested
+            # entry_plan.type) -- this is what the evening grader actually acts on.
+            "picks_today": ledger.picks_for_date(con, d),
             "overall": overall,
             "by_setup": by_setup,
             "streak": streak_str,
@@ -298,6 +309,89 @@ def api_playbook():
         text, version = read_playbook(con)
         return Response(text, mimetype="text/plain",
                         headers={"X-Playbook-Version": version})
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------- raw table access
+#
+# A generic, read-only, whitelisted browser for every ledger table -- so any
+# question like "what did today's MARA pick actually store for entry_type"
+# can be answered straight from the app (GET request, or paste the URL into
+# a browser) instead of needing a local DATABASE_URL + CLI. Table names are
+# whitelisted (never interpolate a caller-controlled table name without one --
+# see agent/ledger.py stats_by for the same pattern/lesson). Only SELECT is
+# ever built here; there is no way to reach this with a write.
+
+# table -> its natural date column (None if it has none / isn't date-filterable)
+_QUERYABLE_TABLES = {
+    "picks": "plan_date",
+    "outcomes": None,
+    "rejections": "plan_date",
+    "daily_plans": "plan_date",
+    "lessons": "created_date",
+    "lesson_confirmations": "session_date",
+    "regime_history": "date",
+    "runs": "run_date",
+    "calibration": "session_date",
+    "rule_confirmations": "session_date",
+    "open_question_progress": "session_date",
+}
+
+
+@app.route("/api/table")
+@login_required
+def api_table_index():
+    """Lists every queryable table + its columns, so you can discover what's
+    available without already knowing the schema."""
+    con = ledger.connect()
+    try:
+        out = {}
+        for name in sorted(_QUERYABLE_TABLES):
+            out[name] = [c[0] for c in con.execute(f"DESCRIBE {name}").fetchall()]
+        return json_response({"tables": out,
+                              "usage": "/api/table/<name>?date=YYYY-MM-DD&ticker=XXX&since=YYYY-MM-DD&limit=N"})
+    finally:
+        con.close()
+
+
+@app.route("/api/table/<name>")
+@login_required
+def api_table(name: str):
+    if name not in _QUERYABLE_TABLES:
+        return json_response(
+            {"error": f"unknown or non-whitelisted table {name!r}",
+             "available": sorted(_QUERYABLE_TABLES)}, 404)
+    con = ledger.connect()
+    try:
+        date_col = _QUERYABLE_TABLES[name]  # trusted constant, not user input
+        cols = [c[0] for c in con.execute(f"DESCRIBE {name}").fetchall()]
+        where: list[str] = []
+        params: list = []
+        if date_col and request.args.get("date"):
+            where.append(f"{date_col} = ?")
+            params.append(parse_date(request.args["date"]))
+        if date_col and request.args.get("since"):
+            where.append(f"{date_col} >= ?")
+            params.append(parse_date(request.args["since"]))
+        if "ticker" in cols and request.args.get("ticker"):
+            where.append("ticker = ?")
+            params.append(request.args["ticker"].strip().upper())
+        try:
+            limit = max(1, min(int(request.args.get("limit", 200)), 1000))
+        except ValueError:
+            limit = 200
+        sql = f"SELECT * FROM {name}"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        if date_col:
+            sql += f" ORDER BY {date_col} DESC"
+        sql += f" LIMIT {limit}"
+        rows = con.execute(sql, params).fetchall()
+        return json_response({"table": name, "columns": cols, "n": len(rows),
+                              "rows": [dict(zip(cols, r)) for r in rows]})
+    except Exception as e:  # noqa: BLE001
+        return json_response({"error": str(e), "trace": traceback.format_exc()}, 500)
     finally:
         con.close()
 

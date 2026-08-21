@@ -53,16 +53,17 @@ def morning_email_html(plan_date: date, plan: dict, regime_md: str) -> str:
     else:
         rows = []
         for p in plan.get("picks", []):
+            entry_type = (p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open"
             rows.append(f"""
             <tr>
               <td>{p['ticker']}</td><td>{p['direction']}</td><td>{p.get('setup_type','')}</td>
-              <td>{p.get('entry_price')}</td><td>{p.get('stop_price')}</td><td>{p.get('target_price')}</td>
+              <td>{entry_type} @ {p.get('entry_price')}</td><td>{p.get('stop_price')}</td><td>{p.get('target_price')}</td>
               <td>{p.get('size_r')}R</td><td>{p.get('conviction')}</td>
               <td>{p.get('thesis_final','')}</td>
             </tr>""")
         picks_html = f"""
         <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:monospace;font-size:13px">
-          <tr style="background:#eee"><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry</th><th>Stop</th>
+          <tr style="background:#eee"><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th><th>Stop</th>
           <th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr>
           {''.join(rows)}
         </table>"""
@@ -204,13 +205,14 @@ def _plan_html(plan: dict | None) -> str:
         return f"<p><b>NO TRADE.</b> {plan.get('no_trade_reason','')}</p><p class='neutral'>{plan.get('market_stance','')}</p>"
     rows = []
     for p in plan.get("picks", []):
+        entry_type = (p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open"
         rows.append(
             f"<tr><td>{p['ticker']}</td><td>{p['direction']}</td><td>{p.get('setup_type','')}</td>"
-            f"<td>{p.get('entry_price')}</td><td>{p.get('stop_price')}</td><td>{p.get('target_price')}</td>"
+            f"<td>{entry_type} @ {p.get('entry_price')}</td><td>{p.get('stop_price')}</td><td>{p.get('target_price')}</td>"
             f"<td>{p.get('size_r')}R</td><td>{p.get('conviction')}</td><td>{p.get('thesis_final','')}</td></tr>"
         )
     table = (
-        "<table><tr><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry</th><th>Stop</th>"
+        "<table><tr><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th><th>Stop</th>"
         "<th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr>" + "".join(rows) + "</table>"
     )
     return f"<p class='neutral'>{plan.get('market_stance','')}</p>{table}"
