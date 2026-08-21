@@ -1,0 +1,331 @@
+"""
+Pinning tests for agent/grading.py — the deterministic outcome simulator.
+
+These are hand-written bar fixtures (plain dicts: o/h/l/c/v, matching the shape
+returned by agent.providers.MarketData.minute_bars). No network access, no
+mocks/ fixtures (those are for pipeline smoke tests, not surgical unit tests).
+
+Each test pins one documented rule from the simulate_pick docstring/spec so a
+future refactor (see Task 3: time_stop, flatten, thin-bar filtering) can tell
+a deliberate semantics change from an accidental regression.
+"""
+from __future__ import annotations
+
+import pytest
+
+from agent.grading import classify_shadow, grade_day, outcomes_md, simulate_pick
+
+
+def _pick(direction="long", entry_type="open", entry=100.0, stop=98.0,
+          target=104.0, pick_id=1, **extra):
+    d = {
+        "pick_id": pick_id,
+        "direction": direction,
+        "entry_type": entry_type,
+        "entry_price": entry,
+        "stop_price": stop,
+        "target_price": target,
+    }
+    d.update(extra)
+    return d
+
+
+def _bar(o, h, l, c, v=10_000):
+    return {"o": o, "h": h, "l": l, "c": c, "v": v}
+
+
+# --------------------------------------------------------------------- fills
+
+def test_open_fill_uses_bar0_open():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(100.0, 100.8, 99.5, 100.2)]
+    out = simulate_pick(pick, bars, None)
+    assert out["triggered"] is True
+    assert out["entry_fill"] == 100.0
+
+
+def test_limit_long_fills_at_entry_when_touched_without_gap():
+    # low touches entry, open is above entry -> no favorable gap, fill at entry
+    pick = _pick(entry_type="limit", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(100.5, 101.0, 99.8, 100.2)]
+    out = simulate_pick(pick, bars, None)
+    assert out["triggered"] is True
+    assert out["entry_fill"] == 100.0
+
+
+def test_limit_long_fills_at_open_on_favorable_gap():
+    # open below entry -> gapped through favorably, fill at the (cheaper) open
+    pick = _pick(entry_type="limit", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(99.0, 99.5, 98.5, 99.2)]
+    out = simulate_pick(pick, bars, None)
+    assert out["triggered"] is True
+    assert out["entry_fill"] == 99.0
+
+
+def test_breakout_long_fills_when_high_touches_entry():
+    pick = _pick(entry_type="breakout", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(99.5, 100.5, 99.2, 100.1)]
+    out = simulate_pick(pick, bars, None)
+    assert out["triggered"] is True
+    assert out["entry_fill"] == 100.0  # open (99.5) did not gap past entry
+
+
+def test_limit_short_fills_at_open_on_favorable_gap():
+    # short limit favorable gap = opening ABOVE entry (better sell price)
+    pick = _pick(direction="short", entry_type="limit", entry=100.0, stop=102.0, target=96.0)
+    bars = [_bar(101.0, 101.5, 100.5, 100.8)]
+    out = simulate_pick(pick, bars, None)
+    assert out["triggered"] is True
+    assert out["entry_fill"] == 101.0
+
+
+def test_breakout_short_fills_when_low_touches_entry():
+    pick = _pick(direction="short", entry_type="breakout", entry=100.0, stop=102.0, target=96.0)
+    bars = [_bar(100.5, 100.8, 99.5, 100.0)]
+    out = simulate_pick(pick, bars, None)
+    assert out["triggered"] is True
+    assert out["entry_fill"] == 100.0  # open (100.5) did not gap past entry
+
+
+# --------------------------------------------------------------- exit rules
+
+def test_stop_and_target_same_bar_is_conservative_stop():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(100.0, 105.0, 97.0, 101.0)]  # touches both stop and target
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "stop"
+
+
+def test_gap_through_stop_exits_at_open_not_stop():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [
+        _bar(100.0, 100.2, 99.5, 99.8),   # fill bar, no stop/target touch
+        _bar(97.0, 97.5, 96.0, 97.2),     # gaps through the stop
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "stop"
+    assert out["exit_price"] == 97.0  # the bar's open, not the stop price (98.0)
+
+
+def test_favorable_gap_fill_floors_effective_risk_at_quarter_planned():
+    # entry 100, stop 99 -> planned risk 1.0. Gap-through fill lands at 99.05,
+    # 0.05 from the stop -- far inside the 25% floor (0.25), so effective risk
+    # is floored at planned_risk * 0.25 = 0.25, not the raw 0.05.
+    pick = _pick(entry_type="limit", entry=100.0, stop=99.0, target=105.0)
+    bars = [
+        _bar(99.05, 99.5, 99.02, 99.3),   # fill @ 99.05; l=99.02 stays above stop (99)
+        _bar(99.4, 105.5, 99.3, 105.2),   # touches target
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["entry_fill"] == 99.05
+    assert out["exit_reason"] == "target"
+    # (105 - 99.05) / 0.25 == 23.8 -- if risk had NOT been floored (0.05), this
+    # would instead be (105-99.05)/0.05 = 119.0 (fantasy R).
+    assert out["r_multiple"] == pytest.approx(23.8, abs=1e-3)
+
+
+# ----------------------------------------------------------- untriggered/null
+
+def test_never_triggered_populates_missed_move_and_baseline():
+    pick = _pick(entry_type="limit", entry=100.0, stop=98.0, target=104.0)
+    bars = [
+        _bar(102.0, 103.0, 101.0, 102.5),
+        _bar(102.5, 103.2, 102.0, 102.8),
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["triggered"] is False
+    # best high across both bars = 103.2; risk = |100-98| = 2 -> (103.2-100)/2 = 1.6
+    assert out["missed_move_r"] == pytest.approx(1.6, abs=1e-3)
+    # baseline_r is still computed for untriggered picks: (close-open)/risk
+    # sess_open = bars[0].o = 102.0, sess_close = bars[-1].c = 102.8
+    assert out["baseline_r"] == pytest.approx(0.4, abs=1e-3)
+
+
+def test_no_bars_is_no_data():
+    pick = _pick()
+    out = simulate_pick(pick, [], None)
+    assert out["exit_reason"] == "no_data"
+    assert out["triggered"] is False
+
+
+def test_missing_target_is_invalid_plan():
+    pick = _pick(target=None)
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "invalid_plan"
+
+
+def test_zero_risk_is_invalid_plan():
+    pick = _pick(entry=100.0, stop=100.0)  # entry == stop -> risk <= 0
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "invalid_plan"
+
+
+def test_short_stop_and_target_walk_forward_symmetry():
+    # short: stop above entry, target below entry -- walk-forward mirror of the
+    # long stop/target branches (b["h"] >= stop, b["l"] <= target).
+    pick = _pick(direction="short", entry_type="open", entry=100.0, stop=102.0, target=96.0)
+    stop_bars = [
+        _bar(100.0, 100.2, 99.8, 100.0),
+        _bar(100.1, 102.5, 100.0, 102.3),  # high touches the stop
+    ]
+    out = simulate_pick(pick, stop_bars, None)
+    assert out["exit_reason"] == "stop"
+    assert out["exit_price"] == 102.0
+
+    target_bars = [
+        _bar(100.0, 100.2, 99.8, 100.0),
+        _bar(99.9, 100.0, 95.5, 95.8),   # low touches the target
+    ]
+    out = simulate_pick(pick, target_bars, None)
+    assert out["exit_reason"] == "target"
+    assert out["exit_price"] == 96.0
+
+
+def test_daily_bar_overrides_bar_derived_ohlc_and_baseline():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    daily = {"open": 99.0, "high": 101.0, "low": 98.5, "close": 100.5, "volume": 500_000}
+    out = simulate_pick(pick, bars, daily)
+    assert out["day_open"] == 99.0
+    assert out["day_close"] == 100.5
+    assert out["day_volume"] == 500_000
+    # baseline_r uses daily open/close (not bar open/close) when daily is provided:
+    # (100.5 - 99.0) / risk(2.0) == 0.75
+    assert out["baseline_r"] == pytest.approx(0.75, abs=1e-3)
+
+
+def test_untouched_trade_exits_eod_at_last_close():
+    pick = _pick(entry_type="open", entry=100.0, stop=90.0, target=120.0)  # far away
+    bars = [
+        _bar(100.0, 101.0, 99.0, 100.5),
+        _bar(100.5, 101.2, 99.8, 100.9),
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "eod"
+    assert out["exit_price"] == 100.9  # bars[-1]["c"]
+
+
+# ---------------------------------------------------------------- friction
+
+def test_slippage_worsens_fill_and_exit_and_lowers_r_multiple():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [
+        _bar(100.0, 100.5, 99.5, 100.2),
+        _bar(100.2, 104.5, 100.0, 104.3),  # touches target
+    ]
+    zero = simulate_pick(dict(pick), bars, None, slippage_bps=0.0)
+    slipped = simulate_pick(dict(pick), bars, None, slippage_bps=50.0)  # 0.5%/side
+
+    assert zero["exit_reason"] == "target"
+    assert slipped["exit_reason"] == "target"
+    # long: slippage worsens fill by making entry MORE expensive
+    assert slipped["entry_fill"] > zero["entry_fill"]
+    # and worsens exit by making the sale price LOWER
+    assert slipped["exit_price"] < zero["exit_price"]
+    assert slipped["r_multiple"] < zero["r_multiple"]
+
+
+# ------------------------------------------------------- target-after-stop
+
+def test_target_hit_after_stop_on_later_bar():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [
+        _bar(100.0, 100.2, 99.5, 100.0),
+        _bar(99.9, 100.0, 97.5, 97.8),   # stops out here
+        _bar(98.0, 104.5, 97.9, 104.2),  # target prints later, same day
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "stop"
+    assert out["target_hit_after_stop"] is True
+
+
+def test_target_hit_after_stop_true_on_same_bar_tie():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(100.0, 105.0, 97.0, 101.0)]  # same-bar stop+target touch
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "stop"
+    assert out["target_hit_after_stop"] is True
+
+
+# --------------------------------------------------------------------- eod_r
+
+def test_eod_r_uses_same_risk_denominator_as_r_multiple():
+    # Same fixture as the fantasy-R guard test: risk is floored at 0.25.
+    pick = _pick(entry_type="limit", entry=100.0, stop=99.0, target=105.0)
+    bars = [
+        _bar(99.05, 99.5, 99.02, 99.3),
+        _bar(99.4, 105.5, 99.3, 105.2),
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "target"
+    assert out["r_multiple"] == pytest.approx(23.8, abs=1e-3)
+    # eod_r = (last close - fill) / SAME floored risk (0.25):
+    # (105.2 - 99.05) / 0.25 == 24.6
+    assert out["eod_r"] == pytest.approx(24.6, abs=1e-3)
+
+
+# ---------------------------------------------------------------- classify_shadow
+
+def test_classify_shadow_no_data_and_invalid_plan_are_unmeasurable():
+    assert classify_shadow({"exit_reason": "no_data", "triggered": False})[0] == "unmeasurable"
+    assert classify_shadow({"exit_reason": "invalid_plan", "triggered": False})[0] == "unmeasurable"
+
+
+def test_classify_shadow_untriggered_is_scratch():
+    kind, forgone = classify_shadow({"exit_reason": "no_trigger", "triggered": False})
+    assert kind == "scratch"
+    assert forgone == 0.0
+
+
+def test_classify_shadow_noise_band_is_scratch():
+    kind, _ = classify_shadow({"exit_reason": "eod", "triggered": True, "r_multiple": 0.1})
+    assert kind == "scratch"
+    kind, _ = classify_shadow({"exit_reason": "eod", "triggered": True, "r_multiple": -0.1})
+    assert kind == "scratch"
+
+
+def test_classify_shadow_would_have_won_and_lost():
+    kind, r = classify_shadow({"exit_reason": "target", "triggered": True, "r_multiple": 1.5})
+    assert kind == "would_have_won"
+    assert r == 1.5
+    kind, r = classify_shadow({"exit_reason": "stop", "triggered": True, "r_multiple": -1.0})
+    assert kind == "would_have_lost"
+    assert r == -1.0
+
+
+# ------------------------------------------------------------- grade_day / md
+
+class _FakeMarketData:
+    """Minimal duck-typed stand-in for agent.providers.MarketData — grade_day
+    only calls .minute_bars() and .daily_bar()."""
+
+    def __init__(self, bars):
+        self._bars = bars
+
+    def minute_bars(self, ticker, d):
+        return self._bars
+
+    def daily_bar(self, ticker, d):
+        return None
+
+
+def test_grade_day_and_outcomes_md_smoke():
+    picks = [{
+        "pick_id": 1, "ticker": "TEST", "direction": "long", "setup_type": "gap_go",
+        "entry_type": "open", "entry_price": 100.0, "stop_price": 98.0,
+        "target_price": 104.0, "size_r": 1.0, "conviction": 4,
+        "time_stop": None, "thesis": "test thesis", "invalidation": "test invalidation",
+    }]
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    md = _FakeMarketData(bars)
+    outcomes = grade_day(md, picks, __import__("datetime").date(2026, 1, 2))
+    assert len(outcomes) == 1
+    assert outcomes[0]["pick_id"] == 1
+    assert outcomes[0]["eval_date"] is not None
+
+    md_text = outcomes_md(picks, outcomes)
+    assert "TEST" in md_text
+    assert "OUTCOME" in md_text
+
