@@ -69,6 +69,13 @@ from .util import log
 
 _CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 
+# Bump this whenever simulate_pick's exit-rule semantics change (Task 4).
+# Written onto every outcome/rejection row so the weekly miner (and any
+# cross-session comparison) can tell rows graded under different rules apart
+# instead of silently averaging them together. v1 = pre-Task-3 semantics
+# (no time_stop enforcement). v2 = time_stop enforced as a hard exit.
+CURRENT_SIM_VERSION = 2
+
 
 def _risk_per_share(entry: float, stop: float) -> float:
     return abs(entry - stop)
@@ -148,6 +155,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "baseline_r": None,
         "eod_r": None,
         "target_hit_after_stop": None,
+        "sim_version": CURRENT_SIM_VERSION,
     }
     if daily:
         out.update({

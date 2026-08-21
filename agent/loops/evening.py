@@ -56,7 +56,8 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
         sim = simulate_pick(shim, bars, None, slippage_bps=slippage_bps,
                             flatten_at=flatten_at, min_bar_volume=min_bar_volume)
         eod_outcome, forgone = classify_shadow(sim)
-        ledger.save_rejection_outcome(con, r["rejection_id"], eod_outcome, forgone)
+        ledger.save_rejection_outcome(con, r["rejection_id"], eod_outcome, forgone,
+                                      sim_version=sim.get("sim_version"))
         summary["scored"] += 1
         summary["net_forgone_r"] += forgone or 0.0
         log("evening", f"  shadow {r['ticker']} ({r['reason'][:40]}): {eod_outcome}"

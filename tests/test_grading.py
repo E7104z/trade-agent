@@ -15,7 +15,7 @@ from datetime import datetime
 
 import pytest
 
-from agent.grading import classify_shadow, grade_day, outcomes_md, simulate_pick
+from agent.grading import CURRENT_SIM_VERSION, classify_shadow, grade_day, outcomes_md, simulate_pick
 
 
 def _pick(direction="long", entry_type="open", entry=100.0, stop=98.0,
@@ -491,5 +491,22 @@ def test_min_bar_volume_still_counts_thin_bars_for_mfe_mae():
     # mae_r reflects the thin bar's low (92.0), not just the non-thin bars:
     # (92.0 - 100.0) / risk(10.0) == -0.8
     assert out["mae_r"] == pytest.approx(-0.8, abs=1e-3)
+
+
+# ------------------------------------------------------------- sim_version (Task 4)
+
+def test_simulate_pick_stamps_current_sim_version():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    out = simulate_pick(pick, bars, None)
+    assert out["sim_version"] == CURRENT_SIM_VERSION
+
+
+def test_simulate_pick_stamps_sim_version_even_on_short_circuit_exits():
+    # no_data and invalid_plan short-circuit before the walk-forward loop --
+    # sim_version must still be present so every row is attributable to a
+    # semantics version, not just the ones that reach a full walk.
+    assert simulate_pick(_pick(), [], None)["sim_version"] == CURRENT_SIM_VERSION
+    assert simulate_pick(_pick(target=None), [_bar(100, 100.5, 99.5, 100.2)], None)["sim_version"] == CURRENT_SIM_VERSION
 
 

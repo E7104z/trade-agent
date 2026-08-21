@@ -71,6 +71,29 @@ def _counterfactuals_md(mem: dict) -> str:
     )
 
 
+def _sim_version_md(mem: dict) -> str:
+    """Flag the Task 3/4 simulation-semantics cutover so the miner doesn't read
+    exit-reason mix as one homogeneous pile across a boundary where the exit
+    rules actually changed (time_stop went from unenforced to a hard exit)."""
+    rows = mem.get("sim_version_breakdown", [])
+    if len(rows) <= 1:
+        return ""
+    table = "\n".join(
+        f"- sim_version {r['sim_version']}: n={r['n']} ({r['first_date']} to {r['last_date']})"
+        for r in rows
+    )
+    return (
+        "## SIMULATION SEMANTICS VERSION BOUNDARY\n\n"
+        "The grading engine's exit rules changed mid-ledger (sim_version bumped). "
+        "Rows below reflect DIFFERENT simulation rules — comparisons of exit-reason "
+        "mix (e.g. \"stops are up\") ACROSS sim_version values are unsound; a shift "
+        "in the mix may be nothing more than the rule change, not a real pattern. "
+        "Compare within a single sim_version, or note the boundary explicitly if "
+        "you must compare across it.\n\n"
+        f"{table}"
+    )
+
+
 def _v3_sections(mem: dict) -> str:
     """Render calibration, shadow, staleness, and question-progress data for the miner."""
     cal = mem.get("calibration", [])
@@ -175,6 +198,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_fmt_stats(mem['by_direction'], 'direction')}\n\n"
             f"{_counterfactuals_md(mem)}\n\n"
             f"{_v3_sections(mem)}\n\n"
+            f"{_sim_version_md(mem)}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"
             f"## LESSON BANK (with IDs for your lesson_actions)\n\n{lessons_md}\n\n"
             f"## REGIME HISTORY (last 30 reads)\n\n{regimes_md}\n\n"

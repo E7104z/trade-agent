@@ -238,6 +238,7 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         "playbook": playbook,
         "playbook_version": version,
         "trades_csv": ledger.all_trades_csv(con),
+        "sim_version_breakdown": ledger.sim_version_breakdown(con),
         "overall": ledger.overall_stats(con),
         "by_setup": ledger.stats_by(con, "setup_type"),
         "by_regime": ledger.stats_by(con, "regime_tag"),

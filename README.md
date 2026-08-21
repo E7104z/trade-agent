@@ -54,6 +54,9 @@ Then put your Anthropic API key in `credentials.json` (`anthropic_api_key`). Alp
 .venv\Scripts\python run.py weekly      # Sunday — mine ledger, rewrite playbook
 .venv\Scripts\python run.py status      # track record snapshot
 .venv\Scripts\python run.py dashboard   # regenerate reports/dashboard.html
+.venv\Scripts\python run.py regrade --from YYYY-MM-DD [--force]
+                                         # recompute outcomes under current sim
+                                         # semantics (explicit, opt-in only)
 ```
 
 Automate with Windows Task Scheduler: run `scripts\setup_tasks.ps1` from an elevated PowerShell (times are local — adjust if not in ET).

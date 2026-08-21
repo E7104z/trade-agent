@@ -7,6 +7,9 @@ Trade Agent CLI.
   python run.py weekly  [--mock] [--date YYYY-MM-DD]
   python run.py dashboard                 regenerate the HTML dashboard
   python run.py status                    ledger + performance snapshot
+  python run.py regrade --from YYYY-MM-DD [--force]
+                                           recompute outcomes under CURRENT sim
+                                           semantics (explicit, never automatic)
 """
 from __future__ import annotations
 
@@ -71,6 +74,53 @@ def cmd_dashboard(cfg, args) -> None:
     print(f"Dashboard: {path}")
 
 
+def cmd_regrade(cfg, args) -> None:
+    """Recompute outcomes for picks on/after --from under CURRENT simulation
+    semantics (agent.grading.CURRENT_SIM_VERSION). Explicit, opt-in, never
+    invoked automatically by any loop -- existing rows were graded under
+    whatever rules were live when they were written, and are not silently
+    rewritten just because the code changed underneath them.
+    """
+    from collections import defaultdict
+
+    from agent.grading import CURRENT_SIM_VERSION, grade_day
+    from agent.providers import MarketData
+
+    from_date = parse_date(args.from_date)
+    con = ledger.connect()
+    picks = ledger.graded_picks_since(con, from_date)
+    if not picks:
+        log("regrade", f"No graded picks on/after {from_date} — nothing to do")
+        con.close()
+        return
+
+    if len(picks) > 50 and not args.force:
+        log("regrade", f"Refusing: this would rewrite {len(picks)} outcome rows (>50). "
+                       "Re-run with --force to proceed.")
+        con.close()
+        sys.exit(1)
+
+    by_date: dict = defaultdict(list)
+    for p in picks:
+        by_date[p["plan_date"]].append(p)
+
+    md = MarketData(cfg)
+    slippage = float(cfg.get("slippage_bps", 5))
+    flatten_at = cfg.get("flatten_at")
+    min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
+
+    n = 0
+    for d in sorted(by_date):
+        outcomes = grade_day(md, by_date[d], d, slippage_bps=slippage,
+                             flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+        for o in outcomes:
+            ledger.save_outcome(con, o)
+            n += 1
+    log("regrade", f"Recomputed {n} outcome row(s) from {from_date} onward "
+                   f"under sim_version={CURRENT_SIM_VERSION}")
+    con.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="trade-agent", description="AI trading analyst with a track record")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -98,6 +148,10 @@ def main() -> None:
     sub.add_parser("status", help="print ledger and performance snapshot")
     sub.add_parser("init", help="initialize directories, DB, credentials template")
 
+    p_regrade = sub.add_parser("regrade", help="recompute outcomes under current sim semantics (explicit, opt-in)")
+    p_regrade.add_argument("--from", dest="from_date", required=True, help="YYYY-MM-DD -- recompute picks on/after this date")
+    p_regrade.add_argument("--force", action="store_true", help="required if this would rewrite more than 50 rows")
+
     args = parser.parse_args()
     cfg = load_config()
     cfg.mock = getattr(args, "mock", False)
@@ -115,6 +169,8 @@ def main() -> None:
         cmd_status(cfg, args)
     elif args.cmd == "dashboard":
         cmd_dashboard(cfg, args)
+    elif args.cmd == "regrade":
+        cmd_regrade(cfg, args)
     elif args.cmd == "morning":
         from agent.loops import morning
         morning.run(cfg, run_date, force=args.force)

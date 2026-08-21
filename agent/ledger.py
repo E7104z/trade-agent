@@ -190,6 +190,12 @@ _MIGRATIONS = [
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS baseline_r DOUBLE",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS eod_r DOUBLE",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS target_hit_after_stop BOOLEAN",
+    # Task 4: version the simulation semantics. Existing rows (graded before
+    # this migration ran) default to 1; everything graded from here on writes
+    # CURRENT_SIM_VERSION explicitly (see agent/grading.py). Never backfilled
+    # silently — see run.py regrade for the explicit, opt-in recompute path.
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS sim_version INTEGER DEFAULT 1",
+    "ALTER TABLE rejections ADD COLUMN IF NOT EXISTS sim_version INTEGER DEFAULT 1",
 ]
 
 
@@ -312,13 +318,17 @@ def plan_for_date(con: duckdb.DuckDBPyConnection, d: date) -> dict | None:
 
 def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
     con.execute("DELETE FROM outcomes WHERE pick_id = ?", [o["pick_id"]])
+    sim_version = o.get("sim_version")
+    if sim_version is None:
+        from .grading import CURRENT_SIM_VERSION
+        sim_version = CURRENT_SIM_VERSION
     con.execute(
         """INSERT INTO outcomes
            (pick_id, eval_date, triggered, entry_fill, exit_price, exit_reason,
             r_multiple, mfe_r, mae_r, day_open, day_high, day_low, day_close,
             day_volume, missed_move_r, baseline_r, eod_r, target_hit_after_stop,
-            grade, grade_notes, graded_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            grade, grade_notes, graded_at, sim_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
@@ -326,7 +336,7 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             o.get("day_low"), o.get("day_close"), o.get("day_volume"),
             o.get("missed_move_r"), o.get("baseline_r"), o.get("eod_r"),
             o.get("target_hit_after_stop"), o.get("grade"), o.get("grade_notes"),
-            o.get("graded_at", datetime.now()),
+            o.get("graded_at", datetime.now()), sim_version,
         ],
     )
 
@@ -633,16 +643,45 @@ def all_trades_csv(con: duckdb.DuckDBPyConnection) -> str:
         """SELECT p.plan_date, p.ticker, p.direction, p.setup_type, p.conviction, p.size_r,
                   p.entry_price, p.stop_price, p.target_price, p.regime_tag,
                   o.triggered, o.exit_reason, o.r_multiple, o.mfe_r, o.mae_r,
-                  o.missed_move_r, o.baseline_r, o.eod_r, o.target_hit_after_stop, o.grade
+                  o.missed_move_r, o.baseline_r, o.eod_r, o.target_hit_after_stop, o.grade,
+                  COALESCE(o.sim_version, 1)
            FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
            ORDER BY p.plan_date, p.pick_id"""
     ).fetchall()
     header = ("date,ticker,dir,setup,conv,size_r,entry,stop,target,regime,"
-              "triggered,exit,r,mfe_r,mae_r,missed_r,baseline_r,eod_r,target_after_stop,grade")
+              "triggered,exit,r,mfe_r,mae_r,missed_r,baseline_r,eod_r,target_after_stop,grade,"
+              "sim_version")
     lines = [header]
     for r in rows:
         lines.append(",".join("" if v is None else str(v) for v in r))
     return "\n".join(lines)
+
+
+def sim_version_breakdown(con: duckdb.DuckDBPyConnection) -> list[dict]:
+    """Counts of graded outcomes by sim_version, with the plan_date span each
+    version covers. Exposes the Task 3/4 simulation-semantics cutover to the
+    weekly miner so it doesn't read exit-reason mix as one homogeneous pile
+    across a boundary where the rules actually changed."""
+    rows = con.execute(
+        """SELECT COALESCE(o.sim_version, 1) AS v, COUNT(*),
+                  MIN(p.plan_date), MAX(p.plan_date)
+           FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+           GROUP BY 1 ORDER BY 1"""
+    ).fetchall()
+    return [{"sim_version": r[0], "n": r[1], "first_date": str(r[2]), "last_date": str(r[3])}
+            for r in rows]
+
+
+def graded_picks_since(con: duckdb.DuckDBPyConnection, from_date: date) -> list[dict]:
+    """Picks with an existing outcome row, plan_date >= from_date -- the
+    candidate set for `run.py regrade`."""
+    cols = [c[0] for c in con.execute("DESCRIBE picks").fetchall()]
+    rows = con.execute(
+        """SELECT p.* FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
+           WHERE p.plan_date >= ? ORDER BY p.plan_date, p.pick_id""",
+        [from_date],
+    ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
 
 
 def log_run(con: duckdb.DuckDBPyConnection, loop: str, run_date: date, started: datetime,
@@ -695,11 +734,15 @@ def ungraded_rejections(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:
 
 
 def save_rejection_outcome(con: duckdb.DuckDBPyConnection, rejection_id: int,
-                           eod_outcome: str, forgone_r: float | None) -> None:
+                           eod_outcome: str, forgone_r: float | None,
+                           sim_version: int | None = None) -> None:
+    if sim_version is None:
+        from .grading import CURRENT_SIM_VERSION
+        sim_version = CURRENT_SIM_VERSION
     con.execute(
-        "UPDATE rejections SET eod_outcome = ?, forgone_r = ?, graded_at = current_timestamp "
-        "WHERE rejection_id = ?",
-        [eod_outcome, forgone_r, rejection_id],
+        "UPDATE rejections SET eod_outcome = ?, forgone_r = ?, graded_at = current_timestamp, "
+        "sim_version = ? WHERE rejection_id = ?",
+        [eod_outcome, forgone_r, sim_version, rejection_id],
     )
 
 
