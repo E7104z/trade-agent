@@ -142,12 +142,25 @@ def _v3_sections(mem: dict) -> str:
 
 
 def _check_wr_suppression(playbook_md: str) -> list[str]:
-    """Write-time enforcement (spec §5): flag any line carrying wr/avgR at n<8."""
+    """Write-time enforcement:
+    (a) spec Sec5 (original check) -- flag any line carrying wr/avgR at n < 8.
+    (b) Task 5 #5 -- flag any line making an effect-size claim (avgR=<number>)
+        that doesn't ALSO cite n, t, and stdR. stats_by computes all three
+        deterministically; the miner must cite them, never derive its own
+        read of significance. Flagged the same way small-sample win rates are.
+    """
     violations = []
     for line in playbook_md.splitlines():
-        m = re.search(r"n\s*=\s*(\d+)", line)
-        if m and int(m.group(1)) < 8 and re.search(r"(wr\s*=|avgR\s*=\s*[+-]?\d)", line, re.IGNORECASE):
-            violations.append(line.strip()[:120])
+        stripped = line.strip()[:160]
+        n_match = re.search(r"n\s*=\s*(\d+)", line)
+        has_effect_claim = re.search(r"avgR\s*=\s*[+-]?\d", line, re.IGNORECASE)
+        if n_match and int(n_match.group(1)) < 8 and re.search(r"(wr\s*=|avgR\s*=\s*[+-]?\d)", line, re.IGNORECASE):
+            violations.append(stripped)
+        if has_effect_claim:
+            missing = [tok for tok in ("n", "t", "stdR")
+                      if not re.search(rf"\b{tok}\s*=\s*[+-]?\d", line, re.IGNORECASE)]
+            if missing:
+                violations.append(f"{stripped}  [missing: {', '.join(missing)}]")
     return violations
 
 
@@ -180,7 +193,9 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         lessons_md = "\n".join(
             f"- [L{l['lesson_id']}] status={l['status']}, conf={l['confidence']}, "
             f"+{l['confirmations']}/-{l['contradictions']}, source={l['source']}, "
-            f"setup={l['setup_type'] or 'any'}: {l['lesson']}"
+            f"setup={l['setup_type'] or 'any'}, "
+            f"holdout_tier={l['tier']} (n={l['confirmations_in_sample'] + l['confirmations_out_of_sample']} "
+            f"({l['confirmations_out_of_sample']} out-of-sample), promoted_at={l['promoted_at']}): {l['lesson']}"
             for l in mem["lessons"]
         ) or "(no lessons recorded yet)"
 
@@ -200,7 +215,15 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_v3_sections(mem)}\n\n"
             f"{_sim_version_md(mem)}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"
-            f"## LESSON BANK (with IDs for your lesson_actions)\n\n{lessons_md}\n\n"
+            f"## LESSON BANK (with IDs for your lesson_actions)\n\n"
+            "Each lesson's `holdout_tier` is gated on OUT-OF-SAMPLE confirmations only "
+            "(session date after promoted_at) -- moderate/established requires that n "
+            "independent of in-sample n. Cite `holdout_tier` when promoting a lesson into "
+            "a rule; do not promote past what holdout_tier supports.\n"
+            + (f"Lesson-confirmation holdout window: {int(cfg.get('lesson_holdout_sessions', 0) or 0)} "
+               "trailing sessions withheld from BOTH in-sample and out-of-sample counts.\n\n"
+               if cfg.get("lesson_holdout_sessions") else "\n")
+            + f"{lessons_md}\n\n"
             f"## REGIME HISTORY (last 30 reads)\n\n{regimes_md}\n\n"
             f"## CURRENT PLAYBOOK (v{mem['playbook_version']}) — you are rewriting this\n\n"
             f"{mem['playbook']}\n\n"

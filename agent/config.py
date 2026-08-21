@@ -44,6 +44,7 @@ _DEFAULTS: dict[str, Any] = {
     "slippage_bps": 5,
     "flatten_at": None,        # e.g. "15:55" -- session-end flatten cutoff, default OFF
     "min_bar_volume": 0,       # thin-bar filter threshold, default OFF (0 = disabled)
+    "lesson_holdout_sessions": 0,  # trailing-window lesson-confirmation holdout, default OFF
     "timezone": "America/New_York",
     "email_enabled": False,
     "data": {

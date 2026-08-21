@@ -273,7 +273,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             log("evening", f"New lesson L{lid}: {l['lesson']}")
         for upd in review.get("lesson_updates", []) or []:
             if isinstance(upd.get("lesson_id"), int):
-                ledger.update_lesson_feedback(con, upd["lesson_id"], upd.get("action", ""))
+                ledger.update_lesson_feedback(con, upd["lesson_id"], upd.get("action", ""), d)
 
         # v3: calibration rows, rule confirmations, open-question progress
         counts = _v3_events(con, md, d, picks, outcomes, review, shadow, slippage_bps=slippage)

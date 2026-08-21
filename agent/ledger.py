@@ -182,6 +182,17 @@ CREATE TABLE IF NOT EXISTS open_question_progress (
     increment     INTEGER,
     note          VARCHAR
 );
+
+-- ------------------------------------------------------- Task 5: lesson holdout
+
+-- Per-event log of lesson "confirm" actions (mirrors rule_confirmations).
+-- Needed because the in-sample/out-of-sample split (vs lessons.promoted_at)
+-- and the optional trailing-window holdout (config lesson_holdout_sessions)
+-- both depend on WHEN each confirmation happened, not just a running total.
+CREATE TABLE IF NOT EXISTS lesson_confirmations (
+    lesson_id     INTEGER,
+    session_date  DATE
+);
 """
 
 # Idempotent upgrades for databases created before these columns existed
@@ -196,6 +207,12 @@ _MIGRATIONS = [
     # silently — see run.py regrade for the explicit, opt-in recompute path.
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS sim_version INTEGER DEFAULT 1",
     "ALTER TABLE rejections ADD COLUMN IF NOT EXISTS sim_version INTEGER DEFAULT 1",
+    # Task 5: out-of-sample holdout for lesson confirmation. promoted_at is the
+    # session date a lesson was written down; confirmations on/before it are
+    # in-sample, after it are out-of-sample. Backfill existing lessons with
+    # their creation date (idempotent -- only touches rows still NULL).
+    "ALTER TABLE lessons ADD COLUMN IF NOT EXISTS promoted_at DATE",
+    "UPDATE lessons SET promoted_at = created_date WHERE promoted_at IS NULL",
 ]
 
 
@@ -375,20 +392,27 @@ def ungraded_picks(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:
 def insert_lesson(con: duckdb.DuckDBPyConnection, l: dict, source: str, created: date) -> int:
     row = con.execute(
         """INSERT INTO lessons
-           (created_date, lesson, setup_type, regime, tags, confidence, evidence, source)
-           VALUES (?,?,?,?,?,?,?,?) RETURNING lesson_id""",
+           (created_date, lesson, setup_type, regime, tags, confidence, evidence, source, promoted_at)
+           VALUES (?,?,?,?,?,?,?,?,?) RETURNING lesson_id""",
         [
             created, l["lesson"], l.get("setup_type"), l.get("regime"),
             ",".join(l.get("tags", [])) if isinstance(l.get("tags"), list) else l.get("tags"),
-            l.get("confidence", "low"), l.get("evidence"), source,
+            l.get("confidence", "low"), l.get("evidence"), source, created,
         ],
     ).fetchone()
     return row[0]
 
 
-def update_lesson_feedback(con: duckdb.DuckDBPyConnection, lesson_id: int, action: str) -> None:
+def update_lesson_feedback(con: duckdb.DuckDBPyConnection, lesson_id: int, action: str,
+                          session_date: date | None = None) -> None:
     if action == "confirm":
         con.execute("UPDATE lessons SET confirmations = confirmations + 1 WHERE lesson_id = ?", [lesson_id])
+        # Task 5: log the event date too (in addition to, not instead of, the
+        # running counter above) so the weekly loop can split in-sample vs
+        # out-of-sample confirmations relative to lessons.promoted_at.
+        if session_date is not None:
+            con.execute("INSERT INTO lesson_confirmations (lesson_id, session_date) VALUES (?, ?)",
+                       [lesson_id, session_date])
     elif action == "contradict":
         con.execute("UPDATE lessons SET contradictions = contradictions + 1 WHERE lesson_id = ?", [lesson_id])
 
@@ -413,6 +437,82 @@ def all_lessons(con: duckdb.DuckDBPyConnection) -> list[dict]:
     cols = [c[0] for c in con.execute("DESCRIBE lessons").fetchall()]
     rows = con.execute("SELECT * FROM lessons ORDER BY lesson_id").fetchall()
     return [dict(zip(cols, r)) for r in rows]
+
+
+# ---------------------------------------------- Task 5: lesson out-of-sample holdout
+
+def lesson_confidence_tier(confirmations_in_sample: int, confirmations_out_of_sample: int) -> str:
+    """
+    Confidence tier for ONE lesson's confirmation evidence, gating on WHEN each
+    confirmation happened relative to the lesson's promoted_at (see
+    lesson_holdout_stats below) -- not just how many there are in total.
+
+    none < provisional < low < moderate < established (same names as the
+    playbook-rule tiers in prompts/weekly_miner.md: none=0, provisional=1-7,
+    low=8-19, moderate=20-39, established=40+).
+
+    provisional/low can be earned on in-sample evidence alone (n_total) --
+    early learning proceeds exactly as it does today. moderate/established
+    require OUT-OF-SAMPLE evidence achieved on ITS OWN: reaching moderate
+    needs as much out-of-sample n (>= 8) as it normally takes to earn low on
+    any evidence; established needs as much out-of-sample n (>= 20) as it
+    normally takes to earn moderate. This keeps the escalation the same size
+    step at every tier and never lets in-sample volume alone carry a lesson
+    past low, no matter how large it gets.
+    """
+    n_in = confirmations_in_sample or 0
+    n_out = confirmations_out_of_sample or 0
+    n_total = n_in + n_out
+    if n_out >= 20:
+        return "established"
+    if n_out >= 8:
+        return "moderate"
+    if n_total >= 8:
+        return "low"
+    if n_total >= 1:
+        return "provisional"
+    return "none"
+
+
+def lesson_holdout_stats(con: duckdb.DuckDBPyConnection, lesson_id: int,
+                        promoted_at: date | None, holdout_sessions: int = 0) -> dict:
+    """In-sample/out-of-sample confirmation counts for one lesson, plus its
+    gated tier (lesson_confidence_tier).
+
+    holdout_sessions (config `lesson_holdout_sessions`, default 0/disabled) is
+    the TRUE withheld-window mechanism: when > 0, confirmations that fall
+    within the most recent `holdout_sessions` distinct sessions are excluded
+    entirely (neither in-sample nor out-of-sample) rather than merely split by
+    promoted_at -- a genuine rolling holdout, for later once sessions are
+    cheap. At 0 it does nothing and this function reduces to the plain
+    promoted_at split.
+    """
+    dates = [r[0] for r in con.execute(
+        "SELECT session_date FROM lesson_confirmations WHERE lesson_id = ?", [lesson_id]
+    ).fetchall()]
+
+    if holdout_sessions:
+        recent = con.execute(
+            "SELECT DISTINCT plan_date FROM daily_plans ORDER BY plan_date DESC LIMIT ?",
+            [holdout_sessions],
+        ).fetchall()
+        if len(recent) == holdout_sessions:
+            cutoff = min(r[0] for r in recent)  # earliest date inside the withheld window
+            dates = [d for d in dates if d < cutoff]
+
+    if promoted_at is not None:
+        n_in = sum(1 for d in dates if d <= promoted_at)
+        n_out = sum(1 for d in dates if d > promoted_at)
+    else:
+        # no promoted_at on record (shouldn't happen post-migration) -- treat
+        # everything as in-sample rather than overclaiming out-of-sample rigor.
+        n_in, n_out = len(dates), 0
+
+    return {
+        "confirmations_in_sample": n_in,
+        "confirmations_out_of_sample": n_out,
+        "tier": lesson_confidence_tier(n_in, n_out),
+    }
 
 
 # --------------------------------------------------------------------- regime

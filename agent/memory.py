@@ -234,6 +234,11 @@ def build_morning_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
 def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
     """Everything the weekly miner needs."""
     playbook, version = read_playbook(con)
+    lessons = ledger.all_lessons(con)
+    holdout_sessions = int(cfg.get("lesson_holdout_sessions", 0) or 0)
+    for l in lessons:
+        l.update(ledger.lesson_holdout_stats(con, l["lesson_id"], l.get("promoted_at"),
+                                            holdout_sessions))
     return {
         "playbook": playbook,
         "playbook_version": version,
@@ -244,7 +249,7 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         "by_regime": ledger.stats_by(con, "regime_tag"),
         "by_conviction": ledger.stats_by(con, "conviction"),
         "by_direction": ledger.stats_by(con, "direction"),
-        "lessons": ledger.all_lessons(con),
+        "lessons": lessons,
         "regimes": ledger.recent_regimes(con, 30),
         # v3: the self-deception closers
         "calibration": ledger.calibration_aggregate(con),

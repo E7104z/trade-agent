@@ -19,6 +19,7 @@
   "slippage_bps": 5,
   "flatten_at": null,
   "min_bar_volume": 0,
+  "lesson_holdout_sessions": 0,
   "drawdown_window": 10,
   "drawdown_pause_r": -4.0,
 
