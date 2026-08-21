@@ -11,6 +11,8 @@ a deliberate semantics change from an accidental regression.
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from agent.grading import classify_shadow, grade_day, outcomes_md, simulate_pick
@@ -32,6 +34,11 @@ def _pick(direction="long", entry_type="open", entry=100.0, stop=98.0,
 
 def _bar(o, h, l, c, v=10_000):
     return {"o": o, "h": h, "l": l, "c": c, "v": v}
+
+
+def _tbar(hh, mm, o, h, l, c, v=10_000):
+    """A bar with a timestamp, for time_stop/flatten bar-index mapping tests."""
+    return {"t": datetime(2026, 1, 2, hh, mm), "o": o, "h": h, "l": l, "c": c, "v": v}
 
 
 # --------------------------------------------------------------------- fills
@@ -328,4 +335,161 @@ def test_grade_day_and_outcomes_md_smoke():
     md_text = outcomes_md(picks, outcomes)
     assert "TEST" in md_text
     assert "OUTCOME" in md_text
+
+
+# ============================================================================
+# Task 3: time_stop, flatten_at, min_bar_volume (all pin NEW behavior; the
+# tests above pin the Task 2 baseline and must keep passing unchanged).
+# ============================================================================
+
+# ------------------------------------------------------------- time_stop
+
+def test_time_stop_exits_at_bar_close_using_bar_timestamps():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0,
+                 time_stop="by 09:32")
+    bars = [
+        _tbar(9, 30, 100.0, 100.5, 99.5, 100.2),
+        _tbar(9, 31, 100.2, 100.6, 99.8, 100.4),
+        _tbar(9, 32, 100.4, 100.8, 100.0, 100.6),  # time_stop cutoff reached here
+        _tbar(9, 33, 100.6, 115.0, 100.0, 112.0),  # target would hit later -- must not matter
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "time_stop"
+    assert out["exit_price"] == 100.6  # the time-stop bar's close, not the stop or target
+
+
+def test_time_stop_ordering_stop_wins_on_same_bar():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0,
+                 time_stop="by 09:31")
+    bars = [
+        _tbar(9, 30, 100.0, 100.5, 99.5, 100.2),
+        _tbar(9, 31, 100.0, 100.5, 94.0, 95.0),   # time_stop cutoff AND stop touched
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "stop"
+    assert out["exit_price"] == 95.0
+
+
+def test_unparseable_time_stop_falls_back_to_no_time_stop():
+    # legacy/stale shape (a duration, not a clock time) -- must not crash, and
+    # must simulate as though no time stop were set at all.
+    pick = _pick(entry_type="open", entry=100.0, stop=90.0, target=120.0,
+                 time_stop="2 days")
+    bars = [
+        _tbar(9, 30, 100.0, 100.5, 99.5, 100.2),
+        _tbar(9, 31, 100.2, 100.6, 99.8, 100.4),
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "eod"
+    assert out["exit_price"] == 100.4
+
+
+def test_time_stop_positional_fallback_when_bars_have_no_timestamp():
+    # no "t" key on any bar -> fall back to a positional offset from bars[0],
+    # assuming consecutive 1-minute bars starting at the 9:30 open.
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0,
+                 time_stop="by 09:32")  # 2 minutes after 9:30 open -> index 2
+    bars = [
+        _bar(100.0, 100.5, 99.5, 100.2),
+        _bar(100.2, 100.6, 99.8, 100.4),
+        _bar(100.4, 100.8, 100.0, 100.6),  # index 2 -> time_stop bar
+        _bar(100.6, 115.0, 100.0, 112.0),
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "time_stop"
+    assert out["exit_price"] == 100.6
+
+
+# ------------------------------------------------------------- flatten_at (default off, explicitly enabled here)
+
+def test_flatten_at_disabled_by_default_has_no_effect():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0)
+    bars = [
+        _tbar(9, 30, 100.0, 100.5, 99.5, 100.2),
+        _tbar(9, 31, 100.2, 100.6, 99.8, 100.4),
+    ]
+    out = simulate_pick(pick, bars, None)  # flatten_at not passed -> default None
+    assert out["exit_reason"] == "eod"
+
+
+def test_flatten_at_exits_open_position_at_its_close_when_enabled():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0)
+    bars = [
+        _tbar(9, 30, 100.0, 100.5, 99.5, 100.2),
+        _tbar(9, 31, 100.2, 100.6, 99.8, 100.4),  # flatten cutoff reached here
+        _tbar(9, 32, 100.4, 120.0, 100.0, 118.0),  # target would hit later -- must not matter
+    ]
+    out = simulate_pick(pick, bars, None, flatten_at="09:31")
+    assert out["exit_reason"] == "flatten"
+    assert out["exit_price"] == 100.4
+
+
+def test_flatten_wins_tie_against_time_stop_on_same_bar():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0,
+                 time_stop="by 09:31")
+    bars = [
+        _tbar(9, 30, 100.0, 100.5, 99.5, 100.2),
+        _tbar(9, 31, 100.2, 100.6, 99.8, 100.4),  # both flatten and time_stop land here
+    ]
+    out = simulate_pick(pick, bars, None, flatten_at="09:31")
+    assert out["exit_reason"] == "flatten"
+
+
+# ------------------------------------------------------------- min_bar_volume (default off, explicitly enabled here)
+
+def test_min_bar_volume_disabled_by_default_lets_thin_bar_trigger_fill():
+    pick = _pick(entry_type="limit", entry=100.0, stop=98.0, target=104.0)
+    bars = [
+        _bar(101.0, 101.5, 100.5, 101.2, v=10_000),  # doesn't touch entry
+        _bar(99.0, 99.5, 98.5, 99.2, v=1_000),       # thin bar, gaps through favorably
+        _bar(100.0, 100.3, 99.6, 100.1, v=10_000),
+    ]
+    out = simulate_pick(pick, bars, None)  # min_bar_volume not passed -> default 0
+    assert out["triggered"] is True
+    assert out["entry_fill"] == 99.0  # filled on the thin bar, favorable gap honored
+
+
+def test_min_bar_volume_excludes_thin_bar_from_trigger_when_enabled():
+    pick = _pick(entry_type="limit", entry=100.0, stop=98.0, target=104.0)
+    bars = [
+        _bar(101.0, 101.5, 100.5, 101.2, v=10_000),  # doesn't touch entry
+        _bar(99.0, 99.5, 98.5, 99.2, v=1_000),       # thin -- excluded from trigger logic
+        _bar(100.0, 100.3, 99.6, 100.1, v=10_000),   # fill happens here instead
+    ]
+    out = simulate_pick(pick, bars, None, min_bar_volume=5_000)
+    assert out["triggered"] is True
+    assert out["entry_fill"] == 100.0  # NOT the thin bar's favorable 99.0 gap-fill
+
+
+def test_min_bar_volume_excludes_thin_bar_from_stop_check_when_enabled():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = [
+        _bar(100.0, 100.2, 99.8, 100.0, v=10_000),
+        _bar(99.9, 100.0, 97.0, 99.5, v=1_000),   # touches stop, but thin
+        _bar(99.5, 100.0, 99.0, 99.7, v=10_000),  # no stop touch, not thin
+    ]
+    out_disabled = simulate_pick(dict(pick), bars, None)  # default: thin filter off
+    assert out_disabled["exit_reason"] == "stop"
+    assert out_disabled["exit_price"] == 98.0
+
+    out_enabled = simulate_pick(dict(pick), bars, None, min_bar_volume=5_000)
+    assert out_enabled["exit_reason"] == "eod"
+    assert out_enabled["exit_price"] == 99.7
+
+
+def test_min_bar_volume_still_counts_thin_bars_for_mfe_mae():
+    # thin bars are excluded from trigger/stop/target/gap logic but MUST still
+    # count toward MFE/MAE and remain in the series for indexing/eod close.
+    pick = _pick(entry_type="open", entry=100.0, stop=90.0, target=120.0)  # far away, no touch
+    bars = [
+        _bar(100.0, 100.2, 99.8, 100.0, v=10_000),
+        _bar(99.9, 100.0, 92.0, 99.5, v=1_000),   # thin, but a real 92.0 low print
+        _bar(99.5, 100.0, 99.0, 99.7, v=10_000),
+    ]
+    out = simulate_pick(pick, bars, None, min_bar_volume=5_000)
+    assert out["exit_reason"] == "eod"
+    # mae_r reflects the thin bar's low (92.0), not just the non-thin bars:
+    # (92.0 - 100.0) / risk(10.0) == -0.8
+    assert out["mae_r"] == pytest.approx(-0.8, abs=1e-3)
+
 

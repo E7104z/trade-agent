@@ -9,11 +9,33 @@ Simulation rules (documented, conservative):
                  gaps through favorably); short mirrored via bar.high
     breakout  -> long fills when bar.high >= entry (stop-order semantics);
                  short mirrored via bar.low
-  Exits, evaluated per bar AFTER the fill (and in the fill bar itself):
-    - If the stop level is touched, exit at the stop. CONSERVATIVE: if both stop and
-      target are touched in the same bar, the stop is assumed to hit first.
-    - If target1 is touched, exit at target1.
-    - Otherwise exit at the session close (eod).
+  Exits, evaluated per bar AFTER the fill (and in the fill bar itself), in this
+  conservative priority order — a bar that satisfies more than one of these
+  is resolved by whichever comes FIRST in this list, not by price magnitude:
+    1. stop     -> the stop level is touched. If both stop and target are
+                    touched in the same bar, the stop is assumed to hit first.
+                    A gap through the stop (session open already past it) exits
+                    at that bar's OPEN, not at the stop price.
+    2. flatten  -> session-end flatten cutoff (config `flatten_at`, e.g.
+                    "15:55"), DEFAULT DISABLED (null). When enabled and the
+                    position is still open at/after that bar, exit at its
+                    close with exit_reason "flatten". Ties against time_stop
+                    (same bar, or time_stop landing later) resolve to flatten.
+    3. time_stop -> pick.time_stop (e.g. "by 11:00") mapped to a bar index;
+                    if reached before stop/flatten/target, exit at that bar's
+                    close with exit_reason "time_stop". This is the only
+                    default-ON exit rule added by this pass — every prior
+                    pick with a time_stop was previously graded against a
+                    plan the desk never actually followed intraday.
+    4. target1  -> target1 is touched, exit at target1.
+    5. eod      -> otherwise exit at the session close.
+  Thin-bar filtering (config `min_bar_volume`, default 0 = disabled): bars
+  whose volume is below the threshold are excluded from trigger, stop,
+  target, and gap-through logic (a quiet, prepopulated bar can fake a
+  breakout or a touch) but still count toward MFE/MAE and remain in the bar
+  series for indexing and for the eod close — they are not deleted, just
+  untrusted for level-touch decisions. Open-type fills are unconditional
+  (there is no "trigger" to distrust) and are unaffected by this filter.
   Metrics:
     r_multiple = signed P&L / initial risk per share
     mfe_r / mae_r = max favorable / adverse excursion in R while in the trade
@@ -24,8 +46,10 @@ Simulation rules (documented, conservative):
                  exit at the close, measured in units of the PLANNED risk. Computed for
                  every pick, triggered or not. Edge = beating this, not raw positive R.
     eod_r      = for triggered picks: R if the trade had been held from the actual fill
-                 to the close with NO stop and NO target. actual_r - eod_r measures
-                 whether active management (the stop/target pair) added or destroyed value.
+                 to the close with NO stop, NO target, NO time_stop and NO flatten. This
+                 counterfactual stays UNCONDITIONED by design — actual_r - eod_r must keep
+                 measuring "did active management add value", not get contaminated by the
+                 new exit rules above.
     target_hit_after_stop = for stopped-out trades: did price go on to touch the target
                  later the same session? A high rate = stops are placed inside the noise.
   Friction (slippage_bps, default 5):
@@ -36,19 +60,80 @@ Simulation rules (documented, conservative):
 """
 from __future__ import annotations
 
-from datetime import date
+import re
+from datetime import date, time as dtime
 from typing import Any
 
 from .providers import MarketData
 from .util import log
+
+_CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 
 
 def _risk_per_share(entry: float, stop: float) -> float:
     return abs(entry - stop)
 
 
+def _parse_clock(value: Any) -> dtime | None:
+    """Parse a clock-time string into a datetime.time, or None if the value
+    doesn't contain one.
+
+    `time_stop` is documented (prompts/morning_analyst.md) as an intraday
+    clock time like "by 11:00" or "by 14:30" — this desk is day-trade only.
+    Older/stale data may carry a different shape (e.g. a legacy "2 days"
+    duration string); any value with no HH:MM in it is unparseable and the
+    caller falls back to "no time stop" rather than crashing the evening loop.
+    """
+    m = _CLOCK_RE.search(str(value))
+    if not m:
+        return None
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if not (0 <= hh < 24 and 0 <= mm < 60):
+        return None
+    return dtime(hh, mm)
+
+
+def _clock_to_bar_index(target_t: dtime, bars: list[dict]) -> int | None:
+    """Map a clock time to the index of the first bar at/after that time.
+
+    Prefers each bar's own timestamp (bar["t"], populated by every real
+    MarketData provider — Alpaca, yfinance, and the offline synthetic
+    generator all set it). Falls back to a positional offset from bars[0]
+    ONLY when bars carry no timestamp at all, assuming consecutive 1-minute
+    bars starting at the 9:30 ET session open (documented fallback — note
+    this assumption does not hold if a future provider returns bars at a
+    different cadence or start time without timestamps).
+    """
+    if bars and bars[0].get("t") is not None:
+        for i, b in enumerate(bars):
+            t = b["t"]
+            bar_t = t.time() if hasattr(t, "time") else t
+            if bar_t >= target_t:
+                return i
+        return None
+    open_t = dtime(9, 30)
+    offset = (target_t.hour * 60 + target_t.minute) - (open_t.hour * 60 + open_t.minute)
+    if offset < 0 or offset >= len(bars):
+        return None
+    return offset
+
+
+def _is_thin(bar: dict, min_bar_volume: float) -> bool:
+    """True if `bar` should be distrusted for trigger/stop/target/gap logic
+    under the thin-bar filter (config min_bar_volume, default 0 = disabled).
+    A bar with no volume field at all is never treated as thin — we don't
+    invent a value, we just can't apply the filter to it."""
+    if not min_bar_volume:
+        return False
+    v = bar.get("v")
+    if v is None:
+        return False
+    return v < min_bar_volume
+
+
 def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
-                  slippage_bps: float = 0.0) -> dict:
+                  slippage_bps: float = 0.0, flatten_at: str | None = None,
+                  min_bar_volume: float = 0) -> dict:
     """Returns an outcome dict ready for ledger.save_outcome (minus grade fields)."""
     out: dict[str, Any] = {
         "pick_id": pick["pick_id"],
@@ -106,6 +191,8 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         fill_idx = 0
     else:
         for i, b in enumerate(bars):
+            if _is_thin(b, min_bar_volume):
+                continue  # thin-bar filter: don't trust a quiet bar to trigger entry
             if entry_type == "limit":
                 if long and b["l"] <= entry:
                     fill_price = min(entry, b["o"]) if b["o"] < entry else entry
@@ -155,6 +242,26 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     out["triggered"] = True
     out["entry_fill"] = round(fill_price, 4)
 
+    # ---- map time_stop / flatten_at to bar indices, once, before the walk ----
+    time_stop_idx = None
+    time_stop_raw = pick.get("time_stop")
+    if time_stop_raw:
+        parsed = _parse_clock(time_stop_raw)
+        if parsed is None:
+            log("grade", f"pick {pick.get('pick_id')}: unparseable time_stop "
+                         f"{time_stop_raw!r}; simulating without a time stop")
+        else:
+            time_stop_idx = _clock_to_bar_index(parsed, bars)
+
+    flatten_idx = None
+    if flatten_at:
+        parsed = _parse_clock(flatten_at)
+        if parsed is None:
+            log("grade", f"unparseable flatten_at config value {flatten_at!r}; "
+                         f"flatten disabled for this simulation")
+        else:
+            flatten_idx = _clock_to_bar_index(parsed, bars)
+
     # ---- walk forward ----------------------------------------------------
     exit_price = None
     exit_reason = "eod"
@@ -164,26 +271,40 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
 
     for i in range(fill_idx, len(bars)):
         b = bars[i]
+        thin = _is_thin(b, min_bar_volume)
         if long:
             worst_px = min(worst_px, b["l"])
             best_px = max(best_px, b["h"])
-            if b["l"] <= stop:                # conservative: stop first
+            if not thin and b["l"] <= stop:    # conservative: stop first
                 exit_price, exit_reason, exit_idx = stop, "stop", i
                 if b["o"] < stop:             # gapped through the stop
                     exit_price = b["o"]
                 break
-            if b["h"] >= target:
+            if flatten_idx is not None and i >= flatten_idx:
+                # flatten wins ties against time_stop (checked first, below)
+                exit_price, exit_reason, exit_idx = b["c"], "flatten", i
+                break
+            if time_stop_idx is not None and i >= time_stop_idx:
+                exit_price, exit_reason, exit_idx = b["c"], "time_stop", i
+                break
+            if not thin and b["h"] >= target:
                 exit_price, exit_reason, exit_idx = target, "target", i
                 break
         else:
             worst_px = max(worst_px, b["h"])
             best_px = min(best_px, b["l"])
-            if b["h"] >= stop:
+            if not thin and b["h"] >= stop:
                 exit_price, exit_reason, exit_idx = stop, "stop", i
                 if b["o"] > stop:
                     exit_price = b["o"]
                 break
-            if b["l"] <= target:
+            if flatten_idx is not None and i >= flatten_idx:
+                exit_price, exit_reason, exit_idx = b["c"], "flatten", i
+                break
+            if time_stop_idx is not None and i >= time_stop_idx:
+                exit_price, exit_reason, exit_idx = b["c"], "time_stop", i
+                break
+            if not thin and b["l"] <= target:
                 exit_price, exit_reason, exit_idx = target, "target", i
                 break
 
@@ -250,7 +371,8 @@ def classify_shadow(outcome: dict) -> tuple[str, float | None]:
 
 
 def grade_day(md: MarketData, picks: list[dict], d: date,
-              slippage_bps: float = 0.0) -> list[dict]:
+              slippage_bps: float = 0.0, flatten_at: str | None = None,
+              min_bar_volume: float = 0) -> list[dict]:
     outcomes = []
     for p in picks:
         try:
@@ -262,7 +384,8 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
             daily = md.daily_bar(p["ticker"], d)
         except Exception:
             daily = None
-        o = simulate_pick(p, bars, daily, slippage_bps=slippage_bps)
+        o = simulate_pick(p, bars, daily, slippage_bps=slippage_bps,
+                          flatten_at=flatten_at, min_bar_volume=min_bar_volume)
         o["eval_date"] = d
         outcomes.append(o)
         log("grade", f"{p['ticker']} {p['direction']}: triggered={o['triggered']} "

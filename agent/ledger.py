@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
     triggered      BOOLEAN,
     entry_fill     DOUBLE,
     exit_price     DOUBLE,
-    exit_reason    VARCHAR,        -- target | stop | eod | no_trigger
+    exit_reason    VARCHAR,        -- target | stop | eod | no_trigger | time_stop | flatten
+                                    -- (time_stop/flatten added by sim_version 2, see Task 3/4)
     r_multiple     DOUBLE,
     mfe_r          DOUBLE,
     mae_r          DOUBLE,

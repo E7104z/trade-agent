@@ -34,8 +34,15 @@ Q_SHADOW_FILTER_COST = 5
 Q_STOP_PLACEMENT = 6
 
 
-def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0) -> dict:
-    """Shadow ledger: simulate every rejected candidate; never touches the equity curve."""
+def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
+                      flatten_at: str | None = None, min_bar_volume: float = 0) -> dict:
+    """Shadow ledger: simulate every rejected candidate; never touches the equity curve.
+
+    Uses the same friction and exit rules (flatten_at, min_bar_volume) as taken
+    picks -- comparisons between taken and rejected are only fair if both sides
+    are graded identically. Rejections don't carry a time_stop (not stored on
+    the rejections table), which behaves the same as a pick with no time_stop.
+    """
     rejections = ledger.ungraded_rejections(con, d)
     summary = {"scored": 0, "net_forgone_r": 0.0, "gap_fade_notes": []}
     for r in rejections:
@@ -46,7 +53,8 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0) -
         shim = {"pick_id": r["rejection_id"], "direction": r["direction"],
                 "entry_type": r["entry_type"], "entry_price": r["entry_price"],
                 "stop_price": r["stop_price"], "target_price": r["target_price"]}
-        sim = simulate_pick(shim, bars, None, slippage_bps=slippage_bps)
+        sim = simulate_pick(shim, bars, None, slippage_bps=slippage_bps,
+                            flatten_at=flatten_at, min_bar_volume=min_bar_volume)
         eod_outcome, forgone = classify_shadow(sim)
         ledger.save_rejection_outcome(con, r["rejection_id"], eod_outcome, forgone)
         summary["scored"] += 1
@@ -200,12 +208,15 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         picks = ledger.picks_for_date(con, d)
         md = MarketData(cfg)
         slippage = float(cfg.get("slippage_bps", 5))
+        flatten_at = cfg.get("flatten_at")
+        min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
 
         # 1. deterministic outcome simulation (with friction — see grading.py)
         if picks:
             log("evening", f"Simulating outcomes for {len(picks)} picks against intraday bars "
                            f"(slippage {slippage:.0f} bps/side)...")
-            outcomes = grade_day(md, picks, d, slippage_bps=slippage)
+            outcomes = grade_day(md, picks, d, slippage_bps=slippage,
+                                 flatten_at=flatten_at, min_bar_volume=min_bar_volume)
             for o in outcomes:
                 ledger.save_outcome(con, o)
         else:
@@ -215,7 +226,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # v3: shadow ledger — grade what the desk REJECTED (counterfactual only,
         # never touches the taken-trade equity curve)
         log("evening", "Scoring rejected candidates (shadow ledger)...")
-        shadow = _grade_rejections(con, md, d, slippage_bps=slippage)
+        shadow = _grade_rejections(con, md, d, slippage_bps=slippage,
+                                   flatten_at=flatten_at, min_bar_volume=min_bar_volume)
 
         out_md = outcomes_md(picks, outcomes) if picks else "(no picks today — no-trade day)"
         recap = md.market_recap(d)

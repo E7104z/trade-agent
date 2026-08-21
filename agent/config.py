@@ -42,6 +42,8 @@ _DEFAULTS: dict[str, Any] = {
     "min_size_r": 0.25,
     "max_total_open_risk_r": 3.0,
     "slippage_bps": 5,
+    "flatten_at": None,        # e.g. "15:55" -- session-end flatten cutoff, default OFF
+    "min_bar_volume": 0,       # thin-bar filter threshold, default OFF (0 = disabled)
     "timezone": "America/New_York",
     "email_enabled": False,
     "data": {
