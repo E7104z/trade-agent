@@ -237,6 +237,19 @@ def run(cfg: Config, run_date: date | None = None) -> None:
                           mock_name="weekly_miner", thinking=True, web_search=False)
         mined = result.parsed or {}
 
+        if cfg.mock:
+            # mocks/weekly_miner.json is a canned fixture. This loop is the SOLE
+            # writer of playbook.md and commits it to git -- persisting a mock
+            # response here would overwrite the agent's real accumulated playbook
+            # with placeholder content and commit that over real history, on top
+            # of writing fake lesson promotions/retirements. Same failure mode as
+            # the morning/evening mock-write bug, but with a much bigger blast
+            # radius (playbook.md, git history), so it gets the same hard stop.
+            log("weekly", f"MOCK RUN — playbook NOT rewritten, no lesson actions applied, "
+                          f"no email sent. Would-be summary: {mined.get('summary_for_email', '(none)')}")
+            ledger.log_run(con, "weekly", d, started, "mock", model, result.usage)
+            return
+
         # apply lesson actions
         for act in mined.get("lesson_actions", []) or []:
             lid, action = act.get("lesson_id"), act.get("action")

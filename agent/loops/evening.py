@@ -34,6 +34,62 @@ Q_SHADOW_FILTER_COST = 5
 Q_STOP_PLACEMENT = 6
 
 
+def _pick_for_review(r: dict, picks: list[dict]) -> dict | None:
+    """Resolve one pick_reviews row back to its pick, by pick_id when the LLM
+    supplied a valid one, else by ticker. Shared by every consumer of
+    pick_reviews so the resolution logic can't drift between them."""
+    if isinstance(r.get("pick_id"), int):
+        p = next((x for x in picks if x["pick_id"] == r["pick_id"]), None)
+        if p is not None:
+            return p
+    return next((x for x in picks if x["ticker"].upper() == str(r.get("ticker", "")).upper()), None)
+
+
+def _drop_invalid_fill_reviews(review: dict, picks: list[dict], outcomes: list[dict]) -> dict:
+    """Strip any pick_reviews row that graded an invalid_fill pick.
+
+    An invalid_fill outcome (agent/grading.py) means the fill landed on the
+    wrong side of its own stop -- a simulation artifact, not a trade. The
+    grader prompt tells the LLM not to grade these, but nothing enforces
+    that: apply_grades and the v3 rule-confirmation loop both trust
+    review["pick_reviews"] wholesale. Filtering it ONCE, here, before either
+    consumer sees it, means neither has to re-derive the rule -- and a
+    non-compliant LLM response can't write a letter grade (or, downstream,
+    a rule confirmation) for a pick that was never actually a trade.
+    """
+    by_id = {o["pick_id"]: o for o in outcomes}
+    kept = []
+    for r in review.get("pick_reviews", []) or []:
+        p = _pick_for_review(r, picks)
+        o = by_id.get(p["pick_id"], {}) if p else {}
+        if o.get("exit_reason") == "invalid_fill":
+            log("evening", f"Dropping LLM grade for {r.get('ticker', '?')} "
+                           f"(pick_id={p['pick_id'] if p else '?'}): invalid_fill -- "
+                           f"not a real trade, no grade persisted regardless of what "
+                           f"the grader returned")
+            continue
+        kept.append(r)
+    review["pick_reviews"] = kept
+    return review
+
+
+def _all_fills_tainted(outcomes: list[dict]) -> bool:
+    """True if every pick that had ANY fill activity today (a real trigger, or
+    an invalid_fill artifact) is unreliable as evidence for a thesis lesson.
+
+    A clean untriggered pick (real no_trigger) doesn't count against this --
+    a genuine non-fill is a legitimate, lesson-worthy outcome on its own
+    (missed_move_r etc). This only fires when the picks that DID see price
+    action are ALL either not-really-trades (invalid_fill) or fills far
+    enough from plan that the thesis was never actually tested
+    (execution_anomaly) -- i.e. there is nothing clean left to learn from.
+    """
+    fills = [o for o in outcomes if o.get("triggered") or o.get("exit_reason") == "invalid_fill"]
+    if not fills:
+        return False
+    return all(o.get("exit_reason") == "invalid_fill" or o.get("execution_anomaly") for o in fills)
+
+
 def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
                       flatten_at: str | None = None, min_bar_volume: float = 0) -> dict:
     """Shadow ledger: simulate every rejected candidate; never touches the equity curve.
@@ -270,14 +326,39 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         result = llm.call(system=system, user=user, model=model,
                           mock_name="evening_grader", thinking=False, web_search=False)
         review = result.parsed or {}
+        review = _drop_invalid_fill_reviews(review, picks, outcomes)
+
+        if cfg.mock:
+            # mocks/evening_grader.json is a canned fixture, not real analysis of
+            # today's picks -- persisting it (grades, lessons, rule confirmations)
+            # would write fabricated process narrative onto real trade rows. This
+            # is exactly how canned pick_reviews/lessons text ended up verbatim in
+            # production for a prior session's NVDA/CVNA/AMD day. The deterministic
+            # outcomes above (real market data, no LLM involved) are already saved
+            # above and stay saved -- that's the legitimate, cost-free value mock
+            # mode is for. Nothing LLM-derived past this point is persisted, and no
+            # email goes out describing a day that didn't really get graded.
+            log("evening", "MOCK RUN — deterministic outcomes saved; grades, lessons, and "
+                           "rule confirmations NOT persisted (canned LLM response); no email sent")
+            ledger.log_run(con, "evening", d, started, "mock", model, result.usage)
+            return
 
         # 3. persist grades + lessons
         n_graded = ledger.apply_grades(con, review.get("pick_reviews", []), picks)
+
+        tainted_day = _all_fills_tainted(outcomes)
         new_lessons = review.get("lessons", []) or []
+        lesson_updates = review.get("lesson_updates", []) or []
+        if tainted_day and (new_lessons or lesson_updates):
+            log("evening", f"Skipping {len(new_lessons)} new lesson(s) and "
+                           f"{len(lesson_updates)} lesson update(s) -- every pick with fill "
+                           f"activity today was invalid_fill or execution_anomaly; nothing "
+                           f"clean today to draw or confirm a thesis lesson from")
+            new_lessons, lesson_updates = [], []
         for l in new_lessons:
             lid = ledger.insert_lesson(con, l, "evening", d)
             log("evening", f"New lesson L{lid}: {l['lesson']}")
-        for upd in review.get("lesson_updates", []) or []:
+        for upd in lesson_updates:
             if isinstance(upd.get("lesson_id"), int):
                 ledger.update_lesson_feedback(con, upd["lesson_id"], upd.get("action", ""), d)
 

@@ -68,6 +68,16 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     resulting fill but can't fix the mistyped plan). Where a reference price
     is available, mistyped picks are dropped rather than silently executed
     as market orders.
+
+    COVERAGE CAVEAT: this gate only fires when ref_prices has an entry for
+    the ticker, and _reference_prices only ever knows about tickers the
+    morning bundle happened to snapshot (scan universe, movers, most
+    actives, premarket gappers >= the gap-scan threshold). A pick sourced
+    from news/EDGAR outside that set, or a gapper below threshold, is simply
+    unchecked here -- not a guaranteed catch. Treat this as best-effort
+    upstream filtering, not a substitute for grading.py's invalid_fill gate,
+    which is the actual backstop and catches every mistyped fill regardless
+    of ticker coverage.
     """
     warnings: list[str] = []
     max_picks = int(cfg.get("max_picks", 4))
@@ -298,13 +308,29 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         plan["regime_tag"] = reg.get("tag", "")
         plan["prompt_version"] = f"analyst_v{prompt_version('morning_analyst')}/risk_v{prompt_version('morning_risk')}"
         plan["playbook_version"] = mem["playbook_version"]
+        usage = merge_usage(analyst.usage, risk.usage)
 
+        if cfg.mock:
+            # Mock mode exists to exercise prompts/parsing/validation for free --
+            # it must never write a fake plan into the same ledger real trading
+            # days use, or email one out as if it were today's picks. This is
+            # exactly how a canned mocks/morning_risk.json fixture ended up as
+            # real-looking NVDA/CVNA/AMD picks (and, via a matching mock evening
+            # run, fabricated grades and lessons) sitting in production.
+            log("morning", f"MOCK RUN — not persisted, no email sent. Would-be plan: "
+                           f"no_trade={plan.get('no_trade')}, {len(plan.get('picks', []))} pick(s)")
+            for p in plan.get("picks", []):
+                log("morning", f"  [mock] {p['ticker']} {p['direction']} {p['setup_type']} | "
+                               f"entry {p['entry_price']} stop {p['stop_price']} target {p['target_price']}")
+            ledger.log_run(con, "morning", d, started, "mock", model, usage)
+            return
+
+        # 8. persist
         pick_ids = ledger.save_daily_plan(con, d, plan, candidates, reg.get("tag", ""))
         n_rej = ledger.save_rejections(con, d, _build_rejections(candidates, plan))
-        usage = merge_usage(analyst.usage, risk.usage)
         ledger.log_run(con, "morning", d, started, "ok", model, usage)
 
-        # 8. deliver
+        # 9. deliver
         if plan.get("no_trade"):
             log("morning", f"PLAN: NO TRADE — {plan.get('no_trade_reason','')}")
         else:
