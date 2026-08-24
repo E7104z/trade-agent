@@ -22,3 +22,22 @@ Thumbs.db
 
 data/*.duckdb
 deploy_log.txt
+deploy_log2.txt
+inspect*.txt
+
+# Scratch/debug scripts from ad-hoc audits (not part of the app)
+scripts/_audit_*
+scripts/_*.py
+scripts/audit_*
+scripts/dump*.py
+scripts/extract_*.py
+scripts/phase1_*
+scripts/xcheck.py
+scripts/greppy.py
+scripts/locate.py
+scripts/show_stations.py
+scripts/final_audit.py
+scripts/grep_mascot.py
+scripts/funcs.txt
+scripts/report.txt
+scripts/AUDIT_MASCOT.txt
