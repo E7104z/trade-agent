@@ -2089,8 +2089,8 @@ _SNIPPET = r"""
     act:function(){ goTo('treadmill'); say(['Cardio between candles.','Sweat now, size later.'][Math.floor(Math.random()*2)], 1600); } });
   registerTarget(shelfG, { label:function(){ return 'Stats shelf'; },
     act:function(){ say(shelfQuip()); } });
-  registerTarget(dartboardG, { label:function(){ return 'Dartboard'; },
-    act:function(){ say(['Aim small, miss small.','Bullseye \u2014 unlike some of my fills.','Darts don\u2019t re-quote.'][Math.floor(Math.random()*3)]); } });
+  registerTarget(dartboardG, { label:function(){ return 'Dartboard \u2014 Shadow Ledger, rejected candidates \u2197'; },
+    act:function(){ scrollToCard(/shadow ledger/i, 'Shadow Ledger card is on this page \u2014 scroll down.'); } });
   registerTarget(bedG, { label:function(){ return 'Bed \u2014 send him to rest'; },
     act:function(){ goTo('bed'); say(['Time to rack out.','Sleep corner calling.'][Math.floor(Math.random()*2)], 1600); } });
   registerTarget(nightG, { label:function(){ return 'Nightstand lamp'; },

@@ -855,6 +855,14 @@ def ungraded_rejections(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
+def rejections_for_date(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:
+    cols = [c[0] for c in con.execute("DESCRIBE rejections").fetchall()]
+    rows = con.execute(
+        "SELECT * FROM rejections WHERE plan_date = ? ORDER BY rejection_id", [d]
+    ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def save_rejection_outcome(con: duckdb.DuckDBPyConnection, rejection_id: int,
                            eod_outcome: str, forgone_r: float | None,
                            sim_version: int | None = None) -> None:

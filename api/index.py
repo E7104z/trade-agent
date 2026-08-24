@@ -204,6 +204,22 @@ function render(d) {
   let runsRows = (d.runs || []).map(r => `<tr><td>${r.loop}</td><td>${r.run_date}</td><td>${r.status}</td>
     <td>${r.model||''}</td><td>$${(r.cost_usd||0).toFixed(3)}</td></tr>`).join('');
 
+  const rejections = d.rejections_today || [];
+  let shadowHtml = "<p class='neutral'>Nothing rejected today — every candidate that survived analysis made the plan.</p>";
+  if (rejections.length) {
+    let shadowRows = rejections.map(r => {
+      const outcome = r.eod_outcome
+        ? `${r.eod_outcome}${r.forgone_r!=null ? ' (' + (r.forgone_r>=0?'+':'') + r.forgone_r + 'R)' : ''}`
+        : 'ungraded';
+      return `<tr><td>${r.ticker}</td><td>${r.direction||''}</td><td>${r.setup_type||''}</td>
+        <td>${r.entry_type||''} @ ${r.entry_price ?? '—'}</td><td>${r.stop_price ?? '—'}</td>
+        <td>${r.target_price ?? '—'}</td><td>${r.conviction ?? '—'}</td>
+        <td>${r.reason||''}</td><td>${r.thesis||''}</td><td>${outcome}</td></tr>`;
+    }).join('');
+    shadowHtml = `<table><tr><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th>
+      <th>Stop</th><th>Target</th><th>Conv</th><th>Kill reason</th><th>Thesis</th><th>Shadow outcome</th></tr>${shadowRows}</table>`;
+  }
+
   el.innerHTML = `
   <div class="card"><h2>Today's Plan — ${d.today}</h2>${planHtml}</div>
   <div class="card"><h2>Performance</h2>
@@ -217,6 +233,7 @@ function render(d) {
     </div></div>
   <div class="card"><h2>By Setup</h2><table><tr><th>Setup</th><th>N</th><th>Triggered</th>
     <th>Win rate</th><th>Avg R</th><th>Total wR</th></tr>${setupRows}</table></div>
+  <div class="card"><h2>Shadow Ledger — Rejected Candidates (${d.today})</h2>${shadowHtml}</div>
   <div class="card"><h2>Playbook v${d.playbook_version}</h2><pre>${d.playbook.replace(/</g,'&lt;')}</pre></div>
   <div class="card"><h2>Recent Runs</h2><table><tr><th>Loop</th><th>Date</th><th>Status</th>
     <th>Model</th><th>Cost</th></tr>${runsRows}</table></div>
@@ -320,6 +337,7 @@ def api_status():
             # field here, unlike plan.picks[] which may only carry a nested
             # entry_plan.type) -- this is what the evening grader actually acts on.
             "picks_today": ledger.picks_for_date(con, d),
+            "rejections_today": ledger.rejections_for_date(con, d),
             "pick_bars": _pick_bars(
                 (plan_row["plan"] or {}).get("picks", []) if plan_row else [], d
             ),
