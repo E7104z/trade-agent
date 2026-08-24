@@ -284,6 +284,7 @@ class MarketData:
         safe("premarket_gappers", lambda: self._gappers())
         safe("movers", self._movers)
         safe("news", self._news)
+        safe("catalyst_quotes", lambda: self._catalyst_quotes(bundle))
         safe("filings_8k", lambda: edgar_recent_8ks(self.cfg.data_cfg["edgar_user_agent"]))
         bundle["econ_today"] = econ_events(d)
         bundle["econ_upcoming"] = econ_upcoming(d + timedelta(days=1), 3)
@@ -369,6 +370,56 @@ class MarketData:
         items = self.alpaca.news(int(self.cfg.data_cfg.get("news_limit", 40)))
         return [{"headline": n.get("headline", ""), "symbols": n.get("symbols", []),
                  "source": n.get("source", ""), "at": n.get("created_at", "")} for n in items]
+
+    def _catalyst_quotes(self, bundle: dict) -> list[dict]:
+        """Last price for every ticker named as a news-headline subject.
+
+        News/8-K driven picks are frequently OUTSIDE the scan universe, so the
+        gap scan and movers never quote them -- which left the analyst free to
+        invent a price and _validate_plan's grounding gate with nothing to
+        check against (real incident 2026-08-24: INSM Japan-approval pick
+        planned at 72.5 while the stock traded ~125). One extra batched
+        snapshot call closes that hole, and rendering these into the prompt
+        anchors the analyst BEFORE it proposes levels. (EDGAR 8-K entries are
+        company-name-keyed, not ticker-keyed, so they can't be quoted this
+        way; Alpaca news symbols cover the wire stories that drive catalyst
+        picks.)
+        """
+        if not self.alpaca:
+            raise RuntimeError("Alpaca not configured — catalyst quotes unavailable")
+        covered = {str(g.get("symbol", "")).upper() for g in (bundle.get("premarket_gappers") or [])}
+        movers = bundle.get("movers") or {}
+        covered |= {str(m.get("symbol", "")).upper()
+                    for m in (movers.get("gainers") or []) + (movers.get("losers") or [])}
+        syms: list[str] = []
+        for n in bundle.get("news") or []:
+            for s in n.get("symbols") or []:
+                s = str(s).upper()
+                # equities only: crypto pairs (BTCUSD) and malformed symbols are skipped
+                if s and s.isalpha() and len(s) <= 5 and s not in covered and s not in syms:
+                    syms.append(s)
+        syms = syms[:60]
+        if not syms:
+            return []
+        snaps = self.alpaca.snapshots(syms)
+        out = []
+        for sym in syms:
+            s = snaps.get(sym)
+            if not isinstance(s, dict):
+                continue
+            try:
+                last = (s.get("latestTrade") or {}).get("p") or (s.get("minuteBar") or {}).get("c")
+                prev_close = (s.get("prevDailyBar") or {}).get("c")
+                if not last:
+                    continue
+                q: dict[str, Any] = {"symbol": sym, "last": round(float(last), 2)}
+                if prev_close:
+                    q["prev_close"] = round(float(prev_close), 2)
+                    q["gap_pct"] = round((float(last) - float(prev_close)) / float(prev_close) * 100, 2)
+                out.append(q)
+            except (KeyError, TypeError, ZeroDivisionError):
+                continue
+        return out
 
     # ---- grading data ----------------------------------------------------
     def minute_bars(self, symbol: str, d: date) -> list[dict]:
@@ -509,6 +560,15 @@ def render_bundle_md(b: dict) -> str:
         for n in news[:30]:
             syms = f" [{','.join(n['symbols'][:4])}]" if n.get("symbols") else ""
             parts.append(f"- {n['headline']}{syms} ({n.get('source','')})")
+
+    cq = b.get("catalyst_quotes")
+    if cq:
+        parts.append("**Live last prices for headline tickers (anchor ALL entry/stop/target levels "
+                     "on these or on scan/mover quotes above — never on remembered prices):** " +
+                     " | ".join(
+                         f"{q['symbol']} {q['last']}"
+                         + (f" ({q['gap_pct']:+.1f}%)" if q.get("gap_pct") is not None else "")
+                         for q in cq[:40]))
 
     filings = b.get("filings_8k")
     if filings:

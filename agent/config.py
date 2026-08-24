@@ -41,6 +41,7 @@ _DEFAULTS: dict[str, Any] = {
     "max_size_r": 1.5,
     "min_size_r": 0.25,
     "max_total_open_risk_r": 3.0,
+    "max_entry_ref_distance_pct": 15.0,  # entry further than this from last price = ungrounded, dropped
     "slippage_bps": 5,
     "flatten_at": None,        # e.g. "15:55" -- session-end flatten cutoff, default OFF
     "min_bar_volume": 0,       # thin-bar filter threshold, default OFF (0 = disabled)

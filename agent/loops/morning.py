@@ -23,10 +23,13 @@ from ..util import is_market_day, log, now_et, today_et
 def _reference_prices(bundle: dict) -> dict[str, float]:
     """Best-known last/current price per ticker from the morning data bundle.
 
-    Used only by _validate_plan's entry_type sanity gate — NOT for grading or
-    sizing. Coverage is whatever the bundle happened to snapshot (scan
-    universe, movers, most actives, premarket gappers); tickers outside that
-    are simply left unchecked rather than guessed at.
+    Used only by _validate_plan's price-grounding gates — NOT for grading or
+    sizing. Sources: premarket gap scan, movers, and catalyst_quotes (live
+    snapshots for every news-headline ticker — added after the 2026-08-24
+    INSM incident, where a news-sourced pick outside the scan universe had no
+    reference at all and sailed through with a hallucinated 72.5 entry on a
+    ~125 stock). Tickers outside all three sources are left unchecked rather
+    than guessed at.
     """
     out: dict[str, float] = {}
     for g in (bundle.get("premarket_gappers") or []):
@@ -38,6 +41,10 @@ def _reference_prices(bundle: dict) -> dict[str, float]:
         sym, px = m.get("symbol"), m.get("price")
         if sym and px and str(sym).upper() not in out:
             out[str(sym).upper()] = float(px)
+    for q in (bundle.get("catalyst_quotes") or []):
+        sym, last = q.get("symbol"), q.get("last")
+        if sym and last and str(sym).upper() not in out:
+            out[str(sym).upper()] = float(last)
     return out
 
 
@@ -56,28 +63,39 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     regardless of what the LLMs proposed. Losing streaks catch consecutive
     losers; this catches the slow bleed that alternating wins/losses hides.
 
-    ENTRY-TYPE SANITY GATE: "limit" means buy at this price or better (so a
-    long limit only makes sense at/below the current price — you're buying
-    weakness); "breakout" means buy as price reaches this level from below
-    (only makes sense at/above current — you're buying strength as it's
-    earned). A long limit order priced ABOVE the market is not a limit order
-    at all — it fills immediately at whatever the market is, i.e. a disguised
-    market order, with the "entry price" purely decorative. Left unchecked,
-    that mistype can fill on a gap-through at a price already past the
-    trade's own stop (see grading.py's invalid_fill gate, which catches the
-    resulting fill but can't fix the mistyped plan). Where a reference price
-    is available, mistyped picks are dropped rather than silently executed
-    as market orders.
+    PRICE-GROUNDING GATE (magnitude): an entry more than
+    max_entry_ref_distance_pct away from the last known price — in EITHER
+    direction — is dropped as ungrounded. A limit 40% below market isn't a
+    patient pullback order, it's evidence the level was invented (stale
+    article price, hallucinated history) and would either never fill or fill
+    only in a crash the thesis never contemplated. Direction-only checking
+    misses this shape entirely: real incident 2026-08-24, INSM long limit
+    72.5 vs actual ~125 — "below market" looked like normal pullback buying
+    to the entry-type gate. Magnitude is checked FIRST so a wildly-off level
+    is diagnosed as ungrounded rather than confusingly as a mistyped order.
 
-    COVERAGE CAVEAT: this gate only fires when ref_prices has an entry for
-    the ticker, and _reference_prices only ever knows about tickers the
-    morning bundle happened to snapshot (scan universe, movers, most
-    actives, premarket gappers >= the gap-scan threshold). A pick sourced
-    from news/EDGAR outside that set, or a gapper below threshold, is simply
-    unchecked here -- not a guaranteed catch. Treat this as best-effort
-    upstream filtering, not a substitute for grading.py's invalid_fill gate,
-    which is the actual backstop and catches every mistyped fill regardless
-    of ticker coverage.
+    ENTRY-TYPE SANITY GATE (side): "limit" means buy at this price or better
+    (so a long limit only makes sense at/below the current price — you're
+    buying weakness); "breakout" means buy as price reaches this level from
+    below (only makes sense at/above current — you're buying strength as
+    it's earned). A long limit order priced ABOVE the market is not a limit
+    order at all — it fills immediately at whatever the market is, i.e. a
+    disguised market order, with the "entry price" purely decorative. Left
+    unchecked, that mistype can fill on a gap-through at a price already
+    past the trade's own stop (see grading.py's invalid_fill gate, which
+    catches the resulting fill but can't fix the mistyped plan). Where a
+    reference price is available, mistyped picks are dropped rather than
+    silently executed as market orders.
+
+    COVERAGE: these gates only fire when ref_prices has an entry for the
+    ticker. _reference_prices now covers the scan universe, movers, most
+    actives, premarket gappers, AND every news-headline ticker (bundle
+    catalyst_quotes) — so catalyst picks sourced from the news feed are no
+    longer invisible to it. Still unchecked: tickers named only in 8-K
+    filings (company-name-keyed, no symbol) or surfaced purely by the LLM's
+    web search. Treat this as best-effort upstream filtering, not a
+    substitute for grading.py's invalid_fill gate, which is the actual
+    backstop and catches every mistyped fill regardless of ticker coverage.
     """
     warnings: list[str] = []
     max_picks = int(cfg.get("max_picks", 4))
@@ -124,6 +142,14 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
 
         ref = (ref_prices or {}).get(t)
         if ref:
+            max_dist = float(cfg.get("max_entry_ref_distance_pct", 15.0))
+            dist_pct = abs(entry - ref) / ref * 100
+            if dist_pct > max_dist:
+                warnings.append(
+                    f"{t}: entry {entry} is {dist_pct:.0f}% away from last price {ref} "
+                    f"(max {max_dist:.0f}%) — dropped as ungrounded; the level was priced off "
+                    f"something other than the actual market")
+                continue
             entry_type = str((p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open").lower()
             tol = 1.01  # 1% buffer for reference-price staleness, not a chase threshold
             mistyped_as = None
