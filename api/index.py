@@ -18,6 +18,7 @@ import io
 import json
 import os
 import sys
+import time
 import traceback
 from datetime import date, datetime
 from decimal import Decimal
@@ -262,6 +263,40 @@ def dashboard():
 
 # ------------------------------------------------------------------------ API
 
+_PICK_BARS_CACHE: dict[tuple[str, str], tuple[float, list]] = {}
+
+
+def _pick_bars(picks: list, d) -> dict:
+    """Best-effort real intraday bars for the desk monitor chart, keyed by ticker.
+
+    Returns {} on any failure so the mascot falls back to its synthetic trace.
+    Cached for a short TTL so the 60s status poll doesn't re-hit the network.
+    """
+    if not picks:
+        return {}
+    out: dict = {}
+    now = time.monotonic()
+    for p in picks[:3]:
+        sym = (p or {}).get("ticker")
+        if not sym:
+            continue
+        key = (str(sym).upper(), d.isoformat())
+        cached = _PICK_BARS_CACHE.get(key)
+        if cached and now - cached[0] < 90:
+            out[sym] = cached[1]
+            continue
+        bars: list = []
+        try:
+            from agent import providers
+            rows = providers.yf_minute_bars(sym, d)
+            bars = [{"o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]} for b in rows]
+        except Exception:
+            bars = []
+        _PICK_BARS_CACHE[key] = (now, bars)
+        out[sym] = bars
+    return out
+
+
 @app.route("/api/status")
 @login_required
 def api_status():
@@ -285,6 +320,9 @@ def api_status():
             # field here, unlike plan.picks[] which may only carry a nested
             # entry_plan.type) -- this is what the evening grader actually acts on.
             "picks_today": ledger.picks_for_date(con, d),
+            "pick_bars": _pick_bars(
+                (plan_row["plan"] or {}).get("picks", []) if plan_row else [], d
+            ),
             "overall": overall,
             "by_setup": by_setup,
             "streak": streak_str,

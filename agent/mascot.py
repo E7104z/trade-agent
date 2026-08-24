@@ -142,7 +142,9 @@ _SNIPPET = r"""
 
   function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
 
-  // Eastern-time helpers (traders live on ET; so does Arby).
+  // Eastern-time helpers (traders live on ET; so does Arby). Market state is
+  // session-aware: pre-market / regular hours / after-hours / closed, with a
+  // hardcoded NYSE holiday table so a weekday holiday never reads as OPEN.
   var ET_FMT;
   try { ET_FMT = new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour12:false,
         weekday:'short',hour:'numeric',minute:'numeric'}); } catch(e){ ET_FMT = null; }
@@ -154,16 +156,59 @@ _SNIPPET = r"""
     return { h: parseInt(get('hour'),10)%24, m: parseInt(get('minute'),10), wd: wd,
              isWeekday: wd!=='Sat' && wd!=='Sun' };
   }
-  function marketOpen(){ var t=etNow(); var mins=t.h*60+t.m; return t.isWeekday && mins>=570 && mins<960; }
-  function sleepTime(){ var t=etNow(); return t.h>=22 || t.h<5; }
+  function etDate(){
+    try {
+      // en-CA yields an ISO-ish YYYY-MM-DD for the requested timezone
+      var s = new Date().toLocaleDateString('en-CA', { timeZone:'America/New_York' });
+      var p = s.split('-');
+      return { year:+p[0], month:+p[1], day:+p[2] };
+    } catch(e){
+      var d = new Date();
+      return { year:d.getFullYear(), month:d.getMonth()+1, day:d.getDate() };
+    }
+  }
+  // NYSE observed holiday dates, month -> [days]. Extend as years roll over;
+  // unknown years degrade to "treat like a normal weekday" rather than crash.
+  var MARKET_HOLIDAYS = {
+    2025:{1:[1,20],2:[17],4:[18],5:[26],6:[19],7:[4],9:[1],11:[27],12:[25]},
+    2026:{1:[1,19],2:[16],4:[3],5:[25],6:[19],7:[3],9:[7],11:[26],12:[25]},
+    2027:{1:[1],2:[15],3:[26],5:[31],6:[18],7:[5],9:[6],11:[25],12:[24]},
+  };
+  function isMarketHoliday(et){
+    var year = MARKET_HOLIDAYS[et.year];
+    if (!year) return false;
+    var days = year[et.month];
+    return !!(days && days.indexOf(et.day) >= 0);
+  }
+  function sessionPhase(){
+    var t = etNow();
+    if (!t.isWeekday || isMarketHoliday(etDate())) return 'closed';
+    var mins = t.h*60 + t.m;
+    if (mins < 240)  return 'closed';      // before 4:00 AM ET
+    if (mins < 570)  return 'premarket';   // 4:00 - 9:30 AM ET
+    if (mins < 960)  return 'open';        // 9:30 AM - 4:00 PM ET
+    if (mins < 1200) return 'afterhours';  // 4:00 - 8:00 PM ET
+    return 'closed';
+  }
+  function marketOpen(){ return sessionPhase()==='open'; }
+  function sleepTime(){
+    var t = etNow();
+    if (!t.isWeekday) return true;               // weekends: market's closed, so is he
+    if (isMarketHoliday(etDate())) return true;  // holidays too
+    return t.h>=22 || t.h<5;
+  }
   function dayPhase(){ var h=etNow().h;
     return (h<5||h>=21)?'night' : h<9?'dawn' : h<17?'day' : 'dusk'; }
   function etClockStr(){ var t=etNow(); return (t.h%12||12)+':'+String(t.m).padStart(2,'0')+(t.h<12?'a':'p')+' ET'; }
 
   function updateMarketBadge(){
-    var open = marketOpen();
-    hudMarket.textContent = (open ? '\u25CF OPEN' : '\u25CB CLOSED') + ' \u00B7 ' + etClockStr();
-    hudMarket.style.color = open ? '#3fb950' : '#8b949e';
+    var t = etNow(), ph = sessionPhase(), txt, color;
+    if (ph==='open'){ txt='\u25CF OPEN'; color='#3fb950'; }
+    else if (ph==='premarket'){ txt='\u25CB PRE-MARKET'; color='#d29922'; }
+    else if (ph==='afterhours'){ txt='\u25CB AFTER-HOURS'; color='#58a6ff'; }
+    else { txt = (!t.isWeekday) ? '\u25CB WEEKEND' : (isMarketHoliday(etDate()) ? '\u25CB HOLIDAY' : '\u25CB CLOSED'); color='#8b949e'; }
+    hudMarket.textContent = txt + ' \u00B7 ' + etClockStr();
+    hudMarket.style.color = color;
   }
   updateMarketBadge();
   setInterval(updateMarketBadge, 15000);
@@ -2197,13 +2242,18 @@ _SNIPPET = r"""
     drawChart(sc.ctx, sc.cv.width, sc.cv.height, {ticker:sc.ticker, bars:bars, levels:levels||null});
     sc.tex.needsUpdate = true;
   }
-  function setChartFromPicks(picks){
+  function setChartFromPicks(picks, d){
     var slots = ['main','left','right'];
+    var real = (d && d.pick_bars) || {};
     (picks||[]).slice(0,3).forEach(function(pick,i){
       var slot = slots[i];
       if (!chartScreens[slot]) return;
       if (pick.entry_price==null || pick.stop_price==null || pick.target_price==null) return;
-      setChartData(slot, synthPickBars(pick, 26), pick.ticker, {
+      // Prefer real intraday bars when the API supplied them; otherwise fall
+      // back to a deterministic synthetic trace so the chart is never blank.
+      var live = real[pick.ticker] && real[pick.ticker].length;
+      var bars = live ? real[pick.ticker] : synthPickBars(pick, 26);
+      setChartData(slot, bars, pick.ticker, {
         entry:+pick.entry_price, stop:+pick.stop_price, target:+pick.target_price,
         direction:pick.direction, size_r:pick.size_r, conviction:pick.conviction,
       });
@@ -2220,7 +2270,7 @@ _SNIPPET = r"""
     var plan = d.plan;
     if (plan){
       if (plan.no_trade) setNoTrade(plan.no_trade_reason);
-      else if ((plan.picks||[]).length) setChartFromPicks(plan.picks);
+      else if ((plan.picks||[]).length) setChartFromPicks(plan.picks, d);
     }
     if (d.equity_curve && d.equity_curve.length>1){
       drawEquity(postCtx, 220, 150, d.equity_curve);
