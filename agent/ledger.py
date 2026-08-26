@@ -228,6 +228,22 @@ _MIGRATIONS = [
     # screeners (or news/EDGAR)? Lets the weekly miner check whether
     # SCAN_UNIVERSE's coverage gap is actually biasing which setups confirm.
     "ALTER TABLE picks ADD COLUMN IF NOT EXISTS in_scan_universe BOOLEAN",
+    # Indicator layer (specs/INDICATOR_LAYER_SPEC_v1.md §4) — VWAP/RVOL/9EMA
+    # fields computed deterministically by agent/grading.py at grading time.
+    # Session-level fields apply whether or not the pick triggered;
+    # fill-dependent ones (vwap_at_fill, ema9_5m_loss_et) only when it did.
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS adv20 DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS vwap_at_fill DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS fill_vs_vwap_pct DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS vwap_side_at_fill VARCHAR",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS first_vwap_reclaim_et TIMESTAMP",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS first_vwap_reject_et TIMESTAMP",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS vwap_crosses INTEGER",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS pct_time_above_vwap DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS rvol_at_1000 DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS rvol_at_1200 DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS rvol_close DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS ema9_5m_loss_et TIMESTAMP",
 ]
 
 
@@ -363,8 +379,12 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             r_multiple, mfe_r, mae_r, day_open, day_high, day_low, day_close,
             day_volume, missed_move_r, baseline_r, eod_r, target_hit_after_stop,
             execution_anomaly, fill_vs_plan_r,
+            adv20, vwap_at_fill, fill_vs_vwap_pct, vwap_side_at_fill,
+            first_vwap_reclaim_et, first_vwap_reject_et, vwap_crosses,
+            pct_time_above_vwap, rvol_at_1000, rvol_at_1200, rvol_close,
+            ema9_5m_loss_et,
             grade, grade_notes, graded_at, sim_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
@@ -372,6 +392,10 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             o.get("day_low"), o.get("day_close"), o.get("day_volume"),
             o.get("missed_move_r"), o.get("baseline_r"), o.get("eod_r"),
             o.get("target_hit_after_stop"), o.get("execution_anomaly"), o.get("fill_vs_plan_r"),
+            o.get("adv20"), o.get("vwap_at_fill"), o.get("fill_vs_vwap_pct"), o.get("vwap_side_at_fill"),
+            o.get("first_vwap_reclaim_et"), o.get("first_vwap_reject_et"), o.get("vwap_crosses"),
+            o.get("pct_time_above_vwap"), o.get("rvol_at_1000"), o.get("rvol_at_1200"), o.get("rvol_close"),
+            o.get("ema9_5m_loss_et"),
             o.get("grade"), o.get("grade_notes"),
             o.get("graded_at", datetime.now()), sim_version,
         ],
@@ -581,23 +605,18 @@ STATS_DIMENSIONS: frozenset[str] = frozenset(
 )
 
 
-def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
-    """Aggregate performance stats grouped by a picks column (setup_type, regime_tag, direction, conviction).
+def _stats_rows(con: duckdb.DuckDBPyConnection, dim_expr: str) -> list[dict]:
+    """Shared aggregation body for stats_by / stats_by_outcome — `dim_expr` is
+    a trusted (whitelisted by the caller) SQL expression, never caller-supplied
+    text, since DuckDB has no way to bind a column/expression as a parameter.
 
     Includes dispersion (std_r) and a plain t-statistic (avg_r / std-error) computed
     HERE, deterministically — the LLM must never be trusted to derive significance
     from a CSV. |t| < ~1.5 means the average is statistically indistinguishable
     from zero at that sample size, regardless of how big n looks.
     """
-    if dim not in STATS_DIMENSIONS:
-        raise ValueError(
-            f"stats_by: unsupported dimension {dim!r}; expected one of {sorted(STATS_DIMENSIONS)}"
-        )
-    # dim is now guaranteed to be one of the whitelisted identifiers above, so
-    # f-string interpolation of a column name here is safe — DuckDB has no way
-    # to bind a column/table identifier as a query parameter.
     rows = con.execute(
-        f"""SELECT COALESCE(CAST(p.{dim} AS VARCHAR),'?') AS dim,
+        f"""SELECT {dim_expr} AS dim,
                    COUNT(*) AS n,
                    SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END) AS triggered,
                    SUM(CASE WHEN o.triggered AND o.r_multiple > 0 THEN 1 ELSE 0 END) AS wins,
@@ -626,6 +645,44 @@ def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
             "baseline_avg_r": float(r[7]) if r[7] is not None else None,
         })
     return out
+
+
+def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
+    """Aggregate performance stats grouped by a picks column (setup_type, regime_tag, direction, conviction)."""
+    if dim not in STATS_DIMENSIONS:
+        raise ValueError(
+            f"stats_by: unsupported dimension {dim!r}; expected one of {sorted(STATS_DIMENSIONS)}"
+        )
+    # dim is now guaranteed to be one of the whitelisted identifiers above, so
+    # f-string interpolation of a column name here is safe.
+    return _stats_rows(con, f"COALESCE(CAST(p.{dim} AS VARCHAR),'?')")
+
+
+# Indicator-layer dimensions (specs/INDICATOR_LAYER_SPEC_v1.md §5) — these live
+# on OUTCOMES (computed at grading time), not on picks, so they can't go
+# through stats_by's p.{dim} lookup. rvol_bucket buckets rvol_at_1000 (the
+# morning-relevant checkpoint) into <1x / 1-2x / >2x of ADV20.
+OUTCOME_STATS_DIMENSIONS: frozenset[str] = frozenset({"rvol_bucket", "vwap_side_at_fill"})
+
+_OUTCOME_DIM_EXPR = {
+    "rvol_bucket": (
+        "CASE WHEN o.rvol_at_1000 IS NULL THEN '?' "
+        "WHEN o.rvol_at_1000 < 1 THEN '<1x' "
+        "WHEN o.rvol_at_1000 < 2 THEN '1-2x' ELSE '>2x' END"
+    ),
+    "vwap_side_at_fill": "COALESCE(o.vwap_side_at_fill, '?')",
+}
+
+
+def stats_by_outcome(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
+    """Same shape as stats_by, grouped by an indicator dimension computed onto
+    the outcomes table by agent/grading.py (rvol_bucket, vwap_side_at_fill)."""
+    if dim not in OUTCOME_STATS_DIMENSIONS:
+        raise ValueError(
+            f"stats_by_outcome: unsupported dimension {dim!r}; "
+            f"expected one of {sorted(OUTCOME_STATS_DIMENSIONS)}"
+        )
+    return _stats_rows(con, _OUTCOME_DIM_EXPR[dim])
 
 
 def equity_curve(con: duckdb.DuckDBPyConnection, account_size: float, dollars_per_r: float) -> list[dict]:

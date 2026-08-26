@@ -658,6 +658,44 @@ _SNIPPET = r"""
     return bars;
   }
 
+  // ------------------------------------------------ indicator overlays (VWAP/9EMA)
+  // Client-side only, mirroring agent/indicators.py's math (no shared code --
+  // this is a decorative canvas widget, not a graded computation). Bars
+  // without volume (older cached data, some synthetic fallbacks) fall back to
+  // an unweighted (v=1) average, which degrades gracefully to a plain
+  // typical-price line rather than crashing or omitting the overlay.
+  function computeVWAP(rawBars){
+    var cumPV=0, cumV=0, out=[];
+    rawBars.forEach(function(b){
+      var h=b.h!=null?b.h:b.high, l=b.l!=null?b.l:b.low, c=b.c!=null?b.c:b.close;
+      var typical=(h+l+c)/3;
+      var v=(b.v!=null && b.v>0) ? b.v : 1;
+      cumPV += typical*v; cumV += v;
+      out.push(cumV>0 ? cumPV/cumV : c);
+    });
+    return out;
+  }
+  function computeEMA(closes, period){
+    var n=closes.length, out=new Array(n).fill(null);
+    if (n<period) return out;
+    var seed=0; for (var i=0;i<period;i++) seed+=closes[i]; seed/=period;
+    out[period-1]=seed;
+    var k=2/(period+1), prev=seed;
+    for (var j=period;j<n;j++){ prev = closes[j]*k + prev*(1-k); out[j]=prev; }
+    return out;
+  }
+  function drawIndicatorLine(ctx, values, slotW, Y, color){
+    ctx.strokeStyle=color; ctx.lineWidth=1.3; ctx.beginPath();
+    var started=false;
+    for (var j=0;j<values.length;j++){
+      var v=values[j];
+      if (v==null) continue;
+      var cx = 8 + j*slotW + slotW/2, cy=Y(v);
+      if (!started){ ctx.moveTo(cx,cy); started=true; } else { ctx.lineTo(cx,cy); }
+    }
+    if (started) ctx.stroke();
+  }
+
   function drawChart(ctx, w, h, opts){
     var ticker=opts.ticker||'', bars=opts.bars||[], levels=opts.levels||null;
     ctx.clearRect(0,0,w,h);
@@ -683,6 +721,10 @@ _SNIPPET = r"""
         ctx.beginPath(); ctx.moveTo(cx,Y(b.h)); ctx.lineTo(cx,Y(b.l)); ctx.stroke();
         ctx.fillRect(cx-bodyW/2, Math.min(Y(b.o),Y(b.c)), bodyW, Math.max(1.5, Math.abs(Y(b.c)-Y(b.o))));
       });
+      drawIndicatorLine(ctx, computeVWAP(bars), slotW, Y, '#d29922');
+      if (norm.length >= 9){
+        drawIndicatorLine(ctx, computeEMA(norm.map(function(b){ return b.c; }), 9), slotW, Y, '#a371f7');
+      }
     }
     if (levels){
       var hline = function(v,color,tag){

@@ -18,6 +18,7 @@ from typing import Any
 import requests
 
 from .config import ECON_OVERRIDES_PATH, MOCKS_DIR, Config
+from .indicators import rvol_simple, vwap_distance, vwap_series
 from .util import ET, is_market_day, log, now_et, prev_market_day
 
 ALPACA_DATA = "https://data.alpaca.markets"
@@ -119,6 +120,38 @@ class Alpaca:
         b = bars[0]
         return {"open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"], "volume": b["v"]}
 
+    def multi_bars(self, symbols: list[str], timeframe: str,
+                   start: datetime, end: datetime) -> dict[str, list[dict]]:
+        """One batched multi-symbol bars fetch (the /v2/stocks/bars endpoint,
+        distinct from /v2/stocks/{symbol}/bars) — used for ADV20 and premarket
+        VWAP/RVOL enrichment so N gappers cost one round trip, not N."""
+        out: dict[str, list[dict]] = {}
+        for i in range(0, len(symbols), 100):
+            batch = symbols[i : i + 100]
+            params = {
+                "symbols": ",".join(batch),
+                "timeframe": timeframe,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "limit": 10000,
+                "adjustment": "raw",
+                "feed": self.feed,
+            }
+            data = self._get("/v2/stocks/bars", params)
+            for sym, bars in (data.get("bars") or {}).items():
+                rows = []
+                for b in bars or []:
+                    ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
+                    rows.append({"t": ts, "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]})
+                out[sym] = rows
+        return out
+
+    def multi_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[dict]]:
+        start_dt = datetime.combine(start, dtime(0, 0), tzinfo=ET)
+        end_dt = datetime.combine(end, dtime(0, 0), tzinfo=ET)
+        raw = self.multi_bars(symbols, "1Day", start_dt, end_dt)
+        return {sym: [{"close": r["c"], "volume": r["v"]} for r in rows] for sym, rows in raw.items()}
+
 
 # --------------------------------------------------------------- yfinance side
 
@@ -181,6 +214,31 @@ def yf_history_closes(symbols: list[str], days: int = 70) -> dict[str, list[floa
     for sym in symbols:
         series = None
         for accessor in (lambda: df[sym]["Close"], lambda: df["Close"][sym], lambda: df["Close"]):
+            try:
+                series = accessor()
+                break
+            except Exception:
+                continue
+        try:
+            out[sym] = [float(x) for x in series.dropna().tolist()] if series is not None else []
+        except Exception:
+            out[sym] = []
+    return out
+
+
+def yf_history_volumes(symbols: list[str], days: int = 40) -> dict[str, list[float]]:
+    """Daily volumes per symbol (oldest -> newest), one batched download.
+    Fallback source for ADV20 when Alpaca's multi-symbol daily bars miss a
+    ticker (mirrors yf_history_closes)."""
+    yf = _yf()
+    df = yf.download(
+        symbols, period=f"{days}d", interval="1d",
+        progress=False, threads=True, auto_adjust=True, group_by="ticker",
+    )
+    out: dict[str, list[float]] = {}
+    for sym in symbols:
+        series = None
+        for accessor in (lambda: df[sym]["Volume"], lambda: df["Volume"][sym], lambda: df["Volume"]):
             try:
                 series = accessor()
                 break
@@ -288,6 +346,12 @@ class MarketData:
         safe("filings_8k", lambda: edgar_recent_8ks(self.cfg.data_cfg["edgar_user_agent"]))
         bundle["econ_today"] = econ_events(d)
         bundle["econ_upcoming"] = econ_upcoming(d + timedelta(days=1), 3)
+        try:
+            self._enrich_indicators((bundle.get("premarket_gappers") or [])
+                                     + (bundle.get("catalyst_quotes") or []))
+        except Exception as e:
+            bundle["missing"].append(f"indicator_enrich: {type(e).__name__}: {e}")
+            log("data", f"WARN indicator enrichment failed: {e}")
         return bundle
 
     def _vix(self) -> dict:
@@ -347,6 +411,12 @@ class MarketData:
                                 "in_scan_universe": sym in base})
             except (KeyError, TypeError):
                 continue
+        band = self.cfg.data_cfg.get("gap_scan_price_band") or [None, None]
+        lo, hi = (list(band) + [None, None])[:2]
+        if lo is not None or hi is not None:
+            # INDEX_ETFS are context, not candidates -- never filtered by price.
+            out = [g for g in out if g["symbol"] in INDEX_ETFS
+                   or ((lo is None or g["last"] >= lo) and (hi is None or g["last"] <= hi))]
         out.sort(key=lambda x: -abs(x["gap_pct"]))
         return out[:30]
 
@@ -420,6 +490,129 @@ class MarketData:
             except (KeyError, TypeError, ZeroDivisionError):
                 continue
         return out
+
+    def pick_quotes(self, symbols: list[str], d: date) -> dict[str, float]:
+        """Live last price for arbitrary proposed-pick tickers (one batched
+        snapshot call). Used by the morning loop to ground tickers the bundle
+        never quoted — web-search- or 8-K-sourced picks that no feed tagged
+        (2026-08-25 DKS incident). Fail-closed contract: a symbol absent from
+        the result means "could not verify" and the caller drops the pick, so
+        this returns only quotes it actually obtained — no guesses.
+        """
+        # equities only, same convention as _catalyst_quotes
+        syms: list[str] = []
+        for s in symbols:
+            s = str(s).upper().strip()
+            if s and s.isalpha() and len(s) <= 5 and s not in syms:
+                syms.append(s)
+        if not syms:
+            return {}
+        if self.cfg.offline:
+            # deterministic synthetic anchor, consistent with offline grading bars
+            return {s: float(synthetic_minute_bars(s, d)[0]["o"]) for s in syms}
+        if not self.alpaca:
+            return {}
+        snaps = self.alpaca.snapshots(syms)
+        out: dict[str, float] = {}
+        for sym in syms:
+            s = snaps.get(sym)
+            if not isinstance(s, dict):
+                continue
+            try:
+                last = (s.get("latestTrade") or {}).get("p") or (s.get("minuteBar") or {}).get("c")
+                if last:
+                    out[sym] = round(float(last), 2)
+            except (KeyError, TypeError):
+                continue
+        return out
+
+    def adv20(self, symbols: list[str]) -> dict[str, float]:
+        """20-day average daily volume per symbol, one batched fetch.
+
+        Feeds v1 RVOL (agent.indicators.rvol_simple — percent of ADV20, not a
+        true time-of-day curve; see specs/INDICATOR_LAYER_SPEC_v1.md §1 v2
+        note). Alpaca's batched multi-symbol daily bars first, yfinance for
+        whatever it missed. A symbol absent from the result means "couldn't
+        compute ADV20" — callers treat that as None, never a fabricated ratio.
+        """
+        syms = sorted({str(s).upper().strip() for s in symbols if s})
+        if not syms:
+            return {}
+        if self.cfg.offline:
+            # deterministic synthetic ADV, consistent with offline grading bars
+            return {s: float(2_000_000 + (int(hashlib.sha256(s.encode()).hexdigest(), 16) % 3_000_000))
+                    for s in syms}
+        out: dict[str, float] = {}
+        end = now_et().date()
+        start = end - timedelta(days=40)  # buffer for weekends/holidays -> >=20 trading days
+        if self.alpaca:
+            try:
+                bars = self.alpaca.multi_daily_bars(syms, start, end)
+                for sym, rows in bars.items():
+                    vols = [r["volume"] for r in rows[-20:] if r.get("volume")]
+                    if vols:
+                        out[sym] = sum(vols) / len(vols)
+            except Exception as e:
+                log("data", f"WARN Alpaca multi_daily_bars failed for adv20: {e}")
+        missing = [s for s in syms if s not in out]
+        if missing:
+            try:
+                vol_hist = yf_history_volumes(missing, days=40)
+                for sym, vols in vol_hist.items():
+                    v20 = vols[-20:]
+                    if v20:
+                        out[sym] = sum(v20) / len(v20)
+            except Exception as e:
+                log("data", f"WARN yfinance adv20 fallback failed: {e}")
+        return out
+
+    def _enrich_indicators(self, quotes: list[dict]) -> None:
+        """Attach premarket VWAP/RVOL fields to gap-scan/catalyst-quote rows,
+        IN PLACE: pm_vwap, vs_pm_vwap, pm_vol_pct_adv20, adv20.
+
+        One batched ADV20 fetch + one batched premarket-minute-bars fetch for
+        every row handed in — not a per-symbol round trip per gapper. Nothing
+        after ~generation time enters this (premarket bars run 04:00 to now,
+        which for the morning bundle is always before the open) — no
+        look-ahead. Individually fault-tolerant: a ticker this can't compute
+        for gets nulls, not a crash and not a guess (spec §0.4).
+        """
+        if not quotes or not self.cfg.data_cfg.get("indicator_enrich", True) or not self.alpaca:
+            return
+        syms = [q["symbol"] for q in quotes if q.get("symbol")]
+        if not syms:
+            return
+        try:
+            adv = self.adv20(syms)
+        except Exception as e:
+            log("data", f"WARN adv20 fetch failed during indicator enrichment: {e}")
+            adv = {}
+        try:
+            start = datetime.combine(now_et().date(), dtime(4, 0), tzinfo=ET)
+            pm_bars = self.alpaca.multi_bars(syms, "1Min", start, now_et())
+        except Exception as e:
+            log("data", f"WARN premarket bars fetch failed during indicator enrichment: {e}")
+            pm_bars = {}
+        for q in quotes:
+            sym = q.get("symbol")
+            a = adv.get(sym)
+            q["adv20"] = round(a) if a else None
+            bars = pm_bars.get(sym) or []
+            if not bars:
+                q["pm_vwap"] = None
+                q["vs_pm_vwap"] = None
+                q["pm_vol_pct_adv20"] = None
+                continue
+            try:
+                last_vwap = vwap_series(bars)[-1]
+                q["pm_vwap"] = round(last_vwap, 4)
+                q["vs_pm_vwap"] = round(vwap_distance(float(q.get("last", 0)), last_vwap), 2)
+            except Exception:
+                q["pm_vwap"] = None
+                q["vs_pm_vwap"] = None
+            cum_vol = sum(b.get("v") or 0 for b in bars)
+            rv = rvol_simple(cum_vol, a)
+            q["pm_vol_pct_adv20"] = round(rv * 100, 1) if rv is not None else None
 
     # ---- grading data ----------------------------------------------------
     def minute_bars(self, symbol: str, d: date) -> list[dict]:
@@ -513,6 +706,16 @@ def synthetic_minute_bars(symbol: str, d: date) -> list[dict]:
 
 # ---------------------------------------------------------- bundle -> markdown
 
+def _indicator_suffix(q: dict) -> str:
+    """Compact 'vs pmVWAP / pm vol %ADV20' suffix for one gap-scan or
+    catalyst-quote row. Null fields render explicitly as 'n/a' — the model
+    must know what it's flying without, same as the bundle's 'missing' list,
+    never silently omitted."""
+    vwap_bit = f"{q['vs_pm_vwap']:+.1f}% vs pmVWAP" if q.get("vs_pm_vwap") is not None else "pmVWAP n/a"
+    vol_bit = f"pm vol {q['pm_vol_pct_adv20']:.0f}% ADV20" if q.get("pm_vol_pct_adv20") is not None else "pm vol n/a"
+    return f"{vwap_bit}, {vol_bit}"
+
+
 def render_bundle_md(b: dict) -> str:
     """Render the morning data bundle as compact markdown for the prompt."""
     parts: list[str] = [f"### Data as of {b.get('generated_at', '?')} ET\n"]
@@ -544,7 +747,8 @@ def render_bundle_md(b: dict) -> str:
         parts.append("**Premarket gap scan (curated universe + live movers/actives):**")
         for g in gappers[:25]:
             tag = "" if g.get("in_scan_universe", True) else " [off-universe]"
-            parts.append(f"- {g['symbol']}{tag}: {g['gap_pct']:+.2f}% (last {g['last']}, prev close {g['prev_close']})")
+            parts.append(f"- {g['symbol']}{tag}: {g['gap_pct']:+.2f}% (last {g['last']}, prev close {g['prev_close']}) "
+                        f"| {_indicator_suffix(g)}")
 
     movers = b.get("movers")
     if movers:
@@ -568,6 +772,7 @@ def render_bundle_md(b: dict) -> str:
                      " | ".join(
                          f"{q['symbol']} {q['last']}"
                          + (f" ({q['gap_pct']:+.1f}%)" if q.get("gap_pct") is not None else "")
+                         + f" [{_indicator_suffix(q)}]"
                          for q in cq[:40]))
 
     filings = b.get("filings_8k")

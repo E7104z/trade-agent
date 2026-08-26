@@ -11,7 +11,7 @@ a deliberate semantics change from an accidental regression.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
@@ -39,6 +39,18 @@ def _bar(o, h, l, c, v=10_000):
 def _tbar(hh, mm, o, h, l, c, v=10_000):
     """A bar with a timestamp, for time_stop/flatten bar-index mapping tests."""
     return {"t": datetime(2026, 1, 2, hh, mm), "o": o, "h": h, "l": l, "c": c, "v": v}
+
+
+def _flat_bars(hh0, mm0, n, o, h, l, c, v=1000):
+    """n consecutive 1-minute bars, identical OHLCV, starting at hh0:mm0."""
+    bars, hh, mm = [], hh0, mm0
+    for _ in range(n):
+        bars.append({"t": datetime(2026, 1, 2, hh, mm), "o": o, "h": h, "l": l, "c": c, "v": v})
+        mm += 1
+        if mm == 60:
+            mm = 0
+            hh += 1
+    return bars
 
 
 # --------------------------------------------------------------------- fills
@@ -583,5 +595,118 @@ def test_invalid_fill_outcome_renders_in_outcomes_md_without_a_narrative():
     md_text = outcomes_md(picks, outcomes)
     assert "INVALID FILL" in md_text
     assert "do not construct a narrative" in md_text
+
+
+# ---------------------------------------------------- indicator layer (spec v1)
+
+def test_indicator_fields_default_to_none_shape():
+    pick = _pick(entry_type="open")
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    out = simulate_pick(pick, bars, None)
+    for key in ("adv20", "rvol_at_1000", "rvol_at_1200", "rvol_close",
+                "vwap_crosses", "pct_time_above_vwap",
+                "first_vwap_reclaim_et", "first_vwap_reject_et"):
+        assert key in out
+
+
+def test_no_data_pick_has_null_indicator_fields_not_a_crash():
+    pick = _pick(entry_type="open")
+    out = simulate_pick(pick, [], None)
+    assert out["exit_reason"] == "no_data"
+    assert out["vwap_crosses"] is None
+    assert out["vwap_at_fill"] is None
+
+
+def test_untriggered_pick_keeps_session_indicators_but_not_fill_fields():
+    # limit entry far below anything the single bar touches -> never fills
+    bars = [_bar(100.0, 101.0, 99.0, 100.5)]
+    pick = _pick(entry_type="limit", entry=50.0, stop=45.0, target=60.0)
+    out = simulate_pick(pick, bars, None, adv20=1000.0)
+    assert out["triggered"] is False
+    assert out["vwap_at_fill"] is None
+    assert out["vwap_side_at_fill"] is None
+    assert out["ema9_5m_loss_et"] is None
+    # session-level VWAP fields are computable from the bars regardless of trigger
+    assert out["pct_time_above_vwap"] is not None
+
+
+def test_vwap_side_at_fill_and_distance_computed_from_fill_bar():
+    # typical price (h+l+c)/3 = (110+100+100)/3 = 103.3333, the only bar so
+    # vwap[0] = 103.3333; entry_type=open fills at the bar's OPEN (100.0),
+    # which sits below that -> "below" and a negative % distance.
+    bar0 = {"t": datetime(2026, 1, 2, 9, 30), "o": 100.0, "h": 110.0, "l": 100.0, "c": 100.0, "v": 100}
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    out = simulate_pick(pick, [bar0], None)
+    assert out["vwap_at_fill"] == pytest.approx(103.3333, abs=1e-3)
+    assert out["vwap_side_at_fill"] == "below"
+    assert out["fill_vs_vwap_pct"] == pytest.approx(-3.2258, abs=1e-2)
+
+
+def test_rvol_checkpoints_use_cumulative_volume_and_adv20():
+    # 35 one-minute bars from 9:30 -> 10:04; the first bar at/after 10:00 is
+    # index 30 (9:30 + 30min), so cumulative volume through it is 31*1000.
+    bars = _flat_bars(9, 30, 35, 100.0, 100.5, 99.5, 100.0, v=1000)
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    out = simulate_pick(pick, bars, None, adv20=31_000.0)
+    assert out["rvol_at_1000"] == pytest.approx(1.0)
+    assert out["rvol_at_1200"] is None  # bars never reach noon
+    assert out["rvol_close"] == pytest.approx(35_000 / 31_000, abs=1e-3)
+
+
+def test_missing_adv20_leaves_rvol_fields_null_but_vwap_fields_populate():
+    bars = _flat_bars(9, 30, 5, 100.0, 100.5, 99.5, 100.0)
+    pick = _pick(entry_type="open")
+    out = simulate_pick(pick, bars, None, adv20=None)
+    assert out["adv20"] is None
+    assert out["rvol_at_1000"] is None
+    assert out["rvol_close"] is None
+    assert out["vwap_crosses"] is not None
+
+
+def test_ema9_5m_loss_et_detected_after_fill():
+    # 45 flat 1-min bars (9 five-minute buckets, closes all 100) seed the 9
+    # EMA at bucket index 8 (=100); a 10th bucket (5 bars closing at 90,
+    # starting 10:15) pulls the EMA to 98 while itself closing at 90 -- a
+    # long loses the EMA there, and nowhere earlier (flat tape, no wick).
+    bars = (_flat_bars(9, 30, 45, 100.0, 100.5, 99.5, 100.0)
+            + _flat_bars(10, 15, 5, 90.0, 91.0, 89.0, 90.0))
+    pick = _pick(entry_type="open", entry=100.0, stop=50.0, target=200.0)
+    out = simulate_pick(pick, bars, None)
+    assert out["ema9_5m_loss_et"] == datetime(2026, 1, 2, 10, 15)
+
+
+def test_ema9_5m_loss_et_none_when_never_lost():
+    bars = _flat_bars(9, 30, 45, 100.0, 100.5, 99.5, 100.0)
+    pick = _pick(entry_type="open", entry=100.0, stop=50.0, target=200.0)
+    out = simulate_pick(pick, bars, None)
+    assert out["ema9_5m_loss_et"] is None
+
+
+def test_grade_day_passes_per_ticker_adv20_into_simulate_pick():
+    class StubMD:
+        def minute_bars(self, ticker, d):
+            return _flat_bars(9, 30, 35, 100.0, 100.5, 99.5, 100.0, v=1000)
+
+        def daily_bar(self, ticker, d):
+            return None
+
+    picks = [_pick(ticker="MARA", entry_type="open", pick_id=1)]
+    outcomes = grade_day(StubMD(), picks, date(2026, 1, 2), adv20_map={"MARA": 31_000.0})
+    assert outcomes[0]["rvol_at_1000"] == pytest.approx(1.0)
+
+
+def test_outcomes_md_renders_indicator_line_for_triggered_pick():
+    picks = [{
+        "pick_id": 9, "ticker": "AAPL", "direction": "long", "setup_type": "gap_go",
+        "entry_type": "open", "entry_price": 100.0, "stop_price": 98.0,
+        "target_price": 104.0, "size_r": 1.0, "conviction": 4,
+        "time_stop": None, "thesis": "t", "invalidation": "i",
+    }]
+    bar0 = {"t": datetime(2026, 1, 2, 9, 30), "o": 100.0, "h": 110.0, "l": 100.0, "c": 100.0, "v": 100}
+    outcomes = [simulate_pick(picks[0], [bar0], None)]
+    outcomes[0]["eval_date"] = None
+    md_text = outcomes_md(picks, outcomes)
+    assert "vwap" in md_text.lower()
+    assert "below VWAP" in md_text or "below vwap" in md_text.lower()
 
 

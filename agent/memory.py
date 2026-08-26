@@ -249,6 +249,10 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         "by_regime": ledger.stats_by(con, "regime_tag"),
         "by_conviction": ledger.stats_by(con, "conviction"),
         "by_direction": ledger.stats_by(con, "direction"),
+        # indicator layer (specs/INDICATOR_LAYER_SPEC_v1.md §5): does
+        # participation (RVOL) or VWAP side at fill separate winners from chop?
+        "by_rvol_bucket": ledger.stats_by_outcome(con, "rvol_bucket"),
+        "by_vwap_side": ledger.stats_by_outcome(con, "vwap_side_at_fill"),
         "lessons": lessons,
         "regimes": ledger.recent_regimes(con, 30),
         # v3: the self-deception closers

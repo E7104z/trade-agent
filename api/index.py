@@ -306,7 +306,10 @@ def _pick_bars(picks: list, d) -> dict:
         try:
             from agent import providers
             rows = providers.yf_minute_bars(sym, d)
-            bars = [{"o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]} for b in rows]
+            # "v" rides along so the dashboard widget can overlay a real VWAP
+            # line (agent/mascot.py computeVWAP) -- without it the chart would
+            # only ever be able to draw candles, never the volume-weighted line.
+            bars = [{"o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b.get("v")} for b in rows]
         except Exception:
             bars = []
         _PICK_BARS_CACHE[key] = (now, bars)

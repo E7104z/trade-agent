@@ -54,6 +54,8 @@ _DEFAULTS: dict[str, Any] = {
         "news_limit": 40,
         "gap_scan_min_pct": 3.0,
         "edgar_user_agent": "TradeAgent research bot (contact: user@example.com)",
+        "indicator_enrich": True,          # premarket VWAP/RVOL on gap-scan + catalyst quotes
+        "gap_scan_price_band": [None, None],  # optional [min, max] last-price hard filter, default OFF
     },
     "memory": {
         "recent_trades_in_context": 20,

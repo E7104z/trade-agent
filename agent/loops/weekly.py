@@ -211,6 +211,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_fmt_stats(mem['by_regime'], 'regime_tag')}\n\n"
             f"{_fmt_stats(mem['by_conviction'], 'conviction')}\n\n"
             f"{_fmt_stats(mem['by_direction'], 'direction')}\n\n"
+            f"{_fmt_stats(mem['by_rvol_bucket'], 'rvol_bucket (RVOL@10:00 vs ADV20)')}\n\n"
+            f"{_fmt_stats(mem['by_vwap_side'], 'vwap_side_at_fill')}\n\n"
             f"{_counterfactuals_md(mem)}\n\n"
             f"{_v3_sections(mem)}\n\n"
             f"{_sim_version_md(mem)}\n\n"

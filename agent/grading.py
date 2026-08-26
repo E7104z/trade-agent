@@ -77,6 +77,7 @@ import re
 from datetime import date, time as dtime
 from typing import Any
 
+from . import indicators as ind
 from .providers import MarketData
 from .util import log
 
@@ -154,9 +155,66 @@ def _is_thin(bar: dict, min_bar_volume: float) -> bool:
     return v < min_bar_volume
 
 
+def _resample_5m(bars: list[dict]) -> list[dict]:
+    """Positionally bucket 1-minute bars into 5-minute candles (o/h/l/c/v +
+    the bucket's opening timestamp). Assumes contiguous 1-minute bars, same
+    assumption _clock_to_bar_index's fallback path makes elsewhere in this
+    module. Used only for the 9 EMA (spec: 5m timeframe -- 1m is too noisy
+    for a process metric on an intraday desk)."""
+    out: list[dict] = []
+    for i in range(0, len(bars), 5):
+        chunk = bars[i:i + 5]
+        if not chunk:
+            continue
+        out.append({
+            "t": chunk[0].get("t"),
+            "o": chunk[0]["o"],
+            "h": max(b["h"] for b in chunk),
+            "l": min(b["l"] for b in chunk),
+            "c": chunk[-1]["c"],
+            "v": sum(b.get("v") or 0 for b in chunk),
+        })
+    return out
+
+
+def _indicator_fields(bars: list[dict], adv20: float | None) -> tuple[dict, list[float]]:
+    """Session-level indicator fields computed from whatever bars a pick has
+    (regardless of trigger status) -- VWAP events + RVOL-at-checkpoint. Never
+    fabricates a value: any field this can't compute from the bars/adv20 on
+    hand stays None (spec §0.4/§9 — never fail a grading run, never guess).
+    Returns (fields, vwap_series) — the caller reuses the series for the
+    fill-dependent fields (vwap_at_fill etc.) instead of recomputing it."""
+    out: dict[str, Any] = {
+        "adv20": round(adv20) if adv20 else None,
+        "first_vwap_reclaim_et": None, "first_vwap_reject_et": None,
+        "vwap_crosses": None, "pct_time_above_vwap": None,
+        "rvol_at_1000": None, "rvol_at_1200": None, "rvol_close": None,
+    }
+    if not bars:
+        return out, []
+    vwap = ind.vwap_series(bars)
+    ev = ind.vwap_events(bars, vwap)
+    out["first_vwap_reclaim_et"] = ev["first_reclaim_et"]
+    out["first_vwap_reject_et"] = ev["first_reject_et"]
+    out["vwap_crosses"] = ev["crosses"]
+    out["pct_time_above_vwap"] = ev["pct_time_above"]
+
+    for key, checkpoint in (("rvol_at_1000", dtime(10, 0)), ("rvol_at_1200", dtime(12, 0))):
+        idx = _clock_to_bar_index(checkpoint, bars)
+        if idx is not None:
+            cum_vol = sum(b.get("v") or 0 for b in bars[: idx + 1])
+            rv = ind.rvol_simple(cum_vol, adv20)
+            out[key] = round(rv, 3) if rv is not None else None
+
+    cum_vol_close = sum(b.get("v") or 0 for b in bars)
+    rv_close = ind.rvol_simple(cum_vol_close, adv20)
+    out["rvol_close"] = round(rv_close, 3) if rv_close is not None else None
+    return out, list(vwap)
+
+
 def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                   slippage_bps: float = 0.0, flatten_at: str | None = None,
-                  min_bar_volume: float = 0) -> dict:
+                  min_bar_volume: float = 0, adv20: float | None = None) -> dict:
     """Returns an outcome dict ready for ledger.save_outcome (minus grade fields)."""
     out: dict[str, Any] = {
         "pick_id": pick["pick_id"],
@@ -174,6 +232,15 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "execution_anomaly": False,
         "fill_vs_plan_r": None,
         "sim_version": CURRENT_SIM_VERSION,
+        # indicator layer (specs/INDICATOR_LAYER_SPEC_v1.md §4) — deterministic,
+        # checkpoint-accurate; session-level fields below apply whether or not
+        # the pick triggered, fill-dependent ones only when it did (see end).
+        "adv20": None,
+        "first_vwap_reclaim_et": None, "first_vwap_reject_et": None,
+        "vwap_crosses": None, "pct_time_above_vwap": None,
+        "rvol_at_1000": None, "rvol_at_1200": None, "rvol_close": None,
+        "vwap_at_fill": None, "fill_vs_vwap_pct": None, "vwap_side_at_fill": None,
+        "ema9_5m_loss_et": None,
     }
     if daily:
         out.update({
@@ -184,6 +251,13 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     if not bars:
         out["exit_reason"] = "no_data"
         return out
+
+    try:
+        ind_fields, vwap = _indicator_fields(bars, adv20)
+        out.update(ind_fields)
+    except Exception as e:
+        log("grade", f"pick {pick.get('pick_id')}: indicator computation failed ({e}) — fields left null")
+        vwap = []
 
     direction = (pick["direction"] or "long").lower()
     long = direction == "long"
@@ -298,6 +372,22 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     out["triggered"] = True
     out["entry_fill"] = round(fill_price, 4)
     out["fill_time"] = fill_time
+
+    # ---- fill-dependent indicator fields (spec §4) ------------------------
+    # Only meaningful once we know there IS a real fill (the invalid_fill gate
+    # above already returned for fills on the wrong side of their own stop).
+    try:
+        if fill_idx < len(vwap):
+            fill_vwap = vwap[fill_idx]
+            out["vwap_at_fill"] = round(fill_vwap, 4)
+            out["fill_vs_vwap_pct"] = round(ind.vwap_distance(fill_price, fill_vwap), 3)
+            out["vwap_side_at_fill"] = "above" if fill_price >= fill_vwap else "below"
+        bars5 = _resample_5m(bars)
+        ema9_5m = ind.ema_series([b["c"] for b in bars5], 9)
+        fill5_idx = fill_idx // 5
+        out["ema9_5m_loss_et"] = ind.ema_loss_time(bars5[fill5_idx:], ema9_5m[fill5_idx:], direction)
+    except Exception as e:
+        log("grade", f"pick {pick.get('pick_id')}: fill-indicator computation failed ({e}) — fields left null")
 
     # ---- map time_stop / flatten_at to bar indices, once, before the walk ----
     time_stop_idx = None
@@ -434,7 +524,7 @@ def classify_shadow(outcome: dict) -> tuple[str, float | None]:
 
 def grade_day(md: MarketData, picks: list[dict], d: date,
               slippage_bps: float = 0.0, flatten_at: str | None = None,
-              min_bar_volume: float = 0) -> list[dict]:
+              min_bar_volume: float = 0, adv20_map: dict[str, float] | None = None) -> list[dict]:
     outcomes = []
     for p in picks:
         try:
@@ -447,7 +537,8 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
         except Exception:
             daily = None
         o = simulate_pick(p, bars, daily, slippage_bps=slippage_bps,
-                          flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+                          flatten_at=flatten_at, min_bar_volume=min_bar_volume,
+                          adv20=(adv20_map or {}).get(p["ticker"].upper()))
         o["eval_date"] = d
         outcomes.append(o)
         log("grade", f"{p['ticker']} {p['direction']}: triggered={o['triggered']} "
@@ -478,6 +569,18 @@ def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
                     f"planned entry ({p['entry_price']}) — the thesis was never actually tested at "
                     f"the intended level. Grade EXECUTION ONLY for this pick; do not extract a "
                     f"thesis lesson or confirm/contradict a setup rule from it.")
+            if o.get("vwap_side_at_fill"):
+                bits = [f"filled {o['vwap_side_at_fill']} VWAP ({o['fill_vs_vwap_pct']:+.1f}%)",
+                        f"session {(o.get('pct_time_above_vwap') or 0) * 100:.0f}% time above VWAP",
+                        f"{o.get('vwap_crosses', 0)} VWAP cross(es)"]
+                if o.get("rvol_at_1000") is not None:
+                    bits.append(f"RVOL@10:00 {o['rvol_at_1000']:.2f}x ADV20")
+                if o.get("rvol_close") is not None:
+                    bits.append(f"RVOL@close {o['rvol_close']:.2f}x ADV20")
+                if o.get("ema9_5m_loss_et"):
+                    bits.append(f"lost 9EMA(5m) at {o['ema9_5m_loss_et']}")
+                lines.append(f"  Indicators (mechanically computed — cite these numbers, "
+                            f"never a guess): {', '.join(bits)}")
         elif o.get("exit_reason") == "invalid_fill":
             lines.append(
                 f"- OUTCOME: INVALID FILL — {o.get('invalid_fill_detail', 'fill landed on the wrong side of the stop; not a real trade.')} "

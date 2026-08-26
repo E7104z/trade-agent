@@ -28,8 +28,8 @@ def _reference_prices(bundle: dict) -> dict[str, float]:
     snapshots for every news-headline ticker — added after the 2026-08-24
     INSM incident, where a news-sourced pick outside the scan universe had no
     reference at all and sailed through with a hallucinated 72.5 entry on a
-    ~125 stock). Tickers outside all three sources are left unchecked rather
-    than guessed at.
+    ~125 stock). This is only the bundle-sourced baseline: _grounded_ref_prices
+    tops it up with a live fetch for any proposed ticker missing here.
     """
     out: dict[str, float] = {}
     for g in (bundle.get("premarket_gappers") or []):
@@ -46,6 +46,32 @@ def _reference_prices(bundle: dict) -> dict[str, float]:
         if sym and last and str(sym).upper() not in out:
             out[str(sym).upper()] = float(last)
     return out
+
+
+def _grounded_ref_prices(md: MarketData, plan: dict, bundle: dict, d: date) -> dict[str, float]:
+    """Reference prices for _validate_plan, keyed off what the analyst PROPOSED.
+
+    The bundle's quotes only cover tickers some feed happened to surface —
+    which is why the 2026-08-25 DKS incident got through: an earnings short
+    sourced purely by the analyst's own web search (no Alpaca news symbol
+    tag, not in the gap scan/movers) was anchored on a fictional '$179.64'
+    while DKS traded ~$124-139, and the grounding gate had nothing to check
+    it against. So: one batched live-snapshot fetch for every proposed
+    ticker the bundle didn't quote, merged in before validation. Tickers
+    whose fetch returns nothing stay absent — _validate_plan drops those
+    (fail closed) rather than trusting an unverifiable price.
+    """
+    refs = _reference_prices(bundle)
+    proposed = [str(p.get("ticker", "")).upper().strip() for p in (plan.get("picks") or [])]
+    missing = [t for t in dict.fromkeys(proposed) if t and t not in refs]
+    if not missing:
+        return refs
+    log("morning", f"Fetching live quotes for unreferenced pick ticker(s): {', '.join(missing)}")
+    try:
+        refs.update(md.pick_quotes(missing, d))
+    except Exception as e:
+        log("morning", f"WARN pick-quote fetch failed ({e}) — affected picks will be dropped as unverifiable")
+    return refs
 
 
 def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
@@ -87,15 +113,19 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     reference price is available, mistyped picks are dropped rather than
     silently executed as market orders.
 
-    COVERAGE: these gates only fire when ref_prices has an entry for the
-    ticker. _reference_prices now covers the scan universe, movers, most
-    actives, premarket gappers, AND every news-headline ticker (bundle
-    catalyst_quotes) — so catalyst picks sourced from the news feed are no
-    longer invisible to it. Still unchecked: tickers named only in 8-K
-    filings (company-name-keyed, no symbol) or surfaced purely by the LLM's
-    web search. Treat this as best-effort upstream filtering, not a
-    substitute for grading.py's invalid_fill gate, which is the actual
-    backstop and catches every mistyped fill regardless of ticker coverage.
+    COVERAGE: every proposed ticker is checked — no exceptions. ref_prices
+    starts from the bundle (scan universe, movers, most actives, premarket
+    gappers, news-headline catalyst_quotes) and _grounded_ref_prices tops it
+    up with one batched live snapshot for any proposed ticker the bundle
+    missed, so coverage tracks what the analyst proposed, not which feed
+    happened to tag it. That closed the last hole — tickers surfaced purely
+    by the LLM's web search or by company-name-keyed 8-K filings (real
+    incident 2026-08-25: DKS earnings short anchored on a fictional $179.64
+    while the stock traded ~$124-139; no feed had quoted DKS, so the gate
+    never fired). A ticker with NO obtainable quote at all is DROPPED, not
+    waved through — fail closed: an unverifiable price is exactly as
+    dangerous as a verifiably wrong one. grading.py's invalid_fill gate
+    remains the final backstop for anything that still slips through.
     """
     warnings: list[str] = []
     max_picks = int(cfg.get("max_picks", 4))
@@ -141,34 +171,39 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
             continue
 
         ref = (ref_prices or {}).get(t)
-        if ref:
-            max_dist = float(cfg.get("max_entry_ref_distance_pct", 15.0))
-            dist_pct = abs(entry - ref) / ref * 100
-            if dist_pct > max_dist:
-                warnings.append(
-                    f"{t}: entry {entry} is {dist_pct:.0f}% away from last price {ref} "
-                    f"(max {max_dist:.0f}%) — dropped as ungrounded; the level was priced off "
-                    f"something other than the actual market")
-                continue
-            entry_type = str((p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open").lower()
-            tol = 1.01  # 1% buffer for reference-price staleness, not a chase threshold
-            mistyped_as = None
-            if entry_type == "limit":
-                if p["direction"] == "long" and entry > ref * tol:
-                    mistyped_as = "breakout"
-                elif p["direction"] == "short" and entry < ref / tol:
-                    mistyped_as = "breakout"
-            elif entry_type == "breakout":
-                if p["direction"] == "long" and entry < ref / tol:
-                    mistyped_as = "limit"
-                elif p["direction"] == "short" and entry > ref * tol:
-                    mistyped_as = "limit"
-            if mistyped_as:
-                warnings.append(
-                    f"{t}: entry_type={entry_type} but entry {entry} is on the wrong side of "
-                    f"last price {ref} for a {p['direction']} (reads as {mistyped_as}) — dropped "
-                    f"rather than let it fill as a disguised market order")
-                continue
+        if not ref:
+            warnings.append(
+                f"{t}: entry {entry} could not be verified against any live quote (no bundle "
+                f"reference and the pre-validation snapshot fetch returned nothing) — dropped; "
+                f"an unverifiable price fails closed, not open")
+            continue
+        max_dist = float(cfg.get("max_entry_ref_distance_pct", 15.0))
+        dist_pct = abs(entry - ref) / ref * 100
+        if dist_pct > max_dist:
+            warnings.append(
+                f"{t}: entry {entry} is {dist_pct:.0f}% away from last price {ref} "
+                f"(max {max_dist:.0f}%) — dropped as ungrounded; the level was priced off "
+                f"something other than the actual market")
+            continue
+        entry_type = str((p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open").lower()
+        tol = 1.01  # 1% buffer for reference-price staleness, not a chase threshold
+        mistyped_as = None
+        if entry_type == "limit":
+            if p["direction"] == "long" and entry > ref * tol:
+                mistyped_as = "breakout"
+            elif p["direction"] == "short" and entry < ref / tol:
+                mistyped_as = "breakout"
+        elif entry_type == "breakout":
+            if p["direction"] == "long" and entry < ref / tol:
+                mistyped_as = "limit"
+            elif p["direction"] == "short" and entry > ref * tol:
+                mistyped_as = "limit"
+        if mistyped_as:
+            warnings.append(
+                f"{t}: entry_type={entry_type} but entry {entry} is on the wrong side of "
+                f"last price {ref} for a {p['direction']} (reads as {mistyped_as}) — dropped "
+                f"rather than let it fill as a disguised market order")
+            continue
 
         size = p.get("size_r")
         if not isinstance(size, (int, float)):
@@ -324,11 +359,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         )
         plan = risk.parsed or {}
 
-        # 7. validate + persist
+        # 7. validate + persist (ref prices cover every proposed ticker — live-fetched if needed)
         plan, warnings = _validate_plan(
             plan, cfg, ledger.current_streak(con),
             ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10))),
-            ref_prices=_reference_prices(bundle))
+            ref_prices=_grounded_ref_prices(md, plan, bundle, d))
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = reg.get("tag", "")

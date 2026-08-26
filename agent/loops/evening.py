@@ -32,6 +32,9 @@ Q_CONVICTION = 3
 Q_GAP_SIZE = 4
 Q_SHADOW_FILTER_COST = 5
 Q_STOP_PLACEMENT = 6
+# indicator layer (specs/INDICATOR_LAYER_SPEC_v1.md §5)
+Q_RVOL_SEPARATION = 7      # does participation (RVOL) separate winners from chop?
+Q_VWAP_REVERSAL_EDGE = 8   # VWAP-reclaim longs vs plain dip-buy longs -- same edge?
 
 
 def _pick_for_review(r: dict, picks: list[dict]) -> dict | None:
@@ -245,6 +248,32 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
                 f"eod_r={o.get('eod_r')}")
             counts["q_increments"] += 1
 
+    # Q7 (indicator layer): does participation (RVOL@10:00 vs ADV20) separate
+    # winners from chop? One increment per triggered pick with a non-null
+    # rvol_at_1000 -- ledger.stats_by_outcome("rvol_bucket") is the deterministic
+    # aggregate the weekly miner reads; this just logs the raw events.
+    for p in picks:
+        o = by_id.get(p["pick_id"], {})
+        if o.get("triggered") and o.get("rvol_at_1000") is not None:
+            ledger.add_question_progress(
+                con, Q_RVOL_SEPARATION, d, 1,
+                f"{p['ticker']} RVOL@10:00={o['rvol_at_1000']:.2f}x R={o.get('r_multiple')}")
+            counts["q_increments"] += 1
+
+    # Q8 (indicator layer): VWAP-reclaim longs vs plain dip-buy longs -- same
+    # edge or different? Approximated by whether the thesis text itself cites
+    # VWAP (the analyst can only do that now that pmVWAP/session VWAP are
+    # checkable bundle fields -- see prompts/morning_analyst.md).
+    for p in picks:
+        o = by_id.get(p["pick_id"], {})
+        if (p.get("direction") == "long" and o.get("triggered")
+                and "vwap" in str(p.get("thesis", "")).lower()):
+            ledger.add_question_progress(
+                con, Q_VWAP_REVERSAL_EDGE, d, 1,
+                f"{p['ticker']} thesis cited VWAP; side_at_fill={o.get('vwap_side_at_fill')} "
+                f"crosses={o.get('vwap_crosses')} R={o.get('r_multiple')}")
+            counts["q_increments"] += 1
+
     counts["q_increments"] += _q1_gap_fade_mechanics(con, md, d, picks, outcomes, shadow,
                                                      slippage_bps=slippage_bps)
     return counts
@@ -278,8 +307,14 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         if picks:
             log("evening", f"Simulating outcomes for {len(picks)} picks against intraday bars "
                            f"(slippage {slippage:.0f} bps/side)...")
+            try:
+                adv20_map = md.adv20([p["ticker"] for p in picks])
+            except Exception as e:
+                log("evening", f"WARN adv20 fetch failed ({e}) — RVOL fields will be null tonight")
+                adv20_map = {}
             outcomes = grade_day(md, picks, d, slippage_bps=slippage,
-                                 flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+                                 flatten_at=flatten_at, min_bar_volume=min_bar_volume,
+                                 adv20_map=adv20_map)
             for o in outcomes:
                 ledger.save_outcome(con, o)
         else:
