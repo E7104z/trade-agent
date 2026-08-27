@@ -392,6 +392,32 @@ def _correlation_matrix_md(tickers: list[str]) -> str:
         return ""
 
 
+def _attach_overlay_context(plan: dict, bundle: dict) -> None:
+    """Attach bundle-computed levels/context to each surviving pick, in-place,
+    so the dashboard's Arby chart can overlay them (PDH/PDL/PMH/PML dashed
+    lines, plus earnings-soon / short%-high / extension quips) — spec v2 §7.
+
+    Additive and best-effort: every field is already computed on the morning
+    bundle (zero extra network), rides in the plan JSON so it reaches both
+    /api/status and the static boot payload with no schema change, and is
+    simply omitted when the bundle never enriched that ticker (e.g. a
+    web-search-sourced name) — never fabricated. Any failure leaves the plan
+    untouched; overlays are decoration and must never fail a real loop.
+    """
+    fields = ("pdh", "pdl", "pm_high", "pm_low", "hi_52w", "atr_pct",
+              "gap_atr", "ext_atr", "earnings_days_away", "short_pct_float")
+    try:
+        maps = {f: _bundle_field(bundle, f) for f in fields}
+    except Exception as e:
+        log("morning", f"WARN overlay-context attach failed ({e}) — dashboard overlays skipped")
+        return
+    for p in plan.get("picks", []):
+        t = str(p.get("ticker", "")).upper()
+        ctx = {f: maps[f][t] for f in fields if maps[f].get(t) is not None}
+        if ctx:
+            p["overlay"] = ctx
+
+
 def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
     """Shadow ledger input: every analyst candidate that did NOT survive to the final
     plan, carrying its full plan levels so the evening loop can grade the counterfactual."""
@@ -532,6 +558,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             return
 
         # 8. persist
+        _attach_overlay_context(plan, bundle)
         pick_ids = ledger.save_daily_plan(con, d, plan, candidates, reg.get("tag", ""))
         n_rej = ledger.save_rejections(con, d, _build_rejections(candidates, plan))
         ledger.log_run(con, "morning", d, started, "ok", model, usage)

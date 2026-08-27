@@ -336,6 +336,19 @@ _SNIPPET = r"""
       if (plan.no_trade) out.push('No trade today \u2014 '+String(plan.no_trade_reason||'no edge').slice(0,70));
       else (plan.picks||[]).slice(0,3).forEach(function(p){
         out.push('Eyes on '+p.ticker+' '+(p.direction||'')+' @ '+p.entry_price+' ('+(p.size_r||1)+'R).');
+        // spec v2 §7 quip pool: earnings-soon / short%-high / ext>3ATR --
+        // every line quotes a mechanically computed field off the pick, never
+        // a vibe (same doctrine as the rest of Arby's fact quips).
+        var ov = p.overlay || {};
+        if (ov.earnings_days_away!=null && ov.earnings_days_away<=5){
+          out.push(ov.earnings_days_away===0
+            ? p.ticker+' reports TODAY \u2014 binary event, the stop is fiction against a gap.'
+            : p.ticker+' reports in '+ov.earnings_days_away+' day'+(ov.earnings_days_away===1?'':'s')+' \u2014 event risk on the clock.');
+        }
+        if (ov.short_pct_float!=null && ov.short_pct_float>=15)
+          out.push(p.ticker+' short '+ov.short_pct_float+'% of float \u2014 squeeze fuel if it runs.');
+        if (ov.ext_atr!=null && Math.abs(ov.ext_atr)>3)
+          out.push(p.ticker+' is '+(ov.ext_atr>0?'+':'')+ov.ext_atr+' ATR from its 20d mean \u2014 stretched, not a fresh entry.');
       });
     }
     var runs = d.runs;
@@ -698,6 +711,7 @@ _SNIPPET = r"""
 
   function drawChart(ctx, w, h, opts){
     var ticker=opts.ticker||'', bars=opts.bars||[], levels=opts.levels||null;
+    var realBars = !!(levels && levels.realBars);
     ctx.clearRect(0,0,w,h);
     ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,w,h);
     ctx.strokeStyle='#20262e'; ctx.lineWidth=1;
@@ -707,13 +721,33 @@ _SNIPPET = r"""
     var lo=Infinity, hi=-Infinity;
     norm.forEach(function(b){ lo=Math.min(lo,b.l); hi=Math.max(hi,b.h); });
     if (levels){ ['entry','stop','target'].forEach(function(k){
-      if (levels[k]!=null){ lo=Math.min(lo,+levels[k]); hi=Math.max(hi,+levels[k]); } }); }
+      if (levels[k]!=null){ lo=Math.min(lo,+levels[k]); hi=Math.max(hi,+levels[k]); } });
+      // prior-day / premarket anchors sit near the tape, so fold them into the
+      // frame (52w high is intentionally NOT ranged in -- it would squash the
+      // chart; it drives a quip instead).
+      var _ov = levels.overlay || {};
+      ['pdh','pdl','pm_high','pm_low'].forEach(function(k){
+        if (_ov[k]!=null){ lo=Math.min(lo,+_ov[k]); hi=Math.max(hi,+_ov[k]); } });
+    }
     if (!isFinite(lo)){ lo=0; hi=1; }
     if (hi===lo){ hi+=1; lo-=1; }
     var padT=20, padB=16, ch=h-padT-padB;
     var Y = function(v){ return padT + ch*(1-(v-lo)/(hi-lo)); };
+    var slotW = norm.length ? Math.max(4,(w-16)/norm.length) : 0;
+    // 15-minute opening-range box (spec v2 §7) -- only over REAL intraday
+    // minute bars; on synthetic pick traces the first 15 "bars" aren't
+    // minutes, so shading them would be a lie.
+    if (realBars && norm.length >= 16){
+      var orH=-Infinity, orL=Infinity;
+      for (var k=0;k<15;k++){ orH=Math.max(orH,norm[k].h); orL=Math.min(orL,norm[k].l); }
+      var xL=8, xR=8+15*slotW;
+      ctx.fillStyle='rgba(88,166,255,.10)';
+      ctx.fillRect(xL, Y(orH), xR-xL, Y(orL)-Y(orH));
+      ctx.strokeStyle='rgba(88,166,255,.35)'; ctx.setLineDash([3,3]);
+      ctx.strokeRect(xL, Y(orH), xR-xL, Y(orL)-Y(orH)); ctx.setLineDash([]);
+    }
     if (norm.length){
-      var slotW = Math.max(4,(w-16)/norm.length), bodyW = Math.max(2, slotW*0.6);
+      var bodyW = Math.max(2, slotW*0.6);
       norm.forEach(function(b,j){
         var cx = 8 + j*slotW + slotW/2;
         var col = b.c>=b.o ? '#3fb950' : '#f85149';
@@ -736,6 +770,20 @@ _SNIPPET = r"""
         ctx.fillStyle=color; ctx.font='9px Consolas,monospace';
         ctx.fillText(tag+' '+(+v), w-64, clamp(yy-3, 10, h-4));
       };
+      // structural anchors (spec v2 §7): dimmer, finer dash than the trade
+      // levels so they read as context, not as the plan.
+      var aline = function(v,color,tag){
+        if (v==null) return;
+        var yy=Y(+v);
+        ctx.strokeStyle=color; ctx.lineWidth=1; ctx.setLineDash([2,3]);
+        ctx.beginPath(); ctx.moveTo(2,yy); ctx.lineTo(w-2,yy); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle=color; ctx.font='8px Consolas,monospace';
+        ctx.fillText(tag, 3, clamp(yy-2, 9, h-3));
+      };
+      var ov = levels.overlay || {};
+      aline(ov.pdh,'#6e7681','PDH'); aline(ov.pdl,'#6e7681','PDL');
+      aline(ov.pm_high,'#8b949e','PMH'); aline(ov.pm_low,'#8b949e','PML');
       hline(levels.target,'#3fb950','T');
       hline(levels.entry,'#58a6ff','E');
       hline(levels.stop,'#f85149','S');
@@ -2298,6 +2346,7 @@ _SNIPPET = r"""
       setChartData(slot, bars, pick.ticker, {
         entry:+pick.entry_price, stop:+pick.stop_price, target:+pick.target_price,
         direction:pick.direction, size_r:pick.size_r, conviction:pick.conviction,
+        overlay:pick.overlay||null, realBars:!!live,
       });
     });
   }
