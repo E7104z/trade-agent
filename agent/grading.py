@@ -214,8 +214,17 @@ def _indicator_fields(bars: list[dict], adv20: float | None) -> tuple[dict, list
 
 def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                   slippage_bps: float = 0.0, flatten_at: str | None = None,
-                  min_bar_volume: float = 0, adv20: float | None = None) -> dict:
-    """Returns an outcome dict ready for ledger.save_outcome (minus grade fields)."""
+                  min_bar_volume: float = 0, adv20: float | None = None,
+                  atr14: float | None = None, trend_snapshot: dict | None = None,
+                  fundamentals: dict | None = None, prev_close: float | None = None,
+                  or_minutes: int = 15) -> dict:
+    """Returns an outcome dict ready for ledger.save_outcome (minus grade fields).
+
+    atr14/trend_snapshot/fundamentals/prev_close are the indicator-layer-v2
+    grading inputs (agent/loops/evening.py passes these from one batched
+    daily_context/fundamentals call per grading run, mirroring how adv20 is
+    already threaded through). All are grader INPUT / miner FUEL only — they
+    never gate a fill or change R math."""
     out: dict[str, Any] = {
         "pick_id": pick["pick_id"],
         "triggered": False,
@@ -232,7 +241,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "execution_anomaly": False,
         "fill_vs_plan_r": None,
         "sim_version": CURRENT_SIM_VERSION,
-        # indicator layer (specs/INDICATOR_LAYER_SPEC_v1.md §4) — deterministic,
+        # indicator layer v1 (specs/INDICATOR_LAYER_SPEC_v1.md §4) — deterministic,
         # checkpoint-accurate; session-level fields below apply whether or not
         # the pick triggered, fill-dependent ones only when it did (see end).
         "adv20": None,
@@ -241,7 +250,23 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "rvol_at_1000": None, "rvol_at_1200": None, "rvol_close": None,
         "vwap_at_fill": None, "fill_vs_vwap_pct": None, "vwap_side_at_fill": None,
         "ema9_5m_loss_et": None,
+        # indicator layer v2 (specs/INDICATOR_LAYER_SPEC_v2.md §5) — ATR/levels/
+        # context, computed here or stamped from the caller's fundamentals cache.
+        "atr14": None, "stop_dist_atr": None, "target_dist_atr": None, "gap_atr": None,
+        "or15_high": None, "or15_low": None, "or_break_dir": None, "or_break_et": None,
+        "fill_vs_or": None, "mae_before_mfe": None, "time_to_mfe_min": None,
+        "gap_fill_frac_1000": None, "gap_fill_frac_1200": None, "gap_fill_frac_close": None,
+        "trend_side_200d": None, "ext_atr_at_entry": None,
+        "short_pct_float": None, "float_shares": None, "mkt_cap": None,
     }
+    above200 = trend_snapshot.get("above_ma200") if trend_snapshot else None
+    out["trend_side_200d"] = "above" if above200 is True else ("below" if above200 is False else None)
+    ext = trend_snapshot.get("ext_atr") if trend_snapshot else None
+    out["ext_atr_at_entry"] = round(ext, 2) if ext is not None else None
+    if fundamentals:
+        out["short_pct_float"] = fundamentals.get("short_pct_float")
+        out["float_shares"] = fundamentals.get("float_shares")
+        out["mkt_cap"] = fundamentals.get("mkt_cap")
     if daily:
         out.update({
             "day_open": daily["open"], "day_high": daily["high"],
@@ -258,6 +283,14 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     except Exception as e:
         log("grade", f"pick {pick.get('pick_id')}: indicator computation failed ({e}) — fields left null")
         vwap = []
+
+    out["atr14"] = round(atr14, 4) if atr14 else None
+    try:
+        orr = ind.opening_range(bars, minutes=or_minutes)
+        out["or15_high"], out["or15_low"] = orr["or_high"], orr["or_low"]
+        out["or_break_dir"], out["or_break_et"] = orr["break_dir"], orr["break_et"]
+    except Exception as e:
+        log("grade", f"pick {pick.get('pick_id')}: opening-range computation failed ({e}) — fields left null")
 
     direction = (pick["direction"] or "long").lower()
     long = direction == "long"
@@ -282,6 +315,25 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     if sess_open is not None and sess_close is not None:
         naive_sign = 1.0 if (pick["direction"] or "long").lower() == "long" else -1.0
         out["baseline_r"] = round(naive_sign * (sess_close - sess_open) / risk, 3)
+
+    # ---- ATR-relative plan geometry + gap/OR context (indicator layer v2) ----
+    # Off the PLANNED entry/stop/target, not the eventual fill — these describe
+    # how the plan was constructed, independent of execution quality.
+    if atr14:
+        out["stop_dist_atr"] = round(abs(entry - stop) / atr14, 2)
+        out["target_dist_atr"] = round(abs(target - entry) / atr14, 2)
+        if prev_close and sess_open is not None:
+            out["gap_atr"] = round(abs(sess_open - prev_close) / atr14, 2)
+
+    # gap_fill_frac_*: fraction of the overnight gap retraced vs prev_close,
+    # checkpoint-stamped (never read a later bar into an earlier checkpoint).
+    if prev_close and sess_open is not None and sess_open != prev_close:
+        gap = sess_open - prev_close
+        for key, checkpoint in (("gap_fill_frac_1000", dtime(10, 0)), ("gap_fill_frac_1200", dtime(12, 0))):
+            idx = _clock_to_bar_index(checkpoint, bars)
+            if idx is not None and idx < len(bars):
+                out[key] = round((sess_open - bars[idx]["c"]) / gap, 3)
+        out["gap_fill_frac_close"] = round((sess_open - bars[-1]["c"]) / gap, 3)
 
     # ---- find fill -------------------------------------------------------
     fill_price = None
@@ -389,6 +441,14 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     except Exception as e:
         log("grade", f"pick {pick.get('pick_id')}: fill-indicator computation failed ({e}) — fields left null")
 
+    if out["or15_high"] is not None and out["or15_low"] is not None:
+        if fill_price > out["or15_high"]:
+            out["fill_vs_or"] = "above"
+        elif fill_price < out["or15_low"]:
+            out["fill_vs_or"] = "below"
+        else:
+            out["fill_vs_or"] = "inside"
+
     # ---- map time_stop / flatten_at to bar indices, once, before the walk ----
     time_stop_idx = None
     time_stop_raw = pick.get("time_stop")
@@ -415,13 +475,17 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     exit_idx = len(bars) - 1
     best_px = fill_price
     worst_px = fill_price
+    best_idx = fill_idx
+    worst_idx = fill_idx
 
     for i in range(fill_idx, len(bars)):
         b = bars[i]
         thin = _is_thin(b, min_bar_volume)
         if long:
-            worst_px = min(worst_px, b["l"])
-            best_px = max(best_px, b["h"])
+            if b["l"] < worst_px:
+                worst_px, worst_idx = b["l"], i
+            if b["h"] > best_px:
+                best_px, best_idx = b["h"], i
             if not thin and b["l"] <= stop:    # conservative: stop first
                 exit_price, exit_reason, exit_idx = stop, "stop", i
                 if b["o"] < stop:             # gapped through the stop
@@ -438,8 +502,10 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                 exit_price, exit_reason, exit_idx = target, "target", i
                 break
         else:
-            worst_px = max(worst_px, b["h"])
-            best_px = min(best_px, b["l"])
+            if b["h"] > worst_px:
+                worst_px, worst_idx = b["h"], i
+            if b["l"] < best_px:
+                best_px, best_idx = b["l"], i
             if not thin and b["h"] >= stop:
                 exit_price, exit_reason, exit_idx = stop, "stop", i
                 if b["o"] > stop:
@@ -467,6 +533,13 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     r_mult = sign * (exit_price - fill_price) / risk
     mfe = sign * (best_px - fill_price) / risk
     mae = sign * (worst_px - fill_price) / risk  # negative or zero
+
+    # mae_before_mfe / time_to_mfe_min: mechanical entry-timing-quality read —
+    # did the worst print before the best, and how long did the best take.
+    out["mae_before_mfe"] = worst_idx <= best_idx
+    fill_t, best_t = bars[fill_idx].get("t"), bars[best_idx].get("t")
+    if fill_t is not None and best_t is not None:
+        out["time_to_mfe_min"] = round((best_t - fill_t).total_seconds() / 60, 1)
 
     # ---- management counterfactuals (same risk denominator as r_multiple) ----
     # eod_r: hold from the actual fill to the close, no stop, no target.
@@ -524,9 +597,15 @@ def classify_shadow(outcome: dict) -> tuple[str, float | None]:
 
 def grade_day(md: MarketData, picks: list[dict], d: date,
               slippage_bps: float = 0.0, flatten_at: str | None = None,
-              min_bar_volume: float = 0, adv20_map: dict[str, float] | None = None) -> list[dict]:
+              min_bar_volume: float = 0, adv20_map: dict[str, float] | None = None,
+              atr_map: dict[str, float] | None = None,
+              trend_map: dict[str, dict] | None = None,
+              fundamentals_map: dict[str, dict] | None = None,
+              prev_close_map: dict[str, float] | None = None,
+              or_minutes: int = 15) -> list[dict]:
     outcomes = []
     for p in picks:
+        t = p["ticker"].upper()
         try:
             bars = md.minute_bars(p["ticker"], d)
         except Exception as e:
@@ -538,7 +617,12 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
             daily = None
         o = simulate_pick(p, bars, daily, slippage_bps=slippage_bps,
                           flatten_at=flatten_at, min_bar_volume=min_bar_volume,
-                          adv20=(adv20_map or {}).get(p["ticker"].upper()))
+                          adv20=(adv20_map or {}).get(t),
+                          atr14=(atr_map or {}).get(t),
+                          trend_snapshot=(trend_map or {}).get(t),
+                          fundamentals=(fundamentals_map or {}).get(t),
+                          prev_close=(prev_close_map or {}).get(t),
+                          or_minutes=or_minutes)
         o["eval_date"] = d
         outcomes.append(o)
         log("grade", f"{p['ticker']} {p['direction']}: triggered={o['triggered']} "
@@ -593,5 +677,33 @@ def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
         if o.get("day_open") is not None:
             lines.append(f"- Day OHLC: O {o['day_open']} H {o['day_high']} L {o['day_low']} "
                          f"C {o['day_close']} Vol {o.get('day_volume','?')}")
+        ctx_bits = []
+        if o.get("stop_dist_atr") is not None:
+            ctx_bits.append(f"stop {o['stop_dist_atr']:.2f} ATR from entry (ATR14 {o.get('atr14')})")
+        if o.get("target_dist_atr") is not None:
+            ctx_bits.append(f"target {o['target_dist_atr']:.2f} ATR from entry")
+        if o.get("gap_atr") is not None:
+            ctx_bits.append(f"gap {o['gap_atr']:.2f} ATR")
+        if o.get("ext_atr_at_entry") is not None:
+            ctx_bits.append(f"extended {o['ext_atr_at_entry']:+.2f} ATR from 20d MA at entry")
+        if o.get("trend_side_200d"):
+            ctx_bits.append(f"{o['trend_side_200d']} 200d MA")
+        if o.get("or15_high") is not None:
+            or_bit = f"OR15 {o['or15_low']:.2f}-{o['or15_high']:.2f}"
+            if o.get("or_break_dir"):
+                or_bit += f", broke {o['or_break_dir']}"
+            ctx_bits.append(or_bit)
+        if o.get("fill_vs_or"):
+            ctx_bits.append(f"filled {o['fill_vs_or']} the opening range")
+        if o.get("mae_before_mfe") is not None:
+            ctx_bits.append("MAE printed before MFE" if o["mae_before_mfe"] else "MFE printed before MAE")
+        if o.get("short_pct_float") is not None:
+            ctx_bits.append(f"short {o['short_pct_float']:.0f}% of float")
+        if o.get("mkt_cap"):
+            mc = o["mkt_cap"]
+            ctx_bits.append(f"mcap ${mc / 1e12:.1f}T" if mc >= 1e12 else f"mcap ${mc / 1e9:.1f}B")
+        if ctx_bits:
+            lines.append(f"  Context (mechanically computed — cite these numbers, "
+                        f"never chart memory): {', '.join(ctx_bits)}")
         lines.append("")
     return "\n".join(lines)

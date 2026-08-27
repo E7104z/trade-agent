@@ -17,6 +17,7 @@ from typing import Any
 
 import requests
 
+from . import indicators as ind
 from .config import ECON_OVERRIDES_PATH, MOCKS_DIR, Config
 from .indicators import rvol_simple, vwap_distance, vwap_series
 from .util import ET, is_market_day, log, now_et, prev_market_day
@@ -246,6 +247,40 @@ def yf_history_volumes(symbols: list[str], days: int = 40) -> dict[str, list[flo
                 continue
         try:
             out[sym] = [float(x) for x in series.dropna().tolist()] if series is not None else []
+        except Exception:
+            out[sym] = []
+    return out
+
+
+def yf_history_bars(symbols: list[str], days: int = 380) -> dict[str, list[dict]]:
+    """Full daily OHLCV bars per symbol (oldest -> newest), one batched
+    download. Fallback source for MarketData.daily_context when Alpaca's
+    multi_bars(1Day) misses a ticker (mirrors yf_history_closes/_volumes)."""
+    yf = _yf()
+    df = yf.download(
+        symbols, period=f"{days}d", interval="1d",
+        progress=False, threads=True, auto_adjust=True, group_by="ticker",
+    )
+    out: dict[str, list[dict]] = {}
+    for sym in symbols:
+        sub = None
+        for accessor in (lambda: df[sym], lambda: df):
+            try:
+                sub = accessor()
+                break
+            except Exception:
+                continue
+        if sub is None:
+            out[sym] = []
+            continue
+        try:
+            rows = []
+            for ts, row in sub.dropna().iterrows():
+                ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+                rows.append({"t": ts_dt, "o": float(row["Open"]), "h": float(row["High"]),
+                            "l": float(row["Low"]), "c": float(row["Close"]),
+                            "v": int(row["Volume"])})
+            out[sym] = rows
         except Exception:
             out[sym] = []
     return out
@@ -566,53 +601,287 @@ class MarketData:
                 log("data", f"WARN yfinance adv20 fallback failed: {e}")
         return out
 
-    def _enrich_indicators(self, quotes: list[dict]) -> None:
-        """Attach premarket VWAP/RVOL fields to gap-scan/catalyst-quote rows,
-        IN PLACE: pm_vwap, vs_pm_vwap, pm_vol_pct_adv20, adv20.
+    def daily_context(self, symbols: list[str]) -> dict[str, dict]:
+        """Widened ~260-trading-day daily-bar fetch (specs indicator layer
+        v2 §2): one batched call derives adv20, atr14, atr_pct, daily_levels,
+        and trend_snapshot together -- this REPLACES the standalone adv20()
+        fetch inside bundle enrichment (one fetch replaces one fetch), though
+        adv20() itself stays for grading-time use elsewhere.
 
-        One batched ADV20 fetch + one batched premarket-minute-bars fetch for
-        every row handed in — not a per-symbol round trip per gapper. Nothing
-        after ~generation time enters this (premarket bars run 04:00 to now,
-        which for the morning bundle is always before the open) — no
-        look-ahead. Individually fault-tolerant: a ticker this can't compute
-        for gets nulls, not a crash and not a guess (spec §0.4).
+        Alpaca's batched multi-symbol daily bars first (full OHLCV, needed
+        for ATR/levels — unlike multi_daily_bars' close/volume-only shape),
+        yfinance for whatever it missed. Any partial "today" bar is dropped
+        before handing bars to agent.indicators — daily_levels/atr must only
+        see COMPLETED sessions. Per-symbol fault isolation: a symbol whose
+        bars can't be fetched/parsed gets an all-None context dict, never a
+        crash and never a fabricated value.
         """
-        if not quotes or not self.cfg.data_cfg.get("indicator_enrich", True) or not self.alpaca:
+        syms = sorted({str(s).upper().strip() for s in symbols if s})
+        out: dict[str, dict] = {}
+        if not syms:
+            return out
+
+        def _null_ctx() -> dict:
+            return {"adv20": None, "atr14": None, "atr_pct": None,
+                    "daily_levels": ind.daily_levels([]), "trend_snapshot": ind.trend_snapshot([], None)}
+
+        if self.cfg.offline:
+            for s in syms:
+                seed = int(hashlib.sha256(s.encode()).hexdigest(), 16)
+                adv = 2_000_000 + (seed % 3_000_000)
+                out[s] = {
+                    "adv20": float(adv), "atr14": 2.5, "atr_pct": 2.1,
+                    "daily_levels": {"pdh": 101.0, "pdl": 98.0, "pdc": 100.0,
+                                     "hi_5d": 103.0, "lo_5d": 97.0,
+                                     "hi_20d": 108.0, "lo_20d": 92.0,
+                                     "hi_52w": 130.0, "lo_52w": 60.0},
+                    "trend_snapshot": {"above_ma20": True, "above_ma50": True,
+                                       "above_ma200": True, "ma20_slope_pct": 0.5,
+                                       "ext_atr": 0.4},
+                }
+            return out
+
+        end = now_et().date()
+        start = end - timedelta(days=380)  # buffer for weekends/holidays -> ~260 trading days
+        bars_by_sym: dict[str, list[dict]] = {}
+        if self.alpaca:
+            try:
+                start_dt = datetime.combine(start, dtime(0, 0), tzinfo=ET)
+                end_dt = datetime.combine(end, dtime(0, 0), tzinfo=ET)
+                bars_by_sym = self.alpaca.multi_bars(syms, "1Day", start_dt, end_dt)
+            except Exception as e:
+                log("data", f"WARN Alpaca multi_bars(1Day) failed for daily_context: {e}")
+        missing = [s for s in syms if not bars_by_sym.get(s)]
+        if missing:
+            try:
+                bars_by_sym.update(yf_history_bars(missing, days=380))
+            except Exception as e:
+                log("data", f"WARN yfinance daily_context fallback failed: {e}")
+
+        today = now_et().date()
+        for s in syms:
+            bars = [b for b in (bars_by_sym.get(s) or [])
+                    if not (b.get("t") and b["t"].date() >= today)]
+            if not bars:
+                out[s] = _null_ctx()
+                continue
+            try:
+                vols = [b["v"] for b in bars[-20:] if b.get("v")]
+                adv20 = sum(vols) / len(vols) if vols else None
+                atr14 = ind.atr(bars, 14)
+                last_close = bars[-1]["c"]
+                atr_pct = (atr14 / last_close * 100) if (atr14 and last_close) else None
+                out[s] = {
+                    "adv20": adv20, "atr14": atr14, "atr_pct": atr_pct,
+                    "daily_levels": ind.daily_levels(bars),
+                    "trend_snapshot": ind.trend_snapshot([b["c"] for b in bars], atr14),
+                }
+            except Exception as e:
+                log("data", f"WARN daily_context computation failed for {s}: {e}")
+                out[s] = _null_ctx()
+        return out
+
+    def fundamentals(self, symbols: list[str], con: Any = None) -> dict[str, dict]:
+        """Float shares, market cap, and short-%-of-float per symbol —
+        yfinance, cached in the ledger DB with a 3-session TTL (this data
+        moves slowly; short interest itself is only exchange-reported
+        roughly biweekly). short_asof always accompanies short_pct_float —
+        stale-and-labeled beats fresh-looking fiction. A symbol this can't
+        compute for is simply absent; callers treat that as unmeasured,
+        never a fabricated number.
+        """
+        syms = sorted({str(s).upper().strip() for s in symbols if s})
+        out: dict[str, dict] = {}
+        if not syms:
+            return out
+        if self.cfg.offline:
+            for s in syms:
+                seed = int(hashlib.sha256(s.encode()).hexdigest(), 16)
+                out[s] = {"mkt_cap": float(1_000_000_000 + seed % 400_000_000_000),
+                          "float_shares": float(10_000_000 + seed % 500_000_000),
+                          "short_pct_float": round((seed % 300) / 10, 1),
+                          "short_asof": now_et().date().isoformat()}
+            return out
+        from . import ledger
+        owns_con = con is None
+        if owns_con:
+            con = ledger.connect()
+        try:
+            out.update(ledger.cached_fundamentals(con, syms))
+            missing = [s for s in syms if s not in out]
+            if not missing:
+                return out
+            yf = _yf()
+            rows: list[dict] = []
+            for s in missing:
+                try:
+                    t = yf.Ticker(s)
+                    info = t.get_info() if hasattr(t, "get_info") else t.info
+                    mkt_cap = info.get("marketCap")
+                    float_shares = info.get("floatShares")
+                    short_pct = info.get("shortPercentOfFloat")
+                    short_ts = info.get("dateShortInterest")
+                    asof = None
+                    if short_ts:
+                        try:
+                            asof = datetime.fromtimestamp(short_ts).date().isoformat()
+                        except Exception:
+                            asof = None
+                    row = {"symbol": s, "mkt_cap": float(mkt_cap) if mkt_cap else None,
+                           "float_shares": float(float_shares) if float_shares else None,
+                           "short_pct_float": round(float(short_pct) * 100, 2) if short_pct else None,
+                           "short_asof": asof}
+                    out[s] = {k: v for k, v in row.items() if k != "symbol"}
+                    rows.append(row)
+                except Exception as e:
+                    log("data", f"WARN fundamentals fetch failed for {s}: {e}")
+            if rows:
+                ledger.save_fundamentals(con, rows)
+        finally:
+            if owns_con:
+                con.close()
+        return out
+
+    def next_earnings(self, symbols: list[str]) -> dict[str, int | None]:
+        """Trading days until next earnings report per symbol (0 = reports
+        today after close), from yfinance's earnings calendar. Known-
+        imperfect source (spec §9: week 1 measures its null/error rate before
+        any gate acts on it hard). Fetched only for the symbols handed in
+        (card-rendered tickers), never the whole scan universe. A symbol
+        this can't determine a date for is simply absent.
+        """
+        syms = sorted({str(s).upper().strip() for s in symbols if s})
+        out: dict[str, int | None] = {}
+        if not syms:
+            return out
+        if self.cfg.offline:
+            for s in syms:
+                seed = int(hashlib.sha256(s.encode()).hexdigest(), 16)
+                out[s] = seed % 45
+            return out
+        yf = _yf()
+        today = now_et().date()
+        for s in syms:
+            try:
+                cal = yf.Ticker(s).get_earnings_dates(limit=4)
+                if cal is None or cal.empty:
+                    continue
+                future = [ts.date() for ts in cal.index if ts.date() >= today]
+                if not future:
+                    continue
+                out[s] = (min(future) - today).days
+            except Exception as e:
+                log("data", f"WARN next_earnings fetch failed for {s}: {e}")
+        return out
+
+    def _enrich_indicators(self, quotes: list[dict]) -> None:
+        """Attach premarket VWAP/RVOL (v1) and ATR/levels/trend/fundamentals/
+        earnings (indicator layer v2) fields to gap-scan/catalyst-quote rows,
+        IN PLACE: pm_vwap, vs_pm_vwap, pm_vol_pct_adv20, adv20, atr14,
+        atr_pct, gap_atr, pdh, pdl, pm_high, pm_low, hi_20d, lo_20d, hi_52w,
+        lo_52w, above_ma20/50/200, ext_atr, mkt_cap, float_shares,
+        short_pct_float, short_asof, earnings_days_away.
+
+        adv20 now comes from ONE widened daily_context fetch (replaces the
+        old standalone adv20() call here — same one-fetch-per-round-trip
+        discipline) and the premarket-minute-bars fetch is reused for BOTH
+        pmVWAP/RVOL (v1) and premarket high/low (v2) — zero additional
+        network for PM levels. Fundamentals/earnings are separate fetches,
+        gated independently via `context_enrich` (default on) so v1
+        pmVWAP/RVOL keeps working even when the v2 pieces are off or fail.
+        Individually fault-tolerant per ticker and per field group: nothing
+        here fabricates a value or crashes the morning run (spec §0.4/§10).
+        """
+        if not quotes or not self.alpaca:
+            return
+        indicator_on = self.cfg.data_cfg.get("indicator_enrich", True)
+        context_on = self.cfg.data_cfg.get("context_enrich", True)
+        if not indicator_on and not context_on:
             return
         syms = [q["symbol"] for q in quotes if q.get("symbol")]
         if not syms:
             return
+
         try:
-            adv = self.adv20(syms)
+            ctx = self.daily_context(syms)
         except Exception as e:
-            log("data", f"WARN adv20 fetch failed during indicator enrichment: {e}")
-            adv = {}
+            log("data", f"WARN daily_context fetch failed during enrichment: {e}")
+            ctx = {}
         try:
             start = datetime.combine(now_et().date(), dtime(4, 0), tzinfo=ET)
             pm_bars = self.alpaca.multi_bars(syms, "1Min", start, now_et())
         except Exception as e:
-            log("data", f"WARN premarket bars fetch failed during indicator enrichment: {e}")
+            log("data", f"WARN premarket bars fetch failed during enrichment: {e}")
             pm_bars = {}
+
+        fund: dict[str, dict] = {}
+        earn: dict[str, int | None] = {}
+        if context_on:
+            try:
+                fund = self.fundamentals(syms)
+            except Exception as e:
+                log("data", f"WARN fundamentals fetch failed during context enrichment: {e}")
+            try:
+                earn = self.next_earnings(syms)
+            except Exception as e:
+                log("data", f"WARN next_earnings fetch failed during context enrichment: {e}")
+
         for q in quotes:
             sym = q.get("symbol")
-            a = adv.get(sym)
-            q["adv20"] = round(a) if a else None
+            c = ctx.get(sym) or {}
+            a = c.get("adv20")
             bars = pm_bars.get(sym) or []
-            if not bars:
-                q["pm_vwap"] = None
-                q["vs_pm_vwap"] = None
-                q["pm_vol_pct_adv20"] = None
+
+            if indicator_on:
+                q["adv20"] = round(a) if a else None
+                if bars:
+                    try:
+                        last_vwap = vwap_series(bars)[-1]
+                        q["pm_vwap"] = round(last_vwap, 4)
+                        q["vs_pm_vwap"] = round(vwap_distance(float(q.get("last", 0)), last_vwap), 2)
+                    except Exception:
+                        q["pm_vwap"] = None
+                        q["vs_pm_vwap"] = None
+                    cum_vol = sum(b.get("v") or 0 for b in bars)
+                    rv = rvol_simple(cum_vol, a)
+                    q["pm_vol_pct_adv20"] = round(rv * 100, 1) if rv is not None else None
+                else:
+                    q["pm_vwap"] = None
+                    q["vs_pm_vwap"] = None
+                    q["pm_vol_pct_adv20"] = None
+
+            if not context_on:
                 continue
+
+            q["atr14"] = round(c["atr14"], 4) if c.get("atr14") else None
+            q["atr_pct"] = round(c["atr_pct"], 2) if c.get("atr_pct") else None
+            levels = c.get("daily_levels") or {}
+            for k in ("pdh", "pdl", "hi_20d", "lo_20d", "hi_52w", "lo_52w"):
+                q[k] = levels.get(k)
+            trend = c.get("trend_snapshot") or {}
+            q["above_ma20"] = trend.get("above_ma20")
+            q["above_ma50"] = trend.get("above_ma50")
+            q["above_ma200"] = trend.get("above_ma200")
+            q["ext_atr"] = round(trend["ext_atr"], 2) if trend.get("ext_atr") is not None else None
             try:
-                last_vwap = vwap_series(bars)[-1]
-                q["pm_vwap"] = round(last_vwap, 4)
-                q["vs_pm_vwap"] = round(vwap_distance(float(q.get("last", 0)), last_vwap), 2)
+                pml = ind.premarket_levels(bars)
             except Exception:
-                q["pm_vwap"] = None
-                q["vs_pm_vwap"] = None
-            cum_vol = sum(b.get("v") or 0 for b in bars)
-            rv = rvol_simple(cum_vol, a)
-            q["pm_vol_pct_adv20"] = round(rv * 100, 1) if rv is not None else None
+                pml = {"pm_high": None, "pm_low": None}
+            q["pm_high"], q["pm_low"] = pml["pm_high"], pml["pm_low"]
+            if q.get("atr14") and q.get("gap_pct") is not None and q.get("prev_close"):
+                try:
+                    gap_abs = abs(float(q["prev_close"])) * abs(float(q["gap_pct"])) / 100.0
+                    q["gap_atr"] = round(gap_abs / q["atr14"], 2)
+                except Exception:
+                    q["gap_atr"] = None
+            else:
+                q["gap_atr"] = None
+            f = fund.get(sym) or {}
+            q["mkt_cap"] = f.get("mkt_cap")
+            q["float_shares"] = f.get("float_shares")
+            q["short_pct_float"] = f.get("short_pct_float")
+            q["short_asof"] = f.get("short_asof")
+            q["earnings_days_away"] = earn.get(sym)
 
     # ---- grading data ----------------------------------------------------
     def minute_bars(self, symbol: str, d: date) -> list[dict]:
@@ -716,6 +985,51 @@ def _indicator_suffix(q: dict) -> str:
     return f"{vwap_bit}, {vol_bit}"
 
 
+def _context_lines(q: dict) -> str:
+    """Extra indented lines for one ticker card (indicator layer v2 §2):
+    ATR/gap-in-ATRs, PDH/PDL/PMH/PML, 52w-high distance, trend/extension,
+    market cap, earnings, and — only when it clears the attention bar
+    (rule 5: no decoration fields) — float/short. Null fields render
+    explicitly as 'n/a', never silently omitted. Empty string when NONE of
+    this context was computable for the ticker (context_enrich off, or every
+    fetch failed) — no half-populated card with nothing but 'n/a' noise."""
+    if q.get("atr_pct") is None and q.get("pdh") is None and q.get("mkt_cap") is None:
+        return ""
+    atr_bit = f"ATR {q['atr_pct']:.1f}%/d" if q.get("atr_pct") is not None else "ATR n/a"
+    gap_bit = f"gap {q['gap_atr']:.1f} ATR" if q.get("gap_atr") is not None else "gap n/a"
+    levels = []
+    if q.get("pdh") is not None:
+        levels.append(f"PDH {q['pdh']:.2f} PDL {q['pdl']:.2f}")
+    if q.get("pm_high") is not None:
+        levels.append(f"PMH {q['pm_high']:.2f} PML {q['pm_low']:.2f}")
+    last = q.get("last")
+    if q.get("hi_52w") is not None and last:
+        dist = (last - q["hi_52w"]) / q["hi_52w"] * 100
+        levels.append(f"52wH {dist:+.1f}%")
+    trend_bits = []
+    for label, key in (("20d", "above_ma20"), ("50d", "above_ma50"), ("200d", "above_ma200")):
+        v = q.get(key)
+        trend_bits.append(("^" if v else ("v" if v is False else "?")) + label)
+    ext_bit = f"ext {q['ext_atr']:+.1f} ATR" if q.get("ext_atr") is not None else "ext n/a"
+    if q.get("mkt_cap"):
+        mc = q["mkt_cap"]
+        mcap_bit = f"mcap ${mc / 1e12:.1f}T" if mc >= 1e12 else f"mcap ${mc / 1e9:.1f}B"
+    else:
+        mcap_bit = "mcap n/a"
+    earn = q.get("earnings_days_away")
+    earn_bit = f"earnings in {earn}d" if earn is not None else "earnings n/a"
+    line1 = f"{atr_bit}, {gap_bit}" + (" | " + " | ".join(levels) if levels else "")
+    line2 = f"trend {' '.join(trend_bits)}, {ext_bit} | {mcap_bit} | {earn_bit}"
+    out_lines = [line1, line2]
+    short_pct, float_sh = q.get("short_pct_float"), q.get("float_shares")
+    if (short_pct is not None and short_pct >= 5) or (float_sh is not None and float_sh <= 100_000_000):
+        float_bit = f"float {float_sh / 1e6:.0f}M" if float_sh else "float n/a"
+        short_bit = (f"short {short_pct:.0f}% of float (as of {q.get('short_asof') or '?'})"
+                    if short_pct is not None else "short n/a")
+        out_lines.append(f"{float_bit}, {short_bit}")
+    return "\n  " + "\n  ".join(out_lines)
+
+
 def render_bundle_md(b: dict) -> str:
     """Render the morning data bundle as compact markdown for the prompt."""
     parts: list[str] = [f"### Data as of {b.get('generated_at', '?')} ET\n"]
@@ -748,7 +1062,7 @@ def render_bundle_md(b: dict) -> str:
         for g in gappers[:25]:
             tag = "" if g.get("in_scan_universe", True) else " [off-universe]"
             parts.append(f"- {g['symbol']}{tag}: {g['gap_pct']:+.2f}% (last {g['last']}, prev close {g['prev_close']}) "
-                        f"| {_indicator_suffix(g)}")
+                        f"| {_indicator_suffix(g)}{_context_lines(g)}")
 
     movers = b.get("movers")
     if movers:

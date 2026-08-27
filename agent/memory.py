@@ -249,10 +249,18 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         "by_regime": ledger.stats_by(con, "regime_tag"),
         "by_conviction": ledger.stats_by(con, "conviction"),
         "by_direction": ledger.stats_by(con, "direction"),
-        # indicator layer (specs/INDICATOR_LAYER_SPEC_v1.md §5): does
+        # indicator layer v1 (specs/INDICATOR_LAYER_SPEC_v1.md §5): does
         # participation (RVOL) or VWAP side at fill separate winners from chop?
         "by_rvol_bucket": ledger.stats_by_outcome(con, "rvol_bucket"),
         "by_vwap_side": ledger.stats_by_outcome(con, "vwap_side_at_fill"),
+        # indicator layer v2 (specs/INDICATOR_LAYER_SPEC_v2.md §6): Q9-Q12 dims
+        "by_stop_atr_bucket": ledger.stats_by_outcome(con, "stop_atr_bucket"),
+        "by_gap_atr_bucket": ledger.stats_by_outcome(con, "gap_atr_bucket"),
+        "by_ext_bucket": ledger.stats_by_outcome(con, "ext_bucket"),
+        "by_trend_side_200d": ledger.stats_by_outcome(con, "trend_side_200d"),
+        "by_mcap_bucket": ledger.stats_by_outcome(con, "mcap_bucket"),
+        "by_short_bucket": ledger.stats_by_outcome(con, "short_bucket"),
+        "by_or_alignment": ledger.stats_by_outcome(con, "or_alignment"),
         "lessons": lessons,
         "regimes": ledger.recent_regimes(con, 30),
         # v3: the self-deception closers

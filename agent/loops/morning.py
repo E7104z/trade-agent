@@ -13,9 +13,10 @@ from datetime import date
 from .. import ledger
 from ..config import REPORTS_DIR, Config
 from ..delivery import morning_email_html, render_dashboard, send_email
+from ..indicators import beta_corr
 from ..llm import LLMClient, load_prompt, merge_usage, prompt_version
 from ..memory import build_morning_memory
-from ..providers import MarketData, render_bundle_md
+from ..providers import MarketData, render_bundle_md, yf_history_closes
 from ..regime import compute_regime, regime_md
 from ..util import is_market_day, log, now_et, today_et
 
@@ -74,9 +75,62 @@ def _grounded_ref_prices(md: MarketData, plan: dict, bundle: dict, d: date) -> d
     return refs
 
 
+def _bundle_field(bundle: dict, field: str) -> dict:
+    """Generic extractor for a per-ticker numeric/scalar field carried on
+    premarket_gappers/catalyst_quotes rows (mirrors _reference_prices' merge
+    order: gap-scan/movers before catalyst quotes, first value wins)."""
+    out: dict = {}
+    for g in (bundle.get("premarket_gappers") or []) + (bundle.get("catalyst_quotes") or []):
+        sym, val = g.get("symbol"), g.get(field)
+        if sym and val is not None and str(sym).upper() not in out:
+            out[str(sym).upper()] = val
+    return out
+
+
+def _grounded_atr(md: MarketData, plan: dict, bundle: dict) -> dict[str, float]:
+    """ATR14 per proposed ticker for the noise-stop gate — bundle-sourced
+    first (already computed during enrichment, zero extra cost), then one
+    batched daily_context fetch for whatever the bundle didn't cover (mirrors
+    _grounded_ref_prices' top-up pattern). A fetch failure leaves affected
+    tickers absent, which _validate_plan treats as fail-OPEN (skip the gate,
+    warn) — never fail-closed like price grounding; see spec §3."""
+    atr_map = {k: float(v) for k, v in _bundle_field(bundle, "atr14").items()}
+    proposed = [str(p.get("ticker", "")).upper().strip() for p in (plan.get("picks") or [])]
+    missing = [t for t in dict.fromkeys(proposed) if t and t not in atr_map]
+    if not missing:
+        return atr_map
+    try:
+        ctx = md.daily_context(missing)
+        for t, c in ctx.items():
+            if c.get("atr14"):
+                atr_map[t] = float(c["atr14"])
+    except Exception as e:
+        log("morning", f"WARN ATR fetch failed for noise-stop gate ({e}) — gate skipped (fails open) for affected tickers")
+    return atr_map
+
+
+def _grounded_earnings(md: MarketData, plan: dict, bundle: dict) -> dict[str, int]:
+    """earnings_days_away per proposed ticker for the binary-event gate —
+    same bundle-first, top-up-fetch, fail-open pattern as _grounded_atr."""
+    earn_map = {k: int(v) for k, v in _bundle_field(bundle, "earnings_days_away").items()}
+    proposed = [str(p.get("ticker", "")).upper().strip() for p in (plan.get("picks") or [])]
+    missing = [t for t in dict.fromkeys(proposed) if t and t not in earn_map]
+    if not missing:
+        return earn_map
+    try:
+        for t, v in md.next_earnings(missing).items():
+            if v is not None:
+                earn_map[t] = int(v)
+    except Exception as e:
+        log("morning", f"WARN earnings fetch failed for binary-event gate ({e}) — gate skipped (fails open) for affected tickers")
+    return earn_map
+
+
 def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                    drawdown: dict | None = None,
-                   ref_prices: dict[str, float] | None = None) -> tuple[dict, list[str]]:
+                   ref_prices: dict[str, float] | None = None,
+                   atr_map: dict[str, float] | None = None,
+                   earnings_map: dict[str, int] | None = None) -> tuple[dict, list[str]]:
     """Hard-validate and normalize the risk manager's plan. Returns (plan, warnings).
 
     The playbook's losing-streak rule (>=3 losers: cap 0.5R, demand conviction >= 4)
@@ -132,6 +186,11 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     min_r, max_r = float(cfg.get("min_size_r", 0.25)), float(cfg.get("max_size_r", 1.5))
     max_total = float(cfg.get("max_total_open_risk_r", 3.0))
     losing_streak = bool(streak and streak.get("kind") == "losing" and streak.get("length", 0) >= 3)
+    atr_gate_mode = str(cfg.get("atr_gate", "warn")).lower()
+    earnings_gate_mode = str(cfg.get("earnings_gate", "warn")).lower()
+    min_stop_atr = float(cfg.get("min_stop_atr", 0.35))
+    warn_stop_atr = float(cfg.get("warn_stop_atr", 2.5))
+    warn_target_atr = float(cfg.get("warn_target_atr", 3.5))
 
     dd_pause = float(cfg.get("drawdown_pause_r", -4.0))
     dd_mode = bool(drawdown and drawdown.get("n", 0) >= 5
@@ -205,6 +264,48 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                 f"rather than let it fill as a disguised market order")
             continue
 
+        # NOISE-STOP / WIDE-STOP / FANTASY-TARGET GATE (fails OPEN on missing ATR —
+        # see module docstring's "null asymmetry" note: ATR is not always
+        # fetchable for a real tradable name, and dropping a real trade on
+        # missing metadata is the worse error than skipping the check).
+        atr14 = (atr_map or {}).get(t)
+        if atr14:
+            stop_dist_atr = abs(entry - stop) / atr14
+            target_dist_atr = abs(target - entry) / atr14
+            if stop_dist_atr < min_stop_atr:
+                msg = (f"{t}: stop is {stop_dist_atr:.2f} ATR from entry (min {min_stop_atr}) — "
+                       f"inside daily noise, the thesis cannot be tested at this distance")
+                if atr_gate_mode == "enforce":
+                    warnings.append(msg + " — dropped")
+                    continue
+                warnings.append(f"[ATR GATE warn-only, would drop if enforced] {msg}")
+            elif stop_dist_atr > warn_stop_atr:
+                warnings.append(f"{t}: stop is {stop_dist_atr:.2f} ATR from entry "
+                                f"(> {warn_stop_atr}) — unusual, not necessarily wrong")
+            if target_dist_atr > warn_target_atr and p.get("time_stop"):
+                warnings.append(f"{t}: target is {target_dist_atr:.2f} ATR from entry "
+                                f"(> {warn_target_atr}) with a same-day time_stop — aggressive")
+        else:
+            warnings.append(f"{t}: ATR unavailable — noise-stop/wide-stop checks skipped (unmeasured)")
+
+        # BINARY-EVENT GATE (fails OPEN on missing earnings data, same reasoning).
+        # earnings_days_away == 0 means "reports today" (spec) -- this desk is
+        # intraday-only (every position exits by the 16:00 close), so "today"
+        # IS the entire holding window.
+        earn_days = (earnings_map or {}).get(t)
+        if earn_days is not None:
+            is_earnings_play = "earnings" in str(p.get("setup_type", "")).lower() or \
+                               "earnings" in str(p.get("thesis") or p.get("thesis_final") or "").lower()
+            if earn_days == 0 and not is_earnings_play:
+                msg = (f"{t}: earnings today (not a declared earnings play) — a report can gap "
+                       f"through the stop; the stop is fiction against a binary event")
+                if earnings_gate_mode == "enforce":
+                    warnings.append(msg + " — dropped")
+                    continue
+                warnings.append(f"[EARNINGS GATE warn-only, would drop if enforced] {msg}")
+        else:
+            warnings.append(f"{t}: earnings date unavailable — binary-event check skipped (unmeasured)")
+
         size = p.get("size_r")
         if not isinstance(size, (int, float)):
             size = min_r
@@ -251,6 +352,44 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
         plan["no_trade_reason"] = plan.get("no_trade_reason") or "All picks failed hard validation."
         warnings.append("no valid picks survived validation — converted to no_trade day")
     return plan, warnings
+
+
+def _correlation_matrix_md(tickers: list[str]) -> str:
+    """Pairwise 20d-return correlation + each name's beta to SPY, for the
+    risk manager's kill-check 17 (thematic exposure -> arithmetic, not just
+    narrative). Rendered only when >= 2 distinct candidates. Best-effort: any
+    fetch/compute failure just omits the section — this never blocks the run,
+    and its absence reads to the risk manager as "not computed," not as a
+    certified absence of correlation (it still owns kill-check 12 either way).
+    """
+    uniq = list(dict.fromkeys(t.upper() for t in tickers if t))
+    if len(uniq) < 2:
+        return ""
+    try:
+        closes = yf_history_closes(uniq + ["SPY"], days=40)
+        spy = closes.get("SPY") or []
+        betas = {}
+        for t in uniq:
+            bc = beta_corr(spy, closes.get(t) or [], n=20)
+            if bc:
+                betas[t] = bc[0]
+        pairs = []
+        for i, a in enumerate(uniq):
+            for b in uniq[i + 1:]:
+                bc = beta_corr(closes.get(a) or [], closes.get(b) or [], n=20)
+                if bc and abs(bc[1]) > 0.7:
+                    pairs.append(f"{a}/{b} corr {bc[1]:+.2f}")
+        if not betas and not pairs:
+            return ""
+        lines = ["## CORRELATION / BETA (candidates, 20d daily returns — computed, not a vibe)\n"]
+        if betas:
+            lines.append("- Beta to SPY: " + ", ".join(f"{t} {b:+.2f}" for t, b in betas.items()))
+        lines.append("- Pairs with |corr| > 0.7 (share ONE risk unit, kill-check 17): "
+                     + (", ".join(pairs) if pairs else "none"))
+        return "\n".join(lines)
+    except Exception as e:
+        log("morning", f"WARN correlation matrix failed ({e}) — kill-check 17 section omitted")
+        return ""
 
 
 def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
@@ -337,6 +476,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         n_cand = len(candidates.get("candidates", []))
         log("morning", f"Analyst produced {n_cand} candidates")
 
+        corr_md = "" if cfg.offline else _correlation_matrix_md(
+            [c.get("ticker", "") for c in candidates.get("candidates", [])])
+
         # 6. stage 2: risk manager
         risk_system = load_prompt("morning_risk", {
             "MAX_PICKS": str(cfg.get("max_picks", 4)),
@@ -348,7 +490,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             f"# TODAY: {d.isoformat()}\n\n"
             f"## THE ANALYST'S CANDIDATES\n\n```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
             f"## MARKET DATA\n\n{bundle_md}\n\n"
-            f"## REGIME READ\n\n{reg_md}\n\n"
+            + (f"{corr_md}\n\n" if corr_md else "")
+            + f"## REGIME READ\n\n{reg_md}\n\n"
             f"{mem['text']}\n\n"
             "Run every candidate through the kill checklist and produce the final plan now."
         )
@@ -363,7 +506,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         plan, warnings = _validate_plan(
             plan, cfg, ledger.current_streak(con),
             ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10))),
-            ref_prices=_grounded_ref_prices(md, plan, bundle, d))
+            ref_prices=_grounded_ref_prices(md, plan, bundle, d),
+            atr_map=_grounded_atr(md, plan, bundle),
+            earnings_map=_grounded_earnings(md, plan, bundle))
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = reg.get("tag", "")

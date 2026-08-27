@@ -42,6 +42,11 @@ _DEFAULTS: dict[str, Any] = {
     "min_size_r": 0.25,
     "max_total_open_risk_r": 3.0,
     "max_entry_ref_distance_pct": 15.0,  # entry further than this from last price = ungrounded, dropped
+    "atr_gate": "warn",         # "warn" | "enforce" -- noise-stop gate rollout switch, default warn-only
+    "earnings_gate": "warn",    # "warn" | "enforce" -- binary-event gate rollout switch, default warn-only
+    "min_stop_atr": 0.35,       # stop closer than this many ATRs from entry = inside daily noise
+    "warn_stop_atr": 2.5,       # stop farther than this many ATRs = unusual, warn but pass
+    "warn_target_atr": 3.5,     # target farther than this (with a same-day time_stop) = warn but pass
     "slippage_bps": 5,
     "flatten_at": None,        # e.g. "15:55" -- session-end flatten cutoff, default OFF
     "min_bar_volume": 0,       # thin-bar filter threshold, default OFF (0 = disabled)
@@ -55,6 +60,8 @@ _DEFAULTS: dict[str, Any] = {
         "gap_scan_min_pct": 3.0,
         "edgar_user_agent": "TradeAgent research bot (contact: user@example.com)",
         "indicator_enrich": True,          # premarket VWAP/RVOL on gap-scan + catalyst quotes
+        "context_enrich": True,            # ATR/levels/trend/fundamentals/earnings ticker cards (v2)
+        "or_minutes": 15,                  # opening-range window, minutes
         "gap_scan_price_band": [None, None],  # optional [min, max] last-price hard filter, default OFF
     },
     "memory": {

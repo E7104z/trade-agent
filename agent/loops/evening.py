@@ -32,9 +32,14 @@ Q_CONVICTION = 3
 Q_GAP_SIZE = 4
 Q_SHADOW_FILTER_COST = 5
 Q_STOP_PLACEMENT = 6
-# indicator layer (specs/INDICATOR_LAYER_SPEC_v1.md §5)
+# indicator layer v1 (specs/INDICATOR_LAYER_SPEC_v1.md §5)
 Q_RVOL_SEPARATION = 7      # does participation (RVOL) separate winners from chop?
 Q_VWAP_REVERSAL_EDGE = 8   # VWAP-reclaim longs vs plain dip-buy longs -- same edge?
+# indicator layer v2 (specs/INDICATOR_LAYER_SPEC_v2.md §6)
+Q_STOP_ATR_SWEET_SPOT = 9      # do 1-2 ATR stops out-R sub-0.5 ATR stops?
+Q_BLUE_SKY_VS_OVERHEAD = 10    # gaps near the 52w high vs gaps into the 20d range
+Q_TREND_ALIGNMENT_200D = 11    # longs above vs below the 200d MA (shorts mirrored)
+Q_SHORTEDNESS = 12             # does short%float >= 15 separate squeeze winners from chop?
 
 
 def _pick_for_review(r: dict, picks: list[dict]) -> dict | None:
@@ -274,6 +279,49 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
                 f"crosses={o.get('vwap_crosses')} R={o.get('r_multiple')}")
             counts["q_increments"] += 1
 
+    # Q9 (indicator layer v2): stop distance sweet spot -- every stopped trade
+    # with a non-null stop_dist_atr (the ATR-normalized denominator makes this
+    # comparable across tickers, unlike the earlier Q6 raw stop-placement question).
+    for p in picks:
+        o = by_id.get(p["pick_id"], {})
+        if o.get("exit_reason") == "stop" and o.get("stop_dist_atr") is not None:
+            ledger.add_question_progress(
+                con, Q_STOP_ATR_SWEET_SPOT, d, 1,
+                f"{p['ticker']} stop_dist_atr={o['stop_dist_atr']:.2f} R={o.get('r_multiple')}")
+            counts["q_increments"] += 1
+
+    # Q10: blue-sky (gap near the 52w high) vs overhead-supply (gap into the
+    # 20d range) -- one increment per triggered gap/breakout-class pick.
+    for p in picks:
+        o = by_id.get(p["pick_id"], {})
+        if o.get("triggered") and p.get("setup_type") in ("gap_go", "gap_fade", "breakout"):
+            ledger.add_question_progress(
+                con, Q_BLUE_SKY_VS_OVERHEAD, d, 1,
+                f"{p['ticker']} setup={p.get('setup_type')} R={o.get('r_multiple')}")
+            counts["q_increments"] += 1
+
+    # Q11: trend alignment (the 200d question) -- every triggered pick with a
+    # non-null trend_side_200d.
+    for p in picks:
+        o = by_id.get(p["pick_id"], {})
+        if o.get("triggered") and o.get("trend_side_200d") is not None:
+            ledger.add_question_progress(
+                con, Q_TREND_ALIGNMENT_200D, d, 1,
+                f"{p['ticker']} {p.get('direction')} trend_side_200d={o['trend_side_200d']} "
+                f"R={o.get('r_multiple')}")
+            counts["q_increments"] += 1
+
+    # Q12: shortedness -- every triggered squeeze/momentum pick with a
+    # non-null short_pct_float.
+    for p in picks:
+        o = by_id.get(p["pick_id"], {})
+        if (o.get("triggered") and o.get("short_pct_float") is not None
+                and p.get("setup_type") in ("short_squeeze", "catalyst_momentum")):
+            ledger.add_question_progress(
+                con, Q_SHORTEDNESS, d, 1,
+                f"{p['ticker']} short_pct_float={o['short_pct_float']} R={o.get('r_multiple')}")
+            counts["q_increments"] += 1
+
     counts["q_increments"] += _q1_gap_fade_mechanics(con, md, d, picks, outcomes, shadow,
                                                      slippage_bps=slippage_bps)
     return counts
@@ -307,14 +355,47 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         if picks:
             log("evening", f"Simulating outcomes for {len(picks)} picks against intraday bars "
                            f"(slippage {slippage:.0f} bps/side)...")
+            tickers = [p["ticker"] for p in picks]
             try:
-                adv20_map = md.adv20([p["ticker"] for p in picks])
+                adv20_map = md.adv20(tickers)
             except Exception as e:
                 log("evening", f"WARN adv20 fetch failed ({e}) — RVOL fields will be null tonight")
                 adv20_map = {}
+            # indicator layer v2 (ATR/levels/context): one widened daily_context
+            # fetch + one fundamentals fetch for tonight's tickers, plus each
+            # ticker's prior-session close for gap-relative fields. Any failure
+            # here degrades those fields to null for the run, never crashes it
+            # (grade_day/simulate_pick already treat every one of these as
+            # optional grader-input context, not something that can fail a grade).
+            atr_map: dict[str, float] = {}
+            trend_map: dict[str, dict] = {}
+            fundamentals_map: dict[str, dict] = {}
+            prev_close_map: dict[str, float] = {}
+            try:
+                ctx = md.daily_context(tickers)
+                atr_map = {t: c["atr14"] for t, c in ctx.items() if c.get("atr14")}
+                trend_map = {t: c["trend_snapshot"] for t, c in ctx.items() if c.get("trend_snapshot")}
+            except Exception as e:
+                log("evening", f"WARN daily_context fetch failed ({e}) — ATR/trend fields null tonight")
+            # prev_close keyed to the GRADED date d (not "now"), same idiom as
+            # the Q4 gap-bucket lookup below — daily_context's own "today" cutoff
+            # tracks wall-clock now, which is wrong for a regrade of a past date.
+            for t in tickers:
+                try:
+                    prev = md.daily_bar(t, prev_market_day(d))
+                    if prev and prev.get("close"):
+                        prev_close_map[t] = prev["close"]
+                except Exception:
+                    pass
+            try:
+                fundamentals_map = md.fundamentals(tickers)
+            except Exception as e:
+                log("evening", f"WARN fundamentals fetch failed ({e}) — short/float/mcap fields null tonight")
             outcomes = grade_day(md, picks, d, slippage_bps=slippage,
                                  flatten_at=flatten_at, min_bar_volume=min_bar_volume,
-                                 adv20_map=adv20_map)
+                                 adv20_map=adv20_map, atr_map=atr_map, trend_map=trend_map,
+                                 fundamentals_map=fundamentals_map, prev_close_map=prev_close_map,
+                                 or_minutes=int(cfg.data_cfg.get("or_minutes", 15)))
             for o in outcomes:
                 ledger.save_outcome(con, o)
         else:

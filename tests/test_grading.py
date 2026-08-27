@@ -695,6 +695,144 @@ def test_grade_day_passes_per_ticker_adv20_into_simulate_pick():
     assert outcomes[0]["rvol_at_1000"] == pytest.approx(1.0)
 
 
+# -------------------------------------------------- indicator layer v2 (ATR/levels)
+
+def test_v2_fields_default_to_none_shape():
+    pick = _pick(entry_type="open")
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    out = simulate_pick(pick, bars, None)
+    # or15_high/or15_low/fill_vs_or/mae_before_mfe ARE computable from even a
+    # single bar (a degenerate 1-bar opening range, and the pick triggers) --
+    # checked separately below, not part of this "nothing supplied" check.
+    # time_to_mfe_min stays None here because this bar carries no timestamp.
+    for key in ("atr14", "stop_dist_atr", "target_dist_atr", "gap_atr",
+                "or_break_dir", "time_to_mfe_min", "gap_fill_frac_close",
+                "trend_side_200d", "ext_atr_at_entry", "short_pct_float"):
+        assert key in out and out[key] is None
+
+
+def test_stop_and_target_dist_atr_computed_from_planned_levels():
+    # entry 100, stop 98 (risk 2), target 106 (risk-to-target 6); atr14=2.0
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=106.0)
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    out = simulate_pick(pick, bars, None, atr14=2.0)
+    assert out["atr14"] == 2.0
+    assert out["stop_dist_atr"] == pytest.approx(1.0)
+    assert out["target_dist_atr"] == pytest.approx(3.0)
+
+
+def test_gap_atr_and_gap_fill_frac_computed_from_prev_close():
+    # prev_close 95, day open 100 -> gap = 5; atr14 = 2.5 -> gap_atr = 2.0
+    daily = {"open": 100.0, "high": 101.0, "low": 99.0, "close": 97.5, "volume": 1000}
+    bars = _flat_bars(9, 30, 5, 100.0, 100.5, 99.5, 97.5)
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=110.0)
+    out = simulate_pick(pick, bars, daily, atr14=2.5, prev_close=95.0)
+    assert out["gap_atr"] == pytest.approx(2.0)
+    # gap=5, close checkpoint price=97.5 -> retraced (100-97.5)/5 = 0.5
+    assert out["gap_fill_frac_close"] == pytest.approx(0.5)
+
+
+def test_trend_and_fundamentals_stamped_from_caller_inputs():
+    pick = _pick(entry_type="open")
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    trend = {"above_ma200": True, "ext_atr": 1.8}
+    fund = {"short_pct_float": 18.0, "float_shares": 41_000_000.0, "mkt_cap": 2.4e12}
+    out = simulate_pick(pick, bars, None, trend_snapshot=trend, fundamentals=fund)
+    assert out["trend_side_200d"] == "above"
+    assert out["ext_atr_at_entry"] == pytest.approx(1.8)
+    assert out["short_pct_float"] == 18.0
+    assert out["float_shares"] == 41_000_000.0
+    assert out["mkt_cap"] == 2.4e12
+
+
+def test_trend_side_below_and_none():
+    pick = _pick(entry_type="open")
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    out_below = simulate_pick(pick, bars, None, trend_snapshot={"above_ma200": False})
+    assert out_below["trend_side_200d"] == "below"
+    out_none = simulate_pick(pick, bars, None, trend_snapshot={"above_ma200": None})
+    assert out_none["trend_side_200d"] is None
+
+
+def test_opening_range_and_fill_vs_or_above():
+    # 15-bar OR at 100-101, then a breakout fill above it
+    or_bars = _flat_bars(9, 30, 15, 100.0, 101.0, 100.0, 100.5)
+    fill_bar = [_tbar(9, 45, 101.5, 103.0, 101.4, 102.8)]
+    bars = or_bars + fill_bar
+    pick = _pick(entry_type="breakout", entry=102.0, stop=99.0, target=110.0)
+    out = simulate_pick(pick, bars, None, or_minutes=15)
+    assert out["or15_high"] == 101.0
+    assert out["or15_low"] == 100.0
+    assert out["triggered"] is True
+    assert out["fill_vs_or"] == "above"
+
+
+def test_mae_before_mfe_true_when_worst_prints_first():
+    # dips to a low first, then rallies to the high -- worst before best
+    pick = _pick(entry_type="open", entry=100.0, stop=90.0, target=120.0)
+    bars = [
+        _tbar(9, 30, 100.0, 100.2, 99.8, 100.0),
+        _tbar(9, 31, 99.9, 100.0, 95.0, 96.0),    # worst print (MAE) here
+        _tbar(9, 32, 96.5, 115.0, 96.0, 114.0),   # best print (MFE) here
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["mae_before_mfe"] is True
+    assert out["time_to_mfe_min"] == pytest.approx(2.0)
+
+
+def test_mae_before_mfe_false_when_best_prints_first():
+    pick = _pick(entry_type="open", entry=100.0, stop=90.0, target=120.0)
+    bars = [
+        _tbar(9, 30, 100.0, 100.2, 99.8, 100.0),
+        _tbar(9, 31, 100.1, 115.0, 100.0, 114.0),  # best print (MFE) here
+        _tbar(9, 32, 113.0, 113.5, 95.0, 96.0),    # worst print (MAE) here
+    ]
+    out = simulate_pick(pick, bars, None)
+    assert out["mae_before_mfe"] is False
+
+
+def test_grade_day_passes_v2_maps_through_to_simulate_pick():
+    class StubMD:
+        def minute_bars(self, ticker, d):
+            return [_bar(100.0, 100.5, 99.5, 100.2)]
+
+        def daily_bar(self, ticker, d):
+            return {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.2, "volume": 1000}
+
+    picks = [_pick(ticker="MARA", entry_type="open", pick_id=1)]
+    outcomes = grade_day(
+        StubMD(), picks, date(2026, 1, 2),
+        atr_map={"MARA": 2.0},
+        trend_map={"MARA": {"above_ma200": True, "ext_atr": 1.5}},
+        fundamentals_map={"MARA": {"short_pct_float": 20.0}},
+        prev_close_map={"MARA": 95.0},
+    )
+    assert outcomes[0]["atr14"] == 2.0
+    assert outcomes[0]["trend_side_200d"] == "above"
+    assert outcomes[0]["short_pct_float"] == 20.0
+    assert outcomes[0]["gap_atr"] == pytest.approx(2.5)  # |100-95|/2.0
+
+
+def test_outcomes_md_renders_v2_context_line():
+    picks = [{
+        "pick_id": 10, "ticker": "NVDA", "direction": "long", "setup_type": "gap_go",
+        "entry_type": "open", "entry_price": 100.0, "stop_price": 98.0,
+        "target_price": 106.0, "size_r": 1.0, "conviction": 4,
+        "time_stop": None, "thesis": "t", "invalidation": "i",
+    }]
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    outcomes = [simulate_pick(picks[0], bars, None, atr14=2.0,
+                              trend_snapshot={"above_ma200": True, "ext_atr": 1.8},
+                              fundamentals={"short_pct_float": 18.0, "mkt_cap": 2.4e12})]
+    outcomes[0]["eval_date"] = None
+    md_text = outcomes_md(picks, outcomes)
+    assert "Context (mechanically computed" in md_text
+    assert "ATR" in md_text
+    assert "above 200d MA" in md_text
+    assert "short 18% of float" in md_text
+    assert "mcap $2.4T" in md_text
+
+
 def test_outcomes_md_renders_indicator_line_for_triggered_pick():
     picks = [{
         "pick_id": 9, "ticker": "AAPL", "direction": "long", "setup_type": "gap_go",

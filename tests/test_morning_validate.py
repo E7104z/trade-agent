@@ -157,11 +157,15 @@ def test_dks_regression_web_search_sourced_hallucinated_entry_is_dropped():
 def test_fetched_quote_with_close_entry_survives():
     # No false positives: same web-search-sourced situation, but the entry is
     # legitimately near the live-fetched quote — must pass through untouched.
+    # (No atr_map/earnings_map supplied here, so the ATR/earnings gates fail
+    # OPEN with an "unmeasured" warning — that's the documented null-asymmetry
+    # behavior, not a grounding false positive; only grounding/mistype wording
+    # is asserted absent.)
     plan = _plan([_pick(ticker="DKS", direction="short", entry_type="limit",
                         entry=130.0, stop=133.0, target=122.0)])
     out, warnings = _validate_plan(plan, _cfg(), ref_prices={"DKS": 128.03})
     assert len(out["picks"]) == 1
-    assert not any("DKS" in w for w in warnings)
+    assert not any("ungrounded" in w or "reads as" in w for w in warnings)
 
 
 def test_grounded_ref_prices_fetches_only_missing_pick_tickers():
@@ -269,6 +273,160 @@ def test_pick_quotes_batches_filters_and_returns_only_real_quotes():
                             date(2026, 8, 25))
     assert md.alpaca.asked == ["DKS", "BAD", "GONE"]
     assert quotes == {"DKS": 128.03}
+
+
+# --------------------------------------------------- indicator layer v2 gates
+
+def test_noise_stop_dropped_in_enforce_mode():
+    # stop 0.3 ATR from entry (ATR=1.0) is inside daily noise -- min_stop_atr default 0.35
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=99.7, target=104.0)])
+    out, warnings = _validate_plan(plan, _cfg(atr_gate="enforce"), ref_prices={"MARA": 100.0},
+                                   atr_map={"MARA": 1.0})
+    assert out["picks"] == []
+    assert any("inside daily noise" in w and "dropped" in w for w in warnings)
+
+
+def test_noise_stop_survives_at_half_atr():
+    # stop 0.5 ATR from entry clears the 0.35 floor
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=99.5, target=104.0)])
+    out, warnings = _validate_plan(plan, _cfg(atr_gate="enforce"), ref_prices={"MARA": 100.0},
+                                   atr_map={"MARA": 1.0})
+    assert len(out["picks"]) == 1
+    assert not any("inside daily noise" in w for w in warnings)
+
+
+def test_noise_stop_warn_mode_never_drops():
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=99.7, target=104.0)])
+    out, warnings = _validate_plan(plan, _cfg(atr_gate="warn"), ref_prices={"MARA": 100.0},
+                                   atr_map={"MARA": 1.0})
+    assert len(out["picks"]) == 1
+    assert any("warn-only" in w and "inside daily noise" in w for w in warnings)
+
+
+def test_wide_stop_warns_but_passes():
+    # 3 ATR stop (ATR=1.0) exceeds warn_stop_atr default 2.5 -- warns, doesn't drop
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=97.0, target=110.0)])
+    out, warnings = _validate_plan(plan, _cfg(), ref_prices={"MARA": 100.0}, atr_map={"MARA": 1.0})
+    assert len(out["picks"]) == 1
+    assert any("unusual" in w for w in warnings)
+
+
+def test_atr_unavailable_skips_check_with_unmeasured_warning():
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=99.7, target=104.0)])
+    out, warnings = _validate_plan(plan, _cfg(atr_gate="enforce"), ref_prices={"MARA": 100.0},
+                                   atr_map={})
+    assert len(out["picks"]) == 1  # fails OPEN -- not dropped
+    assert any("ATR unavailable" in w and "unmeasured" in w for w in warnings)
+
+
+def test_earnings_today_dropped_in_enforce_mode_when_not_declared():
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)])
+    out, warnings = _validate_plan(plan, _cfg(earnings_gate="enforce"), ref_prices={"MARA": 100.0},
+                                   earnings_map={"MARA": 0})
+    assert out["picks"] == []
+    assert any("earnings today" in w and "dropped" in w for w in warnings)
+
+
+def test_earnings_today_survives_as_declared_earnings_play():
+    picks = [_pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)]
+    picks[0]["setup_type"] = "earnings_drift"
+    plan = _plan(picks)
+    out, warnings = _validate_plan(plan, _cfg(earnings_gate="enforce"), ref_prices={"MARA": 100.0},
+                                   earnings_map={"MARA": 0})
+    assert len(out["picks"]) == 1
+    assert not any("earnings today" in w and "dropped" in w for w in warnings)
+
+
+def test_earnings_next_week_does_not_trigger_gate():
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)])
+    out, warnings = _validate_plan(plan, _cfg(earnings_gate="enforce"), ref_prices={"MARA": 100.0},
+                                   earnings_map={"MARA": 5})
+    assert len(out["picks"]) == 1
+    assert not any("earnings today" in w for w in warnings)
+
+
+def test_earnings_gate_warn_mode_never_drops():
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)])
+    out, warnings = _validate_plan(plan, _cfg(earnings_gate="warn"), ref_prices={"MARA": 100.0},
+                                   earnings_map={"MARA": 0})
+    assert len(out["picks"]) == 1
+    assert any("warn-only" in w and "earnings today" in w for w in warnings)
+
+
+def test_earnings_unavailable_skips_check_with_unmeasured_warning():
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)])
+    out, warnings = _validate_plan(plan, _cfg(earnings_gate="enforce"), ref_prices={"MARA": 100.0},
+                                   earnings_map={})
+    assert len(out["picks"]) == 1
+    assert any("earnings date unavailable" in w and "unmeasured" in w for w in warnings)
+
+
+def test_grounded_atr_uses_bundle_first_then_fetches_missing():
+    class StubMD:
+        def daily_context(self, symbols):
+            self.asked = list(symbols)
+            return {"DKS": {"atr14": 3.5}}
+
+    md = StubMD()
+    bundle = {"premarket_gappers": [{"symbol": "MARA", "atr14": 1.0}]}
+    plan = _plan([_pick(ticker="MARA"), _pick(ticker="DKS", direction="short",
+                        entry=130.0, stop=133.0, target=122.0)])
+    from agent.loops.morning import _grounded_atr
+    atr_map = _grounded_atr(md, plan, bundle)
+    assert md.asked == ["DKS"]
+    assert atr_map == {"MARA": 1.0, "DKS": 3.5}
+
+
+def test_grounded_atr_fetch_failure_fails_open_not_closed():
+    class ExplodingMD:
+        def daily_context(self, symbols):
+            raise RuntimeError("alpaca down")
+
+    from agent.loops.morning import _grounded_atr
+    plan = _plan([_pick(ticker="DKS", direction="short", entry=130.0, stop=133.0, target=122.0)])
+    atr_map = _grounded_atr(ExplodingMD(), plan, {})
+    assert atr_map == {}
+    out, warnings = _validate_plan(plan, _cfg(atr_gate="enforce"), ref_prices={"DKS": 128.03},
+                                   atr_map=atr_map)
+    assert len(out["picks"]) == 1  # fails open: gate skipped, pick survives
+    assert any("ATR unavailable" in w for w in warnings)
+
+
+def test_grounded_earnings_uses_bundle_first_then_fetches_missing():
+    class StubMD:
+        def next_earnings(self, symbols):
+            self.asked = list(symbols)
+            return {"DKS": 0}
+
+    md = StubMD()
+    bundle = {"premarket_gappers": [{"symbol": "MARA", "earnings_days_away": 12}]}
+    plan = _plan([_pick(ticker="MARA"), _pick(ticker="DKS", direction="short",
+                        entry=130.0, stop=133.0, target=122.0)])
+    from agent.loops.morning import _grounded_earnings
+    earn_map = _grounded_earnings(md, plan, bundle)
+    assert md.asked == ["DKS"]
+    assert earn_map == {"MARA": 12, "DKS": 0}
+
+
+def test_correlation_matrix_md_empty_below_two_tickers():
+    from agent.loops.morning import _correlation_matrix_md
+    assert _correlation_matrix_md([]) == ""
+    assert _correlation_matrix_md(["MARA"]) == ""
+
+
+def test_correlation_matrix_md_swallows_fetch_failure():
+    import agent.loops.morning as morning_mod
+    from agent.loops.morning import _correlation_matrix_md
+
+    def _boom(*a, **k):
+        raise RuntimeError("network down")
+
+    orig = morning_mod.yf_history_closes
+    morning_mod.yf_history_closes = _boom
+    try:
+        assert _correlation_matrix_md(["MARA", "DKS"]) == ""
+    finally:
+        morning_mod.yf_history_closes = orig
 
 
 def test_pick_quotes_without_alpaca_returns_nothing():

@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from .config import DB_PATH, ensure_dirs
@@ -197,6 +197,22 @@ CREATE TABLE IF NOT EXISTS lesson_confirmations (
     lesson_id     INTEGER,
     session_date  DATE
 );
+
+-- ------------------------------------------------- indicator layer v2 (ATR/levels/context)
+
+-- Fundamentals move slowly; short interest is exchange-reported roughly
+-- biweekly. Cached with a session-based TTL (see cached_fundamentals) so the
+-- morning bundle doesn't re-fetch yfinance for every gap-scan ticker every
+-- day. short_asof is ALWAYS stored alongside short_pct_float -- stale-and-
+-- labeled beats fresh-looking fiction (spec: agent/providers.py fundamentals()).
+CREATE TABLE IF NOT EXISTS fundamentals (
+    symbol          VARCHAR PRIMARY KEY,
+    mkt_cap         DOUBLE,
+    float_shares    DOUBLE,
+    short_pct_float DOUBLE,
+    short_asof      VARCHAR,
+    fetched_date    DATE
+);
 """
 
 # Idempotent upgrades for databases created before these columns existed
@@ -244,6 +260,29 @@ _MIGRATIONS = [
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS rvol_at_1200 DOUBLE",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS rvol_close DOUBLE",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS ema9_5m_loss_et TIMESTAMP",
+    # Indicator layer v2 (ATR/levels/context) — agent/grading.py computes these
+    # deterministically at grading time from daily_context/fundamentals passed
+    # in by agent/loops/evening.py. Never gates fills or changes R math; grader
+    # INPUT and miner FUEL only.
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS atr14 DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS stop_dist_atr DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS target_dist_atr DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS gap_atr DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS or15_high DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS or15_low DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS or_break_dir VARCHAR",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS or_break_et TIMESTAMP",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS fill_vs_or VARCHAR",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS mae_before_mfe BOOLEAN",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS time_to_mfe_min DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS gap_fill_frac_1000 DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS gap_fill_frac_1200 DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS gap_fill_frac_close DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS trend_side_200d VARCHAR",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS ext_atr_at_entry DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS short_pct_float DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS float_shares DOUBLE",
+    "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS mkt_cap DOUBLE",
 ]
 
 
@@ -383,8 +422,14 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             first_vwap_reclaim_et, first_vwap_reject_et, vwap_crosses,
             pct_time_above_vwap, rvol_at_1000, rvol_at_1200, rvol_close,
             ema9_5m_loss_et,
+            atr14, stop_dist_atr, target_dist_atr, gap_atr,
+            or15_high, or15_low, or_break_dir, or_break_et, fill_vs_or,
+            mae_before_mfe, time_to_mfe_min,
+            gap_fill_frac_1000, gap_fill_frac_1200, gap_fill_frac_close,
+            trend_side_200d, ext_atr_at_entry, short_pct_float, float_shares, mkt_cap,
             grade, grade_notes, graded_at, sim_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
@@ -396,6 +441,12 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             o.get("first_vwap_reclaim_et"), o.get("first_vwap_reject_et"), o.get("vwap_crosses"),
             o.get("pct_time_above_vwap"), o.get("rvol_at_1000"), o.get("rvol_at_1200"), o.get("rvol_close"),
             o.get("ema9_5m_loss_et"),
+            o.get("atr14"), o.get("stop_dist_atr"), o.get("target_dist_atr"), o.get("gap_atr"),
+            o.get("or15_high"), o.get("or15_low"), o.get("or_break_dir"), o.get("or_break_et"),
+            o.get("fill_vs_or"), o.get("mae_before_mfe"), o.get("time_to_mfe_min"),
+            o.get("gap_fill_frac_1000"), o.get("gap_fill_frac_1200"), o.get("gap_fill_frac_close"),
+            o.get("trend_side_200d"), o.get("ext_atr_at_entry"), o.get("short_pct_float"),
+            o.get("float_shares"), o.get("mkt_cap"),
             o.get("grade"), o.get("grade_notes"),
             o.get("graded_at", datetime.now()), sim_version,
         ],
@@ -559,6 +610,55 @@ def lesson_holdout_stats(con: duckdb.DuckDBPyConnection, lesson_id: int,
     }
 
 
+# ------------------------------------------------- indicator layer v2: fundamentals cache
+
+def _session_cutoff(con: duckdb.DuckDBPyConnection, n: int) -> date:
+    """The oldest `fetched_date` still considered fresh: the date of the Nth
+    most recent distinct plan_date. Falls back to a conservative calendar
+    estimate (2 calendar days per session) when there isn't yet n sessions of
+    history — a cold ledger must not treat everything as infinitely fresh."""
+    dates = [r[0] for r in con.execute(
+        "SELECT DISTINCT plan_date FROM daily_plans ORDER BY plan_date DESC LIMIT ?", [n]
+    ).fetchall()]
+    if len(dates) == n:
+        return min(dates)
+    return date.today() - timedelta(days=n * 2)
+
+
+def cached_fundamentals(con: duckdb.DuckDBPyConnection, symbols: list[str],
+                        max_age_sessions: int = 3) -> dict[str, dict]:
+    """Fundamentals rows fetched within the last `max_age_sessions` trading
+    sessions. Stale or never-fetched symbols are simply absent from the
+    result -- callers (agent/providers.py fundamentals()) re-fetch those."""
+    if not symbols:
+        return {}
+    cutoff = _session_cutoff(con, max_age_sessions)
+    placeholders = ",".join("?" for _ in symbols)
+    rows = con.execute(
+        f"SELECT symbol, mkt_cap, float_shares, short_pct_float, short_asof, fetched_date "
+        f"FROM fundamentals WHERE symbol IN ({placeholders})", symbols
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for sym, mkt_cap, float_shares, short_pct, short_asof, fetched in rows:
+        if fetched is not None and fetched >= cutoff:
+            out[sym] = {"mkt_cap": mkt_cap, "float_shares": float_shares,
+                       "short_pct_float": short_pct, "short_asof": short_asof}
+    return out
+
+
+def save_fundamentals(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> None:
+    """Upsert freshly-fetched fundamentals rows, stamped with today's date."""
+    today = date.today()
+    for r in rows:
+        con.execute("DELETE FROM fundamentals WHERE symbol = ?", [r["symbol"]])
+        con.execute(
+            "INSERT INTO fundamentals (symbol, mkt_cap, float_shares, short_pct_float, "
+            "short_asof, fetched_date) VALUES (?,?,?,?,?,?)",
+            [r["symbol"], r.get("mkt_cap"), r.get("float_shares"), r.get("short_pct_float"),
+             r.get("short_asof"), today],
+        )
+
+
 # --------------------------------------------------------------------- regime
 
 def save_regime(con: duckdb.DuckDBPyConnection, r: dict) -> None:
@@ -662,7 +762,12 @@ def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
 # on OUTCOMES (computed at grading time), not on picks, so they can't go
 # through stats_by's p.{dim} lookup. rvol_bucket buckets rvol_at_1000 (the
 # morning-relevant checkpoint) into <1x / 1-2x / >2x of ADV20.
-OUTCOME_STATS_DIMENSIONS: frozenset[str] = frozenset({"rvol_bucket", "vwap_side_at_fill"})
+OUTCOME_STATS_DIMENSIONS: frozenset[str] = frozenset({
+    "rvol_bucket", "vwap_side_at_fill",
+    # indicator layer v2 (specs/INDICATOR_LAYER_SPEC_v2.md §6)
+    "stop_atr_bucket", "gap_atr_bucket", "ext_bucket", "trend_side_200d",
+    "mcap_bucket", "short_bucket", "or_alignment",
+})
 
 _OUTCOME_DIM_EXPR = {
     "rvol_bucket": (
@@ -671,6 +776,45 @@ _OUTCOME_DIM_EXPR = {
         "WHEN o.rvol_at_1000 < 2 THEN '1-2x' ELSE '>2x' END"
     ),
     "vwap_side_at_fill": "COALESCE(o.vwap_side_at_fill, '?')",
+    # Q9: stop distance sweet spot
+    "stop_atr_bucket": (
+        "CASE WHEN o.stop_dist_atr IS NULL THEN '?' "
+        "WHEN o.stop_dist_atr < 0.5 THEN '<0.5' "
+        "WHEN o.stop_dist_atr < 1 THEN '0.5-1' "
+        "WHEN o.stop_dist_atr < 2 THEN '1-2' ELSE '>2' END"
+    ),
+    # Q10: blue-sky (small gap/ATR) vs overhead-supply (large gap/ATR)
+    "gap_atr_bucket": (
+        "CASE WHEN o.gap_atr IS NULL THEN '?' "
+        "WHEN o.gap_atr < 1 THEN '<1' "
+        "WHEN o.gap_atr < 2 THEN '1-2' ELSE '>2' END"
+    ),
+    "ext_bucket": (
+        "CASE WHEN o.ext_atr_at_entry IS NULL THEN '?' "
+        "WHEN o.ext_atr_at_entry < -2 THEN '<-2' "
+        "WHEN o.ext_atr_at_entry <= 2 THEN '-2..+2' ELSE '>+2' END"
+    ),
+    # Q11: trend alignment (the 200d question)
+    "trend_side_200d": "COALESCE(o.trend_side_200d, '?')",
+    "mcap_bucket": (
+        "CASE WHEN o.mkt_cap IS NULL THEN '?' "
+        "WHEN o.mkt_cap < 2e9 THEN '<2B' "
+        "WHEN o.mkt_cap < 10e9 THEN '2-10B' ELSE '>10B' END"
+    ),
+    # Q12: shortedness
+    "short_bucket": (
+        "CASE WHEN o.short_pct_float IS NULL THEN '?' "
+        "WHEN o.short_pct_float < 5 THEN '<5%' "
+        "WHEN o.short_pct_float < 15 THEN '5-15%' ELSE '>15%' END"
+    ),
+    "or_alignment": (
+        "CASE WHEN o.or_break_dir IS NULL OR o.fill_vs_or IS NULL THEN '?' "
+        "WHEN (p.direction='long' AND o.or_break_dir='up') "
+        "  OR (p.direction='short' AND o.or_break_dir='down') THEN 'with' "
+        "WHEN (p.direction='long' AND o.or_break_dir='down') "
+        "  OR (p.direction='short' AND o.or_break_dir='up') THEN 'against' "
+        "ELSE '?' END"
+    ),
 }
 
 

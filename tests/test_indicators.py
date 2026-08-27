@@ -10,9 +10,15 @@ from datetime import datetime
 import pytest
 
 from agent.indicators import (
+    atr,
+    beta_corr,
+    daily_levels,
     ema_loss_time,
     ema_series,
+    opening_range,
+    premarket_levels,
     rvol_simple,
+    trend_snapshot,
     vwap_distance,
     vwap_events,
     vwap_series,
@@ -179,3 +185,156 @@ def test_ema_loss_time_skips_bars_with_no_ema_value_yet():
     ]
     ema = [None, 10.0]
     assert ema_loss_time(bars, ema, "long") is None
+
+
+# ---------------------------------------------------------------------- ATR
+
+def _dbar(h, l, c):
+    return {"h": h, "l": l, "c": c}
+
+
+def test_atr_hand_computed_wilder_three_bars():
+    # bar0->bar1 TR = max(12-9, |12-9|, |9-9|) = 3
+    # bar1->bar2 TR = max(13-11, |13-11|, |11-11|) = 2
+    # period=2 needs 3 bars; seed = avg(3, 2) = 2.5, no remaining TRs to smooth
+    bars = [_dbar(10, 8, 9), _dbar(12, 9, 11), _dbar(13, 11, 12)]
+    assert atr(bars, period=2) == pytest.approx(2.5)
+
+
+def test_atr_insufficient_data_is_none():
+    bars = [_dbar(10, 8, 9), _dbar(12, 9, 11)]
+    assert atr(bars, period=14) is None
+
+
+def test_atr_empty_input_is_none():
+    assert atr([], period=14) is None
+
+
+# ------------------------------------------------------------------ daily_levels
+
+def test_daily_levels_ten_day_tape_hand_computed():
+    # 10 COMPLETED sessions (caller already excluded any partial current day).
+    # Highs/lows chosen distinctly per day so windowed max/min are unambiguous.
+    bars = [_dbar(10 + i, 5 + i, 8 + i) for i in range(10)]  # day0..day9
+    lv = daily_levels(bars)
+    last = bars[-1]  # day9: h=19, l=14, c=17
+    assert lv["pdh"] == last["h"] == 19
+    assert lv["pdl"] == last["l"] == 14
+    assert lv["pdc"] == last["c"] == 17
+    # last 5 days: day5..day9 -> h in [15..19], l in [10..14]
+    assert lv["hi_5d"] == 19
+    assert lv["lo_5d"] == 10
+    # only 10 bars available -> 20d/52w windows stay None, not a short-window guess
+    assert lv["hi_20d"] is None and lv["lo_20d"] is None
+    assert lv["hi_52w"] is None and lv["lo_52w"] is None
+
+
+def test_daily_levels_empty_input_all_none():
+    lv = daily_levels([])
+    assert all(v is None for v in lv.values())
+
+
+# -------------------------------------------------------------- premarket_levels
+
+def test_premarket_levels_hand_computed():
+    bars = [_dbar(10.5, 9.5, 10.0), _dbar(11.0, 9.8, 10.5)]
+    lv = premarket_levels(bars)
+    assert lv == {"pm_high": 11.0, "pm_low": 9.5}
+
+
+def test_premarket_levels_empty_input():
+    assert premarket_levels([]) == {"pm_high": None, "pm_low": None}
+
+
+# -------------------------------------------------------------- trend_snapshot
+
+def test_trend_snapshot_hand_computed():
+    closes = [float(i) for i in range(1, 226)]  # 1.0 .. 225.0
+    snap = trend_snapshot(closes, atr_val=5.0)
+    # ma20 = avg(206..225) = 215.5, ma50 = avg(176..225) = 200.5,
+    # ma200 = avg(26..225) = 125.5 -- last (225.0) is above all three.
+    assert snap["above_ma20"] is True
+    assert snap["above_ma50"] is True
+    assert snap["above_ma200"] is True
+    # ma20 5 sessions ago = avg(201..220) = 210.5 -> slope = (215.5-210.5)/210.5*100
+    assert snap["ma20_slope_pct"] == pytest.approx((215.5 - 210.5) / 210.5 * 100, abs=1e-6)
+    # ext_atr = (225.0 - 215.5) / 5.0 = 1.9
+    assert snap["ext_atr"] == pytest.approx(1.9)
+
+
+def test_trend_snapshot_insufficient_data_is_null_shape():
+    snap = trend_snapshot([100.0, 101.0], atr_val=5.0)
+    assert snap == {"above_ma20": None, "above_ma50": None, "above_ma200": None,
+                    "ma20_slope_pct": None, "ext_atr": None}
+
+
+def test_trend_snapshot_empty_input():
+    snap = trend_snapshot([], atr_val=5.0)
+    assert snap["above_ma20"] is None
+
+
+def test_trend_snapshot_no_atr_leaves_ext_atr_none():
+    closes = [float(i) for i in range(1, 226)]
+    snap = trend_snapshot(closes, atr_val=None)
+    assert snap["above_ma20"] is True
+    assert snap["ext_atr"] is None
+
+
+# -------------------------------------------------------------- opening_range
+
+def test_opening_range_close_through_break_up():
+    or_bars = [_bar(10.0, 9.0, 9.5, 100) for _ in range(15)]  # or_high=10.0, or_low=9.0
+    post = [_tbar(9, 45, h=10.2, l=9.6, c=10.5, v=100)]       # closes above range -> break up
+    orr = opening_range(or_bars + post, minutes=15)
+    assert orr["or_high"] == 10.0
+    assert orr["or_low"] == 9.0
+    assert orr["break_dir"] == "up"
+    assert orr["break_et"] == post[0]["t"]
+
+
+def test_opening_range_wick_touch_is_not_a_break():
+    or_bars = [_bar(10.0, 9.0, 9.5, 100) for _ in range(15)]
+    # high pokes above the range but the bar CLOSES back inside -- not a break
+    post = [_tbar(9, 45, h=10.5, l=9.4, c=9.8, v=100)]
+    orr = opening_range(or_bars + post, minutes=15)
+    assert orr["break_dir"] is None
+    assert orr["break_et"] is None
+
+
+def test_opening_range_break_down():
+    or_bars = [_bar(10.0, 9.0, 9.5, 100) for _ in range(15)]
+    post = [_tbar(9, 45, h=9.2, l=8.5, c=8.8, v=100)]
+    orr = opening_range(or_bars + post, minutes=15)
+    assert orr["break_dir"] == "down"
+
+
+def test_opening_range_empty_input():
+    assert opening_range([], minutes=15) == {"or_high": None, "or_low": None,
+                                              "break_dir": None, "break_et": None}
+
+
+# ----------------------------------------------------------------- beta_corr
+
+def test_beta_corr_two_x_levered_copy_has_beta_two_and_perfect_correlation():
+    closes_a = [100.0]
+    for i in range(1, 21):
+        closes_a.append(closes_a[-1] * (1 + (0.01 if i % 2 == 0 else -0.007)))
+    closes_b = [50.0]
+    for i in range(1, 21):
+        ret_a = closes_a[i] / closes_a[i - 1] - 1
+        closes_b.append(closes_b[-1] * (1 + 2 * ret_a))
+    result = beta_corr(closes_a, closes_b, n=20)
+    assert result is not None
+    beta, corr = result
+    assert beta == pytest.approx(2.0, abs=1e-6)
+    assert corr == pytest.approx(1.0, abs=1e-6)
+
+
+def test_beta_corr_insufficient_history_is_none():
+    assert beta_corr([1.0, 2.0], [1.0, 2.0], n=20) is None
+
+
+def test_beta_corr_flat_benchmark_is_none():
+    flat = [100.0] * 25
+    other = [float(i) for i in range(100, 125)]
+    assert beta_corr(flat, other, n=20) is None
