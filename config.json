@@ -37,5 +37,26 @@
   "memory": {
     "recent_trades_in_context": 20,
     "max_active_lessons_in_context": 25
-  }
+  },
+
+  "research": {
+    "fdr_q": 0.10,
+    "min_n": 8
+  },
+  "population": { "enabled": true },
+  "friction": {
+    "model": "flat",
+    "base_bps": 2.0,
+    "spread_k": 1.6,
+    "impact_k": 220.0,
+    "max_bps": 120.0,
+    "stress_multipliers": [1.0, 2.0, 3.0]
+  },
+  "paired": {
+    "enabled": true,
+    "every_n_sessions": 1,
+    "arm_b_context_mode": "aggregate_only",
+    "arm_b_playbook_version": null
+  },
+  "ablation_sim_version": null
 }

@@ -187,6 +187,14 @@ def run(cfg: Config, run_date: date | None = None) -> None:
     try:
         mem = build_weekly_memory(con, cfg)
         overall = mem["overall"]
+
+        # v4: research integrity block (significance/FDR, quarantine, population
+        # baseline, selection ablation, paired-arm comparison) — computed BEFORE
+        # the miner call so `states` reflects exactly what the miner was shown.
+        from .. import integrity
+        from .. import ledger as ledger_mod
+        research_block = integrity.weekly_block(con, cfg, ledger_mod, d)
+
         log("weekly", f"Mining ledger: {overall['picks_graded']} graded picks, "
                       f"{len(mem['lessons'])} lessons on file, playbook v{mem['playbook_version']}")
 
@@ -223,6 +231,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_counterfactuals_md(mem)}\n\n"
             f"{_v3_sections(mem)}\n\n"
             f"{_sim_version_md(mem)}\n\n"
+            f"{research_block['markdown']}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"
             f"## LESSON BANK (with IDs for your lesson_actions)\n\n"
             "Each lesson's `holdout_tier` is gated on OUT-OF-SAMPLE confirmations only "
@@ -274,10 +283,26 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             lid = ledger.insert_lesson(con, l, "weekly", d)
             log("weekly", f"New mined lesson L{lid}: {l['lesson']}")
 
+        # v4: register/quarantine any new rule candidates the miner nominated.
+        # Nomination only — the miner cannot promote a rule to tradable status;
+        # only research.eligible_for_production (already applied inside
+        # integrity.weekly_block, above) graduates a rule out of quarantine.
+        from .. import research
+        for c in mined.get("rule_candidates", []) or []:
+            reg = research.register_rule(
+                con, c.get("statement", ""), c.get("dimensions", []), d,
+                discovery_n=c.get("discovery_n", 0),
+                discovery_effect=c.get("discovery_effect"),
+                discovery_q=c.get("discovery_q"))
+            if reg["state"] == "DISCOVERED":
+                research.advance_quarantine(con, reg["rule_id"], d)
+            log("weekly", f"Rule {reg['rule_id']}: {reg['state']} — {c.get('statement','')[:80]}")
+
         # rewrite the playbook (this loop is the SOLE writer of playbook.md)
         new_pb = mined.get("playbook_markdown", "")
         if new_pb and len(new_pb) > 200:
             violations = _check_wr_suppression(new_pb)
+            violations += integrity.check_playbook(new_pb, research_block["states"])
             for v in violations:
                 log("weekly", f"WARN WR-suppression violation (n<8 with wr/avgR shown): {v}")
             version = write_playbook(new_pb, mined.get("changelog", ""), con)

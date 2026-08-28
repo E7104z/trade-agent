@@ -68,6 +68,29 @@ _DEFAULTS: dict[str, Any] = {
         "recent_trades_in_context": 20,
         "max_active_lessons_in_context": 25,
     },
+    # --- v4 research integrity layer (specs/RESEARCH_INTEGRITY_SPEC_v4.md) ---
+    # Every default here reproduces current behavior exactly; nothing here
+    # changes a number, a fill, or a decision until deliberately flipped.
+    "research": {
+        "fdr_q": 0.10,      # Benjamini-Hochberg FDR level across the whole weekly run
+        "min_n": 8,         # matches the playbook's existing reporting bar
+    },
+    "population": {"enabled": True},   # observation only: adds rows, changes no decision
+    "friction": {
+        "model": "flat",               # "flat" = today's exact behavior
+        "base_bps": 2.0,
+        "spread_k": 1.6,
+        "impact_k": 220.0,
+        "max_bps": 120.0,
+        "stress_multipliers": [1.0, 2.0, 3.0],
+    },
+    "paired": {
+        "enabled": True,               # always-on per decision 2026-08-27
+        "every_n_sessions": 1,          # daily -- throttling costs months of statistical power
+        "arm_b_context_mode": "aggregate_only",  # ablate the ungated last-20-trades channel first
+        "arm_b_playbook_version": None,
+    },
+    "ablation_sim_version": None,       # restrict the selection ablation to one sim_version
 }
 
 # Approximate USD per million tokens (input, output) — for run-cost logging only.

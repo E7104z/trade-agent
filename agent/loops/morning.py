@@ -580,6 +580,41 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         render_dashboard(con, cfg, d)
         log("morning", f"Done. {len(pick_ids)} picks logged, {n_rej} rejections logged to shadow ledger.")
 
+        # v4: snapshot the pre-selection gap-scan population (the unconditional
+        # null). Runs last and is internally guarded — it can never fail the
+        # morning run. was_picked reflects the final validated plan since this
+        # runs after save_daily_plan.
+        from .. import integrity
+        integrity.on_morning(con, cfg, d, bundle, plan)
+
+        # v4: paired challenger arm B — same bundle/regime/memory arm A saw,
+        # context_mode ablated per config (default: aggregate_only, the ungated
+        # last-20-trades channel). Arm B never trades and is never written to
+        # picks; graded later by the SAME simulator in evening.py. Never runs
+        # under mock (no real plan A was persisted to pair against) or dry-run.
+        from . import paired as paired_mod
+        if paired_mod.should_run_paired(cfg, d):
+            def _validate_arm_b(p: dict) -> tuple[dict, list[str]]:
+                return _validate_plan(
+                    p, cfg, ledger.current_streak(con),
+                    ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10))),
+                    ref_prices=_grounded_ref_prices(md, p, bundle, d),
+                    atr_map=_grounded_atr(md, p, bundle),
+                    earnings_map=_grounded_earnings(md, p, bundle))
+
+            log("morning", "Running paired challenger arm B...")
+            arm_b = paired_mod.run_challenger_arm(
+                con, cfg, d,
+                analyst_system=analyst_system, risk_system=risk_system,
+                bundle_md=bundle_md, regime_md_text=reg_md, memory_text=mem["text"],
+                playbook_version=mem["playbook_version"], llm_call=llm.call,
+                validate=_validate_arm_b, regime_tag=reg.get("tag", ""), model=model)
+            if arm_b.get("ok"):
+                log("morning", f"Arm B ({arm_b['context_mode']}): {arm_b['picks']} pick(s), "
+                               f"no_trade={arm_b['no_trade']}, ~${arm_b['cost_usd']:.3f}")
+            else:
+                log("morning", f"Arm B skipped/failed: {arm_b.get('reason')}")
+
     except Exception as e:
         ledger.log_run(con, "morning", d, started, "error", error=str(e))
         log("morning", f"ERROR: {e}")

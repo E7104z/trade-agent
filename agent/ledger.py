@@ -285,6 +285,14 @@ _MIGRATIONS = [
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS mkt_cap DOUBLE",
 ]
 
+# --- v4 research integrity layer (specs/RESEARCH_INTEGRITY_SPEC_v4.md) ---
+# Appended rather than inlined so the v4 schema stays reviewable as one unit.
+# connect() already executes every entry in BOTH the DuckDB and Postgres
+# branches, and the Postgres branch rewrites DOUBLE -> DOUBLE PRECISION, so
+# these statements need no engine-specific handling.
+from . import migrations_v4  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v4.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -427,9 +435,10 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             mae_before_mfe, time_to_mfe_min,
             gap_fill_frac_1000, gap_fill_frac_1200, gap_fill_frac_close,
             trend_side_200d, ext_atr_at_entry, short_pct_float, float_shares, mkt_cap,
+            r_multiple_2x, r_multiple_3x, slippage_bps_used, friction_model, participation_pct,
             grade, grade_notes, graded_at, sim_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
@@ -447,6 +456,8 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             o.get("gap_fill_frac_1000"), o.get("gap_fill_frac_1200"), o.get("gap_fill_frac_close"),
             o.get("trend_side_200d"), o.get("ext_atr_at_entry"), o.get("short_pct_float"),
             o.get("float_shares"), o.get("mkt_cap"),
+            o.get("r_multiple_2x"), o.get("r_multiple_3x"), o.get("slippage_bps_used"),
+            o.get("friction_model"), o.get("participation_pct"),
             o.get("grade"), o.get("grade_notes"),
             o.get("graded_at", datetime.now()), sim_version,
         ],

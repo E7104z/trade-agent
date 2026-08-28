@@ -368,12 +368,14 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             # (grade_day/simulate_pick already treat every one of these as
             # optional grader-input context, not something that can fail a grade).
             atr_map: dict[str, float] = {}
+            atr_pct_map: dict[str, float] = {}
             trend_map: dict[str, dict] = {}
             fundamentals_map: dict[str, dict] = {}
             prev_close_map: dict[str, float] = {}
             try:
                 ctx = md.daily_context(tickers)
                 atr_map = {t: c["atr14"] for t, c in ctx.items() if c.get("atr14")}
+                atr_pct_map = {t: c["atr_pct"] for t, c in ctx.items() if c.get("atr_pct") is not None}
                 trend_map = {t: c["trend_snapshot"] for t, c in ctx.items() if c.get("trend_snapshot")}
             except Exception as e:
                 log("evening", f"WARN daily_context fetch failed ({e}) — ATR/trend fields null tonight")
@@ -398,6 +400,35 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                                  or_minutes=int(cfg.data_cfg.get("or_minutes", 15)))
             for o in outcomes:
                 ledger.save_outcome(con, o)
+
+            # v4: friction stress ladder — re-simulate every triggered pick at
+            # 2x/3x the configured friction (parallel columns only; r_multiple
+            # itself is never recomputed). Reuses the tickers/atr/adv20 already
+            # fetched above; a missing bar/daily fetch just skips that pick's
+            # stress reading rather than failing the grading run.
+            from .. import integrity
+            from ..friction import params_from_config
+            fparams = params_from_config(cfg)
+            by_pick_id = {o["pick_id"]: o for o in outcomes}
+            for p in picks:
+                o = by_pick_id.get(p["pick_id"])
+                if not o or not o.get("triggered"):
+                    continue
+                t = p["ticker"].upper()
+                try:
+                    bars = md.minute_bars(p["ticker"], d)
+                    daily_bar = md.daily_bar(p["ticker"], d)
+                except Exception as e:
+                    log("evening", f"WARN friction stress bars fetch failed for {t}: {e}")
+                    continue
+                stress = integrity.stress_ladder_for_pick(
+                    p, bars, daily_bar, simulate_pick, fparams,
+                    atr_pct=atr_pct_map.get(t), adv20=adv20_map.get(t),
+                    dollars_per_r=cfg.get("dollars_per_r", 500),
+                    flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+                if stress:
+                    o.update(stress)
+                    ledger.save_outcome(con, o)
         else:
             outcomes = []
             log("evening", "No-trade day — grading the decision to stand down.")
@@ -407,6 +438,10 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         log("evening", "Scoring rejected candidates (shadow ledger)...")
         shadow = _grade_rejections(con, md, d, slippage_bps=slippage,
                                    flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+
+        # v4: population monkeys + challenger arms, graded by the SAME simulator.
+        from .. import integrity
+        integrity.on_evening(con, cfg, md, d, simulate=simulate_pick)
 
         out_md = outcomes_md(picks, outcomes) if picks else "(no picks today — no-trade day)"
         recap = md.market_recap(d)

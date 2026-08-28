@@ -10,6 +10,9 @@ Trade Agent CLI.
   python run.py regrade --from YYYY-MM-DD [--force]
                                            recompute outcomes under CURRENT sim
                                            semantics (explicit, never automatic)
+  python run.py research [--full]         research-integrity report: selection
+                                           ablation + population baseline
+                                           (zero API cost, read-only)
 """
 from __future__ import annotations
 
@@ -32,6 +35,27 @@ def cmd_init(cfg, args) -> None:
     con.close()
     log("init", f"Ledger ready at {DB_PATH}")
     log("init", "Next: put your Anthropic key in credentials.json, then run:  python run.py morning")
+
+
+def cmd_research(cfg, args) -> None:
+    """Research-integrity report: selection ablation + population baseline,
+    computed entirely from data already in the ledger (zero API cost). --full
+    also renders the weekly miner's full research block (FDR-corrected looks,
+    quarantine states, paired-arm comparison).
+    """
+    from agent import ablation, integrity, population
+    from agent import ledger as ledger_mod
+
+    con = ledger.connect()
+    try:
+        print(ablation.ablation_md(ablation.random_pick_ablation(con)))
+        print()
+        print(population.population_md(population.population_stats(con)))
+        if args.full:
+            print()
+            print(integrity.weekly_block(con, cfg, ledger_mod, today_et())["markdown"])
+    finally:
+        con.close()
 
 
 def cmd_status(cfg, args) -> None:
@@ -152,6 +176,9 @@ def main() -> None:
     p_regrade.add_argument("--from", dest="from_date", required=True, help="YYYY-MM-DD -- recompute picks on/after this date")
     p_regrade.add_argument("--force", action="store_true", help="required if this would rewrite more than 50 rows")
 
+    p_research = sub.add_parser("research", help="research integrity report (selection ablation + population baseline, zero API cost)")
+    p_research.add_argument("--full", action="store_true", help="also render the full weekly research block (FDR looks, quarantine, paired arms)")
+
     args = parser.parse_args()
     cfg = load_config()
     cfg.mock = getattr(args, "mock", False)
@@ -171,6 +198,8 @@ def main() -> None:
         cmd_dashboard(cfg, args)
     elif args.cmd == "regrade":
         cmd_regrade(cfg, args)
+    elif args.cmd == "research":
+        cmd_research(cfg, args)
     elif args.cmd == "morning":
         from agent.loops import morning
         morning.run(cfg, run_date, force=args.force)
