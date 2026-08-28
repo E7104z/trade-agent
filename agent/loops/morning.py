@@ -8,6 +8,7 @@ MORNING LOOP (6:45 AM ET)
 from __future__ import annotations
 
 import json
+import threading
 from datetime import date
 
 from .. import ledger
@@ -445,6 +446,44 @@ def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
     return out
 
 
+def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: str,
+                      bundle_md: str, bundle: dict, reg_md: str, mem: dict,
+                      regime_tag: str, model: str, llm_call) -> dict:
+    """Run the paired challenger arm on its own DB connection and MarketData
+    instance so it can execute concurrently with arm A on a background thread
+    (see run()) instead of stacking two full analyst+risk-manager LLM round
+    trips back to back. Sharing arm A's `con`/`md` across threads would race
+    on the DB connection and the Alpaca/yfinance client state underneath it;
+    a fresh connection/instance sidesteps that entirely. `bundle` itself is
+    read-only after morning_bundle() returns, so it's safe to share as-is.
+
+    Never raises — mirrors run_challenger_arm's own never-fail contract, since
+    a challenger-arm crash must not take down arm A (which owns this thread).
+    """
+    from . import paired as paired_mod
+    con2 = ledger.connect()
+    md2 = MarketData(cfg)
+    try:
+        def _validate_arm_b(p: dict) -> tuple[dict, list[str]]:
+            return _validate_plan(
+                p, cfg, ledger.current_streak(con2),
+                ledger.trailing_weighted_r(con2, int(cfg.get("drawdown_window", 10))),
+                ref_prices=_grounded_ref_prices(md2, p, bundle, d),
+                atr_map=_grounded_atr(md2, p, bundle),
+                earnings_map=_grounded_earnings(md2, p, bundle))
+
+        return paired_mod.run_challenger_arm(
+            con2, cfg, d,
+            analyst_system=analyst_system, risk_system=risk_system,
+            bundle_md=bundle_md, regime_md_text=reg_md, memory_text=mem["text"],
+            playbook_version=mem["playbook_version"], llm_call=llm_call,
+            validate=_validate_arm_b, regime_tag=regime_tag, model=model)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+    finally:
+        con2.close()
+
+
 def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
     d = run_date or today_et()
     started = now_et().replace(tzinfo=None)
@@ -456,6 +495,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         con.close()
         return
 
+    paired_thread: threading.Thread | None = None
     try:
         # 1. data
         log("morning", "Pulling market data bundle...")
@@ -493,6 +533,32 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # 5. stage 1: analyst
         llm = LLMClient(cfg)
         model = cfg.models["morning"]
+
+        # risk_system doesn't depend on the analyst's output, so it's built
+        # here (rather than after stage 1, where it used to live) so arm B
+        # -- a full independent analyst+risk round trip -- can be kicked off
+        # on a background thread right now and run concurrently with arm A's
+        # two LLM calls below, instead of stacking after them. That's the
+        # difference between ~1x and ~2x the per-call wall time in a
+        # synchronous serverless request with a hard 300s budget.
+        risk_system = load_prompt("morning_risk", {
+            "MAX_PICKS": str(cfg.get("max_picks", 4)),
+            "MIN_SIZE_R": str(cfg.get("min_size_r", 0.25)),
+            "MAX_SIZE_R": str(cfg.get("max_size_r", 1.5)),
+            "MAX_TOTAL_RISK_R": str(cfg.get("max_total_open_risk_r", 3.0)),
+        })
+
+        from . import paired as paired_mod
+        paired_box: dict = {}
+        if not cfg.mock and paired_mod.should_run_paired(cfg, d):
+            def _bg() -> None:
+                paired_box["arm_b"] = _run_paired_arm_b(
+                    cfg, d, analyst_system, risk_system, bundle_md, bundle, reg_md,
+                    mem, reg.get("tag", ""), model, llm.call)
+            paired_thread = threading.Thread(target=_bg, daemon=True)
+            paired_thread.start()
+            log("morning", "Paired challenger arm B started in background...")
+
         log("morning", f"Stage 1/2 — analyst call ({model})...")
         analyst = llm.call(
             system=analyst_system, user=user_block, model=model,
@@ -506,12 +572,6 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             [c.get("ticker", "") for c in candidates.get("candidates", [])])
 
         # 6. stage 2: risk manager
-        risk_system = load_prompt("morning_risk", {
-            "MAX_PICKS": str(cfg.get("max_picks", 4)),
-            "MIN_SIZE_R": str(cfg.get("min_size_r", 0.25)),
-            "MAX_SIZE_R": str(cfg.get("max_size_r", 1.5)),
-            "MAX_TOTAL_RISK_R": str(cfg.get("max_total_open_risk_r", 3.0)),
-        })
         risk_user = (
             f"# TODAY: {d.isoformat()}\n\n"
             f"## THE ANALYST'S CANDIDATES\n\n```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
@@ -592,23 +652,13 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # last-20-trades channel). Arm B never trades and is never written to
         # picks; graded later by the SAME simulator in evening.py. Never runs
         # under mock (no real plan A was persisted to pair against) or dry-run.
-        from . import paired as paired_mod
-        if paired_mod.should_run_paired(cfg, d):
-            def _validate_arm_b(p: dict) -> tuple[dict, list[str]]:
-                return _validate_plan(
-                    p, cfg, ledger.current_streak(con),
-                    ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10))),
-                    ref_prices=_grounded_ref_prices(md, p, bundle, d),
-                    atr_map=_grounded_atr(md, p, bundle),
-                    earnings_map=_grounded_earnings(md, p, bundle))
-
-            log("morning", "Running paired challenger arm B...")
-            arm_b = paired_mod.run_challenger_arm(
-                con, cfg, d,
-                analyst_system=analyst_system, risk_system=risk_system,
-                bundle_md=bundle_md, regime_md_text=reg_md, memory_text=mem["text"],
-                playbook_version=mem["playbook_version"], llm_call=llm.call,
-                validate=_validate_arm_b, regime_tag=reg.get("tag", ""), model=model)
+        # It was started on a background thread back in step 5 (concurrently
+        # with arm A's own analyst+risk calls) — join it here now that arm A
+        # is fully done.
+        if paired_thread is not None:
+            log("morning", "Waiting for paired challenger arm B (background)...")
+            paired_thread.join()
+            arm_b = paired_box.get("arm_b") or {"ok": False, "reason": "background thread produced no result"}
             if arm_b.get("ok"):
                 log("morning", f"Arm B ({arm_b['context_mode']}): {arm_b['picks']} pick(s), "
                                f"no_trade={arm_b['no_trade']}, ~${arm_b['cost_usd']:.3f}")
@@ -618,6 +668,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
     except Exception as e:
         ledger.log_run(con, "morning", d, started, "error", error=str(e))
         log("morning", f"ERROR: {e}")
+        # arm A failed before reaching its own join point above — still wait
+        # (briefly) for the background arm B thread so it isn't left running
+        # against a connection this function is about to close out from under it.
+        if paired_thread is not None:
+            paired_thread.join(timeout=120)
         raise
     finally:
         con.close()
