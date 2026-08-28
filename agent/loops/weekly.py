@@ -301,10 +301,11 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         # rewrite the playbook (this loop is the SOLE writer of playbook.md)
         new_pb = mined.get("playbook_markdown", "")
         if new_pb and len(new_pb) > 200:
-            violations = _check_wr_suppression(new_pb)
-            violations += integrity.check_playbook(new_pb, research_block["states"])
-            for v in violations:
+            wr_violations = _check_wr_suppression(new_pb)
+            for v in wr_violations:
                 log("weekly", f"WARN WR-suppression violation (n<8 with wr/avgR shown): {v}")
+            for v in integrity.check_playbook(new_pb, research_block["states"]):
+                log("weekly", f"WARN playbook violation: {v}")
             version = write_playbook(new_pb, mined.get("changelog", ""), con)
             log("weekly", f"Playbook rewritten -> v{version} (old version archived)")
             if not os.environ.get("DATABASE_URL"):

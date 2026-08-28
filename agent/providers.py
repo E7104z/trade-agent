@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import xml.etree.ElementTree as ET_XML
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any
 
@@ -24,11 +25,22 @@ from .util import ET, is_market_day, log, now_et, prev_market_day
 
 ALPACA_DATA = "https://data.alpaca.markets"
 
+# Per-symbol yfinance lookups (earnings dates, fundamentals) are slow, serial,
+# blocking network calls -- with 40+ symbols in a morning bundle these alone
+# can approach the Vercel 300s function budget. Bounded worker pool + per-call
+# timeout keeps total wall time roughly flat regardless of universe size.
+_YF_FETCH_WORKERS = 8
+_YF_FETCH_TIMEOUT = 12
+
 FUTURES = {"ES=F": "S&P 500 fut", "NQ=F": "Nasdaq fut", "RTY=F": "Russell fut",
            "CL=F": "Crude oil", "GC=F": "Gold", "DX-Y.NYB": "Dollar index", "^TNX": "10Y yield"}
 INTERNATIONAL = {"^N225": "Nikkei", "^HSI": "Hang Seng", "^GDAXI": "DAX", "^FTSE": "FTSE"}
 SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC", "XLRE"]
 INDEX_ETFS = ["SPY", "QQQ", "IWM"]
+
+# ETFs never report single-company earnings -- skipping them here avoids a
+# guaranteed-empty yfinance round trip for every one of them, every morning.
+_NO_EARNINGS_SYMBOLS = frozenset(SECTOR_ETFS) | frozenset(INDEX_ETFS)
 
 # Liquid scan universe for premarket gap detection (Alpaca snapshots).
 SCAN_UNIVERSE = [
@@ -712,8 +724,8 @@ class MarketData:
             if not missing:
                 return out
             yf = _yf()
-            rows: list[dict] = []
-            for s in missing:
+
+            def _fetch_one(s: str) -> dict | None:
                 try:
                     t = yf.Ticker(s)
                     info = t.get_info() if hasattr(t, "get_info") else t.info
@@ -727,14 +739,26 @@ class MarketData:
                             asof = datetime.fromtimestamp(short_ts).date().isoformat()
                         except Exception:
                             asof = None
-                    row = {"symbol": s, "mkt_cap": float(mkt_cap) if mkt_cap else None,
-                           "float_shares": float(float_shares) if float_shares else None,
-                           "short_pct_float": round(float(short_pct) * 100, 2) if short_pct else None,
-                           "short_asof": asof}
-                    out[s] = {k: v for k, v in row.items() if k != "symbol"}
-                    rows.append(row)
+                    return {"symbol": s, "mkt_cap": float(mkt_cap) if mkt_cap else None,
+                            "float_shares": float(float_shares) if float_shares else None,
+                            "short_pct_float": round(float(short_pct) * 100, 2) if short_pct else None,
+                            "short_asof": asof}
                 except Exception as e:
                     log("data", f"WARN fundamentals fetch failed for {s}: {e}")
+                    return None
+
+            rows: list[dict] = []
+            with ThreadPoolExecutor(max_workers=_YF_FETCH_WORKERS) as pool:
+                futures = {pool.submit(_fetch_one, s): s for s in missing}
+                for fut, s in futures.items():
+                    try:
+                        row = fut.result(timeout=_YF_FETCH_TIMEOUT)
+                    except Exception as e:
+                        log("data", f"WARN fundamentals fetch timed out for {s}: {e}")
+                        row = None
+                    if row:
+                        out[s] = {k: v for k, v in row.items() if k != "symbol"}
+                        rows.append(row)
             if rows:
                 ledger.save_fundamentals(con, rows)
         finally:
@@ -750,7 +774,7 @@ class MarketData:
         (card-rendered tickers), never the whole scan universe. A symbol
         this can't determine a date for is simply absent.
         """
-        syms = sorted({str(s).upper().strip() for s in symbols if s})
+        syms = sorted({str(s).upper().strip() for s in symbols if s} - _NO_EARNINGS_SYMBOLS)
         out: dict[str, int | None] = {}
         if not syms:
             return out
@@ -761,17 +785,30 @@ class MarketData:
             return out
         yf = _yf()
         today = now_et().date()
-        for s in syms:
+
+        def _fetch_one(s: str) -> int | None:
             try:
                 cal = yf.Ticker(s).get_earnings_dates(limit=4)
                 if cal is None or cal.empty:
-                    continue
+                    return None
                 future = [ts.date() for ts in cal.index if ts.date() >= today]
                 if not future:
-                    continue
-                out[s] = (min(future) - today).days
+                    return None
+                return (min(future) - today).days
             except Exception as e:
                 log("data", f"WARN next_earnings fetch failed for {s}: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=_YF_FETCH_WORKERS) as pool:
+            futures = {pool.submit(_fetch_one, s): s for s in syms}
+            for fut, s in futures.items():
+                try:
+                    days = fut.result(timeout=_YF_FETCH_TIMEOUT)
+                except Exception as e:
+                    log("data", f"WARN next_earnings fetch timed out for {s}: {e}")
+                    days = None
+                if days is not None:
+                    out[s] = days
         return out
 
     def _enrich_indicators(self, quotes: list[dict]) -> None:

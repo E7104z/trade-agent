@@ -252,8 +252,17 @@ async function runLoop(name) {
   });
   try {
     const r = await fetch('/run/' + name + '?' + params.toString(), {method: 'POST'});
-    const d = await r.json();
-    document.getElementById('log').textContent = (d.log || '') + (d.error ? '\\n\\nERROR: ' + d.error : '');
+    const text = await r.text();
+    // A platform-level failure (e.g. serverless function timeout) returns an
+    // HTML/plain-text error page instead of our JSON contract -- show that
+    // raw instead of crashing on JSON.parse with a cryptic "Unexpected token".
+    let d;
+    try { d = JSON.parse(text); } catch { d = null; }
+    if (d) {
+      document.getElementById('log').textContent = (d.log || '') + (d.error ? '\\n\\nERROR: ' + d.error : '');
+    } else {
+      document.getElementById('log').textContent = `Request failed (HTTP ${r.status}): ` + text.slice(0, 2000);
+    }
   } catch (e) {
     document.getElementById('log').textContent = 'Request failed: ' + e;
   } finally {
