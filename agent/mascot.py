@@ -58,6 +58,10 @@ _SNIPPET = r"""
   #arby-hud{display:flex;justify-content:space-between;align-items:center;max-width:1000px;
     margin:8px auto 0;font-size:12px;color:#8b949e;gap:10px;flex-wrap:wrap;}
   #arby-mood{padding:2px 10px;border-radius:12px;font-weight:700;font-size:11px;white-space:nowrap;}
+  #arby-tipbtn{padding:3px 12px;margin:0;background:#1f6feb;border:1px solid #58a6ff;border-radius:12px;
+    color:#fff;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;}
+  #arby-tipbtn:hover{background:#2f81f7;border-color:#79b8ff;}
+  #arby-tipbtn:active{background:#1c5cbf;}
   #arby-needs{display:flex;align-items:center;gap:8px;}
   .arby-need{display:flex;align-items:center;gap:4px;}
   .arby-need-label{font-size:9px;letter-spacing:.04em;color:#8b949e;}
@@ -82,12 +86,13 @@ _SNIPPET = r"""
     <div id="arby-wrap" tabindex="0">
       <div id="arby-bubble"></div>
       <div id="arby-tip"></div>
-      <div id="arby-hint">Click the floor to send him around &middot; click anything in the room to interact &middot; drag to look around, right-drag to pan, scroll/pinch to zoom &middot; dbl-click resets the view</div>
+      <div id="arby-hint">Click Arby for a trading tip &middot; click the floor to send him around &middot; click anything in the room to interact &middot; drag to look around, right-drag to pan, scroll/pinch to zoom &middot; dbl-click resets the view</div>
       <button id="arby-fullscreen" type="button" title="Fullscreen">&#9974;</button>
     </div>
     <div id="arby-hud">
       <span id="arby-activity">warming up&hellip;</span>
       <span id="arby-mood">NEUTRAL</span>
+      <button id="arby-tipbtn" type="button" title="Ask Arby for a trading tip">&#128161; Tip</button>
       <div id="arby-needs">
         <div class="arby-need"><span class="arby-need-label">ENERGY</span><div class="arby-need-bar"><div id="arby-need-energy" class="arby-need-fill"></div></div></div>
         <div class="arby-need"><span class="arby-need-label">FOCUS</span><div class="arby-need-bar"><div id="arby-need-focus" class="arby-need-fill"></div></div></div>
@@ -368,6 +373,61 @@ _SNIPPET = r"""
     bubbleTimeout = setTimeout(function(){ bubble.classList.remove('show'); }, dur||2600);
   }
 
+  // ------------------------------------------------------------- trading tips
+  // Arby's advice engine: short, educational, process-focused trading tips.
+  // Deliberately general education (risk, sizing, entries/exits, psychology,
+  // process, market mechanics) -- never a specific buy/sell call, same honesty
+  // the rest of the widget commits to. Tips that quote a number come from
+  // synced data; the timeless education below is what doesn't need a feed.
+  var TIPS = [
+    'Risk a fixed % of equity per trade \u2014 most pros stay under 1% per idea.',
+    'Never risk more than 1R per trade. The math survives your bad days.',
+    'Size from your stop distance, not your conviction \u2014 conviction is a feeling, the stop is a number.',
+    'A stop is where the thesis is wrong, not where you\u2019re comfortable losing.',
+    'If one trade can end your week, the position is too big. Period.',
+    'Know your entry type before the open: limit buys weakness, breakout buys strength. Don\u2019t blur them.',
+    'Gap >15% is chase territory \u2014 the fill you get is rarely the price you wanted.',
+    'Plan the exit when you plan the entry. Targets without stops are wishes.',
+    'Scale in with proof, not hope. Let price confirm before adding.',
+    'Don\u2019t average down a losing thesis \u2014 that\u2019s doubling down on being wrong.',
+    'Think in R, not dollars. A 2R win and a 1R loss is a good day.',
+    'Track expectancy, not win rate. 40% wins can print if winners are 3R.',
+    'One clean A+ setup beats five B- ideas \u2014 quality is the position.',
+    'Your best edge is skipping the trade that isn\u2019t your pitch.',
+    'Patience is a position. No edge, no trade.',
+    'Revenge trading turns one loss into three. Step away after a stop.',
+    'The market doesn\u2019t owe you a win back. Process over P&L.',
+    'Boredom is the enemy of discipline \u2014 log it, don\u2019t trade it.',
+    'Write the thesis before the fill. If you can\u2019t, you\u2019re gambling.',
+    'Journal every trade. The playbook only compounds what you measure.',
+    'Review losses for lessons, not just wins for ego.',
+    'A no-trade day can be a winning day \u2014 cash is a position too.',
+    'Cut losers fast, let winners run. The ledger rewards asymmetry.',
+    'Earnings are binary events \u2014 your stop is fiction against a gap.',
+    'High short interest is squeeze fuel, but only if it runs.',
+    'A stock 3+ ATR from its 20-day mean is stretched, not a fresh entry.',
+    'Volume confirms the move; price without volume is noise.',
+    'The first 30 minutes are the noisiest \u2014 let the open settle before forcing entries.',
+    'Mind the spread on thin names \u2014 slippage is a silent tax.',
+    'All paper here \u2014 but the habits are real. Practice like it\u2019s live.',
+    'Not financial advice \u2014 it\u2019s process advice, and process is free.',
+  ];
+  var lastTipIdx = -1;
+  function randomTip(){
+    if (!TIPS.length) return 'Read the playbook.';
+    var i;
+    if (TIPS.length === 1){ i = 0; }
+    else { do { i = Math.floor(Math.random()*TIPS.length); } while (i === lastTipIdx); }
+    lastTipIdx = i;
+    return TIPS[i];
+  }
+  var tipFx = null; // wired by the 3D room to add a small gesture on delivery
+  function deliverTip(){
+    var t = randomTip();
+    say(t, Math.min(7000, Math.max(3600, t.length * 55)));
+    if (tipFx) tipFx();
+  }
+
   // ------------------------------------------------------------- hide/show
   var hidden = false;
   try { hidden = localStorage.getItem('arby.hidden')==='1'; } catch(e){}
@@ -382,6 +442,10 @@ _SNIPPET = r"""
     if (!hidden && typeof sizeCanvas === 'function') sizeCanvas();
   });
   applyHidden();
+
+  // Ask-Arby-for-a-tip button (works in both the 3D and no-WebGL fallback paths).
+  var tipBtn = document.getElementById('arby-tipbtn');
+  if (tipBtn) tipBtn.addEventListener('click', function(){ deliverTip(); });
 
   // ------------------------------------------------------------- data sync (shared)
   var applyStatus3D = null; // wired by 3D init
@@ -460,7 +524,7 @@ _SNIPPET = r"""
       setBlendedMood: function(s){ state.moodScore=clamp(s,-1,1); refreshHud(); },
       syncFromStatus: applyStatus, tryLiveSync: syncLive,
       setChartData:function(){}, setChartFromPicks:function(){}, setNoTrade:function(){},
-      say: say, goTo: function(){},
+      say: say, tip: deliverTip, advice: deliverTip, goTo: function(){},
     };
     return;
   }
@@ -2112,9 +2176,11 @@ _SNIPPET = r"""
   }
   function charQuip(){
     var roll = Math.random();
+    // Talking to Arby leads with actual trading tips, not just mood chatter.
+    if (roll < 0.5) return randomTip();
     var sq = stationQuip();
-    if (sq && roll<0.35) return sq;
-    if (roll<0.7){ var f = factQuips(); return f[Math.floor(Math.random()*f.length)]; }
+    if (sq && roll < 0.62) return sq;
+    if (roll < 0.82){ var f = factQuips(); return f[Math.floor(Math.random()*f.length)]; }
     var m = moodFor(state.moodScore);
     return m.quips[Math.floor(Math.random()*m.quips.length)];
   }
@@ -2136,6 +2202,15 @@ _SNIPPET = r"""
         }};
       }
     } });
+  // Trading-tip delivery gesture (wired from deliverTip() in the shared code).
+  tipFx = function(){
+    var t = clock.getElapsedTime();
+    gesture = { start:t, dur:0.7, apply:function(p){
+      var s = Math.sin(p*Math.PI);
+      armL.rotation.x = 2.2*s; armL.rotation.z = 0.25*Math.sin(p*Math.PI*3);
+      headGroup.rotation.y = Math.sin(p*Math.PI*2)*0.2;
+    }};
+  };
   registerTarget(monitorRoots.main, { label:function(){ return 'TradingView \u2014 '+state.slotTickers.main+' chart \u2197'; },
     act:function(){ window.open('https://www.tradingview.com/chart/?symbol='+encodeURIComponent(state.slotTickers.main),'_blank','noopener'); } });
   registerTarget(monitorRoots.left, { label:function(){ return 'Yahoo Finance \u2014 '+state.slotTickers.left+' \u2197'; },
@@ -2646,6 +2721,8 @@ _SNIPPET = r"""
     setChartFromPicks: setChartFromPicks,
     setNoTrade: setNoTrade,
     say: say,
+    tip: deliverTip,
+    advice: deliverTip,
     goTo: goTo,
     walkTo: function(x,z){ walkToPoint({x:x, z:z}); },
     shootPaper: shootPaper,
