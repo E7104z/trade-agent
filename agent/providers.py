@@ -13,6 +13,7 @@ import hashlib
 import json
 import xml.etree.ElementTree as ET_XML
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any
 
@@ -27,10 +28,55 @@ ALPACA_DATA = "https://data.alpaca.markets"
 
 # Per-symbol yfinance lookups (earnings dates, fundamentals) are slow, serial,
 # blocking network calls -- with 40+ symbols in a morning bundle these alone
-# can approach the Vercel 300s function budget. Bounded worker pool + per-call
-# timeout keeps total wall time roughly flat regardless of universe size.
+# can approach the Vercel 300s function budget. Bounded worker pool + an
+# overall batch deadline keeps total wall time flat regardless of universe
+# size.
+#
+# 2026-08-31 incident: fut.result(timeout=_YF_FETCH_TIMEOUT) only bounds how
+# long the CALLER waits on one future -- it does NOT cancel the underlying
+# thread. `with ThreadPoolExecutor(...) as pool:` then calls
+# pool.shutdown(wait=True) on exit, which blocks until every submitted task
+# has actually finished, including ones the caller already gave up on. One
+# yfinance call hanging on a rate-limited/unresponsive connection (no request
+# timeout is set anywhere in the yfinance call path) was enough to stall the
+# whole batch past the per-future timeout, and the morning cron ate a 300s
+# Vercel timeout before ever reaching send_email. Fixed by waiting on the
+# WHOLE batch against one deadline and shutting the pool down without
+# joining stragglers -- see _bounded_map below.
 _YF_FETCH_WORKERS = 8
-_YF_FETCH_TIMEOUT = 12
+_YF_BATCH_DEADLINE = 25  # hard wall-clock cap for one next_earnings()/fundamentals() call
+
+
+def _bounded_map(items: list[str], fn, workers: int = _YF_FETCH_WORKERS,
+                  deadline: float = _YF_BATCH_DEADLINE) -> dict[str, Any]:
+    """Run fn(item) for each item across a bounded worker pool, but never
+    wait past `deadline` seconds total. Stragglers are abandoned (their
+    threads may keep running in the background, unjoined) rather than
+    blocking the caller -- callers already treat a missing key as
+    "couldn't determine," never as a fabricated value."""
+    out: dict[str, Any] = {}
+    if not items:
+        return out
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {pool.submit(fn, s): s for s in items}
+        done, not_done = wait_futures(futures, timeout=deadline)
+        for fut in done:
+            s = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as e:
+                log("data", f"WARN fetch failed for {s}: {e}")
+                result = None
+            if result is not None:
+                out[s] = result
+        if not_done:
+            stuck = ", ".join(sorted(futures[f] for f in not_done))
+            log("data", f"WARN {len(not_done)} lookup(s) still running after {deadline}s "
+                        f"batch deadline, abandoning: {stuck}")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return out
 
 FUTURES = {"ES=F": "S&P 500 fut", "NQ=F": "Nasdaq fut", "RTY=F": "Russell fut",
            "CL=F": "Crude oil", "GC=F": "Gold", "DX-Y.NYB": "Dollar index", "^TNX": "10Y yield"}
@@ -748,17 +794,10 @@ class MarketData:
                     return None
 
             rows: list[dict] = []
-            with ThreadPoolExecutor(max_workers=_YF_FETCH_WORKERS) as pool:
-                futures = {pool.submit(_fetch_one, s): s for s in missing}
-                for fut, s in futures.items():
-                    try:
-                        row = fut.result(timeout=_YF_FETCH_TIMEOUT)
-                    except Exception as e:
-                        log("data", f"WARN fundamentals fetch timed out for {s}: {e}")
-                        row = None
-                    if row:
-                        out[s] = {k: v for k, v in row.items() if k != "symbol"}
-                        rows.append(row)
+            fetched = _bounded_map(missing, _fetch_one)
+            for s, row in fetched.items():
+                out[s] = {k: v for k, v in row.items() if k != "symbol"}
+                rows.append(row)
             if rows:
                 ledger.save_fundamentals(con, rows)
         finally:
@@ -799,16 +838,7 @@ class MarketData:
                 log("data", f"WARN next_earnings fetch failed for {s}: {e}")
                 return None
 
-        with ThreadPoolExecutor(max_workers=_YF_FETCH_WORKERS) as pool:
-            futures = {pool.submit(_fetch_one, s): s for s in syms}
-            for fut, s in futures.items():
-                try:
-                    days = fut.result(timeout=_YF_FETCH_TIMEOUT)
-                except Exception as e:
-                    log("data", f"WARN next_earnings fetch timed out for {s}: {e}")
-                    days = None
-                if days is not None:
-                    out[s] = days
+        out.update(_bounded_map(syms, _fetch_one))
         return out
 
     def _enrich_indicators(self, quotes: list[dict]) -> None:
