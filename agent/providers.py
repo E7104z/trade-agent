@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import xml.etree.ElementTree as ET_XML
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
@@ -84,9 +85,31 @@ INTERNATIONAL = {"^N225": "Nikkei", "^HSI": "Hang Seng", "^GDAXI": "DAX", "^FTSE
 SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC", "XLRE"]
 INDEX_ETFS = ["SPY", "QQQ", "IWM"]
 
+# Leveraged, inverse, and volatility products. These move on mechanical leverage
+# and decay, not on company-specific catalysts, so a gap in one is a restatement
+# of its underlying index, not an idea — a 3x semiconductor ETF gapping 6% is
+# NVDA gapping 2% wearing a costume. SINGLE SOURCE OF TRUTH — import this,
+# never re-declare it. (DTO's duplicate list drifted and silently readmitted
+# the single-stock leveraged complex; do not repeat that.)
+EXCLUDED_PRODUCTS: frozenset[str] = frozenset({
+    # 3x/2x index & sector
+    "TQQQ", "SQQQ", "SPXL", "SPXS", "SOXL", "SOXS", "TNA", "TZA", "UPRO",
+    "SPXU", "UDOW", "SDOW", "LABU", "LABD", "FAS", "FAZ", "YINN", "YANG",
+    "NUGT", "DUST", "JNUG", "JDST", "BOIL", "KOLD", "UCO", "SCO", "ERX", "ERY",
+    "SSO", "SDS", "QLD", "QID", "TECL", "TECS", "FNGU", "FNGD",
+    # volatility
+    "UVXY", "VXX", "SVXY", "VIXY", "UVIX", "SVIX",
+    # single-stock leveraged complex
+    "NVDL", "NVDU", "NVDD", "TSLL", "TSLQ", "TSLS", "CONL", "MSTX", "MSTZ",
+    "AMDL", "AAPU", "MSFU", "GGLL", "AMZU", "METU", "PLTU",
+})
+
 # ETFs never report single-company earnings -- skipping them here avoids a
 # guaranteed-empty yfinance round trip for every one of them, every morning.
-_NO_EARNINGS_SYMBOLS = frozenset(SECTOR_ETFS) | frozenset(INDEX_ETFS)
+# EXCLUDED_PRODUCTS are all ETFs/ETNs, so they get the same treatment (the
+# 2026-08/09 production error log was flooded by exactly these no-earnings
+# lookups failing one symbol at a time).
+_NO_EARNINGS_SYMBOLS = frozenset(SECTOR_ETFS) | frozenset(INDEX_ETFS) | EXCLUDED_PRODUCTS
 
 # Liquid scan universe for premarket gap detection (Alpaca snapshots).
 SCAN_UNIVERSE = [
@@ -109,6 +132,40 @@ SCAN_UNIVERSE = [
     "F", "GM", "RIVN", "LCID", "NIO", "CHPT", "RUN", "ENPH", "FSLR", "PLUG",
     "GME", "AMC", "CVNA", "UPST", "AFRM", "DKNG", "PENN", "CZR", "WYNN", "MGM",
 ]
+
+_SCAN_SET = frozenset(SCAN_UNIVERSE)
+
+# Structural instrument filter (Addendum A §A3). Warrants, units, rights, and
+# preferreds are not common-stock candidates: they have their own supply
+# mechanics, they routinely gap on conversion/expiry events no equity thesis
+# explains, and yfinance has no earnings/fundamentals coverage for them — so
+# every ATR/earnings gate on one fails OPEN, silently. Observed in production
+# 2026-08/09: GFAIW, GIPRW, PSQH.WS and dozens more via movers/most-actives.
+# Deliberately NARROW: explicit dot/dash suffixes plus the NASDAQ 5th-letter
+# W/U/R convention (allowlist-first — SCAN_UNIVERSE names always pass). A
+# filter that silently drops a real candidate is worse than one that lets a
+# warrant through, because the shadow ledger can price the warrant and cannot
+# price the absence.
+_STRUCTURED_SUFFIX_RE = re.compile(r"[.\-](WS[AB]?|U|R|RT|PR[A-Z]?)$", re.IGNORECASE)
+
+
+def is_common_stock_symbol(sym: str) -> bool:
+    """Conservative shape check. False for warrant/unit/rights suffixes
+    (.WS/.U/.R/.RT/-WS, NASDAQ 5-char symbols ending W/U/R), for symbols
+    carrying digits, and for symbols longer than 5 characters. Symbols in
+    SCAN_UNIVERSE are always common stock and skip the shape rules."""
+    s = str(sym or "").upper().strip()
+    if not s:
+        return False
+    if s in _SCAN_SET:
+        return True
+    if len(s) > 5 or any(ch.isdigit() for ch in s):
+        return False
+    if _STRUCTURED_SUFFIX_RE.search(s):
+        return False
+    if len(s) == 5 and s[-1] in "WUR":
+        return False
+    return True
 
 
 # ------------------------------------------------------------------ Alpaca API
@@ -499,9 +556,15 @@ class MarketData:
                     continue
                 gap = (last - prev_close) / prev_close * 100
                 if sym in INDEX_ETFS or abs(gap) >= min_gap:
+                    # Provenance tags (same pattern as in_scan_universe): tag,
+                    # don't drop — the analyst and the shadow ledger both see
+                    # these rows; exclusion decisions live in _validate_plan
+                    # (leveraged_gate) and population.snapshot_universe.
                     out.append({"symbol": sym, "last": round(float(last), 2),
                                 "gap_pct": round(gap, 2), "prev_close": round(float(prev_close), 2),
-                                "in_scan_universe": sym in base})
+                                "in_scan_universe": sym in base,
+                                "is_leveraged_product": sym in EXCLUDED_PRODUCTS,
+                                "is_common_stock": sym in base or is_common_stock_symbol(sym)})
             except (KeyError, TypeError):
                 continue
         band = self.cfg.data_cfg.get("gap_scan_price_band") or [None, None]
@@ -813,7 +876,12 @@ class MarketData:
         (card-rendered tickers), never the whole scan universe. A symbol
         this can't determine a date for is simply absent.
         """
+        # Structural instruments (warrants/units/rights) have no earnings by
+        # construction and yfinance errors one-by-one on every lookup — the
+        # 2026-08/09 production error flood (GFAIW, GIPRW, PSQH.WS, ...) was
+        # exactly this. Skip them like the ETFs above.
         syms = sorted({str(s).upper().strip() for s in symbols if s} - _NO_EARNINGS_SYMBOLS)
+        syms = [s for s in syms if is_common_stock_symbol(s)]
         out: dict[str, int | None] = {}
         if not syms:
             return out
@@ -1128,6 +1196,10 @@ def render_bundle_md(b: dict) -> str:
         parts.append("**Premarket gap scan (curated universe + live movers/actives):**")
         for g in gappers[:25]:
             tag = "" if g.get("in_scan_universe", True) else " [off-universe]"
+            if g.get("is_leveraged_product"):
+                tag += " [leveraged]"
+            if g.get("is_common_stock") is False:
+                tag += " [warrant/unit]"
             parts.append(f"- {g['symbol']}{tag}: {g['gap_pct']:+.2f}% (last {g['last']}, prev close {g['prev_close']}) "
                         f"| {_indicator_suffix(g)}{_context_lines(g)}")
 

@@ -150,9 +150,29 @@ def test_snapshot_skips_rows_missing_a_price_anchor(con):
 
 
 def test_snapshot_respects_the_symbol_cap(con):
-    g = [{"symbol": f"S{i:03d}", "last": 10.0, "prev_close": 9.0, "gap_pct": 5.0,
-          "atr14": 1.0} for i in range(100)]
+    # letter-only synthetic symbols: digit-bearing ones now read as structural
+    # instruments (Phase 1d shape filter) and are excluded before the cap
+    g = [{"symbol": f"S{chr(65 + i // 26)}{chr(65 + i % 26)}", "last": 10.0,
+          "prev_close": 9.0, "gap_pct": 5.0, "atr14": 1.0} for i in range(100)]
     assert snapshot_universe(con, date(2026, 8, 27), g, max_symbols=5) == 5
+
+
+def test_snapshot_excludes_leveraged_products_and_warrants(con):
+    # Phase 1d universe hygiene: leveraged/inverse/vol products and
+    # warrant/unit-shaped symbols never enter the population baseline.
+    gappers = [
+        {"symbol": "AAAA", "last": 50.0, "prev_close": 48.0, "gap_pct": 4.2, "atr14": 2.0},
+        {"symbol": "SOXL", "last": 30.0, "prev_close": 28.0, "gap_pct": 7.1, "atr14": 1.5},
+        {"symbol": "TQQQ", "last": 60.0, "prev_close": 57.0, "gap_pct": 5.3, "atr14": 2.0},
+        {"symbol": "UVXY", "last": 20.0, "prev_close": 18.0, "gap_pct": 11.1, "atr14": 2.5},
+        {"symbol": "NVDL", "last": 45.0, "prev_close": 42.0, "gap_pct": 7.1, "atr14": 2.0},
+        {"symbol": "GFAIW", "last": 1.2, "prev_close": 0.9, "gap_pct": 33.3, "atr14": 0.2},
+        {"symbol": "PSQH.WS", "last": 0.6, "prev_close": 0.4, "gap_pct": 50.0, "atr14": 0.1},
+    ]
+    n = snapshot_universe(con, date(2026, 8, 27), gappers)
+    assert n == 1
+    rows = con.execute("SELECT symbol FROM population_universe").fetchall()
+    assert [r[0] for r in rows] == ["AAAA"]
 
 
 # ------------------------------------------------------------------- grading

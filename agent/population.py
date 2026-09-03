@@ -84,6 +84,31 @@ def _index_etfs() -> frozenset[str]:
         return _INDEX_FALLBACK
 
 
+def _excluded_products() -> frozenset[str]:
+    """Leveraged/inverse/volatility products (providers.EXCLUDED_PRODUCTS).
+    Excluded for the same reason as index ETFs: they move on mechanical
+    leverage and decay, not company catalysts, so they are not names the desk
+    was genuinely choosing among — leaving them in inflates the monkey
+    baseline's variance and biases selection_edge_r. Fail-open on import
+    problems (empty set = old behavior), never break the control arm."""
+    try:
+        from .providers import EXCLUDED_PRODUCTS
+        return frozenset(str(s).upper() for s in EXCLUDED_PRODUCTS)
+    except Exception:
+        return frozenset()
+
+
+def _is_common_stock(sym: str) -> bool:
+    """Shape check for warrants/units/rights (providers.is_common_stock_symbol).
+    Fail-open: if the import breaks, treat everything as common stock rather
+    than silently shrinking the population."""
+    try:
+        from .providers import is_common_stock_symbol
+        return is_common_stock_symbol(sym)
+    except Exception:
+        return True
+
+
 def _log(scope: str, msg: str) -> None:
     """Log through the repo logger when available; never raise from a control arm."""
     try:
@@ -111,6 +136,7 @@ def snapshot_universe(
     desk was never choosing among.
     """
     index_etfs = _index_etfs()
+    excluded_products = _excluded_products()
     picked = {str(t).upper() for t in picked_tickers if t}
     con.execute("DELETE FROM population_universe WHERE plan_date = ?", [plan_date])
 
@@ -119,6 +145,11 @@ def snapshot_universe(
     for g in list(gappers)[:max_symbols]:
         sym = str(g.get("symbol", "")).upper().strip()
         if not sym or sym in index_etfs:
+            continue
+        # Leveraged/inverse/volatility products and structural instruments
+        # (warrants/units/rights) are not candidates the desk was choosing
+        # among — same rationale as the index-ETF exclusion above.
+        if sym in excluded_products or not _is_common_stock(sym):
             continue
         last, prev = g.get("last"), g.get("prev_close")
         if last is None or prev is None:

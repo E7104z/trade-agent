@@ -17,7 +17,8 @@ from ..delivery import morning_email_html, render_dashboard, send_email
 from ..indicators import beta_corr
 from ..llm import LLMClient, load_prompt, merge_usage, prompt_version
 from ..memory import build_morning_memory
-from ..providers import MarketData, render_bundle_md, yf_history_closes
+from ..providers import (EXCLUDED_PRODUCTS, MarketData, is_common_stock_symbol,
+                         render_bundle_md, yf_history_closes)
 from ..regime import compute_regime, regime_md
 from ..util import is_market_day, log, now_et, today_et
 
@@ -189,6 +190,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     losing_streak = bool(streak and streak.get("kind") == "losing" and streak.get("length", 0) >= 3)
     atr_gate_mode = str(cfg.get("atr_gate", "warn")).lower()
     earnings_gate_mode = str(cfg.get("earnings_gate", "warn")).lower()
+    leveraged_gate_mode = str(cfg.get("leveraged_gate", "warn")).lower()
     min_stop_atr = float(cfg.get("min_stop_atr", 0.35))
     warn_stop_atr = float(cfg.get("warn_stop_atr", 2.5))
     warn_target_atr = float(cfg.get("warn_target_atr", 3.5))
@@ -218,6 +220,21 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
         p["ticker"] = t
         d = str(p.get("direction", "long")).lower()
         p["direction"] = d if d in ("long", "short") else "long"
+
+        # LEVERAGED-PRODUCT / STRUCTURAL-INSTRUMENT GATE (Phase 1d — warn mode
+        # by default, config `leveraged_gate`, same idiom as atr_gate/
+        # earnings_gate). Flip to "enforce" only after shadow evidence shows
+        # what it would have cost.
+        if t in EXCLUDED_PRODUCTS or not is_common_stock_symbol(t):
+            kind = ("leveraged/inverse/volatility product" if t in EXCLUDED_PRODUCTS
+                    else "warrant/unit/rights-shaped symbol")
+            msg = (f"{t}: {kind} — moves on mechanical leverage/decay or conversion "
+                   f"supply, not a company catalyst; a thesis on it is a thesis about "
+                   f"its underlying wearing a costume")
+            if leveraged_gate_mode == "enforce":
+                warnings.append(msg + " — dropped")
+                continue
+            warnings.append(f"[LEVERAGED GATE warn-only, would drop if enforced] {msg}")
 
         entry, stop, target = p.get("entry_price"), p.get("stop_price"), p.get("target_price")
         if not all(isinstance(x, (int, float)) for x in (entry, stop, target)):

@@ -168,6 +168,48 @@ def test_fetched_quote_with_close_entry_survives():
     assert not any("ungrounded" in w or "reads as" in w for w in warnings)
 
 
+def test_leveraged_product_warns_but_survives_in_warn_mode():
+    # Phase 1d: default is warn mode — tag first, gate second. SOXL is a 3x
+    # semiconductor ETF; the pick survives but carries the gate warning.
+    plan = _plan([_pick(ticker="SOXL", entry_type="limit",
+                        entry=11.50, stop=10.90, target=13.00)])
+    out, warnings = _validate_plan(plan, _cfg(), ref_prices={"SOXL": 11.75})
+    assert [p["ticker"] for p in out["picks"]] == ["SOXL"]
+    assert any("LEVERAGED GATE warn-only" in w for w in warnings)
+
+
+def test_leveraged_product_dropped_in_enforce_mode():
+    plan = _plan([_pick(ticker="SOXL", entry_type="limit",
+                        entry=11.50, stop=10.90, target=13.00)])
+    out, warnings = _validate_plan(plan, _cfg(leveraged_gate="enforce"),
+                                   ref_prices={"SOXL": 11.75})
+    assert out["picks"] == []
+    assert any("SOXL" in w and "dropped" in w for w in warnings)
+
+
+def test_warrant_shaped_symbol_hits_the_same_gate():
+    # Addendum A3: the gate covers structural instruments too — GFAIW is a
+    # warrant (production-observed 2026-08/09), not a common-stock candidate.
+    plan = _plan([_pick(ticker="GFAIW", entry_type="limit",
+                        entry=11.50, stop=10.90, target=13.00)])
+    out, warnings = _validate_plan(plan, _cfg(), ref_prices={"GFAIW": 11.75})
+    assert [p["ticker"] for p in out["picks"]] == ["GFAIW"]  # warn mode: survives
+    assert any("warrant/unit/rights" in w for w in warnings)
+
+    out2, warnings2 = _validate_plan(
+        _plan([_pick(ticker="GFAIW", entry_type="limit",
+                     entry=11.50, stop=10.90, target=13.00)]),
+        _cfg(leveraged_gate="enforce"), ref_prices={"GFAIW": 11.75})
+    assert out2["picks"] == []
+
+
+def test_common_stock_pick_does_not_trigger_the_leveraged_gate():
+    plan = _plan([_pick(entry_type="limit", entry=11.50, stop=10.90, target=13.00)])
+    out, warnings = _validate_plan(plan, _cfg(), ref_prices={"MARA": 11.75})
+    assert len(out["picks"]) == 1
+    assert not any("LEVERAGED GATE" in w or "warrant/unit" in w for w in warnings)
+
+
 def test_grounded_ref_prices_fetches_only_missing_pick_tickers():
     # The merge layer: bundle-covered tickers are NOT re-fetched; proposed
     # tickers the bundle missed get one batched pick_quotes call, and

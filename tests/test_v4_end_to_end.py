@@ -1,4 +1,4 @@
-"""
+﻿"""
 End-to-end smoke test for the v4 research layer.
 
 Unit tests prove each module is right in isolation. This file proves they work
@@ -132,17 +132,17 @@ def _season(con, weeks=4, per_day=2):
             d = start + timedelta(days=w * 7 + dow)
             days.append(d)
             gappers = [
-                {"symbol": f"UP{dow}", "last": 50.0, "prev_close": 48.0,
+                {"symbol": f"UP{chr(65 + dow)}", "last": 50.0, "prev_close": 48.0,
                  "gap_pct": 4.2, "atr14": 2.0, "adv20": 3e6, "in_scan_universe": True},
-                {"symbol": f"DN{dow}", "last": 20.0, "prev_close": 21.0,
+                {"symbol": f"DN{chr(65 + dow)}", "last": 20.0, "prev_close": 21.0,
                  "gap_pct": -4.8, "atr14": 1.0, "adv20": 1e6, "in_scan_universe": True},
-                {"symbol": f"UPX{dow}", "last": 30.0, "prev_close": 29.0,
+                {"symbol": f"UPX{chr(65 + dow)}", "last": 30.0, "prev_close": 29.0,
                  "gap_pct": 3.4, "atr14": 1.5, "adv20": 2e6, "in_scan_universe": False},
             ]
             picks = []
             for i in range(per_day):
                 pid += 1
-                sym = f"UP{dow}" if i == 0 else f"DN{dow}"
+                sym = f"UP{chr(65 + dow)}" if i == 0 else f"DN{chr(65 + dow)}"
                 r = 1.2 if sym.startswith("UP") else -0.8
                 con.execute(
                     """INSERT INTO picks (pick_id, plan_date, ticker, direction,
@@ -164,7 +164,7 @@ def _season(con, weeks=4, per_day=2):
                 """INSERT INTO rejections (rejection_id, plan_date, ticker, direction,
                    setup_type, reason, eod_outcome, forgone_r, sim_version)
                    VALUES (?,?,?,'long','sympathy','too correlated','would_have_lost',?,2)""",
-                [rid, d, f"UPX{dow}", -0.4])
+                [rid, d, f"UPX{chr(65 + dow)}", -0.4])
             con.execute(
                 "INSERT INTO daily_plans (plan_date, no_trade, regime_tag) VALUES (?, FALSE, ?)",
                 [d, "uptrend/risk_on/lowvol"])
