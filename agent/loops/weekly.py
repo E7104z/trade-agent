@@ -122,6 +122,41 @@ def _half_day_md(con) -> str:
     )
 
 
+def _data_quality_md(con) -> str:
+    """Phase 1f (Addendum A §A4): name every session where a validation gate
+    failed OPEN because a data provider was unavailable. Picks from a
+    provider_degraded session cleared fewer checks than picks from a clean
+    session — a confound sim_version doesn't watch and the miner cannot see
+    unless it is told (the 2026-08-27 $OKTA "possibly delisted" burst was
+    almost certainly a yfinance degradation, not a real delisting)."""
+    try:
+        rows = con.execute(
+            "SELECT plan_date, gates_failed_open FROM daily_plans "
+            "WHERE provider_degraded = TRUE ORDER BY plan_date"
+        ).fetchall()
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    lines = []
+    for plan_date, gates_json in rows:
+        try:
+            counts = json.loads(gates_json) if gates_json else {}
+        except (TypeError, ValueError):
+            counts = {}
+        detail = ", ".join(f"{k}={v}" for k, v in counts.items() if v)
+        d_str = plan_date.isoformat() if hasattr(plan_date, "isoformat") else str(plan_date)
+        lines.append(f"- {d_str}: {detail or '(counts unavailable)'}")
+    return (
+        "## DATA QUALITY\n\n"
+        "Sessions flagged `provider_degraded` had one or more validation gates fail "
+        "OPEN because a data provider was unavailable. Picks from those sessions "
+        "cleared fewer checks than picks from clean sessions. Do not pool them into "
+        "a gate-effect comparison without saying so, and never attribute a pattern "
+        "to a gate on a session where that gate did not run.\n\n" + "\n".join(lines)
+    )
+
+
 def _v3_sections(mem: dict) -> str:
     """Render calibration, shadow, staleness, and question-progress data for the miner."""
     cal = mem.get("calibration", [])
@@ -260,6 +295,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_v3_sections(mem)}\n\n"
             f"{_sim_version_md(mem)}\n\n"
             f"{_half_day_md(con)}\n\n"
+            f"{_data_quality_md(con)}\n\n"
             f"{research_block['markdown']}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"
             f"## LESSON BANK (with IDs for your lesson_actions)\n\n"

@@ -184,6 +184,21 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     remains the final backstop for anything that still slips through.
     """
     warnings: list[str] = []
+    # Phase 1f fail-open telemetry: count proposed tickers for which each fail-
+    # OPEN gate could not run (data provider outage), and how many were dropped
+    # for having no obtainable price reference at all (a data-quality failure,
+    # not a magnitude rejection — see _validate_plan's PRICE-GROUNDING docstring).
+    # Attached to `plan` (not returned separately) so every existing caller of
+    # this function keeps working unchanged; ledger.save_daily_plan reads it
+    # off `plan` the same way it already reads regime_tag/prompt_version.
+    gate_counts = {"atr": 0, "earnings": 0, "grounding": 0}
+    n_proposed = len(plan.get("picks") or [])
+
+    def _stamp_gate_telemetry() -> None:
+        plan["gates_failed_open"] = json.dumps(gate_counts)
+        plan["provider_degraded"] = bool(
+            n_proposed > 0 and any(v > n_proposed / 2 for v in gate_counts.values()))
+
     max_picks = int(cfg.get("max_picks", 4))
     min_r, max_r = float(cfg.get("min_size_r", 0.25)), float(cfg.get("max_size_r", 1.5))
     max_total = float(cfg.get("max_total_open_risk_r", 3.0))
@@ -207,6 +222,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     picks = plan.get("picks") or []
     if plan.get("no_trade"):
         plan["picks"] = []
+        _stamp_gate_telemetry()
         return plan, warnings
 
     valid: list[dict] = []
@@ -249,6 +265,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
 
         ref = (ref_prices or {}).get(t)
         if not ref:
+            gate_counts["grounding"] += 1
             warnings.append(
                 f"{t}: entry {entry} could not be verified against any live quote (no bundle "
                 f"reference and the pre-validation snapshot fetch returned nothing) — dropped; "
@@ -304,6 +321,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                 warnings.append(f"{t}: target is {target_dist_atr:.2f} ATR from entry "
                                 f"(> {warn_target_atr}) with a same-day time_stop — aggressive")
         else:
+            gate_counts["atr"] += 1
             warnings.append(f"{t}: ATR unavailable — noise-stop/wide-stop checks skipped (unmeasured)")
 
         # BINARY-EVENT GATE (fails OPEN on missing earnings data, same reasoning).
@@ -322,6 +340,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                     continue
                 warnings.append(f"[EARNINGS GATE warn-only, would drop if enforced] {msg}")
         else:
+            gate_counts["earnings"] += 1
             warnings.append(f"{t}: earnings date unavailable — binary-event check skipped (unmeasured)")
 
         size = p.get("size_r")
@@ -369,6 +388,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
         plan["no_trade"] = True
         plan["no_trade_reason"] = plan.get("no_trade_reason") or "All picks failed hard validation."
         warnings.append("no valid picks survived validation — converted to no_trade day")
+    _stamp_gate_telemetry()
     return plan, warnings
 
 

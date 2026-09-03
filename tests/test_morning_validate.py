@@ -403,6 +403,66 @@ def test_earnings_unavailable_skips_check_with_unmeasured_warning():
     assert any("earnings date unavailable" in w and "unmeasured" in w for w in warnings)
 
 
+# --------------------------------------------- Phase 1f: fail-open telemetry
+
+def test_gates_failed_open_all_zero_when_every_gate_has_data():
+    import json as _json
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)])
+    out, _ = _validate_plan(plan, _cfg(), ref_prices={"MARA": 100.0},
+                            atr_map={"MARA": 1.0}, earnings_map={"MARA": 12})
+    assert _json.loads(out["gates_failed_open"]) == {"atr": 0, "earnings": 0, "grounding": 0}
+    assert out["provider_degraded"] is False
+
+
+def test_atr_fail_open_is_counted_structurally():
+    import json as _json
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)])
+    out, _ = _validate_plan(plan, _cfg(), ref_prices={"MARA": 100.0}, atr_map={})
+    assert _json.loads(out["gates_failed_open"])["atr"] == 1
+
+
+def test_earnings_fail_open_is_counted_structurally():
+    import json as _json
+    plan = _plan([_pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)])
+    out, _ = _validate_plan(plan, _cfg(), ref_prices={"MARA": 100.0}, earnings_map={})
+    assert _json.loads(out["gates_failed_open"])["earnings"] == 1
+
+
+def test_unverifiable_price_counted_as_grounding_fail_open():
+    import json as _json
+    plan = _plan([_pick(ticker="OBSCURE", entry_type="limit", entry=12.80)])
+    out, _ = _validate_plan(plan, _cfg(), ref_prices={"MARA": 11.75})
+    assert _json.loads(out["gates_failed_open"])["grounding"] == 1
+
+
+def test_provider_degraded_true_when_a_gate_fails_open_for_more_than_half():
+    # 2 of 3 proposed tickers missing ATR -> session-wide outage, not noise.
+    plan = _plan([_pick(ticker="AAAA", entry_type="open", entry=100.0, stop=98.0, target=104.0),
+                  _pick(ticker="BBBB", entry_type="open", entry=50.0, stop=49.0, target=53.0),
+                  _pick(ticker="CCCC", entry_type="open", entry=20.0, stop=19.5, target=21.5)])
+    out, _ = _validate_plan(plan, _cfg(), ref_prices={"AAAA": 100.0, "BBBB": 50.0, "CCCC": 20.0},
+                            atr_map={"AAAA": 1.0})  # BBBB, CCCC missing -> 2/3
+    assert out["provider_degraded"] is True
+
+
+def test_provider_degraded_false_for_a_single_missing_atr_in_a_larger_book():
+    plan = _plan([_pick(ticker="AAAA", entry_type="open", entry=100.0, stop=98.0, target=104.0),
+                  _pick(ticker="BBBB", entry_type="open", entry=50.0, stop=49.0, target=53.0),
+                  _pick(ticker="CCCC", entry_type="open", entry=20.0, stop=19.5, target=21.5)])
+    out, _ = _validate_plan(plan, _cfg(), ref_prices={"AAAA": 100.0, "BBBB": 50.0, "CCCC": 20.0},
+                            atr_map={"AAAA": 1.0, "BBBB": 1.0},  # only CCCC missing -> 1/3
+                            earnings_map={"AAAA": 10, "BBBB": 10, "CCCC": 10})  # isolate the ATR gate
+    assert out["provider_degraded"] is False
+
+
+def test_gate_telemetry_still_stamped_on_no_trade_early_return():
+    import json as _json
+    plan = {"no_trade": True, "picks": []}
+    out, _ = _validate_plan(plan, _cfg())
+    assert _json.loads(out["gates_failed_open"]) == {"atr": 0, "earnings": 0, "grounding": 0}
+    assert out["provider_degraded"] is False
+
+
 def test_grounded_atr_uses_bundle_first_then_fetches_missing():
     class StubMD:
         def daily_context(self, symbols):

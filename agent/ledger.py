@@ -339,8 +339,9 @@ def save_daily_plan(
     con.execute("DELETE FROM daily_plans WHERE plan_date = ?", [plan_date])
     con.execute(
         """INSERT INTO daily_plans
-           (plan_date, no_trade, market_summary, plan_json, analyst_json, regime_tag, notes_for_evening)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           (plan_date, no_trade, market_summary, plan_json, analyst_json, regime_tag,
+            notes_for_evening, gates_failed_open, provider_degraded)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             plan_date,
             bool(plan.get("no_trade")),
@@ -349,6 +350,8 @@ def save_daily_plan(
             json.dumps(analyst),
             regime_tag,
             plan.get("notes_for_evening", ""),
+            plan.get("gates_failed_open"),
+            plan.get("provider_degraded"),
         ],
     )
     # replace any picks previously stored for this date (re-runs)

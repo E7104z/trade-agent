@@ -34,4 +34,20 @@ STATEMENTS: list[str] = [
     # no flatten was configured / row predates the column (NULL). Recorded so an
     # inert flatten rule is a visible fact, not a silent no-op.
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS flatten_inert BOOLEAN",
+
+    # ------------------------------------------------ Phase 1f: fail-open telemetry
+    # _grounded_atr/_grounded_earnings/price-grounding all fail OPEN by design on a
+    # provider outage (a data outage must not silently kill a trading day) — but
+    # nothing recorded that a gate was skipped. A pick from a degraded session sat
+    # in the ledger indistinguishable from one that cleared every gate. This is the
+    # same confound class sim_version exists to prevent, arriving through a door
+    # nothing was watching (see the 2026-08-27 $OKTA "possibly delisted" burst —
+    # almost certainly a yfinance degradation, not a real delisting).
+    # gates_failed_open: JSON {"atr": n, "earnings": n, "grounding": n} — counts of
+    # proposed tickers for which that gate could not run this session.
+    "ALTER TABLE daily_plans ADD COLUMN IF NOT EXISTS gates_failed_open VARCHAR",
+    # provider_degraded: TRUE when any single gate failed open for MORE THAN HALF
+    # the proposed tickers this session (a single missing ATR is noise; a
+    # session-wide absence is an outage).
+    "ALTER TABLE daily_plans ADD COLUMN IF NOT EXISTS provider_degraded BOOLEAN",
 ]
