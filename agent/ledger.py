@@ -293,6 +293,10 @@ _MIGRATIONS = [
 from . import migrations_v4  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v4.STATEMENTS
 
+# --- v5 DTO-port evidence columns (half-day calendar, Phase 1) ---
+from . import migrations_v5  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v5.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -436,9 +440,11 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             gap_fill_frac_1000, gap_fill_frac_1200, gap_fill_frac_close,
             trend_side_200d, ext_atr_at_entry, short_pct_float, float_shares, mkt_cap,
             r_multiple_2x, r_multiple_3x, slippage_bps_used, friction_model, participation_pct,
+            session_length, flatten_inert,
             grade, grade_notes, graded_at, sim_version)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                   ?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
@@ -458,6 +464,7 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             o.get("float_shares"), o.get("mkt_cap"),
             o.get("r_multiple_2x"), o.get("r_multiple_3x"), o.get("slippage_bps_used"),
             o.get("friction_model"), o.get("participation_pct"),
+            o.get("session_length"), o.get("flatten_inert"),
             o.get("grade"), o.get("grade_notes"),
             o.get("graded_at", datetime.now()), sim_version,
         ],

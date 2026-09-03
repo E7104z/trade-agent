@@ -79,7 +79,7 @@ from typing import Any
 
 from . import indicators as ind
 from .providers import MarketData
-from .util import log
+from .util import is_half_day, log, market_close_et
 
 _CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 
@@ -217,14 +217,23 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                   min_bar_volume: float = 0, adv20: float | None = None,
                   atr14: float | None = None, trend_snapshot: dict | None = None,
                   fundamentals: dict | None = None, prev_close: float | None = None,
-                  or_minutes: int = 15) -> dict:
+                  or_minutes: int = 15, session_date: date | None = None) -> dict:
     """Returns an outcome dict ready for ledger.save_outcome (minus grade fields).
 
     atr14/trend_snapshot/fundamentals/prev_close are the indicator-layer-v2
     grading inputs (agent/loops/evening.py passes these from one batched
     daily_context/fundamentals call per grading run, mirroring how adv20 is
     already threaded through). All are grader INPUT / miner FUEL only — they
-    never gate a fill or change R math."""
+    never gate a fill or change R math.
+
+    session_date (Phase 1c) drives the half-day calendar: on a 13:00 ET early
+    close, flatten_at/time_stop cutoffs at/after the session close are inert by
+    construction and are recorded as such instead of silently never firing.
+    When session_date is None (legacy callers), behavior is unchanged and
+    session_length stays None."""
+    # Session close for cutoff clamping. Without a session_date we assume the
+    # historical behavior: a full 16:00 session.
+    close_t = market_close_et(session_date) if session_date else dtime(16, 0)
     out: dict[str, Any] = {
         "pick_id": pick["pick_id"],
         "triggered": False,
@@ -241,6 +250,12 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "execution_anomaly": False,
         "fill_vs_plan_r": None,
         "sim_version": CURRENT_SIM_VERSION,
+        # Phase 1c half-day calendar: a property of the SESSION, set for every
+        # outcome (including no_data/invalid_plan) whenever the caller supplies
+        # session_date. flatten_inert stays None unless a flatten was configured.
+        "session_length": (("half" if is_half_day(session_date) else "full")
+                           if session_date else None),
+        "flatten_inert": None,
         # indicator layer v1 (specs/INDICATOR_LAYER_SPEC_v1.md §4) — deterministic,
         # checkpoint-accurate; session-level fields below apply whether or not
         # the pick triggered, fill-dependent ones only when it did (see end).
@@ -450,6 +465,10 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
             out["fill_vs_or"] = "inside"
 
     # ---- map time_stop / flatten_at to bar indices, once, before the walk ----
+    # Both cutoffs are clamped against the session close (13:00 on a half day,
+    # via market_close_et). A cutoff at/after the close cannot fire — the eod
+    # exit at the actual close handles the position — and on a half day that
+    # inertness is recorded (flatten_inert) instead of passing silently.
     time_stop_idx = None
     time_stop_raw = pick.get("time_stop")
     if time_stop_raw:
@@ -457,6 +476,9 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         if parsed is None:
             log("grade", f"pick {pick.get('pick_id')}: unparseable time_stop "
                          f"{time_stop_raw!r}; simulating without a time stop")
+        elif parsed >= close_t:
+            log("grade", f"pick {pick.get('pick_id')}: time_stop {time_stop_raw!r} is at/after "
+                         f"the {close_t.strftime('%H:%M')} session close — inert; eod exit applies")
         else:
             time_stop_idx = _clock_to_bar_index(parsed, bars)
 
@@ -466,7 +488,12 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         if parsed is None:
             log("grade", f"unparseable flatten_at config value {flatten_at!r}; "
                          f"flatten disabled for this simulation")
+        elif parsed >= close_t:
+            out["flatten_inert"] = True
+            log("grade", f"flatten_at {flatten_at!r} is at/after the "
+                         f"{close_t.strftime('%H:%M')} session close — flatten rule inert this session")
         else:
+            out["flatten_inert"] = False
             flatten_idx = _clock_to_bar_index(parsed, bars)
 
     # ---- walk forward ----------------------------------------------------
@@ -622,7 +649,7 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
                           trend_snapshot=(trend_map or {}).get(t),
                           fundamentals=(fundamentals_map or {}).get(t),
                           prev_close=(prev_close_map or {}).get(t),
-                          or_minutes=or_minutes)
+                          or_minutes=or_minutes, session_date=d)
         o["eval_date"] = d
         outcomes.append(o)
         log("grade", f"{p['ticker']} {p['direction']}: triggered={o['triggered']} "

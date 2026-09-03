@@ -118,7 +118,8 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
                 "entry_type": r["entry_type"], "entry_price": r["entry_price"],
                 "stop_price": r["stop_price"], "target_price": r["target_price"]}
         sim = simulate_pick(shim, bars, None, slippage_bps=slippage_bps,
-                            flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+                            flatten_at=flatten_at, min_bar_volume=min_bar_volume,
+                            session_date=d)
         eod_outcome, forgone = classify_shadow(sim)
         ledger.save_rejection_outcome(con, r["rejection_id"], eod_outcome, forgone,
                                       sim_version=sim.get("sim_version"))
@@ -153,12 +154,12 @@ def _q1_gap_fade_mechanics(con, md: MarketData, d: date, picks: list[dict],
                                  "entry_type": c.get("entry_type", "limit"),
                                  "entry_price": c["entry_price"], "stop_price": c["stop_price"],
                                  "target_price": c["target_price"]}, bars, None,
-                                slippage_bps=slippage_bps)
+                                slippage_bps=slippage_bps, session_date=d)
         open_sim = simulate_pick({"pick_id": 0, "direction": c["direction"],
                                   "entry_type": "open", "entry_price": bars[0]["o"],
                                   "stop_price": c["stop_price"],
                                   "target_price": c["target_price"]}, bars, None,
-                                 slippage_bps=slippage_bps)
+                                 slippage_bps=slippage_bps, session_date=d)
         note = (f"{c['ticker']}: planned-entry R="
                 f"{planned.get('r_multiple') if planned.get('triggered') else 'untriggered'}, "
                 f"open-print R={open_sim.get('r_multiple')}")

@@ -22,7 +22,7 @@ from ..config import BASE_DIR, Config
 from ..delivery import render_dashboard, send_email, weekly_email_html
 from ..llm import LLMClient, load_prompt
 from ..memory import build_weekly_memory, write_playbook
-from ..util import log, now_et, today_et
+from ..util import is_half_day, log, now_et, today_et
 
 STALE_SESSIONS = 30  # >= this many sessions without confirmation -> auto-demote
 
@@ -91,6 +91,34 @@ def _sim_version_md(mem: dict) -> str:
         "Compare within a single sim_version, or note the boundary explicitly if "
         "you must compare across it.\n\n"
         f"{table}"
+    )
+
+
+def _half_day_md(con) -> str:
+    """Phase 1c: name every early-close (13:00 ET) session in the mined ledger.
+    Same pattern as _sim_version_md — a half-day outcome was graded against a
+    session that ended three hours early (eod at 13:00, late flatten/time_stop
+    cutoffs inert), which is a different rule set arriving through a door
+    sim_version doesn't watch. Checked in code against the calendar rather than
+    the session_length column so rows graded before that column existed are
+    still flagged."""
+    try:
+        rows = con.execute(
+            "SELECT DISTINCT eval_date FROM outcomes WHERE eval_date IS NOT NULL ORDER BY 1"
+        ).fetchall()
+    except Exception:
+        return ""
+    half = [r[0] for r in rows if r[0] is not None and is_half_day(r[0])]
+    if not half:
+        return ""
+    dates = ", ".join(d.isoformat() if hasattr(d, "isoformat") else str(d) for d in half)
+    return (
+        "## HALF-DAY SESSIONS IN THIS LEDGER\n\n"
+        f"The following session(s) closed early at 13:00 ET: {dates}. Outcomes from "
+        "them were graded against a three-hours-shorter session — eod exits resolved "
+        "at 13:00, and any flatten_at/time_stop cutoff later than the close never "
+        "fired. Exclude them from (or explicitly flag them in) any comparison of "
+        "exit-reason mix, time-based management, or hold-duration effects."
     )
 
 
@@ -231,6 +259,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_counterfactuals_md(mem)}\n\n"
             f"{_v3_sections(mem)}\n\n"
             f"{_sim_version_md(mem)}\n\n"
+            f"{_half_day_md(con)}\n\n"
             f"{research_block['markdown']}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"
             f"## LESSON BANK (with IDs for your lesson_actions)\n\n"

@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -26,6 +26,21 @@ MARKET_HOLIDAYS: set[str] = {
 }
 
 
+# NYSE early-close sessions (13:00 ET close). Observed dates: the July 3rd
+# session when July 4th falls on a weekday-Friday, the Friday after
+# Thanksgiving, and Christmas Eve when Dec 25 falls Tue-Fri. Years where one
+# of those days is itself a full holiday (e.g. 2026-07-03, 2027-12-24 — see
+# MARKET_HOLIDAYS above) have no corresponding half day.
+MARKET_HALF_DAYS: set[str] = {
+    # 2025
+    "2025-07-03", "2025-11-28", "2025-12-24",
+    # 2026 (Jul 3 is a full holiday; no July half day)
+    "2026-11-27", "2026-12-24",
+    # 2027 (Jul 5 and Dec 24 are full holidays; no July/December half day)
+    "2027-11-26",
+}
+
+
 def now_et() -> datetime:
     return datetime.now(tz=ET)
 
@@ -37,6 +52,19 @@ def today_et() -> date:
 def is_market_day(d: date | None = None) -> bool:
     d = d or today_et()
     return d.weekday() < 5 and d.isoformat() not in MARKET_HOLIDAYS
+
+
+def is_half_day(d: date | None = None) -> bool:
+    d = d or today_et()
+    return d.isoformat() in MARKET_HALF_DAYS
+
+
+def market_close_et(d: date | None = None) -> dtime:
+    """13:00 on an early-close session, else 16:00. Callers that build a bar
+    index or a flatten cutoff must use this, never a hard-coded 16:00 — on a
+    half day a 15:55 flatten or a 14:00 time_stop maps to a bar that does not
+    exist, and the rule silently never fires."""
+    return dtime(13, 0) if is_half_day(d) else dtime(16, 0)
 
 
 def prev_market_day(d: date | None = None) -> date:

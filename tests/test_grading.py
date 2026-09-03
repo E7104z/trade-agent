@@ -848,3 +848,101 @@ def test_outcomes_md_renders_indicator_line_for_triggered_pick():
     assert "below VWAP" in md_text or "below vwap" in md_text.lower()
 
 
+# ------------------------------------------------------------- half-day calendar (Phase 1c)
+
+HALF_DAY = date(2026, 11, 27)   # Friday after Thanksgiving — 13:00 ET close
+FULL_DAY = date(2026, 11, 30)   # the following Monday — normal 16:00 close
+
+
+def test_market_close_et_and_is_half_day_calendar():
+    from datetime import time
+
+    from agent.util import is_half_day, market_close_et
+    assert is_half_day(HALF_DAY) is True
+    assert market_close_et(HALF_DAY) == time(13, 0)
+    assert is_half_day(FULL_DAY) is False
+    assert market_close_et(FULL_DAY) == time(16, 0)
+
+
+def test_half_day_time_stop_after_close_exits_at_the_1300_close():
+    # time_stop "by 14:00" on a 13:00-close session cannot fire — the position
+    # exits at the actual session close (eod), never against a nonexistent bar.
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0,
+                 time_stop="by 14:00")
+    bars = [
+        _tbar(12, 58, 100.0, 100.5, 99.5, 100.2),
+        _tbar(12, 59, 100.2, 100.6, 99.8, 100.4),  # last bar of the short session
+    ]
+    out = simulate_pick(pick, bars, None, session_date=HALF_DAY)
+    assert out["session_length"] == "half"
+    assert out["exit_reason"] == "eod"
+    assert out["exit_price"] == 100.4
+
+
+def test_half_day_time_stop_before_close_still_fires_normally():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0,
+                 time_stop="by 12:00")
+    bars = [
+        _tbar(11, 58, 100.0, 100.5, 99.5, 100.2),
+        _tbar(12, 0, 100.2, 100.6, 99.8, 100.4),   # time_stop bar
+        _tbar(12, 1, 100.4, 120.0, 100.0, 118.0),  # target would hit later — must not matter
+    ]
+    out = simulate_pick(pick, bars, None, session_date=HALF_DAY)
+    assert out["exit_reason"] == "time_stop"
+    assert out["exit_price"] == 100.4
+
+
+def test_half_day_flatten_1555_is_recorded_inert_not_silently_dropped():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0)
+    bars = [
+        _tbar(12, 58, 100.0, 100.5, 99.5, 100.2),
+        _tbar(12, 59, 100.2, 100.6, 99.8, 100.4),
+    ]
+    out = simulate_pick(pick, bars, None, flatten_at="15:55", session_date=HALF_DAY)
+    assert out["flatten_inert"] is True
+    assert out["exit_reason"] == "eod"
+    assert out["exit_price"] == 100.4
+
+
+def test_full_day_active_flatten_sets_inert_false_and_session_full():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0)
+    bars = [
+        _tbar(9, 30, 100.0, 100.5, 99.5, 100.2),
+        _tbar(9, 31, 100.2, 100.6, 99.8, 100.4),  # flatten cutoff reached here
+    ]
+    out = simulate_pick(pick, bars, None, flatten_at="09:31", session_date=FULL_DAY)
+    assert out["session_length"] == "full"
+    assert out["flatten_inert"] is False
+    assert out["exit_reason"] == "flatten"
+
+
+def test_session_length_set_even_when_there_is_no_data():
+    out = simulate_pick(_pick(), [], None, session_date=HALF_DAY)
+    assert out["exit_reason"] == "no_data"
+    assert out["session_length"] == "half"
+
+
+def test_no_session_date_keeps_legacy_behavior_and_null_session_length():
+    # Legacy callers that don't thread a session date must see no change:
+    # session_length stays None and no clamping is applied beyond the 16:00 default.
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0,
+                 time_stop="by 14:00")
+    bars = [_bar(100.0, 100.5, 99.5, 100.2)]
+    out = simulate_pick(pick, bars, None)
+    assert out["session_length"] is None
+    assert out["flatten_inert"] is None
+
+
+def test_grade_day_threads_session_date_into_session_length():
+    class StubMD:
+        def minute_bars(self, sym, d):
+            return [_bar(100.0, 100.5, 99.5, 100.2)]
+
+        def daily_bar(self, sym, d):
+            return None
+
+    picks = [dict(_pick(), ticker="AAPL", direction="long")]
+    outcomes = grade_day(StubMD(), picks, HALF_DAY)
+    assert outcomes[0]["session_length"] == "half"
+
+

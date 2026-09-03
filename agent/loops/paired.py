@@ -329,7 +329,8 @@ def grade_paired_arms(
             bars = md.minute_bars(row["ticker"], plan_date)
             daily = md.daily_bar(row["ticker"], plan_date)
             out = simulate(pick, bars, daily, slippage_bps=slippage_bps,
-                           flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+                           flatten_at=flatten_at, min_bar_volume=min_bar_volume,
+                           session_date=plan_date)
         except Exception as e:
             _log("paired", f"WARN grading {row['arm']}/{row['ticker']} failed: {e}")
             continue
