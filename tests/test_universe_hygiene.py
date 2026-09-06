@@ -90,3 +90,14 @@ def test_bundle_renders_leveraged_and_warrant_tags():
     assert "[leveraged]" in soxl_line
     assert "[warrant/unit]" in gfaiw_line
     assert "[leveraged]" not in aapl_line and "[warrant/unit]" not in aapl_line
+
+
+def test_bundle_renders_pm_volume_unavailability_reason():
+    b = {
+        "premarket_gappers": [
+            {"symbol": "MARA", "gap_pct": 4.0, "last": 12.0, "prev_close": 11.5,
+             "pm_volume_status": "batch_unavailable"},
+        ],
+    }
+    md = render_bundle_md(b)
+    assert "pm vol n/a (batch_unavailable)" in md

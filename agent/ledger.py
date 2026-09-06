@@ -297,6 +297,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v4.STATEMENTS
 from . import migrations_v5  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v5.STATEMENTS
 
+# --- v6 candidate-flow and shadow-ledger provenance -----------------------
+from . import migrations_v6  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v6.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -340,8 +344,10 @@ def save_daily_plan(
     con.execute(
         """INSERT INTO daily_plans
            (plan_date, no_trade, market_summary, plan_json, analyst_json, regime_tag,
-            notes_for_evening, gates_failed_open, provider_degraded)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            notes_for_evening, gates_failed_open, provider_degraded,
+            analyst_candidate_count, risk_rejection_count, validator_proposed_count,
+            validator_drop_count, persisted_rejection_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             plan_date,
             bool(plan.get("no_trade")),
@@ -352,6 +358,11 @@ def save_daily_plan(
             plan.get("notes_for_evening", ""),
             plan.get("gates_failed_open"),
             plan.get("provider_degraded"),
+            plan.get("analyst_candidate_count"),
+            plan.get("risk_rejection_count"),
+            plan.get("validator_proposed_count"),
+            plan.get("validator_drop_count"),
+            plan.get("persisted_rejection_count"),
         ],
     )
     # replace any picks previously stored for this date (re-runs)
@@ -366,8 +377,8 @@ def save_daily_plan(
                (plan_date, ticker, direction, setup_type, catalyst, thesis, conviction,
                 size_r, entry_type, entry_price, stop_price, target_price, target2_price,
                 time_stop, invalidation, regime_tag, prompt_version, playbook_version,
-                in_scan_universe)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    in_scan_universe, exploration_lane, exploration_rr)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                RETURNING pick_id""",
             [
                 plan_date,
@@ -389,6 +400,8 @@ def save_daily_plan(
                 plan.get("prompt_version", ""),
                 plan.get("playbook_version", ""),
                 ticker in SCAN_UNIVERSE or ticker in INDEX_ETFS,
+                p.get("exploration_lane"),
+                p.get("exploration_rr"),
             ],
         ).fetchone()
         ids.append(row[0])
@@ -1056,13 +1069,15 @@ def save_rejections(con: duckdb.DuckDBPyConnection, plan_date: date, rejections:
         con.execute(
             """INSERT INTO rejections
                (plan_date, ticker, direction, setup_type, reason, entry_type,
-                entry_price, stop_price, target_price, conviction, thesis)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                entry_price, stop_price, target_price, conviction, thesis,
+                source_stage, rejection_category, planned_rr)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 plan_date, r["ticker"].upper(), r.get("direction"), r.get("setup_type"),
                 r.get("reason", ""), r.get("entry_type", "open"), r.get("entry_price"),
                 r.get("stop_price"), r.get("target_price"), r.get("conviction"),
-                r.get("thesis"),
+                r.get("thesis"), r.get("source_stage"), r.get("rejection_category"),
+                r.get("planned_rr"),
             ],
         )
     return len(rejections)

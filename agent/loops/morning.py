@@ -468,19 +468,85 @@ def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
         if not t or t in taken:
             continue
         entry_plan = c.get("entry_plan") or {}
+        entry = entry_plan.get("price", c.get("entry_price"))
+        stop = c.get("stop_price")
+        target = c.get("target_price")
+        planned_rr = None
+        if all(isinstance(x, (int, float)) for x in (entry, stop, target)):
+            risk = abs(float(entry) - float(stop))
+            if risk > 0:
+                planned_rr = round(abs(float(target) - float(entry)) / risk, 4)
+        reason = reasons.get(t)
         out.append({
             "ticker": t,
             "direction": c.get("direction"),
             "setup_type": c.get("setup_type"),
-            "reason": reasons.get(t) or "not selected by risk manager (no explicit reason)",
+            "reason": reason or "not selected by risk manager (no explicit reason)",
             "entry_type": entry_plan.get("type", "open"),
-            "entry_price": entry_plan.get("price", c.get("entry_price")),
-            "stop_price": c.get("stop_price"),
-            "target_price": c.get("target_price"),
+            "entry_price": entry,
+            "stop_price": stop,
+            "target_price": target,
             "conviction": c.get("conviction"),
             "thesis": c.get("thesis"),
+            "source_stage": "risk_rejected" if reason else "validator_or_unselected",
+            "rejection_category": "rr_below_control" if planned_rr is not None and planned_rr < 2.0
+                                  else "other",
+            "planned_rr": planned_rr,
         })
     return out
+
+
+def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
+    """Add one explicitly labeled R:R exploration pick, when enabled.
+
+    This lane only reconsiders a candidate the risk manager rejected for R:R;
+    other rejection reasons remain binding. It is capped and minimum-sized so
+    its results remain a separate experiment rather than a silent policy change.
+    """
+    lane = cfg.get("exploration_lane", {}) or {}
+    if not lane.get("enabled") or plan.get("picks"):
+        return False
+    max_picks = max(0, int(lane.get("max_picks", 1)))
+    if max_picks < 1:
+        return False
+    reasons = {str(r.get("ticker", "")).upper(): str(r.get("reason", ""))
+               for r in plan.get("rejected", []) or []}
+    blocked = ("stale", "event", "binary", "invalid", "ungrounded", "mismatch",
+               "chase", "vague", "unverified", "correlation", "regime")
+    low_rr = float(lane.get("min_rr", 1.8))
+    high_rr = float(lane.get("max_rr", 2.0))
+    for candidate in candidates.get("candidates", []) or []:
+        ticker = str(candidate.get("ticker", "")).upper().strip()
+        reason = reasons.get(ticker, "")
+        if not ticker or "r:r" not in reason.lower() or any(w in reason.lower() for w in blocked):
+            continue
+        entry_plan = candidate.get("entry_plan") or {}
+        entry = entry_plan.get("price", candidate.get("entry_price"))
+        stop = candidate.get("stop_price")
+        target = candidate.get("target_price")
+        if not all(isinstance(x, (int, float)) for x in (entry, stop, target)):
+            continue
+        risk = abs(float(entry) - float(stop))
+        if risk <= 0:
+            continue
+        rr = abs(float(target) - float(entry)) / risk
+        if not low_rr <= rr < high_rr:
+            continue
+        plan["picks"] = [{
+            **candidate,
+            "ticker": ticker,
+            "entry_plan": {"type": entry_plan.get("type", "open"), "price": entry},
+            "entry_price": entry,
+            "size_r": float(lane.get("size_r", cfg.get("min_size_r", 0.25))),
+            "conviction": min(int(candidate.get("conviction", 3) or 3), 3),
+            "exploration_lane": "rr_below_control",
+            "exploration_rr": round(rr, 4),
+        }]
+        plan["no_trade"] = False
+        plan.pop("no_trade_reason", None)
+        plan["exploration_pick_count"] = 1
+        return True
+    return False
 
 
 def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: str,
@@ -624,6 +690,10 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             mock_name="morning_risk", thinking=True, web_search=False,
         )
         plan = risk.parsed or {}
+        plan["analyst_candidate_count"] = n_cand
+        plan["risk_rejection_count"] = len(plan.get("rejected", []) or [])
+        _add_exploration_pick(candidates, plan, cfg)
+        plan["validator_proposed_count"] = len(plan.get("picks", []) or [])
 
         # 7. validate + persist (ref prices cover every proposed ticker — live-fetched if needed)
         plan, warnings = _validate_plan(
@@ -632,6 +702,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             ref_prices=_grounded_ref_prices(md, plan, bundle, d),
             atr_map=_grounded_atr(md, plan, bundle),
             earnings_map=_grounded_earnings(md, plan, bundle))
+        plan["validator_drop_count"] = max(
+            0, plan["validator_proposed_count"] - len(plan.get("picks", []) or []))
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = reg.get("tag", "")
@@ -656,8 +728,10 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
 
         # 8. persist
         _attach_overlay_context(plan, bundle)
+        rejections = _build_rejections(candidates, plan)
+        plan["persisted_rejection_count"] = len(rejections)
         pick_ids = ledger.save_daily_plan(con, d, plan, candidates, reg.get("tag", ""))
-        n_rej = ledger.save_rejections(con, d, _build_rejections(candidates, plan))
+        n_rej = ledger.save_rejections(con, d, rejections)
         ledger.log_run(con, "morning", d, started, "ok", model, usage)
 
         # 9. deliver

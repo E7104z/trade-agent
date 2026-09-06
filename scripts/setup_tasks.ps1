@@ -20,9 +20,12 @@ function Register-LoopTask {
 }
 
 $weekdays = @("Monday","Tuesday","Wednesday","Thursday","Friday")
-Register-LoopTask -Name "TradeAgent-Morning" -Loop "morning" -Time "6:45AM"  -Days $weekdays
-Register-LoopTask -Name "TradeAgent-Evening" -Loop "evening" -Time "4:30PM"  -Days $weekdays
-Register-LoopTask -Name "TradeAgent-Weekly"  -Loop "weekly"  -Time "5:00PM"  -Days @("Sunday")
+# This machine reports as Central Time (UTC-06:00), one hour behind ET year-round
+# (both zones observe the same DST calendar), so times are shifted -1h from the
+# ET targets (6:45AM/4:30PM/5:00PM ET) noted above.
+Register-LoopTask -Name "TradeAgent-Morning" -Loop "morning" -Time "5:45AM"  -Days $weekdays
+Register-LoopTask -Name "TradeAgent-Evening" -Loop "evening" -Time "3:30PM"  -Days $weekdays
+Register-LoopTask -Name "TradeAgent-Weekly"  -Loop "weekly"  -Time "4:00PM"  -Days @("Sunday")
 
 Write-Host ""
 Write-Host "Done. Machine must be on (or waking) at trigger times."

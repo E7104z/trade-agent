@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 import xml.etree.ElementTree as ET_XML
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
@@ -180,9 +181,28 @@ class Alpaca:
         }
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        r = requests.get(f"{ALPACA_DATA}{path}", headers=self.h, params=params or {}, timeout=20)
-        r.raise_for_status()
-        return r.json()
+        # One retry on transient failures (timeout/connection/429/5xx) so a single
+        # network blip doesn't null an entire batched fetch (e.g. multi_bars for
+        # every symbol in the morning enrichment pass) and get misread as "the
+        # feed has no data" when it was actually "the first attempt hiccuped."
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                r = requests.get(f"{ALPACA_DATA}{path}", headers=self.h, params=params or {}, timeout=20)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                if attempt == 0:
+                    time.sleep(0.75)
+                    continue
+                raise
+            if r.status_code == 429 or r.status_code >= 500:
+                last_exc = requests.exceptions.HTTPError(f"{r.status_code} for {path}", response=r)
+                if attempt == 0:
+                    time.sleep(0.75)
+                    continue
+            r.raise_for_status()
+            return r.json()
+        raise last_exc
 
     def snapshots(self, symbols: list[str]) -> dict[str, dict]:
         out: dict[str, dict] = {}
@@ -980,10 +1000,13 @@ class MarketData:
                     cum_vol = sum(b.get("v") or 0 for b in bars)
                     rv = rvol_simple(cum_vol, a)
                     q["pm_vol_pct_adv20"] = round(rv * 100, 1) if rv is not None else None
+                    q["pm_volume_status"] = "measured" if rv is not None else "adv20_unavailable"
                 else:
                     q["pm_vwap"] = None
                     q["vs_pm_vwap"] = None
                     q["pm_vol_pct_adv20"] = None
+                    q["pm_volume_status"] = (
+                        "batch_unavailable" if not pm_bars else "symbol_unavailable")
 
             if not context_on:
                 continue
@@ -1116,7 +1139,11 @@ def _indicator_suffix(q: dict) -> str:
     must know what it's flying without, same as the bundle's 'missing' list,
     never silently omitted."""
     vwap_bit = f"{q['vs_pm_vwap']:+.1f}% vs pmVWAP" if q.get("vs_pm_vwap") is not None else "pmVWAP n/a"
-    vol_bit = f"pm vol {q['pm_vol_pct_adv20']:.0f}% ADV20" if q.get("pm_vol_pct_adv20") is not None else "pm vol n/a"
+    if q.get("pm_vol_pct_adv20") is not None:
+        vol_bit = f"pm vol {q['pm_vol_pct_adv20']:.0f}% ADV20"
+    else:
+        status = q.get("pm_volume_status")
+        vol_bit = f"pm vol n/a ({status})" if status else "pm vol n/a"
     return f"{vwap_bit}, {vol_bit}"
 
 

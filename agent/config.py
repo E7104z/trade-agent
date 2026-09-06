@@ -41,6 +41,13 @@ _DEFAULTS: dict[str, Any] = {
     "max_size_r": 1.5,
     "min_size_r": 0.25,
     "max_total_open_risk_r": 3.0,
+    "exploration_lane": {
+        "enabled": False,
+        "min_rr": 1.8,
+        "max_rr": 2.0,
+        "max_picks": 1,
+        "size_r": 0.25,
+    },
     "max_entry_ref_distance_pct": 15.0,  # entry further than this from last price = ungrounded, dropped
     "atr_gate": "warn",         # "warn" | "enforce" -- noise-stop gate rollout switch, default warn-only
     "earnings_gate": "warn",    # "warn" | "enforce" -- binary-event gate rollout switch, default warn-only

@@ -16,6 +16,13 @@
   "max_size_r": 1.5,
   "min_size_r": 0.25,
   "max_total_open_risk_r": 3.0,
+  "exploration_lane": {
+    "enabled": true,
+    "min_rr": 1.8,
+    "max_rr": 2.0,
+    "max_picks": 1,
+    "size_r": 0.25
+  },
   "slippage_bps": 5,
   "leveraged_gate": "warn",
   "flatten_at": null,

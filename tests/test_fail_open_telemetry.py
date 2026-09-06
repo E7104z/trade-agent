@@ -104,6 +104,35 @@ def test_clean_session_round_trips_provider_degraded_false(con):
     assert row[1] is False
 
 
+def test_candidate_flow_and_rejection_provenance_round_trip(con):
+    d = date(2026, 8, 29)
+    plan = {
+        "no_trade": True,
+        "analyst_candidate_count": 8,
+        "risk_rejection_count": 8,
+        "validator_proposed_count": 0,
+        "validator_drop_count": 0,
+        "persisted_rejection_count": 1,
+        "gates_failed_open": '{"atr": 0, "earnings": 0, "grounding": 0}',
+        "provider_degraded": False,
+        "picks": [],
+    }
+    ledger.save_daily_plan(con, d, plan, {"candidates": []}, "chop")
+    ledger.save_rejections(con, d, [{
+        "ticker": "MARA", "direction": "long", "setup_type": "gap_go",
+        "reason": "R:R 1.83 < 2.0", "entry_type": "limit",
+        "entry_price": 11.5, "stop_price": 10.9, "target_price": 12.6,
+        "source_stage": "risk_rejected", "rejection_category": "rr_below_control",
+        "planned_rr": 1.8333,
+    }])
+    assert con.execute(
+        "SELECT analyst_candidate_count, risk_rejection_count, persisted_rejection_count "
+        "FROM daily_plans WHERE plan_date = ?", [d]).fetchone() == (8, 8, 1)
+    assert con.execute(
+        "SELECT source_stage, rejection_category, planned_rr FROM rejections "
+        "WHERE plan_date = ?", [d]).fetchone() == ("risk_rejected", "rr_below_control", 1.8333)
+
+
 # ------------------------------------------------------------- weekly render
 
 def test_data_quality_md_lists_only_degraded_sessions(con):

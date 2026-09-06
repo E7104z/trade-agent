@@ -7,7 +7,8 @@ mistyped pick before it's ever sent to market).
 from __future__ import annotations
 
 from agent.config import Config
-from agent.loops.morning import _grounded_ref_prices, _reference_prices, _validate_plan
+from agent.loops.morning import (_add_exploration_pick, _build_rejections,
+                                 _grounded_ref_prices, _reference_prices, _validate_plan)
 
 
 def _cfg(**overrides) -> Config:
@@ -208,6 +209,48 @@ def test_common_stock_pick_does_not_trigger_the_leveraged_gate():
     out, warnings = _validate_plan(plan, _cfg(), ref_prices={"MARA": 11.75})
     assert len(out["picks"]) == 1
     assert not any("LEVERAGED GATE" in w or "warrant/unit" in w for w in warnings)
+
+
+def test_exploration_lane_reconsiders_only_risk_rejected_sub2_rr_candidate():
+    candidates = {"candidates": [{
+        "ticker": "MARA", "direction": "long", "setup_type": "gap_go",
+        "entry_plan": {"type": "limit", "price": 11.50},
+        "entry_price": 11.50, "stop_price": 10.90, "target_price": 12.60,
+        "thesis": "fresh catalyst",
+    }]}
+    plan = {"no_trade": True, "picks": [],
+            "rejected": [{"ticker": "MARA", "reason": "R:R 1.83 < 2.0"}]}
+    assert _add_exploration_pick(candidates, plan, _cfg(
+        exploration_lane={"enabled": True, "min_rr": 1.8, "max_rr": 2.0,
+                          "max_picks": 1, "size_r": 0.25})) is True
+    assert plan["picks"][0]["exploration_lane"] == "rr_below_control"
+    assert plan["picks"][0]["size_r"] == 0.25
+    assert plan["picks"][0]["exploration_rr"] == 1.8333
+    assert plan["no_trade"] is False
+
+
+def test_exploration_lane_stays_off_without_explicit_enablement():
+    candidates = {"candidates": [{
+        "ticker": "MARA", "entry_plan": {"type": "limit", "price": 11.50},
+        "entry_price": 11.50, "stop_price": 10.90, "target_price": 12.60,
+    }]}
+    plan = {"no_trade": True, "picks": [],
+            "rejected": [{"ticker": "MARA", "reason": "R:R 1.83 < 2.0"}]}
+    assert _add_exploration_pick(candidates, plan, _cfg()) is False
+    assert plan["picks"] == []
+
+
+def test_rejection_provenance_records_stage_category_and_rr():
+    candidates = {"candidates": [{
+        "ticker": "MARA", "direction": "long", "setup_type": "gap_go",
+        "entry_plan": {"type": "limit", "price": 11.50},
+        "stop_price": 10.90, "target_price": 12.60,
+    }]}
+    plan = {"picks": [], "rejected": [{"ticker": "MARA", "reason": "R:R 1.83 < 2.0"}]}
+    row = _build_rejections(candidates, plan)[0]
+    assert row["source_stage"] == "risk_rejected"
+    assert row["rejection_category"] == "rr_below_control"
+    assert row["planned_rr"] == 1.8333
 
 
 def test_grounded_ref_prices_fetches_only_missing_pick_tickers():
