@@ -1,7 +1,7 @@
 # Trading Agent Playbook
-<!-- version: 4 -->
+<!-- version: 5 -->
 
-> Rewritten by the weekly miner. Rules carry sample counts AND a last_confirmed
+> Rewritten by the weekly miner 2026-09-06. Rules carry sample counts AND a last_confirmed
 > session date. n<8 is provisional and WR/avgR are suppressed below n=8 (raw
 > trade list only — see Ledger Reference). A rule with no confirming observation
 > in >= 30 sessions is auto-demoted to UNVALIDATED regardless of prior n.
@@ -122,17 +122,21 @@ Calibration verdict: **not yet computable** (0 graded picks; threshold is 20).
 > that cost more than they save. This section is the miner's running summary;
 > raw rows live in the ledger DB.
 
-- Trailing sessions with shadow data: 2
-- Total candidates rejected: 16
-- Rejections that would have won (EOD favorable to thesis): 8
-- Rejections that would have lost/scratched: 8 (1 loss, 7 scratch)
-- Net forgone R (positive = filters cost us): **+16.30R**
+- Trailing sessions with shadow data: 3
+- Total candidates rejected: 24
+- Rejections that would have won (EOD favorable to thesis): 9
+- Rejections that would have lost: 3
+- Rejections that scratched: 11
+- Unmeasurable: 1
+- Net forgone R (positive = filters cost us): **+15.79R**
 - Captured R by taken trades over same window: **+0.00R**
-- Most expensive rejection reason: R:R < 2.0 requirement (cited in 16/16 rejections)
+- Most expensive rejection reason: R:R < 2.0 requirement (cited in 24/24 rejections)
 
 **Filters flagged for review** (forgone R > captured R over trailing 20 sessions):
 
-- **R:R >= 2.0 threshold**: +16.30R forgone vs +0.00R captured. However, shadow outcomes assume perfect fills the taken book would not have gotten. Do NOT auto-loosen. See Open Question #7 for pre-registered test.
+- **R:R >= 2.0 threshold**: +15.79R forgone vs +0.00R captured. However, shadow outcomes assume perfect fills the taken book would not have gotten, and 11/24 rejections scratched (would have been dead money). Do NOT auto-loosen. See Open Question #7 for pre-registered test.
+
+**Shadow ledger interpretation warning:** The +15.79R forgone is dominated by 3 rejections (+6.16R, +5.95R, +3.29R) that compound R:R failure with OTHER defects (staleness, sympathy without leader, shorting uptrend without catalyst). Loosening R:R alone would have admitted setups the playbook should still reject.
 
 ## Open Questions (pre-registered experiments)
 
@@ -140,13 +144,19 @@ Calibration verdict: **not yet computable** (0 graded picks; threshold is 20).
 > MUST report progress against every open item, even if progress is zero.
 
 1. **gap_fade entry mechanics** — does failed-bounce entry beat open-print entry?
-   Collecting BOTH prices on every gap_fade candidate. Threshold: n >= 8. **Progress: 1/8.** (NBIS: planned-entry R=0.27, open-print R=-0.028)
+   Collecting BOTH prices on every gap_fade candidate. Threshold: n >= 8. **Progress: 1/8.** (NBIS: planned-entry R=+0.27, open-print R=-0.028 — one observation favors planned entry by +0.30R)
+
 2. **sympathy standalone** — salvageable, or edge-free? Collecting standalone-only observations. Threshold: n >= 8. **Progress: 0/8.**
+
 3. **conviction calibration** — see Calibration table. Threshold: n >= 20 graded picks. **Progress: 0/20.**
+
 4. **gap-size chase threshold** — is 15% the right cutoff? Collecting gap-size buckets on every gap trade. Threshold: n >= 20 gap trades. **Progress: 0/20.**
-5. **shadow-ledger filter cost** — which rejection reasons forgo the most R? Collecting all rejections. Threshold: 20 sessions of shadow data. **Progress: 2/20 sessions.** (16 rejections scored; net forgone +16.30R after risk-floor correction)
+
+5. **shadow-ledger filter cost** — which rejection reasons forgo the most R? Collecting all rejections. Threshold: 20 sessions of shadow data. **Progress: 3/20 sessions.** (24 rejections scored; net forgone +15.79R; R:R < 2.0 is the dominant reason but compounds with other defects in top-cost rows)
+
 6. **stop placement cost** — of stopped-out trades, how often does the target print later the same session (stops inside the noise)? Collecting target_hit_after_stop + eod_r on every stopped trade (deterministic). Threshold: n >= 10 stopped trades. **Progress: 0/10.**
-7. **R:R threshold test** — NEW. Does 1.8 R:R outperform 2.0 R:R on a risk-adjusted basis? Shadow ledger shows 16/16 rejections cite R:R < 2.0; 8 would have won. Collecting: (a) taken trades at R:R >= 2.0, (b) rejected trades at 1.8 <= R:R < 2.0 with shadow outcomes. Compare avgR at n >= 20 each bucket. Threshold: 20 observations per bucket. **Progress: 0/20 taken at >= 2.0; 16/20 rejected at 1.8-2.0 (shadow).** Do NOT loosen filter until forward evidence supports it.
+
+7. **R:R threshold test** — does 1.8 R:R outperform 2.0 R:R on a risk-adjusted basis? Shadow ledger shows 24 rejections cite R:R < 2.0. Collecting: (a) taken trades at R:R >= 2.0, (b) rejected trades at 1.8 <= R:R < 2.0 with shadow outcomes. Compare avgR at n >= 20 each bucket. Threshold: 20 observations per bucket. **Progress: 0/20 taken at >= 2.0; ~7/20 rejected at 1.8-2.0 (shadow).** Do NOT loosen filter until forward evidence supports it.
 
 ## Retired Rules (graveyard — do not re-propose without post-retirement evidence)
 
@@ -157,29 +167,44 @@ _None retired yet._
 
 ---
 
-## Changelog (v4)
+## Changelog (v5)
 
-- **Decay check:** No rules auto-demoted (< 30 sessions since last confirmation for all rules).
-- **Shadow Ledger Summary:** Populated with first real data — 16 rejections over 2 sessions, 8 would-have-won, net forgone +16.30R vs +0.00R captured. R:R >= 2.0 filter flagged for review.
-- **Open Question #7 added:** Pre-registered test of R:R 1.8 vs 2.0 threshold. The filter is expensive but shadow outcomes assume perfect fills; test deliberately, one variable at a time.
-- **Open Question progress updated:** Q1 at 1/8 (one gap_fade observation); Q5 at 2/20 sessions (16 rejections scored).
-- **L9 contradiction noted:** Lesson claimed no-trade saved 0.60R; corrected data shows +16.90R forgone that session. Lesson premise under review but not retired (single session, data correction may have been the error).
-- **No setup-rule changes:** All rules remain at their prior confidence tiers; zero graded picks means no new confirming or disconfirming evidence.
+- **Decay check:** No rules auto-demoted. All rules remain < 30 sessions since last_confirmed (v1 = ~2026-08-19, ~13 sessions ago).
+- **Calibration verdict:** Unchanged at "not yet computable" (0/20 graded picks).
+- **Shadow Ledger Summary:** Updated from 2 sessions to 3 sessions; 16 rejections → 24 rejections; net forgone +16.30R → +15.79R (revised calculation). Added interpretation warning: top 3 cost drivers compound R:R failure with other defects.
+- **Open Question progress:**
+  - Q1: unchanged at 1/8 (no new gap_fade observations)
+  - Q2: unchanged at 0/8
+  - Q3: unchanged at 0/20
+  - Q4: unchanged at 0/20
+  - Q5: 2/20 → 3/20 sessions (+1 this week)
+  - Q6: unchanged at 0/10
+  - Q7: 0/20 taken unchanged; shadow bucket updated to ~7/20
+- **Setup Rules:** All unchanged — zero graded picks means no new confirming or disconfirming evidence.
+  - catalyst_momentum: n=1, provisional, last_confirmed v1
+  - gap_fade: n=1, provisional, last_confirmed v1
+  - gap_go: n=0, UNVALIDATED
+  - sympathy: n=1, provisional, last_confirmed v1
+  - breakout: n=0, UNVALIDATED
+  - short_squeeze: n=0, UNVALIDATED
+- **Regime Rules:** All unchanged.
+  - uptrend/risk_on: n=3, provisional, last_confirmed v2
+  - All others: n=0, UNVALIDATED
 - **Current Best Edge:** Unchanged — NO VALIDATED EDGE YET. Leading candidates remain catalyst_momentum and gap_fade at n=1 each.
+- **No lessons promoted or retired:** No new confirmation/contradiction events this week.
 
 ---
 
-## Changelog (v4)
+## Changelog (v5)
 
-- Decay check: All rules < 30 sessions since last_confirmed; no auto-demotions.
-- catalyst_momentum: unchanged (n=1, last_confirmed v1, no new observations)
-- gap_fade: unchanged (n=1, last_confirmed v1, no new observations)
-- gap_go: unchanged (n=0, UNVALIDATED)
-- sympathy: unchanged (n=1, last_confirmed v1, no new observations)
-- breakout: unchanged (n=0, UNVALIDATED)
-- short_squeeze: unchanged (n=0, UNVALIDATED)
-- uptrend/risk_on regime rule: unchanged (n=3, last_confirmed v2, no new observations)
-- Shadow Ledger Summary: NEW — populated from 2 sessions of data (16 rejections, +16.30R forgone)
-- Open Question #7: NEW — pre-registered R:R threshold test
-- Open Question #1: Progress 0/8 -> 1/8 (one gap_fade observation logged)
-- Open Question #5: Progress 0/20 -> 2/20 sessions (16 rejections scored)
+- Decay check: No rules auto-demoted (all < 30 sessions since last_confirmed)
+- catalyst_momentum: UNCHANGED (n=1, provisional, last_confirmed v1 — no new observations)
+- gap_fade: UNCHANGED (n=1, provisional, last_confirmed v1 — no new observations)
+- gap_go: UNCHANGED (n=0, UNVALIDATED — no new observations)
+- sympathy: UNCHANGED (n=1, provisional, last_confirmed v1 — no new observations)
+- breakout: UNCHANGED (n=0, UNVALIDATED — no new observations)
+- short_squeeze: UNCHANGED (n=0, UNVALIDATED — no new observations)
+- uptrend/risk_on regime: UNCHANGED (n=3, provisional, last_confirmed v2 — no new observations)
+- Shadow Ledger Summary: UPDATED — 3 sessions, 24 rejections, +15.79R forgone; added interpretation warning
+- Open Question #5: PROGRESS 2/20 → 3/20 sessions
+- Current Best Edge: UNCHANGED — NO VALIDATED EDGE YET
