@@ -1,0 +1,17 @@
+name: Trade Agent intraday paper check
+
+on:
+  schedule:
+    - cron: "*/5 13-20 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check open paper orders
+        shell: bash
+        run: |
+          curl --fail-with-body -X POST \
+            -H "Authorization: Bearer ${{ secrets.TRADE_AGENT_CRON_SECRET }}" \
+            "${{ secrets.TRADE_AGENT_URL }}/cron/intraday-check"

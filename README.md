@@ -2,7 +2,7 @@
 
 An AI trading analyst with **memory, feedback, and self-correction**. Not a chatbot that opines about stocks — a system where an LLM's picks are logged, graded against real intraday data every evening, and mined weekly into an evolving playbook. The learning loop is the product; without it, it's the same genius every day with amnesia.
 
-> Paper-trading research tool. Nothing here is investment advice. It never places orders — Alpaca is used for market data only.
+> Paper-trading research tool. Nothing here is investment advice. Live execution is disabled by default and, when deliberately enabled, is restricted to Alpaca's paper host.
 
 ## Architecture
 
@@ -45,6 +45,28 @@ python -m venv .venv
 ```
 
 Then put your Anthropic API key in `credentials.json` (`anthropic_api_key`). Alpaca keys were carried over from Trader Light (market data only). Email is optional — fill the `smtp` block and set `"email_enabled": true` in [config.json](config.json).
+
+### Optional live paper execution
+
+Live paper orders are an observation stream alongside the deterministic simulator. They are disabled by default. To enable them only after the verification checklist is complete, set `live_paper.enabled` and `live_paper.alpaca_paper` to `true` in [config.json](config.json), keep `trading_base` exactly `https://paper-api.alpaca.markets`, and provide paper-account credentials. Any other host or a missing explicit paper flag refuses placement. Breakout picks are recorded as simulator picks but are skipped for live placement until stop-entry plus OCO support is added.
+
+The intraday monitor is intentionally not in `vercel.json` because Vercel Hobby allows only two cron entries. The included route is `POST /cron/intraday-check`. A GitHub Actions scheduler can call it every five minutes:
+
+```yaml
+on:
+    schedule:
+        - cron: "*/5 13-20 * * 1-5"
+jobs:
+    intraday-check:
+        runs-on: ubuntu-latest
+        steps:
+            - run: |
+                    curl --fail-with-body -X POST \
+                        -H "Authorization: Bearer ${{ secrets.TRADE_AGENT_CRON_SECRET }}" \
+                        "${{ secrets.TRADE_AGENT_URL }}/cron/intraday-check"
+```
+
+Set `CRON_SECRET` in the Vercel project environment and create matching GitHub repository secrets `TRADE_AGENT_CRON_SECRET` and `TRADE_AGENT_URL` (the deployed HTTPS origin, without a trailing slash). The endpoint rejects missing or mismatched bearer tokens and independently skips weekends, holidays, and outside-hours calls. Keep the existing two Vercel cron entries unchanged.
 
 ## Daily operation
 

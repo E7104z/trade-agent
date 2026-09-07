@@ -545,6 +545,15 @@ def cron_loop(loop_name: str):
     return json_response(result)
 
 
+@app.route("/cron/intraday-check", methods=["POST"])
+def intraday_check():
+    if not _is_cron_request():
+        return json_response({"error": "unauthorized"}, 401)
+    cfg = load_config()
+    from agent.live_monitor import check
+    return json_response(check(cfg))
+
+
 # Local dev convenience: `python api/index.py` runs a normal Flask dev server.
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

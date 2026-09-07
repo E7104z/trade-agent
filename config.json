@@ -26,6 +26,13 @@
   "slippage_bps": 5,
   "leveraged_gate": "warn",
   "flatten_at": null,
+  "live_paper": {
+    "enabled": false,
+    "alpaca_paper": false,
+    "trading_base": "https://paper-api.alpaca.markets",
+    "max_picks_per_day": 4,
+    "intraday_check_secret_env": "CRON_SECRET"
+  },
   "min_bar_volume": 0,
   "lesson_holdout_sessions": 0,
   "drawdown_window": 10,
@@ -35,7 +42,7 @@
   "email_enabled": true,
 
   "data": {
-    "alpaca_feed": "iex",
+    "alpaca_feed": "sip",
     "movers_top": 18,
     "news_limit": 40,
     "gap_scan_min_pct": 3.0,

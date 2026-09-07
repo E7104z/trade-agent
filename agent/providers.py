@@ -174,7 +174,7 @@ def is_common_stock_symbol(sym: str) -> bool:
 class Alpaca:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.feed = cfg.data_cfg.get("alpaca_feed", "iex")
+        self.feed = cfg.data_cfg.get("alpaca_feed", "sip")
         self.h = {
             "APCA-API-KEY-ID": cfg.alpaca_key_id,
             "APCA-API-SECRET-KEY": cfg.alpaca_secret_key,

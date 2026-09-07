@@ -734,6 +734,30 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         n_rej = ledger.save_rejections(con, d, rejections)
         ledger.log_run(con, "morning", d, started, "ok", model, usage)
 
+        # Live paper orders are a separate ledger concern. The simulator's
+        # picks are already locked above; a broker failure cannot change them.
+        if cfg.get("live_paper", {}).get("enabled") and plan.get("picks"):
+            try:
+                from .. import live_broker
+                for p, pick_id in zip(plan["picks"], pick_ids):
+                    if pick_id not in pick_ids[:int(cfg["live_paper"].get("max_picks_per_day", 4))]:
+                        break
+                    entry = float(p["entry_price"])
+                    stop = float(p["stop_price"])
+                    qty = live_broker.quantity_for_r(
+                        p.get("size_r", 0), cfg.get("dollars_per_r", 500), entry, stop)
+                    order = live_broker.submit_bracket_order(
+                        p["ticker"], qty, "buy" if p["direction"] == "long" else "sell",
+                        p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open"),
+                        entry, stop, float(p["target_price"]), cfg=cfg)
+                    if order:
+                        ledger.save_live_order(
+                            con, pick_id, order, d, p["ticker"],
+                            "buy" if p["direction"] == "long" else "sell", qty,
+                            p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open"))
+            except Exception as e:
+                log("morning", f"WARN live paper placement failed; simulation unchanged: {e}")
+
         # 9. deliver
         if plan.get("no_trade"):
             log("morning", f"PLAN: NO TRADE — {plan.get('no_trade_reason','')}")

@@ -498,6 +498,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # 3. persist grades + lessons
         n_graded = ledger.apply_grades(con, review.get("pick_reviews", []), picks)
 
+        # Observation only: live paper fills are reconciled alongside the
+        # simulator after grading. The simulator's r_multiple remains intact.
+        from ..live_monitor import reconcile_evening
+        live_summary = reconcile_evening(con, cfg, d)
+
         tainted_day = _all_fills_tainted(outcomes)
         new_lessons = review.get("lessons", []) or []
         lesson_updates = review.get("lesson_updates", []) or []
@@ -529,6 +534,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                        f"calibration rows={counts['calibration']}, "
                        f"rule confirmations={counts['confirmations']}, "
                        f"open-question increments={counts['q_increments']}, "
+                       f"live reconciled={live_summary['reconciled']}, "
                        f"lessons extracted={len(new_lessons)}, "
                        f"cost ~${result.usage['cost_usd']:.3f}")
 

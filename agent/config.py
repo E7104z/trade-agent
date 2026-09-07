@@ -56,12 +56,19 @@ _DEFAULTS: dict[str, Any] = {
     "warn_target_atr": 3.5,     # target farther than this (with a same-day time_stop) = warn but pass
     "slippage_bps": 5,
     "flatten_at": None,        # e.g. "15:55" -- session-end flatten cutoff, default OFF
+    "live_paper": {
+        "enabled": False,
+        "alpaca_paper": False,
+        "trading_base": "https://paper-api.alpaca.markets",
+        "max_picks_per_day": 4,
+        "intraday_check_secret_env": "CRON_SECRET",
+    },
     "min_bar_volume": 0,       # thin-bar filter threshold, default OFF (0 = disabled)
     "lesson_holdout_sessions": 0,  # trailing-window lesson-confirmation holdout, default OFF
     "timezone": "America/New_York",
     "email_enabled": False,
     "data": {
-        "alpaca_feed": "iex",
+        "alpaca_feed": "sip",
         "movers_top": 18,
         "news_limit": 40,
         "gap_scan_min_pct": 3.0,

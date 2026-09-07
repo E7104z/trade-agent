@@ -301,6 +301,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v5.STATEMENTS
 from . import migrations_v6  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v6.STATEMENTS
 
+# --- v7 live paper execution ledger ---------------------------------------
+from . import migrations_v7  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v7.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -412,6 +416,55 @@ def picks_for_date(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:
     cols = [c[0] for c in con.execute("DESCRIBE picks").fetchall()]
     rows = con.execute("SELECT * FROM picks WHERE plan_date = ? ORDER BY pick_id", [d]).fetchall()
     return [dict(zip(cols, r)) for r in rows]
+
+
+def save_live_order(con: duckdb.DuckDBPyConnection, pick_id: int, order: dict,
+                    session_date: date, ticker: str, side: str, qty: int,
+                    entry_order_type: str) -> None:
+    """Persist an accepted Alpaca order without touching simulated outcomes."""
+    order_id = order.get("id")
+    if not order_id:
+        return
+    con.execute(
+          """INSERT INTO live_orders
+           (live_order_id, pick_id, session_date, ticker, side, qty, order_class,
+            entry_order_type, submitted_at, status, raw_order_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT (live_order_id) DO UPDATE SET
+                 status = excluded.status, raw_order_json = excluded.raw_order_json""",
+        [str(order_id), pick_id, session_date, ticker.upper(), side.lower(), int(qty),
+         order.get("order_class", "bracket"), entry_order_type,
+         order.get("submitted_at") or datetime.now(), order.get("status"),
+         json.dumps(order, default=str)],
+    )
+
+
+def live_orders_for_date(con: duckdb.DuckDBPyConnection, d: date,
+                         open_only: bool = False) -> list[dict]:
+    cols = [c[0] for c in con.execute("DESCRIBE live_orders").fetchall()]
+    sql = "SELECT * FROM live_orders WHERE session_date = ?"
+    if open_only:
+        sql += " AND exit_reason IS NULL"
+    sql += " ORDER BY submitted_at, live_order_id"
+    rows = con.execute(sql, [d]).fetchall()
+    return [dict(zip(cols, row)) for row in rows]
+
+
+def update_live_order(con: duckdb.DuckDBPyConnection, live_order_id: str, **fields: Any) -> None:
+    allowed = {
+        "status", "entry_fill_price", "entry_fill_at", "exit_reason",
+        "exit_fill_price", "exit_fill_at", "live_r", "reconciled", "raw_order_json",
+    }
+    updates = [(key, value) for key, value in fields.items() if key in allowed]
+    if not updates:
+        return
+    assignments = ", ".join(f"{key} = ?" for key, _ in updates)
+    con.execute(f"UPDATE live_orders SET {assignments} WHERE live_order_id = ?",
+                [value for _, value in updates] + [live_order_id])
+
+
+def set_live_r(con: duckdb.DuckDBPyConnection, pick_id: int, live_r: float) -> None:
+    con.execute("UPDATE outcomes SET live_r = ? WHERE pick_id = ?", [live_r, pick_id])
 
 
 def plan_for_date(con: duckdb.DuckDBPyConnection, d: date) -> dict | None:
