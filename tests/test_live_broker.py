@@ -66,3 +66,38 @@ def test_not_explicitly_paper_refuses_placement(monkeypatch):
     monkeypatch.setattr(live_broker.requests, "request", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
     assert live_broker.submit_bracket_order(
         "AAPL", 1, "buy", "open", 100, 98, 104, cfg=_cfg(alpaca_paper=False)) is None
+
+
+def test_breakout_two_step_is_opt_in(monkeypatch):
+    monkeypatch.setattr(live_broker, "submit_stop_entry_order", lambda *a, **k: {"id": "stop-1"})
+    assert live_broker.submit_bracket_order(
+        "AAPL", 1, "buy", "breakout", 100, 98, 104, cfg=_cfg()) is None
+    result = live_broker.submit_bracket_order(
+        "AAPL", 1, "buy", "breakout", 100, 98, 104,
+        cfg=_cfg(breakout_two_step=True))
+    assert result == {"id": "stop-1"}
+
+
+def test_two_step_order_payloads(monkeypatch):
+    calls = []
+    monkeypatch.setattr(live_broker.requests, "request",
+                        lambda *args, **kwargs: (calls.append((args, kwargs)) or
+                                                  _Response({"id": "order-1"})))
+    cfg = _cfg(breakout_two_step=True)
+    live_broker.submit_stop_entry_order("aapl", 3, "buy", 100, cfg=cfg)
+    live_broker.submit_oco_exit("aapl", 3, "sell", 98, 104, cfg=cfg)
+    assert calls[0][1]["json"] == {
+        "symbol": "AAPL", "qty": "3", "side": "buy", "type": "stop",
+        "time_in_force": "day", "stop_price": 100.0,
+    }
+    assert calls[1][1]["json"] == {
+        "symbol": "AAPL", "qty": "3", "side": "sell", "type": "limit",
+        "time_in_force": "day", "order_class": "oco",
+        "take_profit": {"limit_price": 104.0},
+        "stop_loss": {"stop_price": 98.0},
+    }
+
+
+def test_cancel_order_returns_success(monkeypatch):
+    monkeypatch.setattr(live_broker.requests, "request", lambda *a, **k: _Response({}))
+    assert live_broker.cancel_order("stop-1", cfg=_cfg()) is True

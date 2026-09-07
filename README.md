@@ -68,6 +68,8 @@ jobs:
 
 Set `CRON_SECRET` in the Vercel project environment and create matching GitHub repository secrets `TRADE_AGENT_CRON_SECRET` and `TRADE_AGENT_URL` (the deployed HTTPS origin, without a trailing slash). The endpoint rejects missing or mismatched bearer tokens and independently skips weekends, holidays, and outside-hours calls. Keep the existing two Vercel cron entries unchanged.
 
+Breakout picks have a separate `live_paper.breakout_two_step` gate. It defaults to `false`, so breakout picks remain simulator-only even when ordinary live paper orders are enabled. When deliberately testing this path, the monitor submits a plain stop entry, arms an OCO exit only after the entry fills, cancels unfilled entries at the time/flatten cutoff, and force-closes immediately if OCO arming fails. Keep this flag off until the two-step manual dry run and failsafe test in the execution spec have been observed in the paper account.
+
 ## Daily operation
 
 ```powershell

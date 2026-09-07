@@ -751,6 +751,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                         p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open"),
                         entry, stop, float(p["target_price"]), cfg=cfg)
                     if order:
+                        if ((p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open")).lower()
+                                == "breakout" and cfg["live_paper"].get("breakout_two_step")):
+                            order["order_class"] = "stop_then_oco"
                         ledger.save_live_order(
                             con, pick_id, order, d, p["ticker"],
                             "buy" if p["direction"] == "long" else "sell", qty,

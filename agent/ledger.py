@@ -428,13 +428,16 @@ def save_live_order(con: duckdb.DuckDBPyConnection, pick_id: int, order: dict,
     con.execute(
           """INSERT INTO live_orders
            (live_order_id, pick_id, session_date, ticker, side, qty, order_class,
-            entry_order_type, submitted_at, status, raw_order_json)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        entry_order_type, submitted_at, status, oco_order_id, exit_legs_armed,
+                        raw_order_json)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               ON CONFLICT (live_order_id) DO UPDATE SET
-                 status = excluded.status, raw_order_json = excluded.raw_order_json""",
+                         status = excluded.status, order_class = excluded.order_class,
+                         raw_order_json = excluded.raw_order_json""",
         [str(order_id), pick_id, session_date, ticker.upper(), side.lower(), int(qty),
          order.get("order_class", "bracket"), entry_order_type,
          order.get("submitted_at") or datetime.now(), order.get("status"),
+                 order.get("oco_order_id"), bool(order.get("exit_legs_armed", False)),
          json.dumps(order, default=str)],
     )
 
@@ -454,6 +457,7 @@ def update_live_order(con: duckdb.DuckDBPyConnection, live_order_id: str, **fiel
     allowed = {
         "status", "entry_fill_price", "entry_fill_at", "exit_reason",
         "exit_fill_price", "exit_fill_at", "live_r", "reconciled", "raw_order_json",
+        "oco_order_id", "exit_legs_armed",
     }
     updates = [(key, value) for key, value in fields.items() if key in allowed]
     if not updates:

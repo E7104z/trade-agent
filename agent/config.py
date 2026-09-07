@@ -59,6 +59,7 @@ _DEFAULTS: dict[str, Any] = {
     "live_paper": {
         "enabled": False,
         "alpaca_paper": False,
+        "breakout_two_step": False,
         "trading_base": "https://paper-api.alpaca.markets",
         "max_picks_per_day": 4,
         "intraday_check_secret_env": "CRON_SECRET",

@@ -29,6 +29,7 @@
   "live_paper": {
     "enabled": false,
     "alpaca_paper": false,
+    "breakout_two_step": false,
     "trading_base": "https://paper-api.alpaca.markets",
     "max_picks_per_day": 4,
     "intraday_check_secret_env": "CRON_SECRET"

@@ -54,6 +54,16 @@ def _live_r(pick: dict, entry: float | None, exit_price: float | None) -> float 
     return (float(exit_price) - float(entry)) * direction / risk
 
 
+def _past_cutoff(pick: dict, live_cfg: dict, current: datetime) -> str | None:
+    stop_at = _time_stop(pick.get("time_stop"))
+    flatten_at = _time_stop(live_cfg.get("flatten_at"))
+    if stop_at and current.time() >= stop_at:
+        return "time_stop"
+    if flatten_at and current.time() >= flatten_at:
+        return "flatten"
+    return None
+
+
 def check(cfg: Config, *, run_date: date | None = None, at: datetime | None = None) -> dict:
     d = run_date or today_et()
     current = at or now_et()
@@ -80,6 +90,68 @@ def check(cfg: Config, *, run_date: date | None = None, at: datetime | None = No
                 ledger.update_live_order(con, row["live_order_id"],
                                          entry_fill_price=entry, entry_fill_at=entry_at,
                                          status=order.get("status"), raw_order_json=live_broker.raw_order_json(order))
+
+            if row.get("order_class") == "stop_then_oco":
+                live_entry = entry or row.get("entry_fill_price")
+                if not row.get("exit_legs_armed"):
+                    if str(order.get("status", "")).lower() == "filled":
+                        closing_side = "sell" if row.get("side") == "buy" else "buy"
+                        oco = live_broker.submit_oco_exit(
+                            row["ticker"], row["qty"], closing_side,
+                            pick["stop_price"], pick["target_price"], cfg=cfg)
+                        if oco and oco.get("id"):
+                            ledger.update_live_order(
+                                con, row["live_order_id"], oco_order_id=str(oco["id"]),
+                                exit_legs_armed=True, entry_fill_price=live_entry,
+                                entry_fill_at=entry_at, status="filled")
+                            continue
+
+                        close_order = live_broker.close_position(row["ticker"], cfg=cfg) or {}
+                        exit_price, exit_at = _fill(close_order)
+                        live_r = _live_r(pick, live_entry, exit_price)
+                        ledger.update_live_order(
+                            con, row["live_order_id"], exit_reason="unmanaged_close_failsafe",
+                            exit_fill_price=exit_price, exit_fill_at=exit_at, live_r=live_r,
+                            reconciled=True, status="closed",
+                            raw_order_json=live_broker.raw_order_json(close_order))
+                        log("intraday", f"{row['ticker']}: OCO arm failed post-fill -- "
+                                         "force-closed at market to avoid an unprotected position")
+                        updated += 1
+                        continue
+
+                    cutoff = _past_cutoff(pick, {**live_cfg, "flatten_at": live_cfg.get("flatten_at") or cfg.get("flatten_at")}, current)
+                    if cutoff:
+                        live_broker.cancel_order(row["live_order_id"], cfg=cfg)
+                        ledger.update_live_order(con, row["live_order_id"],
+                                                 exit_reason="cancelled_unfilled", reconciled=True,
+                                                 status="canceled")
+                        updated += 1
+                    continue
+
+                oco_id = row.get("oco_order_id")
+                oco_order = live_broker.get_order(oco_id, cfg=cfg) if oco_id else {}
+                reason, exit_price, exit_at = _exit_from_order(oco_order or {})
+                if reason and exit_price is not None:
+                    live_r = _live_r(pick, live_entry, exit_price)
+                    ledger.update_live_order(
+                        con, row["live_order_id"], exit_reason=reason,
+                        exit_fill_price=exit_price, exit_fill_at=exit_at, live_r=live_r,
+                        reconciled=True, status=oco_order.get("status"))
+                    updated += 1
+                    continue
+
+                cutoff = _past_cutoff(pick, {**live_cfg, "flatten_at": live_cfg.get("flatten_at") or cfg.get("flatten_at")}, current)
+                if cutoff:
+                    live_broker.cancel_order(str(oco_id), cfg=cfg)
+                    close_order = live_broker.close_position(row["ticker"], cfg=cfg) or {}
+                    exit_price, exit_at = _fill(close_order)
+                    live_r = _live_r(pick, live_entry, exit_price)
+                    ledger.update_live_order(
+                        con, row["live_order_id"], exit_reason=cutoff,
+                        exit_fill_price=exit_price, exit_fill_at=exit_at, live_r=live_r,
+                        reconciled=True, status="closed")
+                    updated += 1
+                continue
 
             reason, exit_price, exit_at = _exit_from_order(order)
             if reason is None:
@@ -116,7 +188,15 @@ def reconcile_evening(con, cfg: Config, d: date) -> dict:
     divergence = []
     count = 0
     for row in ledger.live_orders_for_date(con, d):
-        order = live_broker.get_order(row["live_order_id"], cfg=cfg) or {}
+        if row.get("live_r") is not None:
+            ledger.set_live_r(con, row["pick_id"], row["live_r"])
+            sim_r = outcomes.get(row["pick_id"], (None, None))[1]
+            if sim_r is not None:
+                divergence.append(abs(row["live_r"] - sim_r))
+            count += 1
+            continue
+        order_id = row.get("oco_order_id") if row.get("exit_legs_armed") else row["live_order_id"]
+        order = live_broker.get_order(order_id, cfg=cfg) or {}
         reason, exit_price, exit_at = _exit_from_order(order)
         entry, entry_at = _fill(order)
         if entry is not None:

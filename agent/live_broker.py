@@ -69,6 +69,9 @@ def submit_bracket_order(ticker: str, qty: int, side: str, entry_type: str,
         return None
     order_type, entry_params = entry_order_params(entry_type, entry_price)
     if str(entry_type or "open").lower() == "breakout":
+        config = _cfg(cfg)
+        if (config.get("live_paper", {}) or {}).get("breakout_two_step"):
+            return submit_stop_entry_order(ticker, qty, side, entry_price, cfg=config)
         # Alpaca documents bracket entries as market/limit. A stop-entry
         # bracket is not atomic, so leave breakout live placement for the
         # later stop-entry plus OCO flow rather than submit a rejected order.
@@ -83,6 +86,39 @@ def submit_bracket_order(ticker: str, qty: int, side: str, entry_type: str,
     }
     result = _request("POST", "/v2/orders", cfg=cfg, payload=payload)
     return result if isinstance(result, dict) else None
+
+
+def submit_stop_entry_order(ticker: str, qty: int, side: str, stop_price: float,
+                            *, cfg: Config | None = None) -> dict | None:
+    """Submit a plain stop entry; callers must arm exits after fill."""
+    if qty < 1:
+        _LOG.info("Skipping live paper stop entry for %s: qty < 1", ticker)
+        return None
+    payload = {
+        "symbol": str(ticker).upper(), "qty": str(int(qty)), "side": side.lower(),
+        "type": "stop", "time_in_force": "day", "stop_price": float(stop_price),
+    }
+    result = _request("POST", "/v2/orders", cfg=cfg, payload=payload)
+    return result if isinstance(result, dict) else None
+
+
+def submit_oco_exit(ticker: str, qty: int, side: str, stop_loss_price: float,
+                    target_price: float, *, cfg: Config | None = None) -> dict | None:
+    """Submit the closing OCO pair after a stop entry is confirmed filled."""
+    if qty < 1:
+        return None
+    payload = {
+        "symbol": str(ticker).upper(), "qty": str(int(qty)), "side": side.lower(),
+        "type": "limit", "time_in_force": "day", "order_class": "oco",
+        "take_profit": {"limit_price": float(target_price)},
+        "stop_loss": {"stop_price": float(stop_loss_price)},
+    }
+    result = _request("POST", "/v2/orders", cfg=cfg, payload=payload)
+    return result if isinstance(result, dict) else None
+
+
+def cancel_order(order_id: str, *, cfg: Config | None = None) -> bool:
+    return _request("DELETE", f"/v2/orders/{order_id}", cfg=cfg) is not None
 
 
 def get_order(order_id: str, *, cfg: Config | None = None) -> dict | None:

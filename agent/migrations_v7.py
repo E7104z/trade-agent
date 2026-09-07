@@ -27,4 +27,6 @@ STATEMENTS: list[str] = [
         raw_order_json TEXT
     )""",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS live_r DOUBLE",
+    "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS oco_order_id TEXT",
+    "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS exit_legs_armed BOOLEAN DEFAULT FALSE",
 ]
