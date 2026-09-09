@@ -7,6 +7,7 @@ MORNING LOOP (6:45 AM ET)
 """
 from __future__ import annotations
 
+import itertools
 import json
 import threading
 from datetime import date
@@ -51,7 +52,8 @@ def _reference_prices(bundle: dict) -> dict[str, float]:
     return out
 
 
-def _grounded_ref_prices(md: MarketData, plan: dict, bundle: dict, d: date) -> dict[str, float]:
+def _grounded_ref_prices(md: MarketData, plan: dict, bundle: dict, d: date,
+                         seed: dict[str, float] | None = None) -> dict[str, float]:
     """Reference prices for _validate_plan, keyed off what the analyst PROPOSED.
 
     The bundle's quotes only cover tickers some feed happened to surface —
@@ -65,6 +67,16 @@ def _grounded_ref_prices(md: MarketData, plan: dict, bundle: dict, d: date) -> d
     (fail closed) rather than trusting an unverifiable price.
     """
     refs = _reference_prices(bundle)
+    # `seed` carries quotes already fetched this run by
+    # _grounded_candidate_prices (same md, same session, minutes old at most).
+    # Merging them means a ticker grounded before the risk manager is not
+    # re-fetched after it -- one snapshot call per ticker per run, not two, on
+    # a 300s serverless budget with arm B running concurrently. It does not
+    # weaken the gate: these are real fetched quotes, and the magnitude/
+    # entry-type checks below run against them exactly as they would against a
+    # fresh one (the gate's band is 15%, far outside any staleness of this
+    # size). A ticker in neither map is still absent, and still dropped.
+    refs.update(seed or {})
     proposed = [str(p.get("ticker", "")).upper().strip() for p in (plan.get("picks") or [])]
     missing = [t for t in dict.fromkeys(proposed) if t and t not in refs]
     if not missing:
@@ -77,6 +89,84 @@ def _grounded_ref_prices(md: MarketData, plan: dict, bundle: dict, d: date) -> d
     return refs
 
 
+def _candidate_tickers(candidates: dict) -> list[str]:
+    """Deduped, normalized ticker list from an analyst candidate block."""
+    proposed = [str(c.get("ticker", "")).upper().strip()
+                for c in (candidates.get("candidates") or [])]
+    return [t for t in dict.fromkeys(proposed) if t]
+
+
+def _grounded_candidate_prices(md: MarketData, candidates: dict,
+                               bundle: dict, d: date) -> dict[str, float]:
+    """Live last price for every ANALYST candidate the bundle never quoted.
+
+    Runs BEFORE the risk manager -- unlike _grounded_ref_prices, which runs
+    after it -- so a web-search-sourced catalyst is priced while it can still
+    be traded, rather than after kill-check 2c has already dropped it for
+    having no price.
+
+    That ordering was the whole bug (2026-09-08): pick_quotes existed, was
+    built precisely to rescue "tickers the bundle never quoted," and only ever
+    ran on picks that had ALREADY survived the risk manager -- so it never
+    fired for the tickers it was written for. Two catalysts (conviction 5 and
+    4) died that morning annotated "excellent catalyst, untradeable structure",
+    which is this bug's signature: the market offered something, the plumbing
+    did not deliver it.
+
+    Same fail-closed contract as every other grounding fetch: a ticker absent
+    here is still absent downstream and is still dropped by _validate_plan.
+    This only moves the FETCH earlier -- it does not weaken any gate.
+    """
+    refs = _reference_prices(bundle)
+    missing = [t for t in _candidate_tickers(candidates) if t not in refs]
+    if not missing:
+        return {}
+    log("morning", f"Grounding candidate ticker(s) the bundle missed: {', '.join(missing)}")
+    try:
+        return md.pick_quotes(missing, d)
+    except Exception as e:  # noqa: BLE001
+        log("morning", f"WARN candidate-quote fetch failed ({e}) — "
+                       f"risk manager will see no live price for: {', '.join(missing)}")
+        return {}
+
+
+def _live_quotes_md(cand_quotes: dict[str, float]) -> str:
+    """Render the post-analyst quote top-up for the risk manager's user block.
+
+    Deliberately grounds ONLY the tickers actually fetched, BY NAME. This must
+    never read as a blanket pass on kill-check 2c: a candidate not listed here
+    and not in MARKET DATA is still ungrounded, and the mechanical gates in
+    _validate_plan run afterward on the merged map regardless of what the risk
+    manager concludes from this section.
+    """
+    if not cand_quotes:
+        return ""
+    lines = "\n".join(f"- {t}: ${p}" for t, p in sorted(cand_quotes.items()))
+    return ("## LIVE QUOTES — fetched after the analyst call\n\n"
+            "Verified last prices for candidate tickers that were absent from\n"
+            "MARKET DATA above. A ticker listed here IS price-grounded; do not\n"
+            "kill it under check 2c for absence of a quote. A candidate ticker\n"
+            "NOT listed here and not in MARKET DATA remains ungrounded.\n\n"
+            f"{lines}\n")
+
+
+def _candidate_grounding_health(candidates: dict, bundle: dict,
+                                cand_quotes: dict[str, float]) -> dict:
+    """How much of the analyst's OWN candidate list could be priced at all.
+
+    This is the honest denominator for the data-health verdict: it is measured
+    over the population the analyst produced, before the risk manager removes
+    anything, so "half the candidates had no obtainable price" means what it
+    says. Measuring it over surviving picks instead would report a clean
+    session on exactly the mornings that went worst -- if everything was killed
+    for having no price, there are no picks left to count.
+    """
+    priced = {**_reference_prices(bundle), **cand_quotes}
+    tickers = _candidate_tickers(candidates)
+    return {"candidates_seen": len(tickers),
+            "candidates_ungrounded": sum(1 for t in tickers if t not in priced)}
+
+
 def _bundle_field(bundle: dict, field: str) -> dict:
     """Generic extractor for a per-ticker numeric/scalar field carried on
     premarket_gappers/catalyst_quotes rows (mirrors _reference_prices' merge
@@ -87,6 +177,19 @@ def _bundle_field(bundle: dict, field: str) -> dict:
         if sym and val is not None and str(sym).upper() not in out:
             out[str(sym).upper()] = val
     return out
+
+
+def _bundle_health(md: MarketData, bundle: dict) -> dict:
+    """Session-level data facts _validate_plan cannot see for itself: how much
+    the bundle actually covered, and whether the quote feed had to be
+    downgraded to get there. Feeds _data_health; never gates anything."""
+    missing = bundle.get("missing") or []
+    return {
+        "bundle_gappers": len(bundle.get("premarket_gappers") or []),
+        "bundle_catalyst_quotes": len(bundle.get("catalyst_quotes") or []),
+        "catalyst_quotes_failed": any(str(m).startswith("catalyst_quotes:") for m in missing),
+        "feed_downgraded": bool(getattr(md, "feed_downgraded", False)),
+    }
 
 
 def _grounded_atr(md: MarketData, plan: dict, bundle: dict) -> dict[str, float]:
@@ -128,11 +231,71 @@ def _grounded_earnings(md: MarketData, plan: dict, bundle: dict) -> dict[str, in
     return earn_map
 
 
+def _data_health(gate_counts: dict[str, int], n_proposed: int,
+                 session_health: dict | None) -> dict:
+    """The session's DATA-HEALTH verdict: could this pipeline evaluate the
+    market at all, as opposed to evaluating it and declining?
+
+    Today those two states are indistinguishable downstream — a plan reading
+    "systemic data gaps / CANNOT VERIFY ATR/VWAP" is stored beside a run row
+    saying status "ok", error "". Nothing can then tell a plumbing failure from
+    a judgment call, and the miner ends up pooling two entirely different
+    classes under one "no_trade" label. This promotes the existing Phase 1f
+    fail-open counters to a first-class verdict; it gates nothing and changes
+    no number.
+
+    `session_health` carries the facts _validate_plan cannot see for itself
+    (bundle coverage, feed state, the analyst's candidate population) and is
+    supplied by run(); callers that omit it still get a valid verdict computed
+    from the gate counters alone, with the checks whose inputs are absent
+    simply not firing — never fabricated as passing.
+    """
+    sh = dict(session_health or {})
+    out: dict = {
+        "candidates_seen": sh.get("candidates_seen"),
+        "candidates_ungrounded": sh.get("candidates_ungrounded"),
+        "picks_proposed": n_proposed,
+        "picks_ungrounded": gate_counts["grounding"],
+        "atr_unmeasured": gate_counts["atr"],
+        "earnings_unmeasured": gate_counts["earnings"],
+        "bundle_gappers": sh.get("bundle_gappers"),
+        "bundle_catalyst_quotes": sh.get("bundle_catalyst_quotes"),
+        "catalyst_quotes_failed": sh.get("catalyst_quotes_failed"),
+        "feed_downgraded": sh.get("feed_downgraded"),
+    }
+
+    # Ungrounded ratio: measured over the ANALYST's candidates when the
+    # candidate-grounding pass ran (that population is the honest denominator —
+    # it is measured before the risk manager removes anything), and otherwise
+    # over the picks the risk manager proposed. Never mixed: a ratio whose
+    # numerator and denominator come from different populations is worse than
+    # no ratio at all.
+    by_candidate = out["candidates_ungrounded"] is not None and bool(out["candidates_seen"])
+    ungrounded, seen = ((out["candidates_ungrounded"], out["candidates_seen"])
+                        if by_candidate else (out["picks_ungrounded"], n_proposed))
+    out["ungrounded_basis"] = "candidates" if by_candidate else "picks"
+
+    reasons: list[str] = []
+    # A gap scan that returned NOTHING is a feed failure, not a flat tape: the
+    # scan folds in INDEX_ETFS unconditionally, so a healthy call cannot come
+    # back empty.
+    if out["bundle_gappers"] == 0:
+        reasons.append("premarket gap scan returned no rows at all")
+    if out["catalyst_quotes_failed"]:
+        reasons.append("catalyst-quote fetch raised")
+    if seen and ungrounded >= max(2, 0.5 * seen):
+        reasons.append(f"{ungrounded}/{seen} {out['ungrounded_basis']} had no obtainable price")
+    out["degraded"] = bool(reasons)
+    out["degraded_reasons"] = reasons
+    return out
+
+
 def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                    drawdown: dict | None = None,
                    ref_prices: dict[str, float] | None = None,
                    atr_map: dict[str, float] | None = None,
-                   earnings_map: dict[str, int] | None = None) -> tuple[dict, list[str]]:
+                   earnings_map: dict[str, int] | None = None,
+                   session_health: dict | None = None) -> tuple[dict, list[str]]:
     """Hard-validate and normalize the risk manager's plan. Returns (plan, warnings).
 
     The playbook's losing-streak rule (>=3 losers: cap 0.5R, demand conviction >= 4)
@@ -198,6 +361,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
         plan["gates_failed_open"] = json.dumps(gate_counts)
         plan["provider_degraded"] = bool(
             n_proposed > 0 and any(v > n_proposed / 2 for v in gate_counts.values()))
+        plan["data_health"] = _data_health(gate_counts, n_proposed, session_health)
 
     max_picks = int(cfg.get("max_picks", 4))
     min_r, max_r = float(cfg.get("min_size_r", 0.25)), float(cfg.get("max_size_r", 1.5))
@@ -462,6 +626,10 @@ def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
     taken = {p["ticker"].upper() for p in plan.get("picks", [])}
     reasons = {str(r.get("ticker", "")).upper(): r.get("reason", "")
                for r in plan.get("rejected", []) or []}
+    # Stamped per row rather than filtered out: a rejection from a degraded
+    # session is still graded (a counterfactual is still a counterfactual), it
+    # just must not be counted as a REASON — see ledger.shadow_summary.
+    degraded = bool((plan.get("data_health") or {}).get("degraded"))
     out = []
     for c in candidates.get("candidates", []) or []:
         t = str(c.get("ticker", "")).upper()
@@ -492,6 +660,7 @@ def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
             "rejection_category": "rr_below_control" if planned_rr is not None and planned_rr < 2.0
                                   else "other",
             "planned_rr": planned_rr,
+            "session_degraded": degraded,
         })
     return out
 
@@ -511,6 +680,18 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
         return False
     reasons = {str(r.get("ticker", "")).upper(): str(r.get("reason", ""))
                for r in plan.get("rejected", []) or []}
+    # The risk manager writes kill reasons as PROSE, so these words are matched
+    # as substrings against a whole sentence: a candidate killed purely on
+    # "R:R 1.86 < 2.0" is rescuable, but the same candidate killed with
+    # "R:R 1.86 < 2.0, and regime is chop" is blocked by the word `regime`
+    # alone. That is how a lane can be enabled, in-band, and still never fire.
+    # The blocklist is NOT widened and no matching is loosened here -- widening
+    # it is gate-loosening by another name, and it is doing real work. What is
+    # added below is a log line naming every in-band candidate a reason word
+    # blocked, so after a few weeks the ledger can say empirically whether the
+    # blocklist over-fires. FOLLOW-UP (not built now): if it does, the right
+    # repair is a STRUCTURED rejection reason from the risk manager (a
+    # `primary_kill_check` field), not fuzzier substring matching on prose.
     blocked = ("stale", "event", "binary", "invalid", "ungrounded", "mismatch",
                "chase", "vague", "unverified", "correlation", "regime")
     low_rr = float(lane.get("min_rr", 1.8))
@@ -518,7 +699,7 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
     for candidate in candidates.get("candidates", []) or []:
         ticker = str(candidate.get("ticker", "")).upper().strip()
         reason = reasons.get(ticker, "")
-        if not ticker or "r:r" not in reason.lower() or any(w in reason.lower() for w in blocked):
+        if not ticker or "r:r" not in reason.lower():
             continue
         entry_plan = candidate.get("entry_plan") or {}
         entry = entry_plan.get("price", candidate.get("entry_price"))
@@ -531,6 +712,14 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
             continue
         rr = abs(float(target) - float(entry)) / risk
         if not low_rr <= rr < high_rr:
+            continue
+        # Checked AFTER the R:R band so the log line can report the rr that was
+        # actually in range. Same candidates are admitted as before -- both
+        # conditions still have to hold, only the order of evaluation moved.
+        blocking = [w for w in blocked if w in reason.lower()]
+        if blocking:
+            log("morning", f"EXPLORATION: {ticker} in-band (R:R {rr:.2f}) but blocked "
+                           f"by reason word(s) {blocking} - reason: {reason!r}")
             continue
         plan["picks"] = [{
             **candidate,
@@ -567,20 +756,39 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
     con2 = ledger.connect()
     md2 = MarketData(cfg)
     try:
+        # Arm B gets candidate grounding on exactly the same terms as arm A.
+        # An arm denied a pipeline fix the other arm has is not a comparison of
+        # context modes any more -- it is context mode confounded with whether
+        # prices reached the risk manager, which is the larger effect of the
+        # two. Arm B runs its own analyst, so it grounds its own candidates
+        # against its own MarketData.
+        armb_quotes: dict[str, float] = {}
+        armb_health: dict = {}
+
+        def _quotes_md_arm_b(cands: dict) -> str:
+            q = _grounded_candidate_prices(md2, cands, bundle, d)
+            armb_quotes.update(q)
+            armb_health.update(_candidate_grounding_health(cands, bundle, q))
+            return _live_quotes_md(q)
+
         def _validate_arm_b(p: dict) -> tuple[dict, list[str]]:
+            # data_health from the shared bundle but ITS OWN MarketData (md2
+            # probes the feed independently) and its own candidate population.
             return _validate_plan(
                 p, cfg, ledger.current_streak(con2),
                 ledger.trailing_weighted_r(con2, int(cfg.get("drawdown_window", 10))),
-                ref_prices=_grounded_ref_prices(md2, p, bundle, d),
+                ref_prices=_grounded_ref_prices(md2, p, bundle, d, seed=armb_quotes),
                 atr_map=_grounded_atr(md2, p, bundle),
-                earnings_map=_grounded_earnings(md2, p, bundle))
+                earnings_map=_grounded_earnings(md2, p, bundle),
+                session_health={**_bundle_health(md2, bundle), **armb_health})
 
         return paired_mod.run_challenger_arm(
             con2, cfg, d,
             analyst_system=analyst_system, risk_system=risk_system,
             bundle_md=bundle_md, regime_md_text=reg_md, memory_text=mem["text"],
             playbook_version=mem["playbook_version"], llm_call=llm_call,
-            validate=_validate_arm_b, regime_tag=regime_tag, model=model)
+            validate=_validate_arm_b, quotes_md_for=_quotes_md_arm_b,
+            regime_tag=regime_tag, model=model)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
     finally:
@@ -671,6 +879,14 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         n_cand = len(candidates.get("candidates", []))
         log("morning", f"Analyst produced {n_cand} candidates")
 
+        # Between stage 1 and stage 2: price every candidate the bundle never
+        # quoted, while the risk manager can still act on it. See
+        # _grounded_candidate_prices -- this is the ordering fix, and it is the
+        # difference between "the market offered nothing" and "our plumbing
+        # offered nothing."
+        cand_quotes = _grounded_candidate_prices(md, candidates, bundle, d)
+        quotes_md = _live_quotes_md(cand_quotes)
+
         corr_md = "" if cfg.offline else _correlation_matrix_md(
             [c.get("ticker", "") for c in candidates.get("candidates", [])])
 
@@ -679,6 +895,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             f"# TODAY: {d.isoformat()}\n\n"
             f"## THE ANALYST'S CANDIDATES\n\n```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
             f"## MARKET DATA\n\n{bundle_md}\n\n"
+            + (f"{quotes_md}\n" if quotes_md else "")
             + (f"{corr_md}\n\n" if corr_md else "")
             + f"## REGIME READ\n\n{reg_md}\n\n"
             f"{mem['text']}\n\n"
@@ -696,12 +913,15 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         plan["validator_proposed_count"] = len(plan.get("picks", []) or [])
 
         # 7. validate + persist (ref prices cover every proposed ticker — live-fetched if needed)
+        session_health = {**_bundle_health(md, bundle),
+                          **_candidate_grounding_health(candidates, bundle, cand_quotes)}
         plan, warnings = _validate_plan(
             plan, cfg, ledger.current_streak(con),
             ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10))),
-            ref_prices=_grounded_ref_prices(md, plan, bundle, d),
+            ref_prices=_grounded_ref_prices(md, plan, bundle, d, seed=cand_quotes),
             atr_map=_grounded_atr(md, plan, bundle),
-            earnings_map=_grounded_earnings(md, plan, bundle))
+            earnings_map=_grounded_earnings(md, plan, bundle),
+            session_health=session_health)
         plan["validator_drop_count"] = max(
             0, plan["validator_proposed_count"] - len(plan.get("picks", []) or []))
         for w in warnings:
@@ -732,16 +952,32 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         plan["persisted_rejection_count"] = len(rejections)
         pick_ids = ledger.save_daily_plan(con, d, plan, candidates, reg.get("tag", ""))
         n_rej = ledger.save_rejections(con, d, rejections)
-        ledger.log_run(con, "morning", d, started, "ok", model, usage)
+        # A degraded session is one the pipeline could not EVALUATE, as opposed
+        # to one it evaluated and declined. Both are stored — the degraded rate
+        # is itself operational evidence — but only the second is a decision,
+        # and runs.status is where that distinction has to live for anything
+        # downstream to honor it. `runs.status` is already free text, so this
+        # needs no migration.
+        health = plan.get("data_health") or {}
+        if health.get("degraded"):
+            log("morning", "SESSION DEGRADED — the pipeline could not evaluate the market: "
+                           + "; ".join(health.get("degraded_reasons") or ["(unspecified)"])
+                           + ". This is logged as an outage, NOT as a stand-down decision.")
+        ledger.log_run(con, "morning", d, started,
+                       "degraded" if health.get("degraded") else "ok", model, usage)
 
         # Live paper orders are a separate ledger concern. The simulator's
         # picks are already locked above; a broker failure cannot change them.
         if cfg.get("live_paper", {}).get("enabled") and plan.get("picks"):
             try:
                 from .. import live_broker
-                for p, pick_id in zip(plan["picks"], pick_ids):
-                    if pick_id not in pick_ids[:int(cfg["live_paper"].get("max_picks_per_day", 4))]:
-                        break
+                # Explicit slice, not membership-testing the id list: the old
+                # `pick_id not in pick_ids[:max]` form only emulated an index
+                # check while pick_ids happened to be unique and ordered, and
+                # would mis-slice (silently, and in O(n^2)) if an id ever
+                # repeated. Behavior-identical in the normal case.
+                max_live = int(cfg["live_paper"].get("max_picks_per_day", 4))
+                for p, pick_id in itertools.islice(zip(plan["picks"], pick_ids), max_live):
                     entry = float(p["entry_price"])
                     stop = float(p["stop_price"])
                     qty = live_broker.quantity_for_r(

@@ -213,6 +213,7 @@ def run_challenger_arm(
     playbook_version: str,
     llm_call: Callable[..., Any],
     validate: Callable[[dict], tuple[dict, list[str]]] | None = None,
+    quotes_md_for: Callable[[dict], str] | None = None,
     regime_tag: str = "",
     model: str = "",
 ) -> dict[str, Any]:
@@ -248,11 +249,19 @@ def run_challenger_arm(
                            mock_name="morning_analyst", thinking=True, web_search=True)
         candidates = getattr(analyst, "parsed", None) or {}
 
+        # Same post-analyst quote top-up arm A gets, injected rather than
+        # imported so this module stays free of MarketData/provider knowledge
+        # (the same reason `validate` and `llm_call` are injected). Omitting it
+        # would hold arm B to a weaker pipeline than arm A -- a handicap, not a
+        # comparison.
+        quotes_md = quotes_md_for(candidates) if quotes_md_for is not None else ""
+
         risk_user = (
             f"# TODAY: {plan_date.isoformat()}\n\n"
             f"## THE ANALYST'S CANDIDATES\n\n```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
             f"## MARKET DATA\n\n{bundle_md}\n\n"
-            f"## REGIME READ\n\n{regime_md_text}\n\n"
+            + (f"{quotes_md}\n" if quotes_md else "")
+            + f"## REGIME READ\n\n{regime_md_text}\n\n"
             f"{arm_memory}\n\n"
             "Run every candidate through the kill checklist and produce the final plan now."
         )

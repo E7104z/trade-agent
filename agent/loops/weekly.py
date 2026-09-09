@@ -157,6 +157,51 @@ def _data_quality_md(con) -> str:
     )
 
 
+def _degraded_sessions_md(con) -> str:
+    """Name every session the pipeline could not EVALUATE, so the miner never
+    counts an outage as a stand-down.
+
+    A no-trade day has two entirely different causes -- "the market offered
+    nothing" and "our plumbing offered nothing" -- and until data_health existed
+    they were stored identically (plan prose saying "systemic data gaps" beside a
+    run row saying status "ok", error ""). Pooling them means the miner is
+    measuring a mislabeled class, which no amount of FDR correction repairs.
+    Degraded sessions are still STORED -- the degraded rate is itself evidence --
+    they are simply not countable as decisions.
+    """
+    try:
+        rows = con.execute(
+            "SELECT plan_date, data_health FROM daily_plans "
+            "WHERE session_degraded = TRUE ORDER BY plan_date"
+        ).fetchall()
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    lines = []
+    for plan_date, health_json in rows:
+        try:
+            health = json.loads(health_json) if health_json else {}
+        except (TypeError, ValueError):
+            health = {}
+        why = "; ".join(health.get("degraded_reasons") or []) or "(reasons unavailable)"
+        d_str = plan_date.isoformat() if hasattr(plan_date, "isoformat") else str(plan_date)
+        lines.append("- " + d_str + ": " + why)
+    return (
+        "## DEGRADED SESSIONS (data outages, NOT stand-down decisions)\n\n"
+        "On the sessions below the pipeline could not evaluate the market: prices "
+        "never reached the analyst or the risk manager, so the resulting no-trade "
+        "was a consequence of the plumbing, not a judgment about market quality. "
+        "EXCLUDE these dates from any no-trade / stand-down rate, from any claim "
+        "about the desk's selectivity or patience, and from rejection-reason "
+        "frequency (their rejection rows are flagged session_degraded and are "
+        "already excluded from the forgone-R-by-reason table above). Their "
+        "counterfactual grades remain valid and still count. The degraded RATE "
+        "itself is worth reporting -- as an operational finding, never as a "
+        "behavioral one.\n\n" + "\n".join(lines)
+    )
+
+
 def _v3_sections(mem: dict) -> str:
     """Render calibration, shadow, staleness, and question-progress data for the miner."""
     cal = mem.get("calibration", [])
@@ -296,6 +341,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_sim_version_md(mem)}\n\n"
             f"{_half_day_md(con)}\n\n"
             f"{_data_quality_md(con)}\n\n"
+            f"{_degraded_sessions_md(con)}\n\n"
             f"{research_block['markdown']}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"
             f"## LESSON BANK (with IDs for your lesson_actions)\n\n"

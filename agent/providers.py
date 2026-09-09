@@ -210,6 +210,13 @@ class Alpaca:
             batch = symbols[i : i + 100]
             data = self._get("/v2/stocks/snapshots",
                              {"symbols": ",".join(batch), "feed": self.feed})
+            # Defensive unwrap: the endpoint returns a bare {symbol: snapshot}
+            # map today, but some Alpaca data routes nest their payload under a
+            # named key. If that shape ever arrives here the bare-map read below
+            # would silently yield zero quotes -- indistinguishable from "the
+            # feed has no data" -- so normalize it rather than trust the shape.
+            if isinstance(data, dict) and isinstance(data.get("snapshots"), dict):
+                data = data["snapshots"]
             out.update(data if isinstance(data, dict) else {})
         out.pop("next_page_token", None)
         return out
@@ -489,11 +496,73 @@ class MarketData:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.alpaca = Alpaca(cfg) if cfg.has_alpaca else None
+        # Feed health, established lazily by _ensure_feed() on the first call
+        # that actually needs quotes (never in __init__ -- constructing a
+        # MarketData must stay free, since tests and the paired arm-B thread
+        # both build one). None = not probed yet.
+        self.feed_ok: bool | None = None
+        self.feed_downgraded = False
+
+    # ---- feed preflight -------------------------------------------------
+    def _preflight_feed(self) -> None:
+        """One snapshot call on a known-liquid symbol to distinguish 'this feed
+        is not entitled' from 'this symbol has no data'.
+
+        Without it, an entitlement error (403 on a `sip` feed the deployed keys
+        aren't subscribed to) fails EVERY ticker identically to a genuinely
+        empty market: each caller catches broadly, logs one WARN, and the
+        session becomes a no-trade with no durable trace. Sets self.feed_ok and
+        logs loudly. Never raises -- a preflight failure must not become a new
+        way for the morning loop to die.
+        """
+        if not self.alpaca:
+            self.feed_ok = False
+            return
+        try:
+            snap = self.alpaca.snapshots(["SPY"])
+            self.feed_ok = bool(snap.get("SPY"))
+            if not self.feed_ok:
+                log("data", f"WARN feed '{self.alpaca.feed}' returned no data for SPY")
+        except Exception as e:  # noqa: BLE001
+            self.feed_ok = False
+            log("data", f"WARN feed preflight FAILED for '{self.alpaca.feed}': {e}")
+
+    def _ensure_feed(self) -> None:
+        """Probe the configured feed once per instance, and fall back from
+        `sip` to `iex` rather than losing the whole session to an entitlement
+        error.
+
+        Degraded data beats no data for a system whose only job is accumulating
+        evidence -- but ONLY because the downgrade is recorded (feed_downgraded
+        rides into the plan's data_health, so a later analysis can segregate
+        IEX-sourced sessions). The downgrade is deliberately not sticky beyond
+        this instance: every run re-probes sip, so a restored entitlement is
+        picked up on its own instead of being cached away.
+        """
+        if self.feed_ok is not None or self.cfg.offline or not self.alpaca:
+            return
+        self._preflight_feed()
+        if self.feed_ok or self.alpaca.feed == "iex":
+            return
+        original = self.alpaca.feed
+        log("data", f"Feed '{original}' unusable — retrying preflight on 'iex'")
+        self.alpaca.feed = "iex"
+        self._preflight_feed()
+        if self.feed_ok:
+            self.feed_downgraded = True
+            log("data", f"FEED DOWNGRADED: '{original}' -> 'iex' for this run "
+                        f"(recorded as data_health.feed_downgraded; sessions sourced "
+                        f"from IEX are not comparable to SIP sessions without saying so)")
+        else:
+            self.alpaca.feed = original
+            log("data", f"WARN 'iex' preflight also failed — no usable quote feed "
+                        f"this run; every price-grounding check will fail closed")
 
     # ---- morning bundle -------------------------------------------------
     def morning_bundle(self, d: date) -> dict:
         if self.cfg.offline:
             return self._offline_bundle(d)
+        self._ensure_feed()
 
         bundle: dict[str, Any] = {"date": d.isoformat(), "generated_at": now_et().isoformat(), "missing": []}
 
@@ -688,6 +757,9 @@ class MarketData:
             return {s: float(synthetic_minute_bars(s, d)[0]["o"]) for s in syms}
         if not self.alpaca:
             return {}
+        # Arm B (and any caller that never built a bundle) reaches the quote
+        # feed through here first, so probe from this entry point too.
+        self._ensure_feed()
         snaps = self.alpaca.snapshots(syms)
         out: dict[str, float] = {}
         for sym in syms:

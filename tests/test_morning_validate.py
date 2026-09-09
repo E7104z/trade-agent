@@ -354,6 +354,7 @@ def test_pick_quotes_batches_filters_and_returns_only_real_quotes():
     md = MarketData.__new__(MarketData)
     md.alpaca = StubAlpaca()
     md.cfg = SimpleNamespace(offline=False)
+    md.feed_ok = True  # bare instance: stand in for an already-passed feed preflight
     quotes = md.pick_quotes(["dks", "DKS", "BAD", "GONE", "BTCUSD", "BRK.B", ""],
                             date(2026, 8, 25))
     assert md.alpaca.asked == ["DKS", "BAD", "GONE"]

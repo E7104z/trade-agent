@@ -19,6 +19,7 @@ from typing import Any
 
 from .config import DB_PATH, ensure_dirs
 from .providers import INDEX_ETFS, SCAN_UNIVERSE
+from .util import now_et
 
 _SCHEMA = """
 CREATE SEQUENCE IF NOT EXISTS seq_pick_id START 1;
@@ -123,7 +124,7 @@ CREATE TABLE IF NOT EXISTS runs (
     run_date      DATE,
     started_at    TIMESTAMP,
     finished_at   TIMESTAMP,
-    status        VARCHAR,      -- ok | error | skipped
+    status        VARCHAR,      -- ok | degraded | error | skipped | mock | dry_run
     model         VARCHAR,
     input_tokens  BIGINT DEFAULT 0,
     output_tokens BIGINT DEFAULT 0,
@@ -305,6 +306,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v6.STATEMENTS
 from . import migrations_v7  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v7.STATEMENTS
 
+# --- v8 session data-health telemetry -------------------------------------
+from . import migrations_v8  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v8.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -350,8 +355,9 @@ def save_daily_plan(
            (plan_date, no_trade, market_summary, plan_json, analyst_json, regime_tag,
             notes_for_evening, gates_failed_open, provider_degraded,
             analyst_candidate_count, risk_rejection_count, validator_proposed_count,
-            validator_drop_count, persisted_rejection_count)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            validator_drop_count, persisted_rejection_count,
+            data_health, session_degraded)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             plan_date,
             bool(plan.get("no_trade")),
@@ -367,6 +373,8 @@ def save_daily_plan(
             plan.get("validator_proposed_count"),
             plan.get("validator_drop_count"),
             plan.get("persisted_rejection_count"),
+            json.dumps(plan["data_health"]) if plan.get("data_health") else None,
+            bool((plan.get("data_health") or {}).get("degraded")),
         ],
     )
     # replace any picks previously stored for this date (re-runs)
@@ -1101,11 +1109,12 @@ def graded_picks_since(con: duckdb.DuckDBPyConnection, from_date: date) -> list[
 def log_run(con: duckdb.DuckDBPyConnection, loop: str, run_date: date, started: datetime,
             status: str, model: str = "", usage: dict | None = None, error: str = "") -> None:
     u = usage or {}
+    finished = now_et().replace(tzinfo=None)  # same naive ET clock as `started`
     con.execute(
         """INSERT INTO runs (loop, run_date, started_at, finished_at, status, model,
                              input_tokens, output_tokens, web_searches, cost_usd, error)
-           VALUES (?,?,?,current_timestamp,?,?,?,?,?,?,?)""",
-        [loop, run_date, started, status, model,
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        [loop, run_date, started, finished, status, model,
          u.get("input_tokens", 0), u.get("output_tokens", 0),
          u.get("web_searches", 0), u.get("cost_usd", 0.0), error[:2000]],
     )
@@ -1127,14 +1136,14 @@ def save_rejections(con: duckdb.DuckDBPyConnection, plan_date: date, rejections:
             """INSERT INTO rejections
                (plan_date, ticker, direction, setup_type, reason, entry_type,
                 entry_price, stop_price, target_price, conviction, thesis,
-                source_stage, rejection_category, planned_rr)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                source_stage, rejection_category, planned_rr, session_degraded)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 plan_date, r["ticker"].upper(), r.get("direction"), r.get("setup_type"),
                 r.get("reason", ""), r.get("entry_type", "open"), r.get("entry_price"),
                 r.get("stop_price"), r.get("target_price"), r.get("conviction"),
                 r.get("thesis"), r.get("source_stage"), r.get("rejection_category"),
-                r.get("planned_rr"),
+                r.get("planned_rr"), bool(r.get("session_degraded")),
             ],
         )
     return len(rejections)
@@ -1188,9 +1197,20 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20) 
                   SUM(CASE WHEN eod_outcome='unmeasurable' THEN 1 ELSE 0 END),
                   SUM(COALESCE(forgone_r, 0))
            FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?""", [lo]).fetchone()
+    # Rejection-reason FREQUENCY is the one aggregate a degraded session
+    # actively corrupts: on a day the pipeline could not price its candidates,
+    # every "could not be verified" row is a fact about the plumbing, not about
+    # the desk's judgment, and pooling them inflates whichever reason the
+    # outage happened to produce. The rows stay stored and stay graded (the
+    # counterfactual is still real, and the totals above still count them) --
+    # they are just not counted as reasons. COALESCE covers rows written
+    # before the column existed; those sessions are not retroactively
+    # relabeled, they are simply read as not-degraded, which is what they were
+    # recorded as.
     by_reason = con.execute(
         """SELECT reason, COUNT(*), ROUND(CAST(SUM(COALESCE(forgone_r,0)) AS NUMERIC), 2)
            FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?
+             AND COALESCE(session_degraded, FALSE) = FALSE
            GROUP BY reason ORDER BY SUM(COALESCE(forgone_r,0)) DESC""", [lo]).fetchall()
     captured = con.execute(
         """SELECT COALESCE(SUM(o.r_multiple * COALESCE(p.size_r,1)), 0)
