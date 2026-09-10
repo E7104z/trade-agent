@@ -466,20 +466,29 @@ def api_history_dates():
     """Return every session date represented in the historical ledger tables."""
     con = ledger.connect()
     try:
-        rows = con.execute(
-            """SELECT DISTINCT session_date FROM (
-                   SELECT plan_date AS session_date FROM picks
-                   UNION ALL SELECT plan_date FROM rejections
-                   UNION ALL SELECT plan_date FROM daily_plans
-                   UNION ALL SELECT date FROM regime_history
-                   UNION ALL SELECT created_date FROM lessons
-                   UNION ALL SELECT session_date FROM calibration
-                   UNION ALL SELECT session_date FROM rule_confirmations
-                   UNION ALL SELECT session_date FROM open_question_progress
-                   UNION ALL SELECT run_date FROM runs
-               ) WHERE session_date IS NOT NULL ORDER BY session_date DESC"""
-        ).fetchall()
-        return json_response({"dates": [row[0] for row in rows]})
+        dates = set()
+        date_sources = {
+            "picks": "plan_date",
+            "rejections": "plan_date",
+            "daily_plans": "plan_date",
+            "regime_history": "date",
+            "lessons": "created_date",
+            "calibration": "session_date",
+            "rule_confirmations": "session_date",
+            "open_question_progress": "session_date",
+            "runs": "run_date",
+        }
+        for table, column in date_sources.items():
+            try:
+                rows = con.execute(
+                    f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
+                ).fetchall()
+                dates.update(row[0].isoformat() for row in rows if row[0] is not None)
+            except Exception:
+                # Historical browsing should remain available if an older hosted
+                # database is missing an optional v3 table.
+                continue
+        return json_response({"dates": sorted(dates, reverse=True)})
     finally:
         con.close()
 
