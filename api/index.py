@@ -139,6 +139,13 @@ button{padding:10px 18px;background:#238636;border:none;border-radius:6px;color:
 button:disabled{background:#30363d;cursor:not-allowed}
 button.secondary{background:#30363d}
 label{font-size:13px;color:#8b949e;margin-right:14px}
+select{padding:9px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;margin:4px 8px 4px 0}
+button.small{padding:8px 12px;font-size:13px}
+.history-controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:12px}
+.history-controls label{margin-right:0}
+.history-meta{color:#8b949e;font-size:13px;margin:8px 0 12px}
+.history-table{overflow:auto;max-height:560px}
+.history-table table{min-width:760px}
 pre{white-space:pre-wrap;font-size:12px;background:#0d1117;border:1px solid #30363d;
      border-radius:6px;padding:12px;max-height:400px;overflow:auto}
 a{color:#58a6ff}
@@ -234,6 +241,27 @@ function render(d) {
   <div class="card"><h2>By Setup</h2><table><tr><th>Setup</th><th>N</th><th>Triggered</th>
     <th>Win rate</th><th>Avg R</th><th>Total wR</th></tr>${setupRows}</table></div>
   <div class="card"><h2>Shadow Ledger — Rejected Candidates (${d.today})</h2>${shadowHtml}</div>
+    <div class="card"><h2>Historical Data</h2>
+        <p class="history-meta">Choose a date and data type to inspect everything saved for that session.</p>
+        <div class="history-controls">
+            <label for="historyDate">Date</label><select id="historyDate"></select>
+            <label for="historyTable">Data</label><select id="historyTable">
+                <option value="rejections">Shadow ledger</option>
+                <option value="picks">Trade picks</option>
+                <option value="outcomes">Trade outcomes</option>
+                <option value="daily_plans">Daily plans</option>
+                <option value="regime_history">Market regimes</option>
+                <option value="lessons">Lessons</option>
+                <option value="calibration">Calibration</option>
+                <option value="rule_confirmations">Rule confirmations</option>
+                <option value="open_question_progress">Question progress</option>
+                <option value="runs">Run history</option>
+            </select>
+            <button class="small" onclick="loadHistory()">View</button>
+        </div>
+        <div id="historyResult" class="history-meta">Loading available dates...</div>
+        <div id="historyTableView" class="history-table"></div>
+    </div>
   <div class="card"><h2>Playbook v${d.playbook_version}</h2><pre>${d.playbook.replace(/</g,'&lt;')}</pre></div>
   <div class="card"><h2>Recent Runs</h2><table><tr><th>Loop</th><th>Date</th><th>Status</th>
     <th>Model</th><th>Cost</th></tr>${runsRows}</table></div>
@@ -273,6 +301,57 @@ async function runLoop(name) {
 }
 
 loadData();
+
+async function loadHistoryDates() {
+    const result = document.getElementById('historyResult');
+    try {
+        const r = await fetch('/api/history/dates');
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Could not load dates');
+        const select = document.getElementById('historyDate');
+        select.innerHTML = (d.dates || []).map(day => `<option value="${day}">${day}</option>`).join('');
+        if (!d.dates || !d.dates.length) {
+            result.textContent = 'No historical sessions have been recorded yet.';
+            return;
+        }
+        await loadHistory();
+    } catch (e) {
+        result.textContent = 'Could not load history: ' + e.message;
+    }
+}
+
+async function loadHistory() {
+    const date = document.getElementById('historyDate').value;
+    const table = document.getElementById('historyTable').value;
+    const result = document.getElementById('historyResult');
+    const view = document.getElementById('historyTableView');
+    if (!date) return;
+    result.textContent = 'Loading...';
+    view.innerHTML = '';
+    try {
+        const r = await fetch(`/api/table/${table}?date=${encodeURIComponent(date)}&limit=1000`);
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Could not load records');
+        result.textContent = `${d.n} record${d.n === 1 ? '' : 's'} in ${table.replaceAll('_', ' ')} for ${date}`;
+        if (!d.n) {
+            view.innerHTML = '<p class="history-meta">No records for this date.</p>';
+            return;
+        }
+        const headers = d.columns || [];
+        const headerHtml = headers.map(column => `<th>${historyText(column)}</th>`).join('');
+        const rowsHtml = d.rows.map(row => '<tr>' + headers.map(column => `<td>${historyText(row[column])}</td>`).join('') + '</tr>').join('');
+        view.innerHTML = `<table><tr>${headerHtml}</tr>${rowsHtml}</table>`;
+    } catch (e) {
+        result.textContent = 'Could not load history: ' + e.message;
+    }
+}
+
+function historyText(value) {
+    if (value === null || value === undefined) return '—';
+    return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+loadHistoryDates();
 </script>
 </body></html>"""
 
@@ -381,6 +460,30 @@ def api_playbook():
         con.close()
 
 
+@app.route("/api/history/dates")
+@login_required
+def api_history_dates():
+    """Return every session date represented in the historical ledger tables."""
+    con = ledger.connect()
+    try:
+        rows = con.execute(
+            """SELECT DISTINCT session_date FROM (
+                   SELECT plan_date AS session_date FROM picks
+                   UNION ALL SELECT plan_date FROM rejections
+                   UNION ALL SELECT plan_date FROM daily_plans
+                   UNION ALL SELECT date FROM regime_history
+                   UNION ALL SELECT created_date FROM lessons
+                   UNION ALL SELECT session_date FROM calibration
+                   UNION ALL SELECT session_date FROM rule_confirmations
+                   UNION ALL SELECT session_date FROM open_question_progress
+                   UNION ALL SELECT run_date FROM runs
+               ) WHERE session_date IS NOT NULL ORDER BY session_date DESC"""
+        ).fetchall()
+        return json_response({"dates": [row[0] for row in rows]})
+    finally:
+        con.close()
+
+
 # --------------------------------------------------------- raw table access
 #
 # A generic, read-only, whitelisted browser for every ledger table -- so any
@@ -394,7 +497,7 @@ def api_playbook():
 # table -> its natural date column (None if it has none / isn't date-filterable)
 _QUERYABLE_TABLES = {
     "picks": "plan_date",
-    "outcomes": None,
+    "outcomes": "eval_date",
     "rejections": "plan_date",
     "daily_plans": "plan_date",
     "lessons": "created_date",
