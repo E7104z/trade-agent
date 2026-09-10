@@ -266,6 +266,10 @@ function render(d) {
   <div class="card"><h2>Recent Runs</h2><table><tr><th>Loop</th><th>Date</th><th>Status</th>
     <th>Model</th><th>Cost</th></tr>${runsRows}</table></div>
   `;
+  // The Historical Data controls above just got (re)created by the innerHTML
+  // assignment, so their dropdown needs to be (re)populated every time render()
+  // runs -- not just once at page load, or it's left empty after any refresh.
+  loadHistoryDates();
 }
 
 async function runLoop(name) {
@@ -350,8 +354,6 @@ function historyText(value) {
     if (value === null || value === undefined) return '—';
     return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
-
-loadHistoryDates();
 </script>
 </body></html>"""
 
