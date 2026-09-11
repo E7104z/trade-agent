@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from agent.config import Config
 from agent.loops.morning import (_add_exploration_pick, _build_rejections,
-                                 _grounded_ref_prices, _reference_prices, _validate_plan)
+                                 _grounded_ref_prices, _no_trade_category,
+                                 _reference_prices, _validate_plan)
 
 
 def _cfg(**overrides) -> Config:
@@ -251,6 +252,121 @@ def test_rejection_provenance_records_stage_category_and_rr():
     assert row["source_stage"] == "risk_rejected"
     assert row["rejection_category"] == "rr_below_control"
     assert row["planned_rr"] == 1.8333
+    assert row["primary_kill_check"] is None
+
+
+def test_rejection_category_prefers_structured_kill_check_over_coincidental_rr():
+    # Real production shape (2026-09-10 IWM/XLE): a catastrophic price-
+    # grounding failure can still compute to a sub-2.0 R:R by coincidence.
+    # The old heuristic mislabeled these as rejection_category
+    # "rr_below_control"; primary_kill_check must override that.
+    candidates = {"candidates": [{
+        "ticker": "IWM", "direction": "long", "setup_type": "gap_go",
+        "entry_plan": {"type": "limit", "price": 191.00},
+        "stop_price": 185.00, "target_price": 201.00,
+    }]}
+    plan = {"picks": [], "rejected": [{
+        "ticker": "IWM", "primary_kill_check": "grounding",
+        "reason": "CATASTROPHIC price-grounding failure: entry $191.00 is "
+                  "-34% below live quote $290.72",
+    }]}
+    row = _build_rejections(candidates, plan)[0]
+    assert row["primary_kill_check"] == "grounding"
+    assert row["rejection_category"] == "other"
+
+
+def test_exploration_lane_admits_via_primary_kill_check_despite_incidental_blocklist_word():
+    # The blocklist matches "regime" as a substring anywhere in the prose --
+    # but primary_kill_check is the authoritative signal now, and it says R:R
+    # was the sole binding reason. This is the exact false-block the spec
+    # calls out: a sentence that mentions regime in passing while regime was
+    # not what actually killed the candidate.
+    candidates = {"candidates": [{
+        "ticker": "MARA", "direction": "long", "setup_type": "gap_go",
+        "entry_plan": {"type": "limit", "price": 11.50},
+        "entry_price": 11.50, "stop_price": 10.90, "target_price": 12.60,
+        "thesis": "fresh catalyst",
+    }]}
+    plan = {"no_trade": True, "picks": [],
+            "rejected": [{"ticker": "MARA", "primary_kill_check": "rr",
+                         "reason": "R:R 1.83 < 2.0; regime is gap_go 5/7, fine otherwise"}]}
+    assert _add_exploration_pick(candidates, plan, _cfg(
+        exploration_lane={"enabled": True, "min_rr": 1.8, "max_rr": 2.0,
+                          "max_picks": 1, "size_r": 0.25})) is True
+    assert plan["picks"][0]["exploration_lane"] == "rr_below_control"
+
+
+def test_exploration_lane_blocks_via_primary_kill_check_despite_clean_prose():
+    # Mirror case: prose contains none of the blocklist words, but the risk
+    # manager's own enum says the binding reason was regime fit, not R:R.
+    # The enum must still block -- clean-sounding prose is not a pass.
+    candidates = {"candidates": [{
+        "ticker": "MARA", "direction": "long", "setup_type": "gap_go",
+        "entry_plan": {"type": "limit", "price": 11.50},
+        "entry_price": 11.50, "stop_price": 10.90, "target_price": 12.60,
+        "thesis": "fresh catalyst",
+    }]}
+    plan = {"no_trade": True, "picks": [],
+            "rejected": [{"ticker": "MARA", "primary_kill_check": "regime_fit",
+                         "reason": "R:R 1.83 < 2.0, and the setup has a poor record right now"}]}
+    assert _add_exploration_pick(candidates, plan, _cfg(
+        exploration_lane={"enabled": True, "min_rr": 1.8, "max_rr": 2.0,
+                          "max_picks": 1, "size_r": 0.25})) is False
+    assert plan["picks"] == []
+
+
+def test_exploration_lane_falls_back_to_blocklist_when_kill_check_absent_or_invalid():
+    candidates = {"candidates": [{
+        "ticker": "MARA", "direction": "long", "setup_type": "gap_go",
+        "entry_plan": {"type": "limit", "price": 11.50},
+        "entry_price": 11.50, "stop_price": 10.90, "target_price": 12.60,
+        "thesis": "fresh catalyst",
+    }]}
+    # Garbage/unrecognized enum value is treated the same as absent.
+    plan = {"no_trade": True, "picks": [],
+            "rejected": [{"ticker": "MARA", "primary_kill_check": "not_a_real_check",
+                         "reason": "R:R 1.83 < 2.0, regime is chop"}]}
+    assert _add_exploration_pick(candidates, plan, _cfg(
+        exploration_lane={"enabled": True, "min_rr": 1.8, "max_rr": 2.0,
+                          "max_picks": 1, "size_r": 0.25})) is False
+    assert plan["picks"] == []
+
+
+def test_no_trade_category_none_when_plan_has_trades():
+    assert _no_trade_category({"no_trade": False}, []) is None
+
+
+def test_no_trade_category_data_incomplete_takes_precedence():
+    plan = {"no_trade": True, "analyst_candidate_count": 8,
+            "data_health": {"degraded": True}}
+    rejections = [{"primary_kill_check": "rr"}] * 5
+    assert _no_trade_category(plan, rejections) == "data_incomplete"
+
+
+def test_no_trade_category_empty_universe():
+    plan = {"no_trade": True, "analyst_candidate_count": 0, "data_health": {"degraded": False}}
+    assert _no_trade_category(plan, []) == "empty_universe"
+
+
+def test_no_trade_category_all_failed_rr_on_majority():
+    plan = {"no_trade": True, "analyst_candidate_count": 5, "data_health": {"degraded": False}}
+    rejections = [{"primary_kill_check": "rr"}] * 4 + [{"primary_kill_check": "chase"}]
+    assert _no_trade_category(plan, rejections) == "all_failed_rr"
+
+
+def test_no_trade_category_all_failed_regime_on_majority():
+    plan = {"no_trade": True, "analyst_candidate_count": 5, "data_health": {"degraded": False}}
+    rejections = [{"primary_kill_check": "regime_fit"}] * 3 + [{"primary_kill_check": "rr"}] * 2
+    assert _no_trade_category(plan, rejections) == "all_failed_regime"
+
+
+def test_no_trade_category_falls_back_to_validator_on_mixed_or_missing_data():
+    plan = {"no_trade": True, "analyst_candidate_count": 5, "data_health": {"degraded": False}}
+    mixed = [{"primary_kill_check": "rr"}, {"primary_kill_check": "chase"},
+             {"primary_kill_check": "stop_quality"}]
+    assert _no_trade_category(plan, mixed) == "all_failed_validator"
+    assert _no_trade_category(plan, [{"primary_kill_check": None}]) == "all_failed_validator"
+    assert _no_trade_category(plan, []) == "all_failed_validator"
 
 
 def test_grounded_ref_prices_fetches_only_missing_pick_tickers():

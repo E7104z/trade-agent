@@ -27,8 +27,8 @@
   "leveraged_gate": "warn",
   "flatten_at": null,
   "live_paper": {
-    "enabled": false,
-    "alpaca_paper": false,
+    "enabled": true,
+    "alpaca_paper": true,
     "breakout_two_step": false,
     "trading_base": "https://paper-api.alpaca.markets",
     "max_picks_per_day": 4,

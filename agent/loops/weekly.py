@@ -202,6 +202,44 @@ def _degraded_sessions_md(con) -> str:
     )
 
 
+def _no_trade_reason_md(con) -> str:
+    """PARTICIPATION_UNBLOCK_SPEC_v2 Phase 3: no-trade days classified by a
+    closed enum (`daily_plans.no_trade_category`) instead of only free
+    prose, so the miner can see whether standing down is chronically caused
+    by R:R, by regime fit, by the mechanical validator, or by an empty
+    universe -- each implies a different fix, and pooling them under one
+    "no_trade" label hides which one actually needs it. `data_incomplete`
+    days are counted here too (for the rate), but are the SAME sessions
+    _degraded_sessions_md already tells the miner to exclude from any
+    stand-down/selectivity judgment.
+    """
+    try:
+        rows = con.execute(
+            "SELECT no_trade_category, count(*) FROM daily_plans "
+            "WHERE no_trade = TRUE AND no_trade_category IS NOT NULL "
+            "GROUP BY 1 ORDER BY 2 DESC"
+        ).fetchall()
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    lines = [f"- {cat}: {n}" for cat, n in rows]
+    return (
+        "## NO-TRADE DAY CLASSIFICATION\n\n"
+        "Distribution of WHY no-trade days happened, by closed category: "
+        "`all_failed_rr` (every live candidate died on R:R alone), "
+        "`all_failed_regime` (regime fit was the dominant kill-check), "
+        "`all_failed_validator` (mixed reasons, or the mechanical validator "
+        "dropped picks the risk manager had approved), `empty_universe` (no "
+        "candidates reached the risk manager at all), `data_incomplete` (the "
+        "session was degraded -- see DEGRADED SESSIONS above, exclude from "
+        "selectivity judgments). A `all_failed_rr` share that stays high "
+        "while the exploration lane's admitted-picks count stays low is the "
+        "signal that the R:R band itself, not just the blocklist, needs "
+        "another look.\n\n" + "\n".join(lines)
+    )
+
+
 def _v3_sections(mem: dict) -> str:
     """Render calibration, shadow, staleness, and question-progress data for the miner."""
     cal = mem.get("calibration", [])
@@ -291,6 +329,14 @@ def run(cfg: Config, run_date: date | None = None) -> None:
     d = run_date or today_et()
     started = now_et().replace(tzinfo=None)
     con = ledger.connect()
+    lock = None
+
+    if not cfg.mock:
+        lock = ledger.acquire_run_lock(con, d, "weekly")
+        if not lock["acquired"]:
+            log("weekly", f"Duplicate trigger suppressed for {d} (lock status={lock['status']})")
+            con.close()
+            return
 
     try:
         mem = build_weekly_memory(con, cfg)
@@ -342,6 +388,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_half_day_md(con)}\n\n"
             f"{_data_quality_md(con)}\n\n"
             f"{_degraded_sessions_md(con)}\n\n"
+            f"{_no_trade_reason_md(con)}\n\n"
             f"{research_block['markdown']}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"
             f"## LESSON BANK (with IDs for your lesson_actions)\n\n"
@@ -425,6 +472,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             log("weekly", "WARN: miner returned no usable playbook — keeping current version")
 
         ledger.log_run(con, "weekly", d, started, "ok", model, result.usage)
+        ledger.finish_run_lock(con, d, "weekly", lock["request_id"], "complete")
 
         log("weekly", f"Summary: {mined.get('summary_for_email','(none)')}")
         if mined.get("current_best_edge"):
@@ -439,6 +487,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         render_dashboard(con, cfg, None)
 
     except Exception as e:
+        if lock:
+            ledger.finish_run_lock(con, d, "weekly", lock["request_id"], "failed")
         ledger.log_run(con, "weekly", d, started, "error", error=str(e))
         log("weekly", f"ERROR: {e}")
         raise

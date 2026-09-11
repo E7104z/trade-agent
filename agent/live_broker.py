@@ -48,8 +48,12 @@ def _request(method: str, path: str, *, cfg: Config | None = None,
 def entry_order_params(entry_type: str, entry_price: float | None) -> tuple[str, dict]:
     kind = str(entry_type or "open").lower()
     if kind == "limit":
+        if entry_price is None:
+            raise ValueError("limit entry requires entry_price")
         return "limit", {"limit_price": float(entry_price)}
     if kind == "breakout":
+        if entry_price is None:
+            raise ValueError("breakout entry requires entry_price")
         return "stop", {"stop_price": float(entry_price)}
     return "market", {}
 

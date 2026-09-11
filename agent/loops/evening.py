@@ -332,12 +332,20 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
     d = run_date or today_et()
     started = now_et().replace(tzinfo=None)
     con = ledger.connect()
+    lock = None
 
     if not is_market_day(d) and not force:
         log("evening", f"{d} is not a market day — skipping")
         ledger.log_run(con, "evening", d, started, "skipped")
         con.close()
         return
+
+    if not cfg.mock:
+        lock = ledger.acquire_run_lock(con, d, "evening")
+        if not lock["acquired"]:
+            log("evening", f"Duplicate trigger suppressed for {d} (lock status={lock['status']})")
+            con.close()
+            return
 
     try:
         plan_row = ledger.plan_for_date(con, d)
@@ -432,7 +440,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                     ledger.save_outcome(con, o)
         else:
             outcomes = []
-            log("evening", "No-trade day — grading the decision to stand down.")
+            live_fills = [o for o in ledger.live_orders_for_date(con, d)
+                          if o.get("entry_fill_price") is not None]
+            log("evening", "No simulated picks; confirmed no live fills exist."
+                if not live_fills else
+                f"No simulated picks, but found {len(live_fills)} live fill(s); grading execution evidence.")
 
         # v3: shadow ledger — grade what the desk REJECTED (counterfactual only,
         # never touches the taken-trade equity curve)
@@ -466,6 +478,10 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             + (f" — reason: {plan_row['plan'].get('no_trade_reason','')}" if plan_row["no_trade"] else "")
             + f"\nNotes for evening from the risk manager: {plan_row.get('notes_for_evening','')}\n\n"
             f"## PICKS + COMPUTED OUTCOMES (mechanically simulated from real bars)\n\n{out_md}\n\n"
+            f"## EXECUTION GROUND TRUTH\n\n"
+            f"Live fills recorded for {d}: "
+            f"{sum(1 for o in ledger.live_orders_for_date(con, d) if o.get('entry_fill_price') is not None)}. "
+            "Build the narrative from fills when present; only call this a stand-down after confirming zero fills.\n\n"
             f"## SHADOW LEDGER TODAY (rejected candidates — context only, do not grade them)\n\n{shadow_md}\n\n"
             f"## MARKET RECAP TODAY\n\n{recap_md or '(recap unavailable)'}\n\n"
             f"## ACTIVE LESSONS (for confirm/contradict updates — use these IDs)\n\n{lessons_md}\n\n"
@@ -541,8 +557,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         send_email(cfg, f"Trade Agent — Evening Review {d.isoformat()}",
                    evening_email_html(d, review, out_md))
         render_dashboard(con, cfg, d)
+        ledger.finish_run_lock(con, d, "evening", lock["request_id"], "complete")
 
     except Exception as e:
+        if lock:
+            ledger.finish_run_lock(con, d, "evening", lock["request_id"], "failed")
         ledger.log_run(con, "evening", d, started, "error", error=str(e))
         log("evening", f"ERROR: {e}")
         raise

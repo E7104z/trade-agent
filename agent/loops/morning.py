@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import json
 import threading
+from collections import Counter
 from datetime import date
 
 from .. import ledger
@@ -620,12 +621,16 @@ def _attach_overlay_context(plan: dict, bundle: dict) -> None:
             p["overlay"] = ctx
 
 
+_KILL_CHECK_ENUM = {"staleness", "chase", "entry_type", "grounding", "crowding",
+                    "stop_quality", "rr", "regime_fit", "correlation", "event_risk",
+                    "conviction"}
+
+
 def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
     """Shadow ledger input: every analyst candidate that did NOT survive to the final
     plan, carrying its full plan levels so the evening loop can grade the counterfactual."""
     taken = {p["ticker"].upper() for p in plan.get("picks", [])}
-    reasons = {str(r.get("ticker", "")).upper(): r.get("reason", "")
-               for r in plan.get("rejected", []) or []}
+    rejected_rows = {str(r.get("ticker", "")).upper(): r for r in plan.get("rejected", []) or []}
     # Stamped per row rather than filtered out: a rejection from a degraded
     # session is still graded (a counterfactual is still a counterfactual), it
     # just must not be counted as a REASON — see ledger.shadow_summary.
@@ -644,7 +649,22 @@ def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
             risk = abs(float(entry) - float(stop))
             if risk > 0:
                 planned_rr = round(abs(float(target) - float(entry)) / risk, 4)
-        reason = reasons.get(t)
+        rejected_row = rejected_rows.get(t) or {}
+        reason = rejected_row.get("reason")
+        kill_check = str(rejected_row.get("primary_kill_check") or "").strip().lower() or None
+        if kill_check not in _KILL_CHECK_ENUM:
+            kill_check = None
+        # Prefer the risk manager's own structured verdict over the locally
+        # computed R:R -- a candidate can compute to <2.0 by coincidence (a
+        # price-grounding failure, say) while the actual binding reason was
+        # something else entirely; see PARTICIPATION_UNBLOCK_SPEC_v2 Phase 1.1.
+        # Falls back to the old inferred heuristic for rows with no enum
+        # (pre-migration data, or malformed LLM output).
+        if kill_check is not None:
+            rejection_category = "rr_below_control" if kill_check == "rr" else "other"
+        else:
+            rejection_category = ("rr_below_control" if planned_rr is not None and planned_rr < 2.0
+                                  else "other")
         out.append({
             "ticker": t,
             "direction": c.get("direction"),
@@ -657,12 +677,44 @@ def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
             "conviction": c.get("conviction"),
             "thesis": c.get("thesis"),
             "source_stage": "risk_rejected" if reason else "validator_or_unselected",
-            "rejection_category": "rr_below_control" if planned_rr is not None and planned_rr < 2.0
-                                  else "other",
+            "rejection_category": rejection_category,
+            "primary_kill_check": kill_check,
             "planned_rr": planned_rr,
             "session_degraded": degraded,
         })
     return out
+
+
+def _no_trade_category(plan: dict, rejections: list[dict]) -> str | None:
+    """Closed-enum classification of WHY a no-trade day happened
+    (PARTICIPATION_UNBLOCK_SPEC_v2 Phase 3), separate from the risk manager's
+    own free-text `plan["no_trade_reason"]` prose (kept as-is).
+
+    `data_incomplete` always wins when data_health.degraded is true — a
+    stand-down declared on degraded data is not a stand-down, regardless of
+    what the rejection mix looks like (the mix itself is suspect on a
+    degraded session). Otherwise the category is read off the
+    `primary_kill_check` distribution across the day's rejections.
+    """
+    if not plan.get("no_trade"):
+        return None
+    if (plan.get("data_health") or {}).get("degraded"):
+        return "data_incomplete"
+    if not plan.get("analyst_candidate_count"):
+        return "empty_universe"
+    checks = [r.get("primary_kill_check") for r in rejections if r.get("primary_kill_check")]
+    if checks:
+        top_check, top_n = Counter(checks).most_common(1)[0]
+        if top_n >= len(checks) / 2:
+            if top_check == "rr":
+                return "all_failed_rr"
+            if top_check == "regime_fit":
+                return "all_failed_regime"
+    # Mixed kill-check mix, no primary_kill_check data at all (pre-migration
+    # rows), or picks that the risk manager approved but the mechanical
+    # validator gates then dropped — none of those are a single clean story,
+    # so they're grouped under the validator catch-all rather than guessed at.
+    return "all_failed_validator"
 
 
 def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
@@ -678,28 +730,32 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
     max_picks = max(0, int(lane.get("max_picks", 1)))
     if max_picks < 1:
         return False
-    reasons = {str(r.get("ticker", "")).upper(): str(r.get("reason", ""))
-               for r in plan.get("rejected", []) or []}
-    # The risk manager writes kill reasons as PROSE, so these words are matched
-    # as substrings against a whole sentence: a candidate killed purely on
-    # "R:R 1.86 < 2.0" is rescuable, but the same candidate killed with
-    # "R:R 1.86 < 2.0, and regime is chop" is blocked by the word `regime`
-    # alone. That is how a lane can be enabled, in-band, and still never fire.
-    # The blocklist is NOT widened and no matching is loosened here -- widening
-    # it is gate-loosening by another name, and it is doing real work. What is
-    # added below is a log line naming every in-band candidate a reason word
-    # blocked, so after a few weeks the ledger can say empirically whether the
-    # blocklist over-fires. FOLLOW-UP (not built now): if it does, the right
-    # repair is a STRUCTURED rejection reason from the risk manager (a
-    # `primary_kill_check` field), not fuzzier substring matching on prose.
+    rejected_rows = {str(r.get("ticker", "")).upper(): r for r in plan.get("rejected", []) or []}
+    # PARTICIPATION_UNBLOCK_SPEC_v2 Phase 1.1/1.2: the risk manager can now
+    # name the ONE kill-check that actually ended a candidate
+    # (`primary_kill_check`). When it does, that enum is authoritative — admit
+    # only when R:R was the SOLE binding reason (kill_check == "rr"), and
+    # every other primary reason blocks regardless of what the prose says.
+    # When it's absent (pre-migration rows, or malformed LLM output), fall
+    # back to the old prose blocklist: these words are matched as substrings
+    # against a whole sentence, so a candidate killed purely on "R:R 1.86 <
+    # 2.0" is rescuable, but the same candidate killed with "R:R 1.86 < 2.0,
+    # and regime is chop" is blocked by the word `regime` alone. The blocklist
+    # is NOT widened here -- widening it is gate-loosening by another name.
     blocked = ("stale", "event", "binary", "invalid", "ungrounded", "mismatch",
                "chase", "vague", "unverified", "correlation", "regime")
     low_rr = float(lane.get("min_rr", 1.8))
     high_rr = float(lane.get("max_rr", 2.0))
     for candidate in candidates.get("candidates", []) or []:
         ticker = str(candidate.get("ticker", "")).upper().strip()
-        reason = reasons.get(ticker, "")
-        if not ticker or "r:r" not in reason.lower():
+        rejected_row = rejected_rows.get(ticker) or {}
+        reason = str(rejected_row.get("reason", ""))
+        kill_check = str(rejected_row.get("primary_kill_check") or "").strip().lower() or None
+        if kill_check not in _KILL_CHECK_ENUM:
+            kill_check = None
+        if not ticker:
+            continue
+        if kill_check is None and "r:r" not in reason.lower():
             continue
         entry_plan = candidate.get("entry_plan") or {}
         entry = entry_plan.get("price", candidate.get("entry_price"))
@@ -714,13 +770,21 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
         if not low_rr <= rr < high_rr:
             continue
         # Checked AFTER the R:R band so the log line can report the rr that was
-        # actually in range. Same candidates are admitted as before -- both
-        # conditions still have to hold, only the order of evaluation moved.
-        blocking = [w for w in blocked if w in reason.lower()]
-        if blocking:
-            log("morning", f"EXPLORATION: {ticker} in-band (R:R {rr:.2f}) but blocked "
-                           f"by reason word(s) {blocking} - reason: {reason!r}")
-            continue
+        # actually in range. Silent on a clean admit either way -- which path
+        # decided is recorded durably on the persisted rejection row itself
+        # (primary_kill_check), a stdout log line is not; logging is reserved
+        # for the diagnostic case (an in-band candidate that got blocked).
+        if kill_check is not None:
+            if kill_check != "rr":
+                log("morning", f"EXPLORATION: {ticker} in-band (R:R {rr:.2f}) but blocked "
+                               f"by primary_kill_check={kill_check!r} - reason: {reason!r}")
+                continue
+        else:
+            blocking = [w for w in blocked if w in reason.lower()]
+            if blocking:
+                log("morning", f"EXPLORATION: {ticker} in-band (R:R {rr:.2f}) but blocked "
+                               f"by legacy blocklist word(s) {blocking} - reason: {reason!r}")
+                continue
         plan["picks"] = [{
             **candidate,
             "ticker": ticker,
@@ -799,12 +863,20 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
     d = run_date or today_et()
     started = now_et().replace(tzinfo=None)
     con = ledger.connect()
+    lock = None
 
     if not is_market_day(d) and not force:
         log("morning", f"{d} is not a market day — skipping (use --force to override)")
         ledger.log_run(con, "morning", d, started, "skipped")
         con.close()
         return
+
+    if not cfg.mock:
+        lock = ledger.acquire_run_lock(con, d, "morning")
+        if not lock["acquired"]:
+            log("morning", f"Duplicate trigger suppressed for {d} (lock status={lock['status']})")
+            con.close()
+            return
 
     paired_thread: threading.Thread | None = None
     try:
@@ -839,6 +911,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             path.write_text(analyst_system + "\n\n---\n\n" + user_block, encoding="utf-8")
             log("morning", f"DRY RUN — prompt written to {path}, no API call made")
             ledger.log_run(con, "morning", d, started, "dry_run")
+            ledger.finish_run_lock(con, d, "morning", lock["request_id"], "complete")
             return
 
         # 5. stage 1: analyst
@@ -950,7 +1023,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         _attach_overlay_context(plan, bundle)
         rejections = _build_rejections(candidates, plan)
         plan["persisted_rejection_count"] = len(rejections)
+        plan["no_trade_category"] = _no_trade_category(plan, rejections)
         pick_ids = ledger.save_daily_plan(con, d, plan, candidates, reg.get("tag", ""))
+        ledger.append_plan_run(con, d, "morning", lock["request_id"], plan)
         n_rej = ledger.save_rejections(con, d, rejections)
         # A degraded session is one the pipeline could not EVALUATE, as opposed
         # to one it evaluated and declined. Both are stored — the degraded rate
@@ -1038,8 +1113,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                                f"no_trade={arm_b['no_trade']}, ~${arm_b['cost_usd']:.3f}")
             else:
                 log("morning", f"Arm B skipped/failed: {arm_b.get('reason')}")
+        ledger.finish_run_lock(con, d, "morning", lock["request_id"], "complete")
 
     except Exception as e:
+        if lock:
+            ledger.finish_run_lock(con, d, "morning", lock["request_id"], "failed")
         ledger.log_run(con, "morning", d, started, "error", error=str(e))
         log("morning", f"ERROR: {e}")
         # arm A failed before reaching its own join point above — still wait

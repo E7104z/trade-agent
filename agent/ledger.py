@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -100,7 +101,29 @@ CREATE TABLE IF NOT EXISTS daily_plans (
     analyst_json    VARCHAR,
     regime_tag      VARCHAR,
     notes_for_evening VARCHAR,
+    canonical_plan_run_id INTEGER,
     created_at      TIMESTAMP DEFAULT current_timestamp
+);
+
+CREATE SEQUENCE IF NOT EXISTS seq_plan_run_id START 1;
+
+CREATE TABLE IF NOT EXISTS plan_runs (
+    plan_run_id      INTEGER PRIMARY KEY DEFAULT nextval('seq_plan_run_id'),
+    trading_date     DATE NOT NULL,
+    run_type         VARCHAR NOT NULL,
+    request_id       VARCHAR,
+    created_at       TIMESTAMP DEFAULT current_timestamp,
+    plan_json        VARCHAR NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_locks (
+    trading_date     DATE NOT NULL,
+    run_type         VARCHAR NOT NULL CHECK (run_type IN ('morning', 'evening', 'weekly')),
+    status           VARCHAR NOT NULL CHECK (status IN ('in_progress', 'complete', 'failed')),
+    request_id       VARCHAR,
+    started_at       TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    completed_at     TIMESTAMP,
+    PRIMARY KEY (trading_date, run_type)
 );
 
 CREATE TABLE IF NOT EXISTS regime_history (
@@ -219,6 +242,7 @@ CREATE TABLE IF NOT EXISTS fundamentals (
 # Idempotent upgrades for databases created before these columns existed
 # (both DuckDB and Postgres support ADD COLUMN IF NOT EXISTS).
 _MIGRATIONS = [
+    "ALTER TABLE daily_plans ADD COLUMN IF NOT EXISTS canonical_plan_run_id INTEGER",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS baseline_r DOUBLE",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS eod_r DOUBLE",
     "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS target_hit_after_stop BOOLEAN",
@@ -310,6 +334,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v7.STATEMENTS
 from . import migrations_v8  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v8.STATEMENTS
 
+# --- v9 structured kill reason + no-trade classification ------------------
+from . import migrations_v9  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v9.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -339,6 +367,64 @@ def connect() -> Any:
     return con
 
 
+def acquire_run_lock(con: Any, trading_date: date, run_type: str,
+                     request_id: str | None = None) -> dict:
+    """Atomically claim one daily loop, allowing retries after failure."""
+    request_id = request_id or uuid.uuid4().hex
+    row = con.execute(
+        """INSERT INTO run_locks (trading_date, run_type, status, request_id)
+           VALUES (?, ?, 'in_progress', ?)
+           ON CONFLICT (trading_date, run_type) DO NOTHING
+           RETURNING status, request_id""",
+        [trading_date, run_type, request_id],
+    ).fetchone()
+    if row:
+        return {"acquired": True, "status": row[0], "request_id": row[1]}
+
+    existing = con.execute(
+        "SELECT status, request_id FROM run_locks WHERE trading_date = ? AND run_type = ?",
+        [trading_date, run_type],
+    ).fetchone()
+    if existing and existing[0] == "failed":
+        row = con.execute(
+            """UPDATE run_locks
+               SET status = 'in_progress', request_id = ?, started_at = current_timestamp,
+                   completed_at = NULL
+               WHERE trading_date = ? AND run_type = ? AND status = 'failed'
+               RETURNING status, request_id""",
+            [request_id, trading_date, run_type],
+        ).fetchone()
+        if row:
+            return {"acquired": True, "status": row[0], "request_id": row[1]}
+    return {"acquired": False, "status": existing[0] if existing else "unknown",
+            "request_id": existing[1] if existing else None}
+
+
+def finish_run_lock(con: Any, trading_date: date, run_type: str,
+                    request_id: str, status: str) -> None:
+    con.execute(
+        """UPDATE run_locks SET status = ?, completed_at = current_timestamp
+           WHERE trading_date = ? AND run_type = ? AND request_id = ?""",
+        [status, trading_date, run_type, request_id],
+    )
+
+
+def append_plan_run(con: Any, trading_date: date, run_type: str,
+                    request_id: str, plan: dict) -> int:
+    row = con.execute(
+        """INSERT INTO plan_runs (trading_date, run_type, request_id, plan_json)
+           VALUES (?, ?, ?, ?) RETURNING plan_run_id""",
+        [trading_date, run_type, request_id, json.dumps(plan)],
+    ).fetchone()
+    plan_run_id = row[0]
+    con.execute(
+        """UPDATE daily_plans SET canonical_plan_run_id = ?
+           WHERE plan_date = ? AND canonical_plan_run_id IS NULL""",
+        [plan_run_id, trading_date],
+    )
+    return plan_run_id
+
+
 # ------------------------------------------------------------------ picks/plans
 
 def save_daily_plan(
@@ -349,15 +435,18 @@ def save_daily_plan(
     regime_tag: str,
 ) -> list[int]:
     """Persist plan row + individual picks. Returns inserted pick_ids."""
-    con.execute("DELETE FROM daily_plans WHERE plan_date = ?", [plan_date])
+    existing = con.execute("SELECT 1 FROM daily_plans WHERE plan_date = ?", [plan_date]).fetchone()
+    if existing:
+        rows = con.execute("SELECT pick_id FROM picks WHERE plan_date = ? ORDER BY pick_id", [plan_date]).fetchall()
+        return [row[0] for row in rows]
     con.execute(
         """INSERT INTO daily_plans
            (plan_date, no_trade, market_summary, plan_json, analyst_json, regime_tag,
             notes_for_evening, gates_failed_open, provider_degraded,
             analyst_candidate_count, risk_rejection_count, validator_proposed_count,
             validator_drop_count, persisted_rejection_count,
-            data_health, session_degraded)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            data_health, session_degraded, canonical_plan_run_id, no_trade_category)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             plan_date,
             bool(plan.get("no_trade")),
@@ -375,9 +464,12 @@ def save_daily_plan(
             plan.get("persisted_rejection_count"),
             json.dumps(plan["data_health"]) if plan.get("data_health") else None,
             bool((plan.get("data_health") or {}).get("degraded")),
+            None,
+            plan.get("no_trade_category"),
         ],
     )
-    # replace any picks previously stored for this date (re-runs)
+    # The run lock normally makes this path single-writer; keep the first plan
+    # authoritative even if an older caller bypasses the lock.
     con.execute("DELETE FROM outcomes WHERE pick_id IN (SELECT pick_id FROM picks WHERE plan_date = ?)", [plan_date])
     con.execute("DELETE FROM picks WHERE plan_date = ?", [plan_date])
 
@@ -1136,14 +1228,16 @@ def save_rejections(con: duckdb.DuckDBPyConnection, plan_date: date, rejections:
             """INSERT INTO rejections
                (plan_date, ticker, direction, setup_type, reason, entry_type,
                 entry_price, stop_price, target_price, conviction, thesis,
-                source_stage, rejection_category, planned_rr, session_degraded)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                source_stage, rejection_category, planned_rr, session_degraded,
+                primary_kill_check)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 plan_date, r["ticker"].upper(), r.get("direction"), r.get("setup_type"),
                 r.get("reason", ""), r.get("entry_type", "open"), r.get("entry_price"),
                 r.get("stop_price"), r.get("target_price"), r.get("conviction"),
                 r.get("thesis"), r.get("source_stage"), r.get("rejection_category"),
                 r.get("planned_rr"), bool(r.get("session_degraded")),
+                r.get("primary_kill_check"),
             ],
         )
     return len(rejections)

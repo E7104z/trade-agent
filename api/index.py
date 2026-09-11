@@ -441,6 +441,10 @@ def api_status():
             "equity": equity,
             "equity_curve": curve[-120:],
             "runs": runs,
+            "run_locks": [dict(zip([c[0] for c in con.execute("DESCRIBE run_locks").fetchall()], row))
+                         for row in con.execute(
+                             "SELECT * FROM run_locks WHERE trading_date = ? ORDER BY run_type", [d]
+                         ).fetchall()],
             "playbook": playbook_text,
             "playbook_version": version,
         })
@@ -479,6 +483,8 @@ def api_history_dates():
             "rule_confirmations": "session_date",
             "open_question_progress": "session_date",
             "runs": "run_date",
+            "run_locks": "trading_date",
+            "plan_runs": "trading_date",
         }
         for table, column in date_sources.items():
             try:
@@ -600,7 +606,16 @@ def _execute_loop(loop_name: str, cfg, force: bool) -> dict:
     except Exception as e:  # noqa: BLE001
         error = f"{type(e).__name__}: {e}"
         buf.write(f"\n\n{traceback.format_exc()}")
-    return {"loop": loop_name, "log": buf.getvalue(), "error": error}
+    result = {"loop": loop_name, "log": buf.getvalue(), "error": error}
+    if not error and "Duplicate trigger suppressed" in result["log"]:
+        con = ledger.connect()
+        try:
+            existing = ledger.plan_for_date(con, today_et()) if loop_name in ("morning", "evening") else None
+            result["duplicate_suppressed"] = True
+            result["existing_result"] = existing["plan"] if existing else None
+        finally:
+            con.close()
+    return result
 
 
 @app.route("/run/<loop_name>", methods=["POST"])
