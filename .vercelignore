@@ -8,3 +8,4 @@ playbook_history/
 .git/
 credentials.json
 .env
+tests/
