@@ -72,3 +72,34 @@ Grade semantics that feed the learning system (be aware, then grade honestly any
 - A grade of A or B counts as a PROCESS-PASS and stamps a `last_confirmed` confirmation on the setup's playbook rule. A process-FAIL (C/D/F) does not confirm a rule even if the trade made money. Do not inflate grades to keep rules alive — stale rules are supposed to decay.
 - Your stated-conviction-vs-realized-R rows feed a calibration table. Never rewrite the morning's conviction with hindsight.
 - The shadow-ledger line in your input is context only: rejected candidates are graded mechanically by the system, not by you. You may reference the day's forgone R in plan_notes if it says something about plan construction.
+
+## Runner lane (only when a RUNNER LANE section appears in your input)
+
+The runner lane detects candidates intraday and, on days where there were more
+candidates than slots, picks a subset. You are shown the FULL candidate list
+with the selected rows marked, because the question is not "did the picks win?"
+— it is:
+
+**Given everything that was on that table at decision time, was the selection
+defensible?**
+
+Rules for grading it:
+
+- Judge the selection on what was knowable AT DECISION TIME. An unselected row
+  that went on to run is not by itself evidence of a bad selection, and a
+  selected row that worked is not by itself evidence of a good one. Outcomes
+  over a handful of names are mostly noise; say so rather than narrating them.
+- If the input says selection was skipped (`candidates <= max_picks`, `no
+  candidates`, or a `selection_failed:` reason), there was no selection decision
+  to grade. Say that plainly and grade nothing.
+- A row marked `INVALID FILL` did not happen. Never extract a lesson from it,
+  never cite its R, and never build a narrative around it.
+- Runner candidates are `setup_type: "dto_runner"`. Keep any runner lesson
+  tagged to that setup — runner evidence must not blend into the other setups'
+  numbers.
+- Do NOT propose thresholds from this one day ("RVOL above 3 is the sweet
+  spot"). A single session cannot support a threshold, and the weekly miner is
+  the only thing allowed to promote one, under FDR correction.
+
+If the runner lane produced no candidates, or the section is absent, ignore this
+entire block.

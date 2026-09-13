@@ -267,26 +267,57 @@ class Alpaca:
                    start: datetime, end: datetime) -> dict[str, list[dict]]:
         """One batched multi-symbol bars fetch (the /v2/stocks/bars endpoint,
         distinct from /v2/stocks/{symbol}/bars) — used for ADV20 and premarket
-        VWAP/RVOL enrichment so N gappers cost one round trip, not N."""
+        VWAP/RVOL enrichment so N gappers cost one round trip, not N.
+
+        Follows `next_page_token`. Alpaca caps a response by TOTAL bars across
+        every symbol, not per symbol, and it orders the payload alphabetically,
+        so a request that spans pages returns a complete prefix and then simply
+        stops — every symbol after the cut comes back absent. That is
+        indistinguishable from "those tickers had no data," which is the worst
+        possible failure shape for a gate that treats missing bars as a
+        rejection.
+
+        Measured before this fix (2026-09-11, 95 symbols, 5Min, 09:30–15:00 ET):
+        40 symbols and 2289 bars returned with `next_page_token` set, 55 symbols
+        silently empty — a contiguous alphabetical tail from LABU onward.
+        The 09:30–11:30 window fit in one page, which is why this stayed
+        invisible: it only bites as the window or the symbol count grows.
+        """
         out: dict[str, list[dict]] = {}
         for i in range(0, len(symbols), 100):
             batch = symbols[i : i + 100]
-            params = {
-                "symbols": ",".join(batch),
-                "timeframe": timeframe,
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-                "limit": 10000,
-                "adjustment": "raw",
-                "feed": self.feed,
-            }
-            data = self._get("/v2/stocks/bars", params)
-            for sym, bars in (data.get("bars") or {}).items():
-                rows = []
-                for b in bars or []:
-                    ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
-                    rows.append({"t": ts, "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]})
-                out[sym] = rows
+            page_token: str | None = None
+            # Bounded so a malformed/cyclic token can never spin forever; 10k
+            # bars/page over a 100-symbol batch is far more than a session holds.
+            for _ in range(50):
+                params = {
+                    "symbols": ",".join(batch),
+                    "timeframe": timeframe,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "limit": 10000,
+                    "adjustment": "raw",
+                    "feed": self.feed,
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                data = self._get("/v2/stocks/bars", params)
+                for sym, bars in (data.get("bars") or {}).items():
+                    rows = out.setdefault(sym, [])
+                    for b in bars or []:
+                        ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
+                        rows.append({"t": ts, "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]})
+                page_token = data.get("next_page_token")
+                if not page_token:
+                    break
+            else:
+                log("data", f"WARN multi_bars hit the page cap for a {len(batch)}-symbol "
+                            f"{timeframe} batch; results may be truncated")
+            # A symbol present in the request but absent from every page genuinely
+            # has no bars — keep the empty list so callers can tell "asked and got
+            # nothing" from "never asked."
+            for sym in batch:
+                out.setdefault(sym, [])
         return out
 
     def multi_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[dict]]:

@@ -27,6 +27,7 @@ from datetime import date
 from typing import Any, Callable
 
 from . import ablation, friction, population, research
+from . import runner_research
 from .stats import annotate_stats_rows, evaluate_search
 
 __all__ = [
@@ -200,6 +201,18 @@ def build_search(con: Any, ledger_mod: Any, q: float = 0.10, min_n: int = 8):
         fn = ledger_mod.stats_by if source == "picks" else ledger_mod.stats_by_outcome
         rows = _safe("integrity", f"stats_by({dim})", lambda f=fn, d=dim: f(con, d), [])
         comps.extend(annotate_stats_rows(rows, dim, n_dimensions=1))
+
+    # Runner lane (RUNNER_PORT_SPEC §2.6). Folded into the SAME batch rather
+    # than corrected separately: the runner dimensions widen the same search,
+    # and correcting them apart would leave the across-family multiplicity
+    # uncontrolled — which is exactly where the width lives.
+    runner_rows = _safe("integrity", "runner candidate rows",
+                        lambda: runner_research.candidate_rows(con), [])
+    if runner_rows:
+        comps.extend(_safe("integrity", "runner dimensions",
+                           lambda: runner_research.candidate_comparisons(runner_rows), []))
+        comps.append(runner_research.setup_edge(runner_rows, min_n=min_n)["comparison"])
+        comps.append(runner_research.selection_edge(runner_rows, min_n=min_n)["comparison"])
     return evaluate_search(comps, q=q, min_n=min_n)
 
 
@@ -247,12 +260,31 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         paired_cmp = _safe("integrity", "paired comparison",
                            lambda: paired_mod.paired_comparison(con), {})
 
+    runner_rows = _safe("integrity", "runner candidate rows",
+                        lambda: runner_research.candidate_rows(con), [])
+    runner_setup = _safe("integrity", "runner setup edge",
+                         lambda: runner_research.setup_edge(runner_rows, min_n=min_n),
+                         {"n": 0})
+    runner_selection_edge = _safe("integrity", "runner selection edge",
+                                  lambda: runner_research.selection_edge(runner_rows, min_n=min_n),
+                                  {"sessions_contested": 0, "n_selected": 0,
+                                   "n_unselected": 0, "mean_r_selected": None,
+                                   "mean_r_unselected": None, "delta_r": None,
+                                   "p_value": None, "verdict": "not computed"})
+    # Reuse the scored comparisons from the search so the q-values shown to the
+    # miner are the corrected ones, not a second uncorrected pass.
+    runner_comps = [c for c in (getattr(search, "comparisons", None) or [])
+                    if str(getattr(c, "dimension", "")).startswith("runner_")]
+
     parts = [
         research.provenance_md(states, looks),
         _graduation_md(graduation),
         _cumulative_md(cumulative),
         population.population_md(pop),
         ablation.ablation_md(abl),
+        _safe("integrity", "runner markdown",
+              lambda: runner_research.runner_md(runner_setup, runner_selection_edge,
+                                                runner_comps), ""),
     ]
     if paired_mod is not None:
         parts.append(paired_mod.paired_md(paired_cmp))
@@ -268,6 +300,8 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         "population": pop,
         "ablation": abl,
         "paired": paired_cmp,
+        "runner_setup_edge": runner_setup,
+        "runner_selection_edge": runner_selection_edge,
     }
 
 

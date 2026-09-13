@@ -524,6 +524,9 @@ _QUERYABLE_TABLES = {
     "calibration": "session_date",
     "rule_confirmations": "session_date",
     "open_question_progress": "session_date",
+    "runner_candidates": "session_date",
+    "runner_candidate_outcomes": "session_date",
+    "runner_sessions": "session_date",
 }
 
 
@@ -680,7 +683,69 @@ def intraday_check():
         return json_response({"error": "unauthorized"}, 401)
     cfg = load_config()
     from agent.live_monitor import check
-    return json_response(check(cfg))
+    # The live position monitor runs FIRST and unguarded. It is the job this
+    # endpoint exists for; if it raises, the request should fail loudly.
+    monitor = check(cfg)
+    # Spec §1.4 nests the monitor result under "monitor". Its existing keys are
+    # ALSO kept at the top level: this response is an established contract and
+    # R-3 is additive-only, so re-shaping it would be a behavior change smuggled
+    # in under a feature flag — and one that only shows up in production, since
+    # the GitHub Actions cron discards the body.
+    result = dict(monitor)
+    result["monitor"] = monitor
+    # The runner lane runs second, inside try/except. This is required, not
+    # defensive habit: the runner lane must never be able to break the live
+    # position monitor, and a monitor that stops running is a real position
+    # left unwatched.
+    if (cfg.get("runner", {}) or {}).get("enabled"):
+        from agent.util import log
+        try:
+            from agent.loops.runner import tick
+            result["runner"] = tick(cfg)
+        except Exception as e:
+            log("runner", f"WARN runner tick failed; monitor unaffected: {e}")
+            result["runner"] = {"error": str(e)}
+    return json_response(result)
+
+
+@app.route("/api/runner/candidates")
+@login_required
+def api_runner_candidates():
+    """Candidates for one session, alphabetical (spec R-1: detection must not
+    rank). Defaults to today."""
+    con = ledger.connect()
+    try:
+        d = parse_date(request.args["date"]) if request.args.get("date") else today_et()
+        rows = ledger.runner_candidates_for_date(con, d)
+        outcomes = {o["ticker"]: o for o in ledger.runner_outcomes_for_date(con, d)}
+        for r in rows:
+            r["outcome"] = outcomes.get(r["ticker"])
+        return json_response({"date": d.isoformat(), "count": len(rows),
+                              "session": ledger.runner_session(con, d),
+                              "candidates": rows})
+    finally:
+        con.close()
+
+
+@app.route("/api/runner/sessions")
+@login_required
+def api_runner_sessions():
+    """Per-session scan telemetry — the stand-down-vs-outage discriminator.
+
+    A zero-candidate day with universe_size 0 or provider_degraded true is a
+    pipeline failure; a zero-candidate day with a full universe and a high
+    rejected_conditions is a genuine stand-down. Vercel keeps logs about an
+    hour, so this table is the durable record.
+    """
+    con = ledger.connect()
+    try:
+        try:
+            limit = max(1, min(int(request.args.get("limit", 40)), 400))
+        except ValueError:
+            limit = 40
+        return json_response({"sessions": ledger.recent_runner_sessions(con, limit)})
+    finally:
+        con.close()
 
 
 # Local dev convenience: `python api/index.py` runs a normal Flask dev server.

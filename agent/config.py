@@ -64,6 +64,50 @@ _DEFAULTS: dict[str, Any] = {
         "max_picks_per_day": 4,
         "intraday_check_secret_env": "CRON_SECRET",
     },
+    # --- DTO Runner lane (specs/RUNNER_PORT_SPEC_v1.md §1.6) ---------------
+    # Three independent switches so each phase can be turned on alone:
+    #   enabled             gates the intraday scan (Phase 1)
+    #   selection_enabled   gates the one LLM call per session (Phase 2)
+    #   live_orders_enabled gates paper order placement (Phase 2)
+    # All default OFF. With every switch off this block changes nothing.
+    "runner": {
+        "enabled": False,
+        "phase": 1,
+        "scan_start_et": "09:45",
+        "scan_end_et": "15:00",
+        "universe_size": 150,
+        "price_min": 5.0,
+        "price_max": 50.0,
+        "min_vwap_pct": 0.5,
+        "min_rvol": 1.5,
+        # Minimum stop distance, max(abs, pct * price). When price sits on the
+        # 9 EMA at detection the stop collapses toward zero and every R against
+        # it is meaningless (measured: a $0.01 stop grading -5.15R). DTO applies
+        # the same floor; it is a sanity guard on geometry, not an edge claim.
+        "min_stop_abs": 0.10,
+        "min_stop_pct": 0.005,
+        "float_min_m": 5.0,
+        "float_max_m": 200.0,
+        # DTO hard-gates trend consistency at 45. The THRESHOLD is corpus-
+        # derived and so is a "conclusion" under spec R-2, but it is also a
+        # live condition that changes the passing set. Kept at DTO's value so
+        # detection matches what was actually traded; set to null to run
+        # detection without it and re-derive the threshold from our own
+        # forward evidence.
+        "min_trend_consistency": 45.0,
+        # Walk first_pass_et back to the bar where conditions actually turned
+        # true, instead of stamping the scan cycle that happened to notice.
+        "walkback": True,
+        "earnings_exclude_days": 2,
+        "decision_time_et": "10:30",
+        "max_picks": 10,
+        "selection_enabled": False,
+        "selection_model": "claude-sonnet-4-6",
+        "live_orders_enabled": False,
+        "max_live_orders_per_day": 10,
+        "dollars_per_r": 100,
+        "size_r": 0.25,
+    },
     "min_bar_volume": 0,       # thin-bar filter threshold, default OFF (0 = disabled)
     "lesson_holdout_sessions": 0,  # trailing-window lesson-confirmation holdout, default OFF
     "timezone": "America/New_York",

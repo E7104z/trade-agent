@@ -9,7 +9,6 @@
   "max_output_tokens": 16000,
   "enable_web_search": true,
   "web_search_max_uses": 6,
-
   "account_size": 100000,
   "dollars_per_r": 500,
   "max_picks": 4,
@@ -38,10 +37,8 @@
   "lesson_holdout_sessions": 0,
   "drawdown_window": 10,
   "drawdown_pause_r": -4.0,
-
   "timezone": "America/New_York",
   "email_enabled": true,
-
   "data": {
     "alpaca_feed": "sip",
     "movers_top": 18,
@@ -49,24 +46,28 @@
     "gap_scan_min_pct": 3.0,
     "edgar_user_agent": "TradeAgent research bot (contact: user@example.com)"
   },
-
   "memory": {
     "recent_trades_in_context": 20,
     "max_active_lessons_in_context": 25
   },
-
   "research": {
-    "fdr_q": 0.10,
+    "fdr_q": 0.1,
     "min_n": 8
   },
-  "population": { "enabled": true },
+  "population": {
+    "enabled": true
+  },
   "friction": {
     "model": "flat",
     "base_bps": 2.0,
     "spread_k": 1.6,
     "impact_k": 220.0,
     "max_bps": 120.0,
-    "stress_multipliers": [1.0, 2.0, 3.0]
+    "stress_multipliers": [
+      1.0,
+      2.0,
+      3.0
+    ]
   },
   "paired": {
     "enabled": true,
@@ -74,5 +75,31 @@
     "arm_b_context_mode": "aggregate_only",
     "arm_b_playbook_version": null
   },
-  "ablation_sim_version": null
+  "ablation_sim_version": null,
+  "runner": {
+    "enabled": false,
+    "phase": 1,
+    "scan_start_et": "09:45",
+    "scan_end_et": "15:00",
+    "universe_size": 150,
+    "price_min": 5.0,
+    "price_max": 50.0,
+    "min_vwap_pct": 0.5,
+    "min_rvol": 1.5,
+    "min_stop_abs": 0.1,
+    "min_stop_pct": 0.005,
+    "float_min_m": 5.0,
+    "float_max_m": 200.0,
+    "min_trend_consistency": 45.0,
+    "walkback": true,
+    "earnings_exclude_days": 2,
+    "decision_time_et": "10:30",
+    "max_picks": 10,
+    "selection_enabled": false,
+    "selection_model": "claude-sonnet-4-6",
+    "live_orders_enabled": false,
+    "max_live_orders_per_day": 10,
+    "dollars_per_r": 100,
+    "size_r": 0.25
+  }
 }

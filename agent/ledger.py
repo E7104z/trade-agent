@@ -338,6 +338,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v8.STATEMENTS
 from . import migrations_v9  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v9.STATEMENTS
 
+# --- v10 DTO Runner lane (candidates / outcomes / sessions) ----------------
+from . import migrations_v10  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v10.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -1394,3 +1398,225 @@ def question_progress_totals(con: duckdb.DuckDBPyConnection) -> list[dict]:
         out.append({"question_id": r[0], "total": r[1] or 0, "events": r[2],
                     "last_event": str(r[3]), "recent_notes": [n[0] for n in notes]})
     return out
+
+
+# ------------------------------------------------------- v10: DTO Runner lane
+# RUNNER_PORT_SPEC_v1 1.1. Additive: nothing below is called by the morning or
+# evening loop unless cfg["runner"]["enabled"] is true.
+
+def save_runner_candidate(con: duckdb.DuckDBPyConnection, c: dict) -> bool:
+    """Insert one candidate. FIRST PASS WINS - a later scan cycle is a no-op.
+
+    Returns True if this call actually inserted the row. The detection snapshot
+    is an anchor: if a later cycle could overwrite it, detection_price would
+    drift with the tape and detection_minutes would stop meaning anything.
+    """
+    before = con.execute(
+        "SELECT COUNT(*) FROM runner_candidates WHERE session_date = ? AND ticker = ?",
+        [c["session_date"], c["ticker"].upper()],
+    ).fetchone()[0]
+    if before:
+        return False
+    con.execute(
+        """INSERT INTO runner_candidates
+           (session_date, ticker, first_pass_et, detection_minutes, scan_pass_et,
+            detection_price, vwap, vwap_pct_above, ema9, ema9_slope, rvol,
+            trend_consistency, change_pct, float_shares, earnings_days_away,
+            prev_close, prev_volume, price_tier, stop_price, target_price,
+            stop_dist, gates_status, scan_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [
+            c["session_date"], c["ticker"].upper(), c.get("first_pass_et"),
+            c.get("detection_minutes"), c.get("scan_pass_et"),
+            c.get("detection_price"), c.get("vwap"), c.get("vwap_pct_above"),
+            c.get("ema9"), c.get("ema9_slope"), c.get("rvol"),
+            c.get("trend_consistency"), c.get("change_pct"), c.get("float_shares"),
+            c.get("earnings_days_away"), c.get("prev_close"), c.get("prev_volume"),
+            c.get("price_tier"), c.get("stop_price"), c.get("target_price"),
+            c.get("stop_dist"), c.get("gates_status"), c.get("scan_version"),
+        ],
+    )
+    return True
+
+
+def runner_candidates_for_date(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:
+    """All candidates for a session, ALPHABETICAL by ticker.
+
+    The ordering is load-bearing, not cosmetic (spec R-1): detection must not
+    rank. Selection quality is the quantity being measured, so if this returned
+    rows sorted by RVOL or any other feature, the selector would inherit a
+    ranking and the measurement would be contaminated by the ranker.
+    """
+    cols = [c[0] for c in con.execute("DESCRIBE runner_candidates").fetchall()]
+    rows = con.execute(
+        "SELECT * FROM runner_candidates WHERE session_date = ? ORDER BY ticker", [d]
+    ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def runner_candidate_tickers(con: duckdb.DuckDBPyConnection, d: date) -> list[str]:
+    rows = con.execute(
+        "SELECT ticker FROM runner_candidates WHERE session_date = ? ORDER BY ticker", [d]
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
+    """Upsert a simulated outcome. Re-running the evening loop must be safe.
+
+    Selection stamps (selected / selection_rank / pick_id) are written at 10:30
+    by Phase 2 and must survive the 20:30 grading pass, so they are carried
+    forward from any existing row rather than reset to defaults.
+    """
+    prior = con.execute(
+        """SELECT selected, selection_rank, pick_id FROM runner_candidate_outcomes
+           WHERE session_date = ? AND ticker = ?""",
+        [o["session_date"], o["ticker"].upper()],
+    ).fetchone()
+    selected = o.get("selected", prior[0] if prior else False)
+    rank = o.get("selection_rank", prior[1] if prior else None)
+    pick_id = o.get("pick_id", prior[2] if prior else None)
+    con.execute(
+        "DELETE FROM runner_candidate_outcomes WHERE session_date = ? AND ticker = ?",
+        [o["session_date"], o["ticker"].upper()],
+    )
+    con.execute(
+        """INSERT INTO runner_candidate_outcomes
+           (session_date, ticker, eval_date, triggered, entry_fill, exit_price,
+            exit_reason, r_multiple, mfe_r, mae_r, eod_r, selected,
+            selection_rank, pick_id, sim_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [
+            o["session_date"], o["ticker"].upper(), o.get("eval_date"),
+            o.get("triggered"), o.get("entry_fill"), o.get("exit_price"),
+            o.get("exit_reason"), o.get("r_multiple"), o.get("mfe_r"),
+            o.get("mae_r"), o.get("eod_r"), bool(selected), rank, pick_id,
+            o.get("sim_version"),
+        ],
+    )
+
+
+def runner_outcomes_for_date(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:
+    cols = [c[0] for c in con.execute("DESCRIBE runner_candidate_outcomes").fetchall()]
+    rows = con.execute(
+        "SELECT * FROM runner_candidate_outcomes WHERE session_date = ? ORDER BY ticker", [d]
+    ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def mark_runner_selected(con: duckdb.DuckDBPyConnection, session_date: date,
+                         ticker: str, rank: int, pick_id: int | None) -> None:
+    """Stamp selection onto the outcome row, creating a stub if the evening
+    simulation has not run yet (selection happens at 10:30, grading at 20:30)."""
+    existing = con.execute(
+        "SELECT COUNT(*) FROM runner_candidate_outcomes WHERE session_date = ? AND ticker = ?",
+        [session_date, ticker.upper()],
+    ).fetchone()[0]
+    if existing:
+        con.execute(
+            """UPDATE runner_candidate_outcomes
+               SET selected = TRUE, selection_rank = ?, pick_id = ?
+               WHERE session_date = ? AND ticker = ?""",
+            [rank, pick_id, session_date, ticker.upper()],
+        )
+    else:
+        con.execute(
+            """INSERT INTO runner_candidate_outcomes
+               (session_date, ticker, selected, selection_rank, pick_id)
+               VALUES (?,?,TRUE,?,?)""",
+            [session_date, ticker.upper(), rank, pick_id],
+        )
+
+
+_RUNNER_SESSION_FIELDS = [
+    "universe_size", "scan_passes", "candidates_found", "rejected_price",
+    "rejected_rvol", "rejected_conditions", "rejected_float",
+    "rejected_earnings", "rejected_excluded", "rejected_no_bars",
+    "rejected_too_few_bars", "gates_unavailable", "provider_degraded",
+    "selection_made", "selection_skipped_reason", "scan_version",
+]
+
+
+def upsert_runner_session(con: duckdb.DuckDBPyConnection, s: dict) -> None:
+    """Upsert the per-session scan telemetry row.
+
+    This row is the stand-down-vs-outage discriminator. A zero-candidate day
+    must never be ambiguous after the fact - Vercel keeps logs about an hour on
+    Hobby, so if it isn't here it is gone. Only keys actually present in `s`
+    are written, so a partial update (e.g. selection fields alone) cannot null
+    out the scan counters.
+    """
+    existing = con.execute(
+        "SELECT COUNT(*) FROM runner_sessions WHERE session_date = ?",
+        [s["session_date"]],
+    ).fetchone()[0]
+    present = [f for f in _RUNNER_SESSION_FIELDS if f in s]
+    if existing:
+        if not present:
+            return
+        sets = ", ".join(f"{f} = ?" for f in present)
+        con.execute(f"UPDATE runner_sessions SET {sets} WHERE session_date = ?",
+                    [s[f] for f in present] + [s["session_date"]])
+    else:
+        cols = ["session_date"] + present
+        ph = ",".join(["?"] * len(cols))
+        con.execute(f"INSERT INTO runner_sessions ({', '.join(cols)}) VALUES ({ph})",
+                    [s["session_date"]] + [s[f] for f in present])
+
+
+def runner_session(con: duckdb.DuckDBPyConnection, d: date) -> dict | None:
+    cols = [c[0] for c in con.execute("DESCRIBE runner_sessions").fetchall()]
+    row = con.execute("SELECT * FROM runner_sessions WHERE session_date = ?", [d]).fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
+def recent_runner_sessions(con: duckdb.DuckDBPyConnection, limit: int = 40) -> list[dict]:
+    cols = [c[0] for c in con.execute("DESCRIBE runner_sessions").fetchall()]
+    rows = con.execute(
+        "SELECT * FROM runner_sessions ORDER BY session_date DESC LIMIT ?", [limit]
+    ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def claim_runner_selection(con: duckdb.DuckDBPyConnection, d: date) -> bool:
+    """Atomically claim the one selection call for this session.
+
+    Returns True exactly once per session. The intraday cron fires every five
+    minutes and can retry or overlap; without this guard a decision tick could
+    pay for two LLM calls and write two competing pick sets. Modeled on
+    acquire_run_lock: the UPDATE's WHERE clause is the lock, so concurrency is
+    resolved by the database rather than by a read-then-write race.
+    """
+    con.execute(
+        """INSERT INTO runner_sessions (session_date, selection_made)
+           VALUES (?, FALSE) ON CONFLICT (session_date) DO NOTHING""",
+        [d],
+    )
+    row = con.execute(
+        """UPDATE runner_sessions SET selection_made = TRUE
+           WHERE session_date = ? AND (selection_made IS NULL OR selection_made = FALSE)
+           RETURNING session_date""",
+        [d],
+    ).fetchone()
+    return bool(row)
+
+
+def runner_candidate_outcomes_since(con: duckdb.DuckDBPyConnection,
+                                    from_date: date) -> list[dict]:
+    """Joined candidate + outcome rows for the weekly miner."""
+    cols_c = [c[0] for c in con.execute("DESCRIBE runner_candidates").fetchall()]
+    cols_o = [c[0] for c in con.execute("DESCRIBE runner_candidate_outcomes").fetchall()]
+    sel_c = ", ".join(f"c.{c}" for c in cols_c)
+    extra_o = [c for c in cols_o if c not in ("session_date", "ticker")]
+    sel_o = ", ".join(f"o.{c}" for c in extra_o)
+    rows = con.execute(
+        f"""SELECT {sel_c}, {sel_o}
+            FROM runner_candidates c
+            LEFT JOIN runner_candidate_outcomes o
+              ON o.session_date = c.session_date AND o.ticker = c.ticker
+            WHERE c.session_date >= ?
+            ORDER BY c.session_date, c.ticker""",
+        [from_date],
+    ).fetchall()
+    names = cols_c + extra_o
+    return [dict(zip(names, r)) for r in rows]

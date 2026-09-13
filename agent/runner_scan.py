@@ -1,25 +1,33 @@
 """
 DTO Runner detection - condition check and gate chain.
 
-PHASE 0 SCOPE ONLY. This module currently contains the pure, deterministic
-parts of the port: `check_runner_conditions` (spec 0.3), the ported
-`EXCLUDED_TICKERS` set, and `evaluate_ticker` - the gate chain the parity
-harness needs in order to diff DTO's rejection counters (spec 0.4).
+Two halves, deliberately separated by a hard line in the file:
 
-Deliberately NOT here yet, per spec 0.6 ("No code written for Phase 1 or
-Phase 2"): `scan()`, universe construction, any database write, any cron
-wiring, any provider call. Nothing in this module performs I/O or reads a
-clock.
+  ABOVE the PHASE 1 banner - pure, deterministic, no I/O and no clock reads:
+  `check_runner_conditions` (spec 0.3), the ported `EXCLUDED_TICKERS` set, and
+  `evaluate_ticker`, the gate chain the parity harness diffs against DTO's own
+  rejection counters (spec 0.4). This half is what Phase 0 proved; keep it
+  pure so the parity gate stays meaningful.
+
+  BELOW it - `scan()`, the Phase 1 tick that performs provider calls and
+  database writes (spec 1.3). Gated by cfg["runner"]["enabled"], default
+  false.
 
 Source: js/runner-scanner.js from the DTO Trading App repo (`E7104z/trading`).
 """
 from __future__ import annotations
 
+import json
+import time
+from datetime import datetime, time as dtime
+
 from . import runner_indicators as ri
+from .util import ET, log, prev_market_day
 
 __all__ = [
     "EXCLUDED_TICKERS",
     "SCAN_VERSION",
+    "scan",
     "check_runner_conditions",
     "evaluate_ticker",
     "market_hours_bars",
@@ -350,3 +358,327 @@ def evaluate_ticker(
                    check=check, rv=rv, tc=tc)
 
     return out(True, None, check["reason"], check=check, rv=rv, tc=tc)
+
+
+# ===========================================================================
+# PHASE 1 - THE SCAN LOOP
+# ===========================================================================
+# Everything above this line is pure. Everything below performs I/O and is
+# gated by cfg["runner"]["enabled"], which defaults to false.
+
+
+# Float/earnings are per-symbol network round trips with slow-moving answers,
+# so they are fetched once per symbol per session and reused across the ~60
+# scan ticks a session contains. Keyed by (session_date, symbol) so the cache
+# cannot leak across days in a warm serverless container.
+_GATE_CACHE: dict[tuple, dict] = {}
+
+
+def _session_gate_cache(d) -> dict:
+    stale = [k for k in _GATE_CACHE if k[0] != d]
+    for k in stale:
+        _GATE_CACHE.pop(k, None)
+    return _GATE_CACHE
+
+
+def _price_tier(price: float | None) -> str | None:
+    if price is None:
+        return None
+    if price < 20.0:
+        return "5-20"
+    return "20-50"
+
+
+def _fetch_gate_inputs(md, symbols: list[str], d, con=None) -> tuple[dict, dict]:
+    """Float (in millions) and earnings-days-away per symbol, session-cached.
+
+    ── A PORTING DIVERGENCE WORTH KNOWING ────────────────────────────────────
+    DTO's float gate reads Finnhub `shareOutstanding` and its own comment says
+    plainly that this is TOTAL shares, not free float ("for large-caps it runs
+    into the billions (NVDA ~24,000M)"). Its [5M, 200M] band was calibrated
+    against that quantity.
+
+    Trade Agent has no Finnhub key. `providers.fundamentals()` returns
+    yfinance `floatShares` - genuine free float, which for most names is
+    materially SMALLER than shares outstanding. Applying DTO's band to free
+    float is therefore a STRICTER filter than DTO's, not an equivalent one.
+
+    Using the number we actually have and labelling it honestly beats
+    inventing a conversion factor. The consequence is that `float_min_m` /
+    `float_max_m` must be re-derived against Trade Agent's own forward
+    evidence rather than inherited (spec R-2 in spirit: port the condition,
+    re-derive the threshold). Until then the band is deliberately wide.
+    """
+    cache = _session_gate_cache(d)
+    need = [s for s in symbols if (d, s) not in cache]
+
+    floats: dict[str, float | None] = {}
+    earnings: dict[str, int | None] = {}
+    if need:
+        try:
+            # Pass `con` so this uses the ledger-backed fundamentals cache
+            # (3-session TTL) rather than re-hitting yfinance. The in-process
+            # cache above only helps inside one warm container, and a Vercel
+            # cron tick is frequently a cold start - without the DB cache every
+            # five-minute tick would re-fetch the whole universe.
+            fund = md.fundamentals(need, con)
+            for s, row in (fund or {}).items():
+                fs = (row or {}).get("float_shares")
+                floats[s] = (float(fs) / 1e6) if fs else None
+        except Exception as e:
+            log("runner", f"WARN fundamentals fetch failed for {len(need)} symbols: {e}")
+        try:
+            earn = md.next_earnings(need)
+            for s, days in (earn or {}).items():
+                earnings[s] = days
+        except Exception as e:
+            log("runner", f"WARN next_earnings fetch failed for {len(need)} symbols: {e}")
+        for s in need:
+            cache[(d, s)] = {"float_m": floats.get(s), "earnings_days_away": earnings.get(s)}
+
+    out_f = {s: cache.get((d, s), {}).get("float_m") for s in symbols}
+    out_e = {s: cache.get((d, s), {}).get("earnings_days_away") for s in symbols}
+    return out_f, out_e
+
+
+def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
+    """One scan tick (RUNNER_PORT_SPEC_v1 §1.3).
+
+    `cfg` is the `runner` config block. `at` is the tick time (ET). `con` is an
+    open ledger connection; when None a connection is opened and closed here.
+
+    Returns a stats dict. Never raises for data reasons - a provider failure
+    produces a recorded, degraded session rather than an exception, because the
+    caller (the intraday cron) also runs the live position monitor and must not
+    be destabilised by this lane.
+    """
+    t0 = time.monotonic()
+    owns_con = con is None
+    if owns_con:
+        from . import ledger as _ledger
+        con = _ledger.connect()
+    from . import ledger
+    from . import runner_universe
+
+    d = at.date()
+    counters = {"rejected_no_bars": 0, "rejected_too_few_bars": 0,
+                "rejected_price": 0, "rejected_rvol": 0,
+                "rejected_conditions": 0, "rejected_float": 0,
+                "rejected_earnings": 0, "rejected_excluded": 0}
+    unavailable = {"float": 0, "earnings": 0, "prev_volume": 0, "prev_close": 0}
+
+    try:
+        # -- 1. universe -----------------------------------------------------
+        universe, ustats = runner_universe.build_universe(md, cfg, at=at, con=con)
+        if not universe:
+            # An empty universe is a pipeline failure, not a market condition.
+            # Record it loudly; do NOT silently no-op into "zero candidates".
+            ledger.upsert_runner_session(con, {
+                "session_date": d, "universe_size": 0, "candidates_found": 0,
+                "provider_degraded": True, "scan_version": SCAN_VERSION,
+                "gates_unavailable": json.dumps(unavailable),
+            })
+            log("runner", "universe empty - recorded provider_degraded, no scan performed")
+            return {"universe_size": 0, "candidates": 0, "provider_degraded": True,
+                    "elapsed_ms": int((time.monotonic() - t0) * 1000)}
+
+        # -- 2. 5-min bars, session open through `at` ------------------------
+        # multi_bars chunks at 100 symbols AND follows next_page_token. Before
+        # that fix a multi-page response dropped a contiguous alphabetical tail
+        # of symbols, which this loop would have counted as rejected_no_bars -
+        # a plausible-looking stand-down produced by an outage.
+        start = datetime.combine(d, dtime(9, 30), tzinfo=ET)
+        bars_by_sym: dict[str, list[dict]] = {}
+        try:
+            bars_by_sym = md.alpaca.multi_bars(universe, "5Min", start, at)
+        except Exception as e:
+            log("runner", f"WARN 5Min bar fetch failed: {e}")
+
+        # -- 3. previous-session daily bars ----------------------------------
+        prev_close: dict[str, float | None] = {}
+        prev_volume: dict[str, float | None] = {}
+        try:
+            pd = prev_market_day(d)
+            daily = md.alpaca.multi_daily_bars(universe, pd, d)
+            for s, rows in (daily or {}).items():
+                if rows:
+                    prev_close[s] = rows[0].get("close")
+                    prev_volume[s] = rows[0].get("volume")
+        except Exception as e:
+            log("runner", f"WARN previous-session daily fetch failed: {e}")
+
+        # -- 4. float + earnings, session-cached -----------------------------
+        floats, earnings = _fetch_gate_inputs(md, universe, d, con)
+
+        # -- 5. gate chain ---------------------------------------------------
+        found = 0
+        for ticker in sorted(universe):
+            bars = bars_by_sym.get(ticker) or []
+            res = evaluate_ticker(
+                ticker, bars,
+                prev_volume=prev_volume.get(ticker),
+                prev_close=prev_close.get(ticker),
+                float_m=floats.get(ticker),
+                earnings_days_away=earnings.get(ticker),
+                min_vwap_pct=float(cfg.get("min_vwap_pct", 0.5)),
+                price_min=float(cfg.get("price_min", 5.0)),
+                price_max=float(cfg.get("price_max", 50.0)),
+                min_rvol=float(cfg.get("min_rvol", 1.5)),
+                float_min_m=float(cfg.get("float_min_m", 5.0)),
+                float_max_m=float(cfg.get("float_max_m", 200.0)),
+                earnings_exclude_days=int(cfg.get("earnings_exclude_days", 2)),
+                min_trend_consistency=cfg.get("min_trend_consistency", 45.0),
+                # R-4: a gate that cannot run has not passed.
+                null_gates="reject",
+                end_et_minutes=int(cfg.get("scan_end_et_minutes", 900)),
+            )
+            for key in res["unavailable"]:
+                if key in unavailable:
+                    unavailable[key] += 1
+
+            if not res["passes"]:
+                counters[_counter_column(res)] += 1
+                continue
+
+            mkt = market_hours_bars(bars, int(cfg.get("scan_end_et_minutes", 900)))
+
+            # First-pass anchoring. DTO walks firstSeenAt back up to 12 bars to
+            # find when conditions actually turned true, but then takes its
+            # detectionPrice from the CURRENT bar - so its detection time and
+            # detection price describe different bars. That is incoherent for a
+            # simulator that enters at "the open of the bar following
+            # first_pass_et": the entry would be anchored to a bar whose price
+            # was never recorded. Here the whole snapshot is taken AT the
+            # walked-back bar, so first_pass_et, detection_price, ema9, vwap,
+            # stop and target all describe one bar.
+            idx = first_pass_index(mkt, float(cfg.get("min_vwap_pct", 0.5))) \
+                if cfg.get("walkback", True) else len(mkt) - 1
+            snap_bars = mkt[: idx + 1]
+            snap = check_runner_conditions(snap_bars, float(cfg.get("min_vwap_pct", 0.5)))
+            if not snap["passes"]:
+                # Defensive: first_pass_index only returns indices where the
+                # check passed, so this is unreachable by construction. If it
+                # ever fires, fall back to the confirmed final bar rather than
+                # storing a snapshot that never satisfied the conditions.
+                snap_bars, snap = mkt, res["check"]
+
+            detection_price = snap["price"]
+            ema9 = snap["ema9"]
+            stop_dist = (detection_price - ema9) if (detection_price and ema9) else None
+            if not stop_dist or stop_dist <= 0:
+                # A non-positive stop distance is not a tradeable plan; storing
+                # it would put a negative-risk row into the evidence base.
+                counters["rejected_conditions"] += 1
+                continue
+
+            # Minimum stop distance. When price sits almost exactly on the 9
+            # EMA at detection, stop_dist collapses toward zero and every R
+            # computed against it is arithmetically valid and meaningless -
+            # measured live on 2026-09-11, ATEC detected with a $0.01 stop on a
+            # $10.19 stock and graded -5.15R, which describes noise, not the
+            # setup. Rows like that would silently corrupt the Phase 1 baseline
+            # that Phase 1 exists to produce.
+            #
+            # DTO applies the same floor (js/runner-scanner.js:245,
+            # `minStop = Math.max(0.10, entry * 0.005)`, commented "stop too
+            # tight - R calc meaningless"). It is a sanity floor on tradeable
+            # geometry rather than a corpus-derived edge claim, so porting the
+            # numbers is consistent with R-2.
+            min_stop = max(float(cfg.get("min_stop_abs", 0.10)),
+                           detection_price * float(cfg.get("min_stop_pct", 0.005)))
+            if stop_dist < min_stop:
+                counters["rejected_conditions"] += 1
+                log("runner", f"  reject {ticker}: stop_dist {stop_dist:.4f} below "
+                              f"minimum {min_stop:.4f} (price sits on the 9 EMA)")
+                continue
+
+            first_pass_et = snap_bars[-1]["t"]
+            pc = prev_close.get(ticker)
+            row = {
+                "session_date": d,
+                "ticker": ticker,
+                "first_pass_et": first_pass_et.replace(tzinfo=None),
+                "detection_minutes": ri.et_minutes(first_pass_et),
+                "scan_pass_et": at.replace(tzinfo=None),
+                "detection_price": detection_price,
+                "vwap": snap["vwap"],
+                "vwap_pct_above": snap["vwap_pct_above"],
+                "ema9": ema9,
+                "ema9_slope": snap["ema9_slope"],
+                "rvol": ri.rvol(snap_bars, prev_volume.get(ticker)),
+                "trend_consistency": ri.trend_consistency(snap_bars),
+                "change_pct": (((detection_price - pc) / pc) * 100) if pc else None,
+                "float_shares": floats.get(ticker),
+                "earnings_days_away": earnings.get(ticker),
+                "prev_close": pc,
+                "prev_volume": prev_volume.get(ticker),
+                "price_tier": _price_tier(detection_price),
+                "stop_price": ema9,
+                "target_price": detection_price + 2 * stop_dist,
+                "stop_dist": stop_dist,
+                "gates_status": json.dumps({
+                    "float": "pass" if floats.get(ticker) is not None else "unavailable",
+                    "earnings": "pass" if earnings.get(ticker) is not None else "unavailable",
+                    "prev_volume": "pass" if prev_volume.get(ticker) else "unavailable",
+                    "walkback_bars": len(mkt) - 1 - idx,
+                }),
+                "scan_version": SCAN_VERSION,
+            }
+            if ledger.save_runner_candidate(con, row):
+                found += 1
+                log("runner", f"  candidate {ticker} @ {detection_price:.2f} "
+                              f"(det {row['detection_minutes']}m, rvol "
+                              f"{(row['rvol'] or 0):.2f}, stop {stop_dist:.2f})")
+
+        # -- 6. session telemetry -------------------------------------------
+        scanned = len(universe)
+        degraded = bool(ustats.get("provider_degraded")) or any(
+            v > scanned / 2 for v in unavailable.values()
+        )
+        prior = ledger.runner_session(con, d) or {}
+        total_candidates = len(ledger.runner_candidate_tickers(con, d))
+        payload = {
+            "session_date": d,
+            "universe_size": scanned,
+            "scan_passes": (prior.get("scan_passes") or 0) + 1,
+            "candidates_found": total_candidates,
+            "gates_unavailable": json.dumps(unavailable),
+            "provider_degraded": degraded,
+            "scan_version": SCAN_VERSION,
+        }
+        for k, v in counters.items():
+            payload[k] = v
+        ledger.upsert_runner_session(con, payload)
+
+        elapsed = int((time.monotonic() - t0) * 1000)
+        log("runner", f"scan {at:%H:%M} - {scanned} scanned, {found} new, "
+                      f"{total_candidates} total candidates, {elapsed}ms"
+                      + (" [DEGRADED]" if degraded else ""))
+        return {"universe_size": scanned, "new_candidates": found,
+                "candidates": total_candidates, "provider_degraded": degraded,
+                "rejections": counters, "gates_unavailable": unavailable,
+                "elapsed_ms": elapsed}
+    finally:
+        if owns_con:
+            con.close()
+
+
+def _counter_column(res: dict) -> str:
+    """Map a gate-chain verdict onto its runner_sessions counter.
+
+    evaluate_ticker reports DTO's five coarse counters (so the parity harness
+    can diff them) plus a finer `reason`. runner_sessions has separate columns
+    for float / earnings / excluded, which DTO folds into `conditions`. This
+    splits them back out - the coarse counter is what DTO logged, the fine one
+    is what actually makes a zero-candidate day diagnosable.
+    """
+    reason = res.get("reason") or ""
+    if res["counter"] == "conditions":
+        if reason == "excluded ticker":
+            return "rejected_excluded"
+        if reason.startswith("float"):
+            return "rejected_float"
+        if reason.startswith("earnings"):
+            return "rejected_earnings"
+        return "rejected_conditions"
+    return f"rejected_{res['counter']}"

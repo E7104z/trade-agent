@@ -1,0 +1,3 @@
+{
+  "text": "{\"picks\": [{\"ticker\": \"AAAA\", \"rank\": 1, \"conviction\": 3, \"rationale\": \"widest stop_dist_pct of the field with rvol above the median.\"}, {\"ticker\": \"CCCC\", \"rank\": 2, \"conviction\": 2, \"rationale\": \"earliest detection with trend_consistency still under 80.\"}]}"
+}

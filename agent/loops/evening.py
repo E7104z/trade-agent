@@ -15,12 +15,13 @@ v3 additions (specs/EVENING_GRADER_SPEC_v3.md):
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 
 from .. import ledger
 from ..config import Config
 from ..delivery import evening_email_html, render_dashboard, send_email
-from ..grading import classify_shadow, grade_day, outcomes_md, simulate_pick
+from ..grading import (CURRENT_SIM_VERSION, classify_shadow, grade_day,
+                       outcomes_md, simulate_pick)
 from ..llm import LLMClient, load_prompt, prompt_version
 from ..providers import MarketData
 from ..util import is_market_day, log, now_et, prev_market_day, today_et
@@ -96,6 +97,149 @@ def _all_fills_tainted(outcomes: list[dict]) -> bool:
     if not fills:
         return False
     return all(o.get("exit_reason") == "invalid_fill" or o.get("execution_anomaly") for o in fills)
+
+
+def _runner_grader_block(con, d: date) -> str:
+    """The full runner candidate list, with the selected rows marked.
+
+    Spec 2.6: the grader is asked whether the SELECTION was defensible at
+    decision time, which is unanswerable from the picks alone. A grader that
+    cannot see what was passed over has to reconstruct the decision from a
+    fragment - and that is the exact condition under which it previously
+    invented a narrative around a trade that never validly existed.
+    """
+    candidates = ledger.runner_candidates_for_date(con, d)
+    if not candidates:
+        return ""
+    outcomes = {o["ticker"]: o for o in ledger.runner_outcomes_for_date(con, d)}
+    session = ledger.runner_session(con, d) or {}
+
+    def _n(v, dg=2):
+        return "" if v is None else f"{v:.{dg}f}"
+
+    lines = ["| sel | rank | ticker | det ET | price | rvol | vwap% | tc | stop_dist | R | exit |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
+    n_sel = 0
+    for c in candidates:
+        o = outcomes.get(c["ticker"]) or {}
+        sel = bool(o.get("selected"))
+        n_sel += 1 if sel else 0
+        fp = c.get("first_pass_et")
+        # A fill that landed on the wrong side of its own stop is not a trade.
+        # Mask its R so no lesson is ever extracted from a structurally
+        # impossible outcome - the existing fill-validity hard gate, applied
+        # here before any runner row can reach lesson extraction.
+        invalid = o.get("exit_reason") == "invalid_fill"
+        r_txt = "INVALID FILL" if invalid else _n(o.get("r_multiple"))
+        lines.append(
+            f"| {'YES' if sel else ''} | {o.get('selection_rank') or ''} | {c['ticker']} | "
+            f"{fp.strftime('%H:%M') if isinstance(fp, datetime) else ''} | "
+            f"{_n(c.get('detection_price'))} | {_n(c.get('rvol'))} | "
+            f"{_n(c.get('vwap_pct_above'))} | {_n(c.get('trend_consistency'), 1)} | "
+            f"{_n(c.get('stop_dist'))} | {r_txt} | {o.get('exit_reason') or ''} |")
+
+    skipped = session.get("selection_skipped_reason")
+    header = (f"{len(candidates)} candidate(s) detected, {n_sel} selected."
+              + (f" Selection note: {skipped}." if skipped else ""))
+    body = chr(10).join(lines)
+    return ("## RUNNER LANE - FULL CANDIDATE LIST (selected rows marked)" + chr(10) * 2
+            + header + chr(10) * 2 + body + chr(10) * 2
+            + "Every row was priced by the same simulator, selected or not. Judge "
+              "whether the SELECTION was defensible on what was knowable at "
+              "decision time - not on which row happened to win.")
+
+
+def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
+    """Price EVERY runner candidate, traded or not (RUNNER_PORT_SPEC 1.5).
+
+    This is the free evidence engine. Simulating 40 candidates instead of 10
+    costs bar fetches, not tokens, and it is the only way to get a denominator
+    for "did selection help?" - you cannot measure a picker against the field
+    if the field was never priced.
+
+    Entry is the OPEN OF THE BAR FOLLOWING first_pass_et, never the detection
+    bar's close. Entering at the close of the bar that triggered detection is a
+    look-ahead fill: the condition check reads that bar's close, so filling
+    there buys at a price the rule needed in order to fire.
+
+    Implementation note on how that entry is expressed: simulate_pick with
+    entry_type="open" fills at bars[0]["o"], so the minute-bar array is SLICED
+    to begin at the first bar strictly after first_pass_et and handed over. The
+    persisted columns (triggered/fill/exit/R/MFE/MAE/EOD) are all post-entry
+    quantities, so the slice is exactly the right window for them. Session-wide
+    indicator fields that simulate_pick also computes would be wrong on a
+    sliced array - none of them are read or stored here.
+    """
+    candidates = ledger.runner_candidates_for_date(con, d)
+    summary = {"scored": 0, "triggered": 0, "sum_r": 0.0, "no_bars": 0, "skipped": 0}
+    if not candidates:
+        return summary
+
+    slippage = float(cfg.get("slippage_bps", 0) or 0)
+    flatten_at = cfg.get("flatten_at")
+    min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
+
+    for c in candidates:
+        ticker = c["ticker"]
+        try:
+            bars = md.minute_bars(ticker, d)
+        except Exception as e:
+            log("evening", f"  runner {ticker}: bar fetch failed ({e})")
+            bars = []
+
+        first_pass = c.get("first_pass_et")
+        entry_bars = bars
+        if bars and first_pass is not None:
+            fp = first_pass if isinstance(first_pass, datetime) else None
+            if fp is not None:
+                # Compare on naive ET wall-clock: first_pass_et is stored
+                # without a tzinfo, while provider bars carry one.
+                fp_naive = fp.replace(tzinfo=None)
+                entry_bars = [b for b in bars
+                              if b["t"].replace(tzinfo=None) > fp_naive]
+
+        if not entry_bars:
+            summary["no_bars"] += 1
+            ledger.save_runner_candidate_outcome(con, {
+                "session_date": d, "ticker": ticker, "eval_date": d,
+                "triggered": False, "exit_reason": "no_data",
+                "sim_version": CURRENT_SIM_VERSION,
+            })
+            continue
+
+        shim = {"pick_id": 0, "direction": "long", "entry_type": "open",
+                "entry_price": c.get("detection_price"),
+                "stop_price": c.get("stop_price"),
+                "target_price": c.get("target_price")}
+        sim = simulate_pick(shim, entry_bars, None, slippage_bps=slippage,
+                            flatten_at=flatten_at, min_bar_volume=min_bar_volume,
+                            session_date=d)
+
+        ledger.save_runner_candidate_outcome(con, {
+            "session_date": d, "ticker": ticker, "eval_date": d,
+            "triggered": sim.get("triggered"),
+            "entry_fill": sim.get("entry_fill"),
+            "exit_price": sim.get("exit_price"),
+            "exit_reason": sim.get("exit_reason"),
+            "r_multiple": sim.get("r_multiple"),
+            "mfe_r": sim.get("mfe_r"),
+            "mae_r": sim.get("mae_r"),
+            "eod_r": sim.get("eod_r"),
+            "sim_version": sim.get("sim_version"),
+        })
+        summary["scored"] += 1
+        if sim.get("triggered"):
+            summary["triggered"] += 1
+            if sim.get("r_multiple") is not None:
+                summary["sum_r"] += sim["r_multiple"]
+
+    summary["sum_r"] = round(summary["sum_r"], 2)
+    summary["mean_r"] = (round(summary["sum_r"] / summary["triggered"], 3)
+                         if summary["triggered"] else None)
+    log("evening", f"Runner candidates priced: {summary['scored']} scored, "
+                   f"{summary['triggered']} triggered, mean R "
+                   f"{summary['mean_r'] if summary['mean_r'] is not None else 'n/a'}")
+    return summary
 
 
 def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
@@ -456,6 +600,19 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         from .. import integrity
         integrity.on_evening(con, cfg, md, d, simulate=simulate_pick)
 
+        # v10: DTO Runner lane — price EVERY candidate the intraday scan found,
+        # selected or not. Additive and fully isolated: it runs after all
+        # existing grading, and a failure here must not cost the desk its
+        # already-computed outcomes, lessons, or email.
+        runner_summary = {"scored": 0}
+        if (cfg.get("runner", {}) or {}).get("enabled"):
+            try:
+                runner_summary = _grade_runner_candidates(con, md, d, cfg)
+            except Exception as e:
+                log("evening", f"WARN runner candidate grading failed; "
+                               f"existing grading unaffected: {e}")
+                runner_summary = {"scored": 0, "error": str(e)}
+
         out_md = outcomes_md(picks, outcomes) if picks else "(no picks today — no-trade day)"
         recap = md.market_recap(d)
         recap_md = ", ".join(f"{k} {v:+.2f}%" for k, v in (recap.get("pct_change") or {}).items())
@@ -483,8 +640,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             f"{sum(1 for o in ledger.live_orders_for_date(con, d) if o.get('entry_fill_price') is not None)}. "
             "Build the narrative from fills when present; only call this a stand-down after confirming zero fills.\n\n"
             f"## SHADOW LEDGER TODAY (rejected candidates — context only, do not grade them)\n\n{shadow_md}\n\n"
-            f"## MARKET RECAP TODAY\n\n{recap_md or '(recap unavailable)'}\n\n"
-            f"## ACTIVE LESSONS (for confirm/contradict updates — use these IDs)\n\n{lessons_md}\n\n"
+            + (f"{_runner_grader_block(con, d)}\n\n" if runner_summary.get("scored") else "")
+            + f"## MARKET RECAP TODAY\n\n{recap_md or '(recap unavailable)'}\n\n"
+            + f"## ACTIVE LESSONS (for confirm/contradict updates — use these IDs)\n\n{lessons_md}\n\n"
             "Grade the day now, following the output contract exactly."
         )
 
