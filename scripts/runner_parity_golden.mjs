@@ -33,6 +33,7 @@
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 
@@ -90,7 +91,11 @@ function etMinutes(t) {
 }
 
 // ── Fixture ──────────────────────────────────────────────────────
-const fixture = JSON.parse(readFileSync(fixturePath, 'utf8'));
+// Fixtures are stored gzipped (they are raw bar arrays and compress >10:1).
+// Plain .json is still read so an older or hand-written fixture keeps working.
+const isGz = fixturePath.endsWith('.gz');
+const raw = readFileSync(fixturePath);
+const fixture = JSON.parse(isGz ? gunzipSync(raw).toString('utf8') : raw.toString('utf8'));
 const minVwapPct = fixture.min_vwap_pct ?? 0.5;
 const tickers = fixture.tickers || {};
 
@@ -189,7 +194,13 @@ fixture.expected = {
   },
 };
 
-writeFileSync(fixturePath, JSON.stringify(fixture, null, 2) + '\n');
+{
+  const text = JSON.stringify(fixture, null, 2) + '\n';
+  // mtime 0 so regenerating an unchanged fixture is byte-identical rather than
+  // producing a diff from the gzip header timestamp alone.
+  writeFileSync(fixturePath,
+    isGz ? gzipSync(Buffer.from(text, 'utf8'), { level: 9, mtime: 0 }) : text);
+}
 console.log(
   `[golden] ${path.basename(fixturePath)} — ${Object.keys(passing).length} passing of ` +
   `${Object.keys(tickers).length} | rejected: ${noBars} no-bars, ${tooFewBars} too-few-bars, ` +

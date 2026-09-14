@@ -457,10 +457,12 @@ def test_first_pass_index_walks_back_to_first_true_bar():
 # --------------------------------------------------------- fixture parity
 
 def _fixture_paths():
+    """Fixtures are stored gzipped; plain .json is still accepted."""
     if not os.path.isdir(FIXTURE_DIR):
         return []
     return sorted(os.path.join(FIXTURE_DIR, f)
-                  for f in os.listdir(FIXTURE_DIR) if f.endswith(".json"))
+                  for f in os.listdir(FIXTURE_DIR)
+                  if f.endswith((".json.gz", ".json")))
 
 
 @pytest.mark.parametrize("path", _fixture_paths() or [None],
@@ -487,8 +489,10 @@ def test_fixture_coverage_meets_spec_minimum():
     paths = _fixture_paths()
     if not paths:
         pytest.skip("no parity fixtures - run scripts/runner_parity_fixtures.py")
+    import gzip
     dates = set()
     for p in paths:
-        with open(p, encoding="utf-8") as fh:
+        opener = gzip.open if p.endswith(".gz") else open
+        with opener(p, "rt", encoding="utf-8") as fh:
             dates.add(json.load(fh)["session_date"])
     assert len(dates) >= 5, f"only {len(dates)} distinct session dates: {sorted(dates)}"

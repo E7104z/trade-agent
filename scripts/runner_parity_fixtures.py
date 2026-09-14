@@ -45,6 +45,9 @@ from agent.config import load_config  # noqa: E402
 from agent.providers import Alpaca, is_common_stock_symbol  # noqa: E402
 from agent.util import ET, is_market_day, prev_market_day  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from runner_parity import dump_fixture  # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_DIR = os.path.join(REPO, "tests", "fixtures", "runner_parity")
 
@@ -228,7 +231,10 @@ def main() -> int:
             continue
         fixture = build_fixture(alp, d, args.universe, cutoff)
         tag = cutoff.strftime("%H%M")
-        path = os.path.join(FIXTURE_DIR, f"{d.isoformat()}_{tag}.json")
+        # Gzipped: these are raw bar arrays for ~95 tickers and compress
+        # better than 10:1. Ten plain files came to 6.5 MB, five times the
+        # size of the codebase they are evidence for.
+        path = os.path.join(FIXTURE_DIR, f"{d.isoformat()}_{tag}.json.gz")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(fixture, fh, indent=2)
             fh.write("\n")

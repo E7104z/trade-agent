@@ -26,6 +26,7 @@ Node. Regenerate fixtures with scripts/runner_parity_fixtures.py.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import sys
@@ -52,6 +53,50 @@ TOLERANCES = {
     "trend_consistency": 1e-6,
     "ema9_slope": 1e-9,
 }
+
+
+FIXTURE_SUFFIXES = (".json.gz", ".json")
+
+
+def load_fixture(path: str) -> dict:
+    """Read a fixture, gzipped or plain.
+
+    Fixtures are stored gzipped: they are raw 5-minute bar arrays for ~95
+    tickers a session, which pretty-printed run about 1 MB each and compress
+    better than 10:1. Ten of them uncompressed came to 6.5 MB — five times the
+    size of the entire codebase — which is too much weight for evidence files
+    to carry in a repo that gets indexed elsewhere. Plain .json is still
+    accepted so an older or hand-written fixture keeps working.
+    """
+    if path.endswith(".gz"):
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            return json.load(fh)
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def dump_fixture(path: str, fixture: dict) -> None:
+    """Write a fixture, gzipping when the path says so.
+
+    mtime=0 so regenerating an unchanged fixture produces byte-identical
+    output instead of a spurious diff from the gzip header timestamp.
+    """
+    text = json.dumps(fixture, indent=2) + "\n"
+    if path.endswith(".gz"):
+        with gzip.GzipFile(path, "wb", compresslevel=9, mtime=0) as gz:
+            gz.write(text.encode("utf-8"))
+    else:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+
+def fixture_paths(directory: str = None) -> list[str]:
+    """Every fixture in `directory`, gzipped or plain, sorted."""
+    directory = directory or FIXTURE_DIR
+    if not os.path.isdir(directory):
+        return []
+    names = [f for f in os.listdir(directory) if f.endswith(FIXTURE_SUFFIXES)]
+    return sorted(os.path.join(directory, f) for f in names)
 
 
 def _parse_bar(b: dict) -> dict:
@@ -180,8 +225,7 @@ def compare(fixture: dict, actual: dict) -> list[str]:
 
 
 def run_fixture(path: str) -> list[str]:
-    with open(path, encoding="utf-8") as fh:
-        fixture = json.load(fh)
+    fixture = load_fixture(path)
     return compare(fixture, run_python_scan(fixture))
 
 
@@ -192,10 +236,7 @@ def main(argv: list[str]) -> int:
             print(f"FAIL  no fixture directory at {FIXTURE_DIR}")
             print("      generate fixtures with scripts/runner_parity_fixtures.py")
             return 1
-        paths = sorted(
-            os.path.join(FIXTURE_DIR, f)
-            for f in os.listdir(FIXTURE_DIR) if f.endswith(".json")
-        )
+        paths = fixture_paths()
     if not paths:
         print(f"FAIL  no fixtures found in {FIXTURE_DIR}")
         print("      generate fixtures with scripts/runner_parity_fixtures.py")
@@ -211,8 +252,7 @@ def main(argv: list[str]) -> int:
             for f in failures:
                 print(f"        {f}")
         else:
-            with open(path, encoding="utf-8") as fh:
-                n = len(json.load(fh).get("expected", {}).get("passing", {}))
+            n = len(load_fixture(path).get("expected", {}).get("passing", {}))
             print(f"ok    {name}  ({n} passing tickers matched)")
 
     print()
