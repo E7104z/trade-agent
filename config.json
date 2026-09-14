@@ -77,7 +77,7 @@
   },
   "ablation_sim_version": null,
   "runner": {
-    "enabled": false,
+    "enabled": true,
     "phase": 1,
     "scan_start_et": "09:45",
     "scan_end_et": "15:00",
@@ -95,9 +95,9 @@
     "earnings_exclude_days": 2,
     "decision_time_et": "10:30",
     "max_picks": 10,
-    "selection_enabled": false,
+    "selection_enabled": true,
     "selection_model": "claude-sonnet-4-6",
-    "live_orders_enabled": false,
+    "live_orders_enabled": true,
     "max_live_orders_per_day": 10,
     "dollars_per_r": 100,
     "size_r": 0.25
