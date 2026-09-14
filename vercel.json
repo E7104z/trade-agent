@@ -19,10 +19,6 @@
     {
       "path": "/cron/evening",
       "schedule": "30 20 * * 1-5"
-    },
-    {
-      "path": "/cron/intraday-check",
-      "schedule": "*/5 13-20 * * 1-5"
     }
   ]
 }
