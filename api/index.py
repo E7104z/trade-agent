@@ -677,7 +677,10 @@ def cron_loop(loop_name: str):
     return json_response(result)
 
 
-@app.route("/cron/intraday-check", methods=["POST"])
+# GET as well as POST: Vercel Cron issues GET and sends
+# "Authorization: Bearer $CRON_SECRET" automatically. POST is retained so
+# the GitHub Actions workflow (and any external caller) keeps working.
+@app.route("/cron/intraday-check", methods=["GET", "POST"])
 def intraday_check():
     if not _is_cron_request():
         return json_response({"error": "unauthorized"}, 401)

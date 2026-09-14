@@ -1,7 +1,10 @@
 {
   "framework": null,
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api/index" }
+    {
+      "source": "/(.*)",
+      "destination": "/api/index"
+    }
   ],
   "functions": {
     "api/index.py": {
@@ -9,7 +12,17 @@
     }
   },
   "crons": [
-    { "path": "/cron/morning", "schedule": "45 10 * * 1-5" },
-    { "path": "/cron/evening", "schedule": "30 20 * * 1-5" }
+    {
+      "path": "/cron/morning",
+      "schedule": "45 10 * * 1-5"
+    },
+    {
+      "path": "/cron/evening",
+      "schedule": "30 20 * * 1-5"
+    },
+    {
+      "path": "/cron/intraday-check",
+      "schedule": "*/5 13-20 * * 1-5"
+    }
   ]
 }
