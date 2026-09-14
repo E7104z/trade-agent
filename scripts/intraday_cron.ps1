@@ -1,17 +1,17 @@
 # =============================================================================
-# LOCAL INTRADAY TRIGGER — stands in for the dead GitHub Actions cron.
+# LOCAL INTRADAY TRIGGER - stands in for the dead GitHub Actions cron.
 #
 # Why this exists
 # ---------------
 # /cron/intraday-check is what runs BOTH the live paper position monitor and
 # the runner lane. Nothing is currently calling it:
 #
-#   * GitHub Actions  — every scheduled run since at least 2026-09-09 ends as
+#   * GitHub Actions  - every scheduled run since at least 2026-09-09 ends as
 #                       startup_failure in 0s with zero jobs and zero billable
 #                       time. A trivial "echo hello" workflow fails the same
 #                       way, so it is an account-level block (Actions minutes
 #                       or a spending limit on a private repo), not the YAML.
-#   * Vercel Cron     — rejected at deploy time: "Hobby accounts are limited to
+#   * Vercel Cron     - rejected at deploy time: "Hobby accounts are limited to
 #                       daily cron jobs." Needs Pro for a */5 schedule.
 #
 # This script polls the production endpoint from this machine instead. It is a
@@ -81,7 +81,7 @@ function Invoke-Tick {
         if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
         $msg = $_.Exception.Message
         if ($code -eq 401) {
-            Write-Host "[$($et.ToString('HH:mm:ss')) ET] 401 UNAUTHORIZED — CRON_SECRET is wrong." -ForegroundColor Red
+            Write-Host "[$($et.ToString('HH:mm:ss')) ET] 401 UNAUTHORIZED - CRON_SECRET is wrong." -ForegroundColor Red
         } else {
             Write-Host "[$($et.ToString('HH:mm:ss')) ET] FAILED ($code) $msg" -ForegroundColor Yellow
         }
@@ -106,18 +106,18 @@ while ($true) {
     $t  = $et.TimeOfDay
 
     if ($et.DayOfWeek -eq 'Saturday' -or $et.DayOfWeek -eq 'Sunday') {
-        Write-Host "[$($et.ToString('ddd HH:mm')) ET] weekend — sleeping 1h" -ForegroundColor DarkGray
+        Write-Host "[$($et.ToString('ddd HH:mm')) ET] weekend - sleeping 1h" -ForegroundColor DarkGray
         Start-Sleep -Seconds 3600
         continue
     }
     if ($t -lt $start) {
         $wait = [int]([math]::Min(($start - $t).TotalSeconds, 600))
-        Write-Host "[$($et.ToString('HH:mm:ss')) ET] before window — sleeping $wait s" -ForegroundColor DarkGray
+        Write-Host "[$($et.ToString('HH:mm:ss')) ET] before window - sleeping $wait s" -ForegroundColor DarkGray
         Start-Sleep -Seconds ([math]::Max($wait, 15))
         continue
     }
     if ($t -gt $end) {
-        Write-Host "[$($et.ToString('HH:mm:ss')) ET] past window — done for today." -ForegroundColor Cyan
+        Write-Host "[$($et.ToString('HH:mm:ss')) ET] past window - done for today." -ForegroundColor Cyan
         Start-Sleep -Seconds 3600
         continue
     }
