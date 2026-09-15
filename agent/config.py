@@ -73,9 +73,18 @@ _DEFAULTS: dict[str, Any] = {
     "runner": {
         "enabled": False,
         "phase": 1,
-        "scan_start_et": "09:45",
+        # Conditions need 10 five-minute bars from 09:30, so nothing can
+        # qualify before 10:20. Scanning earlier finds nothing and spends
+        # bar-fetch budget on ~1,190 symbols for no reason.
+        "scan_start_et": "10:20",
         "scan_end_et": "15:00",
-        "universe_size": 150,
+        # Liquid tradable universe (~4,068 at a $5M/day dollar floor)
+        # + DEFAULT_UNIVERSE + most-actives(100 x2) + movers(50),
+        # which is ~4,224 after filtering. The cap exists only to bound
+        # a runaway screener - set it ABOVE the real population, or it
+        # silently truncates the scan (measured: a 1,500 cap cut 4,224
+        # to 1,500 and took candidates from 11 to 3).
+        "universe_size": 6000,
         "price_min": 5.0,
         "price_max": 50.0,
         "min_vwap_pct": 0.5,
@@ -99,6 +108,10 @@ _DEFAULTS: dict[str, Any] = {
         # true, instead of stamping the scan cycle that happened to notice.
         "walkback": True,
         "earnings_exclude_days": 2,
+        # "dto"    - a missing float/earnings PASSES and is recorded
+        #            (matches DTO; keeps the candidate pool intact)
+        # "reject" - a gate that cannot run has not passed (strict)
+        "null_gates": "dto",
         "decision_time_et": "10:30",
         "max_picks": 10,
         "selection_enabled": False,

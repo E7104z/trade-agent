@@ -224,8 +224,52 @@ class Alpaca:
     def movers(self, top: int = 18) -> dict:
         return self._get("/v1beta1/screener/stocks/movers", {"top": top})
 
-    def most_actives(self, top: int = 15) -> dict:
-        return self._get("/v1beta1/screener/stocks/most-actives", {"by": "volume", "top": top})
+    def tradable_assets(self) -> list[str]:
+        """Active, tradable US common-stock symbols from /v2/assets.
+
+        /v2/assets lives on the TRADING host, not the data host, and the two
+        take different key pairs. DTO's notes say its live keys worked on
+        api.alpaca.markets and 401'd on paper-api; this account is the mirror
+        image — measured 2026-09-15, paper-api returns 200 with 12,890 assets
+        and api.alpaca.markets 401s. So the paper host is tried first here and
+        the live host is the fallback, which covers either key type.
+
+        The filter reproduces DTO's (js/alpaca.js:307-309): tradable,
+        fractionable is not False, no digit in the symbol, at most 5
+        characters. That leaves ~7,182 symbols, which the caller then screens
+        on dollar volume.
+        """
+        hosts = ["https://paper-api.alpaca.markets", "https://api.alpaca.markets"]
+        params = {"status": "active", "asset_class": "us_equity",
+                  "exchange": "NYSE,NASDAQ,ARCA,BATS"}
+        for host in hosts:
+            try:
+                r = requests.get(f"{host}/v2/assets", headers=self.h,
+                                 params=params, timeout=60)
+                if r.status_code in (401, 403):
+                    continue
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e:
+                log("data", f"WARN /v2/assets failed on {host}: {e}")
+                continue
+            out = [
+                a["symbol"] for a in data
+                if a.get("tradable")
+                and a.get("fractionable") is not False
+                and not re.search(r"\d", a.get("symbol", ""))
+                and len(a.get("symbol", "")) <= 5
+            ]
+            if out:
+                return sorted(set(out))
+        log("data", "WARN /v2/assets returned nothing on either host")
+        return []
+
+    def most_actives(self, top: int = 15, by: str = "volume") -> dict:
+        """Most-actives screener. `by` is "volume" (default, unchanged for every
+        existing caller) or "trades" — the runner universe unions both, since
+        DTO's scanner pulls 100 of each and they do not fully overlap."""
+        return self._get("/v1beta1/screener/stocks/most-actives", {"by": by, "top": top})
 
     def news(self, limit: int = 40) -> list[dict]:
         data = self._get("/v1beta1/news", {"limit": limit, "sort": "desc"})

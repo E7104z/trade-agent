@@ -47,7 +47,7 @@ def con(monkeypatch):
 def _cfg(**runner_over) -> Config:
     runner = {
         "enabled": True, "scan_start_et": "09:45", "scan_end_et": "15:00",
-        "universe_size": 150, "price_min": 5.0, "price_max": 50.0,
+        "universe_size": 6000, "price_min": 5.0, "price_max": 50.0,
         "min_vwap_pct": 0.5, "min_rvol": 1.5, "float_min_m": 5.0,
         "float_max_m": 200.0, "min_trend_consistency": 45.0, "walkback": True,
         "earnings_exclude_days": 2, "decision_time_et": "10:30", "max_picks": 2,
@@ -176,29 +176,78 @@ def test_outcome_upsert_preserves_selection_stamps(con):
 
 
 def test_universe_drops_excluded_and_non_common(monkeypatch, con):
+    """The screeners are unioned INTO the standing list, not used instead of it.
+
+    The first version of build_universe used movers + most-actives alone and
+    landed on 84 symbols against a real population of ~4,200, which starved
+    detection so thoroughly that the empty result read as a quiet market. So
+    this asserts the filters behave AND that the standing list is present.
+    """
     class _Alp:
         def movers(self, top=50):
             return {"gainers": [{"symbol": "GOOD"}, {"symbol": "SOXL"}],
                     "losers": [{"symbol": "BADW"}]}
-        def most_actives(self, top=50):
+        def most_actives(self, top=50, by="volume"):
             return {"most_actives": [{"symbol": "ALSO"}]}
-        def snapshots(self, syms):
-            return {s: {"latestTrade": {"p": 10.0}} for s in syms}
 
     class _MD:
         alpaca = _Alp()
 
     monkeypatch.setattr(runner_universe, "is_common_stock_symbol",
                         lambda s: s != "BADW")
+    # No liquid universe in this test: assert the screener/standing-list union.
+    monkeypatch.setattr(runner_universe, "liquid_universe",
+                        lambda *a, **k: ([], {}))
+
     at = datetime(2026, 9, 11, 11, 30, tzinfo=ET)
     syms, stats = runner_universe.build_universe(_MD(), _cfg().get("runner"),
                                                  at=at, con=con)
-    assert "SOXL" not in syms        # leveraged ETF
-    assert "BADW" not in syms        # not common stock
-    assert set(syms) == {"GOOD", "ALSO"}
-    assert stats["dropped_excluded"] == 1
+    assert "GOOD" in syms and "ALSO" in syms      # screener names included
+    assert "SOXL" not in syms                     # leveraged ETF excluded
+    assert "BADW" not in syms                     # not common stock
+    assert "AAPL" in syms                         # standing list present
+    assert len(syms) > 1000, "the standing list must not be dropped"
+    assert stats["dropped_excluded"] >= 1
     assert stats["dropped_not_common"] == 1
-    assert stats["provider_degraded"] is False
+
+
+def test_universe_below_the_expected_floor_is_recorded_as_degraded(monkeypatch, con):
+    """A collapsed universe is an outage, not a market condition.
+
+    This is the guard against repeating the original bug silently: if the
+    population falls far below the standing list, the session is flagged so a
+    thin candidate list can never be read as a genuine stand-down.
+    """
+    class _MD:
+        alpaca = None
+
+    monkeypatch.setattr(runner_universe, "liquid_universe", lambda *a, **k: ([], {}))
+    monkeypatch.setattr(runner_universe, "DEFAULT_UNIVERSE", ("AAA", "BBB"))
+    at = datetime(2026, 9, 11, 11, 30, tzinfo=ET)
+    syms, stats = runner_universe.build_universe(_MD(), _cfg().get("runner"),
+                                                 at=at, con=con)
+    assert len(syms) < runner_universe.EXPECTED_MIN_UNIVERSE
+    assert stats["provider_degraded"] is True
+
+
+def test_universe_cap_must_sit_above_the_real_population(con, monkeypatch):
+    """The cap bounds a runaway screener; it must never trim the real universe.
+
+    Measured: a 1,500 cap against a 4,224-symbol population silently cut the
+    scan and took candidates from 11 to 3.
+    """
+    monkeypatch.setattr(runner_universe, "liquid_universe",
+                        lambda *a, **k: ([f"L{i:04d}" for i in range(4000)], {}))
+    monkeypatch.setattr(runner_universe, "is_common_stock_symbol", lambda s: True)
+
+    class _MD:
+        alpaca = None
+
+    at = datetime(2026, 9, 11, 11, 30, tzinfo=ET)
+    cfg = dict(_cfg().get("runner"))
+    cfg["universe_size"] = 6000
+    syms, _ = runner_universe.build_universe(_MD(), cfg, at=at, con=con)
+    assert len(syms) > 4000, "a cap above the population must not truncate"
 
 
 def test_universe_keeps_today_s_candidates_even_if_they_fall_off_movers(con):

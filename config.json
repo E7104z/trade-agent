@@ -79,9 +79,9 @@
   "runner": {
     "enabled": true,
     "phase": 1,
-    "scan_start_et": "09:45",
+    "scan_start_et": "10:20",
     "scan_end_et": "15:00",
-    "universe_size": 150,
+    "universe_size": 6000,
     "price_min": 5.0,
     "price_max": 50.0,
     "min_vwap_pct": 0.5,
@@ -100,6 +100,7 @@
     "live_orders_enabled": true,
     "max_live_orders_per_day": 10,
     "dollars_per_r": 100,
-    "size_r": 0.25
+    "size_r": 0.25,
+    "null_gates": "dto"
   }
 }

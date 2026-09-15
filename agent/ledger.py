@@ -342,6 +342,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v9.STATEMENTS
 from . import migrations_v10  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v10.STATEMENTS
 
+# --- v11 daily cache for the runner's liquid universe ----------------------
+from . import migrations_v11  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v11.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -1620,3 +1624,31 @@ def runner_candidate_outcomes_since(con: duckdb.DuckDBPyConnection,
     ).fetchall()
     names = cols_c + extra_o
     return [dict(zip(names, r)) for r in rows]
+
+
+def get_runner_universe_cache(con: duckdb.DuckDBPyConnection, d: date,
+                              kind: str = "liquid") -> dict | None:
+    """The cached liquid-universe payload for a session, or None."""
+    row = con.execute(
+        "SELECT payload, n, source FROM runner_universe_cache "
+        "WHERE session_date = ? AND kind = ?", [d, kind]).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return {"payload": payload, "n": row[1], "source": row[2]}
+
+
+def save_runner_universe_cache(con: duckdb.DuckDBPyConnection, d: date,
+                               payload: dict, *, kind: str = "liquid",
+                               source: str = "") -> None:
+    """Store the per-session universe payload. Rewritten if rebuilt."""
+    con.execute("DELETE FROM runner_universe_cache WHERE session_date = ? AND kind = ?",
+                [d, kind])
+    con.execute(
+        "INSERT INTO runner_universe_cache (session_date, kind, built_at, n, source, payload) "
+        "VALUES (?,?,current_timestamp,?,?,?)",
+        [d, kind, len(payload.get("liquid") or []), source, json.dumps(payload)],
+    )

@@ -28,6 +28,7 @@ __all__ = [
     "EXCLUDED_TICKERS",
     "SCAN_VERSION",
     "scan",
+    "apply_network_gates",
     "check_runner_conditions",
     "evaluate_ticker",
     "market_hours_bars",
@@ -245,6 +246,7 @@ def evaluate_ticker(
     min_trend_consistency: float | None = 45.0,
     null_gates: str = "dto",
     end_et_minutes: int | None = None,
+    defer_network_gates: bool = False,
 ) -> dict:
     """Run DTO's full gate chain over one ticker.
 
@@ -335,6 +337,16 @@ def evaluate_ticker(
                                         f"{min_trend_consistency}",
                    check=check, rv=rv, tc=tc)
 
+    # ---- everything below needs a NETWORK lookup ------------------------
+    # `defer_network_gates` stops here and reports the ticker as a survivor of
+    # every cheap local gate. The scan uses it to fetch float and earnings for
+    # the handful of names that got this far instead of the whole ~1,190-symbol
+    # universe, then finishes the chain with apply_network_gates(). DTO made
+    # the same split for the same reason (js/runner-scanner.js:1149).
+    # The parity harness never sets this, so the full chain is unchanged there.
+    if defer_network_gates:
+        return out(True, None, "pending network gates", check=check, rv=rv, tc=tc)
+
     # Float gate. Finnhub shareOutstanding in millions.
     if float_m is None:
         unavailable.append("float")
@@ -358,6 +370,58 @@ def evaluate_ticker(
                    check=check, rv=rv, tc=tc)
 
     return out(True, None, check["reason"], check=check, rv=rv, tc=tc)
+
+
+def apply_network_gates(
+    res: dict,
+    *,
+    float_m: float | None,
+    earnings_days_away: float | None,
+    float_min_m: float = 5.0,
+    float_max_m: float = 200.0,
+    earnings_exclude_days: int = 2,
+    null_gates: str = "dto",
+) -> dict:
+    """Finish a deferred gate chain with the float and earnings gates.
+
+    `res` is what evaluate_ticker(defer_network_gates=True) returned. Returns a
+    verdict in the same shape, so callers handle both identically.
+
+    On `null_gates="dto"` a missing float or earnings PASSES and is recorded in
+    `unavailable` — matching DTO, which fails these gates open. That is a
+    deliberate reversal of the original spec's R-4 ("a gate that cannot run has
+    not passed"): across a ~1,190-symbol universe, yfinance float and earnings
+    coverage is patchy enough that rejecting on absence removes a large share
+    of legitimate candidates and would not reproduce the desk this port exists
+    to reproduce. The nulls are still recorded per candidate in `gates_status`
+    and counted per session in `gates_unavailable`, so research can filter on
+    them later — the information is kept, it just no longer silently kills the
+    candidate. Pass `null_gates="reject"` to restore the strict behaviour.
+    """
+    unavailable = list(res.get("unavailable") or [])
+
+    def out(passes, counter=None, reason=None):
+        return {**res, "passes": passes, "counter": counter,
+                "reason": reason if reason is not None else res.get("reason"),
+                "unavailable": unavailable}
+
+    if float_m is None:
+        unavailable.append("float")
+        if null_gates == "reject":
+            return out(False, "conditions", "float unavailable")
+    elif float_m < float_min_m or float_m > float_max_m:
+        return out(False, "conditions",
+                   f"float {float_m}M outside [{float_min_m}, {float_max_m}]")
+
+    if earnings_days_away is None:
+        unavailable.append("earnings")
+        if null_gates == "reject":
+            return out(False, "conditions", "earnings unavailable")
+    elif abs(earnings_days_away) <= earnings_exclude_days:
+        return out(False, "conditions", f"earnings {earnings_days_away}d away")
+
+    check = res.get("check") or {}
+    return out(True, None, check.get("reason") or "passes")
 
 
 # ===========================================================================
@@ -390,37 +454,43 @@ def _price_tier(price: float | None) -> str | None:
 
 
 def _fetch_gate_inputs(md, symbols: list[str], d, con=None) -> tuple[dict, dict]:
-    """Float (in millions) and earnings-days-away per symbol, session-cached.
+    """Float (in millions) and earnings-days-away for a SMALL set of symbols.
+
+    ── CALL THIS LAST, NEVER FOR THE WHOLE UNIVERSE ──────────────────────────
+    These are the only network round trips in the gate chain, and they are slow
+    per-symbol yfinance lookups. They must run AFTER every cheap local gate, so
+    only the handful of genuine survivors pay for them.
+
+    An earlier version prefetched float and earnings for the entire universe up
+    front. At 84 symbols that cost 15 seconds; at the real population of ~1,190
+    it would be minutes and would blow the serverless function limit outright.
+    DTO hit exactly this and fixed it the same way (js/runner-scanner.js:1149,
+    "Network gates LAST (perf fix 2026-06-24) ... so only a handful of genuine
+    candidates per scan hit Finnhub instead of every RVOL-passing ticker").
 
     ── A PORTING DIVERGENCE WORTH KNOWING ────────────────────────────────────
-    DTO's float gate reads Finnhub `shareOutstanding` and its own comment says
+    DTO's float gate reads Finnhub `shareOutstanding`, and its own comment says
     plainly that this is TOTAL shares, not free float ("for large-caps it runs
     into the billions (NVDA ~24,000M)"). Its [5M, 200M] band was calibrated
     against that quantity.
 
-    Trade Agent has no Finnhub key. `providers.fundamentals()` returns
-    yfinance `floatShares` - genuine free float, which for most names is
-    materially SMALLER than shares outstanding. Applying DTO's band to free
-    float is therefore a STRICTER filter than DTO's, not an equivalent one.
-
-    Using the number we actually have and labelling it honestly beats
-    inventing a conversion factor. The consequence is that `float_min_m` /
-    `float_max_m` must be re-derived against Trade Agent's own forward
-    evidence rather than inherited (spec R-2 in spirit: port the condition,
-    re-derive the threshold). Until then the band is deliberately wide.
+    Trade Agent has no Finnhub key. `providers.fundamentals()` returns yfinance
+    `floatShares` - genuine free float, which for most names is materially
+    SMALLER than shares outstanding, so applying DTO's band to it is a STRICTER
+    filter, not an equivalent one. Using the number we actually have and
+    labelling it honestly beats inventing a conversion factor; the band must be
+    re-derived against this desk's own forward evidence.
     """
     cache = _session_gate_cache(d)
     need = [s for s in symbols if (d, s) not in cache]
 
-    floats: dict[str, float | None] = {}
-    earnings: dict[str, int | None] = {}
     if need:
+        floats: dict[str, float | None] = {}
+        earnings: dict[str, int | None] = {}
         try:
-            # Pass `con` so this uses the ledger-backed fundamentals cache
-            # (3-session TTL) rather than re-hitting yfinance. The in-process
-            # cache above only helps inside one warm container, and a Vercel
-            # cron tick is frequently a cold start - without the DB cache every
-            # five-minute tick would re-fetch the whole universe.
+            # `con` routes this through the ledger-backed fundamentals cache
+            # (3-session TTL). The in-process cache above only helps inside one
+            # warm container, and a cron tick is frequently a cold start.
             fund = md.fundamentals(need, con)
             for s, row in (fund or {}).items():
                 fs = (row or {}).get("float_shares")
@@ -453,6 +523,12 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
     be destabilised by this lane.
     """
     t0 = time.monotonic()
+    # DTO fails the float/earnings gates OPEN. Across ~1,190 symbols,
+    # yfinance coverage is patchy enough that rejecting on absence would
+    # remove a large share of legitimate candidates; the nulls are recorded
+    # in gates_status and gates_unavailable instead. "reject" restores the
+    # original strict behaviour.
+    null_policy = str(cfg.get("null_gates", "dto"))
     owns_con = con is None
     if owns_con:
         from . import ledger as _ledger
@@ -494,43 +570,75 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
         except Exception as e:
             log("runner", f"WARN 5Min bar fetch failed: {e}")
 
-        # -- 3. previous-session daily bars ----------------------------------
+        # -- 3. previous-session close/volume --------------------------------
+        # Normally these arrive with the liquid universe: the same daily-bar
+        # fetch that applies the dollar-volume floor produces them, and it is
+        # cached for the session. Only symbols the cache missed (screener names
+        # outside the liquid list) need a fetch here, so the ~77s daily pass
+        # runs once a day rather than once a tick.
         prev_close: dict[str, float | None] = {}
         prev_volume: dict[str, float | None] = {}
-        try:
-            pd = prev_market_day(d)
-            daily = md.alpaca.multi_daily_bars(universe, pd, d)
-            for s, rows in (daily or {}).items():
-                if rows:
-                    prev_close[s] = rows[0].get("close")
-                    prev_volume[s] = rows[0].get("volume")
-        except Exception as e:
-            log("runner", f"WARN previous-session daily fetch failed: {e}")
+        for sym, row in (ustats.get("prev_daily") or {}).items():
+            prev_close[sym] = row.get("close")
+            prev_volume[sym] = row.get("volume")
+        missing = [s_ for s_ in universe if s_ not in prev_volume]
+        if missing:
+            try:
+                pd_ = prev_market_day(d)
+                daily = md.alpaca.multi_daily_bars(missing, pd_, d)
+                for sym, rows in (daily or {}).items():
+                    if rows:
+                        prev_close[sym] = rows[0].get("close")
+                        prev_volume[sym] = rows[0].get("volume")
+            except Exception as e:
+                log("runner", f"WARN previous-session daily fetch failed for "
+                              f"{len(missing)} uncached symbols: {e}")
 
-        # -- 4. float + earnings, session-cached -----------------------------
-        floats, earnings = _fetch_gate_inputs(md, universe, d, con)
-
-        # -- 5. gate chain ---------------------------------------------------
-        found = 0
+        # -- 4. cheap gates first, for the WHOLE universe --------------------
+        # Nothing here touches the network. At ~1,190 symbols that matters: the
+        # float and earnings lookups are per-symbol yfinance calls, and running
+        # them over the full universe would take minutes and blow the function
+        # limit. DTO made the same split (js/runner-scanner.js:1149).
+        end_min = int(cfg.get("scan_end_et_minutes", 900))
+        survivors: list[tuple[str, dict]] = []
         for ticker in sorted(universe):
             bars = bars_by_sym.get(ticker) or []
             res = evaluate_ticker(
                 ticker, bars,
                 prev_volume=prev_volume.get(ticker),
                 prev_close=prev_close.get(ticker),
-                float_m=floats.get(ticker),
-                earnings_days_away=earnings.get(ticker),
                 min_vwap_pct=float(cfg.get("min_vwap_pct", 0.5)),
                 price_min=float(cfg.get("price_min", 5.0)),
                 price_max=float(cfg.get("price_max", 50.0)),
                 min_rvol=float(cfg.get("min_rvol", 1.5)),
+                min_trend_consistency=cfg.get("min_trend_consistency", 45.0),
+                null_gates=null_policy,
+                end_et_minutes=end_min,
+                defer_network_gates=True,
+            )
+            for key in res["unavailable"]:
+                if key in unavailable:
+                    unavailable[key] += 1
+            if res["passes"]:
+                survivors.append((ticker, res))
+            else:
+                counters[_counter_column(res)] += 1
+
+        # -- 5. network gates, for survivors ONLY ----------------------------
+        floats, earnings = _fetch_gate_inputs(
+            md, [t for t, _ in survivors], d, con)
+
+        found = 0
+        for ticker, res in survivors:
+            bars = bars_by_sym.get(ticker) or []
+            res = apply_network_gates(
+                res,
+                float_m=floats.get(ticker),
+                earnings_days_away=earnings.get(ticker),
                 float_min_m=float(cfg.get("float_min_m", 5.0)),
                 float_max_m=float(cfg.get("float_max_m", 200.0)),
                 earnings_exclude_days=int(cfg.get("earnings_exclude_days", 2)),
-                min_trend_consistency=cfg.get("min_trend_consistency", 45.0),
-                # R-4: a gate that cannot run has not passed.
-                null_gates="reject",
-                end_et_minutes=int(cfg.get("scan_end_et_minutes", 900)),
+                null_gates=null_policy,
             )
             for key in res["unavailable"]:
                 if key in unavailable:
@@ -540,7 +648,7 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
                 counters[_counter_column(res)] += 1
                 continue
 
-            mkt = market_hours_bars(bars, int(cfg.get("scan_end_et_minutes", 900)))
+            mkt = market_hours_bars(bars, end_min)
 
             # First-pass anchoring. DTO walks firstSeenAt back up to 12 bars to
             # find when conditions actually turned true, but then takes its
