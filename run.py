@@ -145,6 +145,95 @@ def cmd_regrade(cfg, args) -> None:
     con.close()
 
 
+def cmd_runner(cfg, args) -> None:
+    """One intraday Runner tick (or a loop of them) from this machine.
+
+    The hosted path for this lane is POST /cron/intraday-check, driven by a
+    scheduler. On this account neither available scheduler can do it: GitHub
+    Actions returns startup_failure for every run (an account-level block -- a
+    trivial `echo hello` workflow fails identically), and Vercel Cron on the
+    Hobby plan rejects any schedule that fires more than once a day.
+
+    So this runs the same `agent.loops.runner.tick()` locally, against the
+    local ledger, using the credentials already in credentials.json. Orders go
+    to the SAME Alpaca paper account either way -- the only difference is which
+    database records the evidence.
+    """
+    import time as _time
+    from datetime import datetime, time as dtime
+
+    from agent.loops import runner as runner_loop
+    from agent.providers import MarketData
+    from agent.util import ET, now_et
+
+    if args.no_orders:
+        cfg.raw.setdefault("runner", {})["live_orders_enabled"] = False
+        log("runner", "--no-orders: order placement disabled for this run")
+
+    rcfg = cfg.get("runner", {}) or {}
+    if not rcfg.get("enabled"):
+        log("runner", "runner.enabled is false in config.json -- nothing to do")
+        return
+
+    md = MarketData(cfg)
+    con = ledger.connect()
+
+    def _at_override():
+        if not args.at:
+            return None
+        hh, mm = (int(x) for x in args.at.split(":"))
+        return datetime.combine(now_et().date(), dtime(hh, mm), tzinfo=ET)
+
+    try:
+        while True:
+            at = _at_override() or now_et()
+            started = _time.monotonic()
+            try:
+                res = runner_loop.tick(cfg, at=at, md=md, con=con)
+            except Exception as e:
+                # A tick must never kill the loop: a transient provider error
+                # at 10:35 should not cost the rest of the session.
+                log("runner", f"WARN tick failed ({type(e).__name__}: {e}) -- continuing")
+                res = {"error": str(e)}
+
+            if res.get("skipped"):
+                log("runner", f"skipped: {res['skipped']}")
+            elif "error" not in res:
+                log("runner",
+                    f"universe={res.get('universe_size')} "
+                    f"new={res.get('new_candidates')} "
+                    f"total={res.get('candidates')} "
+                    f"{res.get('elapsed_ms')}ms"
+                    + (" [DEGRADED]" if res.get("provider_degraded") else ""))
+                sel = res.get("selection") or {}
+                if sel.get("selected"):
+                    log("runner", f"SELECTED {len(sel['selected'])}: "
+                                  + ", ".join(sel["selected"]))
+                    orders = sel.get("orders") or {}
+                    log("runner", f"orders placed: {orders.get('placed', 0)}"
+                                  + (f" | skipped: {orders['skipped']}"
+                                     if orders.get("skipped") else ""))
+                elif sel.get("selection_skipped_reason"):
+                    log("runner", f"selection: {sel['selection_skipped_reason']}")
+
+            if not args.loop:
+                break
+
+            # Stop once the window has closed for the day rather than spinning
+            # until the process is killed.
+            end = str(rcfg.get("scan_end_et", "15:00"))
+            eh, em = (int(x) for x in end.split(":"))
+            now_t = now_et().timetz().replace(tzinfo=None)
+            if now_t > dtime(eh, em):
+                log("runner", f"scan window closed ({end} ET) -- exiting loop")
+                break
+
+            sleep_for = max(5.0, args.every - (_time.monotonic() - started))
+            _time.sleep(sleep_for)
+    finally:
+        con.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="trade-agent", description="AI trading analyst with a track record")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -175,6 +264,20 @@ def main() -> None:
     p_regrade = sub.add_parser("regrade", help="recompute outcomes under current sim semantics (explicit, opt-in)")
     p_regrade.add_argument("--from", dest="from_date", required=True, help="YYYY-MM-DD -- recompute picks on/after this date")
     p_regrade.add_argument("--force", action="store_true", help="required if this would rewrite more than 50 rows")
+
+    p_runner = sub.add_parser(
+        "runner",
+        help="run one intraday Runner scan tick (scan -> select -> place)")
+    add_common(p_runner)
+    p_runner.add_argument("--at", type=str, default=None,
+                          help="override the tick time, HH:MM ET (testing)")
+    p_runner.add_argument("--loop", action="store_true",
+                          help="keep ticking every --every seconds until the "
+                               "scan window closes, then exit")
+    p_runner.add_argument("--every", type=int, default=300,
+                          help="seconds between ticks in --loop mode (default 300)")
+    p_runner.add_argument("--no-orders", action="store_true",
+                          help="scan and select but never place an order")
 
     p_research = sub.add_parser("research", help="research integrity report (selection ablation + population baseline, zero API cost)")
     p_research.add_argument("--full", action="store_true", help="also render the full weekly research block (FDR looks, quarantine, paired arms)")
@@ -209,6 +312,8 @@ def main() -> None:
     elif args.cmd == "weekly":
         from agent.loops import weekly
         weekly.run(cfg, run_date)
+    elif args.cmd == "runner":
+        cmd_runner(cfg, args)
 
 
 if __name__ == "__main__":

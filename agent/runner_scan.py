@@ -566,6 +566,23 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
     unavailable = {"float": 0, "earnings": 0, "prev_volume": 0, "prev_close": 0}
 
     try:
+        # -- 0. feed entitlement ---------------------------------------------
+        # This account's SIP subscription covers historical data but NOT the
+        # current session: feed=sip returns 403 for today's bars while iex
+        # returns them. Without this probe the 10:30 fetch would fail wholesale
+        # and the session would be recorded as a clean zero-candidate
+        # stand-down - the exact confusion runner_sessions exists to prevent.
+        try:
+            md._ensure_feed()
+        except Exception as e:
+            log("runner", f"WARN feed preflight failed: {e}")
+        feed = getattr(getattr(md, "alpaca", None), "feed", "?")
+        feed_downgraded = bool(getattr(md, "feed_downgraded", False))
+        if feed_downgraded:
+            log("runner", "feed downgraded to IEX - IEX prints are a small "
+                          "fraction of consolidated volume, so RVOL is not "
+                          "comparable and is recorded as null for this session")
+
         # -- 1. universe -----------------------------------------------------
         universe, ustats = runner_universe.build_universe(md, cfg, at=at, con=con)
         if not universe:
@@ -587,10 +604,16 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
         # a plausible-looking stand-down produced by an outage.
         start = datetime.combine(d, dtime(9, 30), tzinfo=ET)
         bars_by_sym: dict[str, list[dict]] = {}
+        bars_failed = False
         try:
             bars_by_sym = md.alpaca.multi_bars(universe, "5Min", start, at)
         except Exception as e:
+            bars_failed = True
             log("runner", f"WARN 5Min bar fetch failed: {e}")
+        if not any(bars_by_sym.values()):
+            # No bars for ANY symbol during the session window is an outage,
+            # never a market state. Say so, loudly and durably.
+            bars_failed = True
 
         # -- 3. previous-session close/volume --------------------------------
         # Normally these arrive with the liquid universe: the same daily-bar
@@ -735,7 +758,12 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
                 "vwap_pct_above": snap["vwap_pct_above"],
                 "ema9": ema9,
                 "ema9_slope": snap["ema9_slope"],
-                "rvol": ri.rvol(snap_bars, prev_volume.get(ticker)),
+                # An IEX-only session sees a few percent of consolidated
+                # volume, so the ratio is not an RVOL - recording the number
+                # anyway would put a uniformly wrong figure in front of the
+                # selector and into the research corpus.
+                "rvol": (None if feed_downgraded
+                         else ri.rvol(snap_bars, prev_volume.get(ticker))),
                 "trend_consistency": ri.trend_consistency(snap_bars),
                 "change_pct": (((detection_price - pc) / pc) * 100) if pc else None,
                 "float_shares": floats.get(ticker),
@@ -751,6 +779,9 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
                     "earnings": "pass" if earnings.get(ticker) is not None else "unavailable",
                     "prev_volume": "pass" if prev_volume.get(ticker) else "unavailable",
                     "walkback_bars": len(mkt) - 1 - idx,
+                    "feed": feed,
+                    "rvol_unavailable_reason": ("feed_downgraded_iex"
+                                                if feed_downgraded else None),
                 }),
                 "scan_version": SCAN_VERSION,
             }
@@ -762,9 +793,9 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
 
         # -- 6. session telemetry -------------------------------------------
         scanned = len(universe)
-        degraded = bool(ustats.get("provider_degraded")) or any(
-            v > scanned / 2 for v in unavailable.values()
-        )
+        degraded = (bool(ustats.get("provider_degraded"))
+                    or bars_failed
+                    or any(v > scanned / 2 for v in unavailable.values()))
         prior = ledger.runner_session(con, d) or {}
         total_candidates = len(ledger.runner_candidate_tickers(con, d))
         payload = {
@@ -772,7 +803,9 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
             "universe_size": scanned,
             "scan_passes": (prior.get("scan_passes") or 0) + 1,
             "candidates_found": total_candidates,
-            "gates_unavailable": json.dumps(unavailable),
+            "gates_unavailable": json.dumps({**unavailable, "feed": feed,
+                                             "feed_downgraded": feed_downgraded,
+                                             "bars_failed": bars_failed}),
             "provider_degraded": degraded,
             "scan_version": SCAN_VERSION,
         }

@@ -104,11 +104,28 @@ def liquid_universe(md, con, d, *, floor_usd: float = LIQUIDITY_FLOOR_USD,
         return [], {}
 
     pd_ = prev_market_day(d)
+    # The liquidity screen and prev_close/prev_volume are HISTORICAL reads, and
+    # this account's SIP entitlement covers history even when it is refused for
+    # the current session. The intraday feed may have been downgraded to IEX
+    # for today's bars; that must not follow us here, because IEX prints are a
+    # few percent of consolidated volume and a dollar-volume floor applied to
+    # them cuts the universe by more than half for no real reason (measured:
+    # 4,068 liquid names on SIP became 1,233 on IEX).
+    original_feed = alp.feed
     try:
+        alp.feed = "sip"
         daily = alp.multi_daily_bars(assets, pd_, d)
     except Exception as e:
-        log("runner", f"WARN daily-bar liquidity screen failed: {e}")
-        return [], {}
+        log("runner", f"WARN SIP liquidity screen failed ({e}); retrying on "
+                      f"'{original_feed}' - the universe will be smaller than it should be")
+        try:
+            alp.feed = original_feed
+            daily = alp.multi_daily_bars(assets, pd_, d)
+        except Exception as e2:
+            log("runner", f"WARN daily-bar liquidity screen failed: {e2}")
+            return [], {}
+    finally:
+        alp.feed = original_feed
 
     liquid: list[str] = []
     prev: dict[str, dict] = {}
