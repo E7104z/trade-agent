@@ -227,6 +227,14 @@ def render_dashboard(con: duckdb.DuckDBPyConnection, cfg: Config, plan_date: dat
     curve = ledger.equity_curve(con, cfg.get("account_size", 100000), cfg.get("dollars_per_r", 500))
     runs = ledger.recent_runs(con, 12)
 
+    # Runner lane card. Returns "" when the lane never ran on this date, so the
+    # dashboard omits the section rather than rendering an empty shell.
+    try:
+        from . import runner_view
+        runner_html = runner_view.render_html(con, plan_date or date.today())
+    except Exception:
+        runner_html = ""
+
     # Room dressing: live wires from the ledger so Arby's man cave reflects the
     # desk's actual state (not decorative fixtures). All deterministic.
     regimes = ledger.recent_regimes(con, 5)

@@ -83,6 +83,19 @@ def cmd_status(cfg, args) -> None:
         for r in runs:
             print(f"  {r['run_date']} {r['loop']:8s} {r['status']:8s} "
                   f"${r['cost_usd']:.3f} {r['model']}")
+    try:
+        from agent import runner_view
+        rs = runner_view.session_summary(con, today_et())
+        if rs["session"] or rs["rows"]:
+            print("")
+            print(f"Runner today: {rs['n_candidates']} candidates, "
+                  f"{rs['n_selected']} selected, {len(rs['orders'])} live orders"
+                  + ("  [DEGRADED]" if rs["session"].get("provider_degraded") else ""))
+            print("  full detail: run.py runner-status")
+    except Exception as e:
+        print("")
+        print(f"Runner today: unavailable ({e})")
+
     total_cost = sum(r["cost_usd"] or 0 for r in ledger.recent_runs(con, 1000))
     print(f"\nAll-time API spend: ~${total_cost:.2f}")
     con.close()
@@ -279,6 +292,12 @@ def main() -> None:
     p_runner.add_argument("--no-orders", action="store_true",
                           help="scan and select but never place an order")
 
+    p_rstatus = sub.add_parser(
+        "runner-status",
+        help="show today's Runner scan: candidates, picks, outcomes")
+    p_rstatus.add_argument("--date", type=str, default=None,
+                           help="YYYY-MM-DD (default: today ET)")
+
     p_research = sub.add_parser("research", help="research integrity report (selection ablation + population baseline, zero API cost)")
     p_research.add_argument("--full", action="store_true", help="also render the full weekly research block (FDR looks, quarantine, paired arms)")
 
@@ -314,6 +333,13 @@ def main() -> None:
         weekly.run(cfg, run_date)
     elif args.cmd == "runner":
         cmd_runner(cfg, args)
+    elif args.cmd == "runner-status":
+        from agent import runner_view
+        con = ledger.connect()
+        try:
+            print(runner_view.render_text(con, run_date or today_et()))
+        finally:
+            con.close()
 
 
 if __name__ == "__main__":
