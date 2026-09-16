@@ -311,17 +311,39 @@ def evaluate_ticker(
     if ticker in EXCLUDED_TICKERS:
         return out(False, "conditions", "excluded ticker")
 
-    # RVOL gate - session bars only. Premarket volume distorts the ratio and
+    # RVOL - session bars only. Premarket volume distorts the ratio and
     # produces false positives on names that spike premarket then fade.
-    # Null is a FAIL in both modes here: the JS comment at
-    # js/runner-scanner.js:1129-1130 is explicit that unverified volume was a
-    # documented corpus integrity failure and must never pass silently.
-    if not prev_volume:
+    #
+    # ── WHY min_rvol CAN BE ZERO ──────────────────────────────────────────
+    # DTO's rule is "RVOL >= 1.5", but its RVOL readings are inflated by
+    # roughly an order of magnitude, so in practice the gate passed nearly
+    # everything and the breadth of its scan list came from the VWAP/EMA
+    # conditions alone.
+    #
+    # The evidence is in DTO's own output. A real 10:30 ET scan list of 46
+    # names had a MEDIAN RVOL of 7.0x and included AGNC at 11.2x, EWZ at
+    # 10.1x, KHC at 11.1x and ORC at 7.6x - a mortgage REIT, a Brazil ETF,
+    # Kraft Heinz and Orchid Island Capital do not all trade at ten times
+    # normal volume in the same hour. Measured on the same venue and session,
+    # the true cross-sectional median is 0.41x.
+    #
+    # So porting "RVOL >= 1.5" onto a correctly-scaled RVOL is NOT porting
+    # DTO's behaviour - it is applying a filter roughly 17x stricter than the
+    # one that actually ran, which cut a 57-candidate list to 7. With
+    # min_rvol at 0 the gate is skipped and RVOL is still computed, stored,
+    # and shown to the selector, so it informs the choice without silently
+    # deciding it. Raise min_rvol once forward evidence says a threshold
+    # earns its keep on THIS scale.
+    rv = ri.rvol(mkt, prev_volume) if prev_volume else None
+    if min_rvol > 0:
+        if not prev_volume:
+            unavailable.append("prev_volume")
+            return out(False, "rvol", "prev_volume unavailable")
+        if rv is None or rv < min_rvol:
+            return out(False, "rvol", f"rvol {rv} < {min_rvol}", rv=rv)
+    elif not prev_volume:
+        # Not a rejection, but the absence is still recorded.
         unavailable.append("prev_volume")
-        return out(False, "rvol", "prev_volume unavailable")
-    rv = ri.rvol(mkt, prev_volume)
-    if rv is None or rv < min_rvol:
-        return out(False, "rvol", f"rvol {rv} < {min_rvol}", rv=rv)
 
     check = check_runner_conditions(mkt, min_vwap_pct)
     if not check["passes"]:

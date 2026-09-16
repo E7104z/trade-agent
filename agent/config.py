@@ -88,7 +88,13 @@ _DEFAULTS: dict[str, Any] = {
         "price_min": 5.0,
         "price_max": 50.0,
         "min_vwap_pct": 0.5,
-        "min_rvol": 1.5,
+        # 0 = RVOL is computed, recorded and shown to the selector, but does
+        # not gate. DTO nominally requires 1.5x, but its RVOL runs ~17x hot
+        # (a real scan list of 46 names had a MEDIAN of 7.0x and included
+        # AGNC at 11.2x and EWZ at 10.1x), so that gate passed almost
+        # everything. On a correctly-scaled RVOL, 1.5 cuts a 57-candidate
+        # list to 7 - a filter 17x stricter than the one that actually ran.
+        "min_rvol": 0.0,
         # Minimum stop distance, max(abs, pct * price). When price sits on the
         # 9 EMA at detection the stop collapses toward zero and every R against
         # it is meaningless (measured: a $0.01 stop grading -5.15R). DTO applies
