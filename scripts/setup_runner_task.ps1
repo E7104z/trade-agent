@@ -18,6 +18,13 @@
 # The task starts once a day and the process loops internally until the scan
 # window closes, so Task Scheduler only has to fire it once.
 
+param(
+    # Paste your Postgres connection string to send results to the web
+    # dashboard. Stored as a USER environment variable on this machine only;
+    # it is never written to the repo, never logged, and never leaves here.
+    [string]$DatabaseUrl
+)
+
 $ErrorActionPreference = "Stop"
 
 $projectDir = Split-Path -Parent $PSScriptRoot
@@ -41,6 +48,15 @@ Write-Host "This machine is $offsetHours h from ET; 10:15 ET = $startStr local."
 # local DuckDB file otherwise. The hosted dashboard at iwilltrade.com reads
 # Postgres. So without DATABASE_URL the scan still runs and still places the
 # same paper orders, but the dashboard shows nothing and the lane looks dead.
+if ($DatabaseUrl) {
+    if ($DatabaseUrl -notmatch '^postgres(ql)?://') {
+        throw "That does not look like a Postgres URL (expected it to start with postgres:// or postgresql://)."
+    }
+    [Environment]::SetEnvironmentVariable("DATABASE_URL", $DatabaseUrl, "User")
+    $env:DATABASE_URL = $DatabaseUrl
+    Write-Host "DATABASE_URL saved for your Windows user account." -ForegroundColor Green
+}
+
 $dbUrl = [Environment]::GetEnvironmentVariable("DATABASE_URL", "User")
 if (-not $dbUrl) { $dbUrl = $env:DATABASE_URL }
 if ($dbUrl) {
@@ -50,11 +66,14 @@ if ($dbUrl) {
     Write-Host "NOTE: DATABASE_URL is not set." -ForegroundColor Yellow
     Write-Host "  The scan will run and place orders, but its results go to the"
     Write-Host "  LOCAL database, so iwilltrade.com will keep showing 'no scan"
-    Write-Host "  recorded'. To put them on the dashboard, copy DATABASE_URL"
-    Write-Host "  from Vercel (Project > Settings > Environment Variables) and"
-    Write-Host "  run ONCE, then re-run this script:"
+    Write-Host "  recorded'."
     Write-Host ""
-    Write-Host "    [Environment]::SetEnvironmentVariable('DATABASE_URL','<paste>','User')" -ForegroundColor Cyan
+    Write-Host "  Vercel cannot show you the value again - DATABASE_URL is marked"
+    Write-Host "  Sensitive, so the box you see there is an empty placeholder."
+    Write-Host "  Get the connection string from the database itself (Neon:"
+    Write-Host "  console.neon.tech > your project > Connection string), then:"
+    Write-Host ""
+    Write-Host "    .\scripts\setup_runner_task.ps1 -DatabaseUrl '<paste it here>'" -ForegroundColor Cyan
     Write-Host ""
 }
 
