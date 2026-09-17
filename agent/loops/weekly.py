@@ -17,7 +17,7 @@ import re
 import subprocess
 from datetime import date
 
-from .. import ledger
+from .. import ledger, open_questions
 from ..config import BASE_DIR, Config
 from ..delivery import render_dashboard, send_email, weekly_email_html
 from ..llm import LLMClient, load_prompt
@@ -41,6 +41,30 @@ def _fmt_stats(stats: list[dict], label: str) -> str:
     return "\n".join(lines)
 
 
+# Below this many observations a counterfactual average is reported as a number
+# and nothing else: no direction, no reading, no verdict. Two diagnostics that
+# disagree at n=1 are not a divergence to investigate — they are two numbers.
+MIN_INTERPRETABLE_N = 8
+
+
+def _stat(value, n: int, reading: str) -> str:
+    """One counterfactual average, with its own n and a reading it only gets to
+    keep once n supports one.
+
+    Each average in this block is computed over a DIFFERENT subset of rows —
+    triggered, triggered-with-baseline, triggered-with-eod — so they cannot
+    share a single n. Printing one `triggered` count beside four numbers let
+    the largest n attach itself to whichever number was most interesting.
+    """
+    if value is None or not n:
+        return "not computable (n=0)"
+    if n < MIN_INTERPRETABLE_N:
+        return (f"{value} over n={n} — NOT INTERPRETABLE (below n={MIN_INTERPRETABLE_N}); "
+                "report the number, state no direction, draw no contrast with any "
+                "other counterfactual")
+    return f"{value} over n={n} ({reading})"
+
+
 def _counterfactuals_md(mem: dict) -> str:
     """Null-model, trade-management, and sizing diagnostics — computed in code,
     never by the LLM. Edge must beat the baseline; management must beat holding."""
@@ -48,25 +72,38 @@ def _counterfactuals_md(mem: dict) -> str:
     sc = mem.get("sizing_cf", {})
     stop_rate = (f"{m['stopped_then_target']}/{m['stopped']}"
                  if m.get("stopped") else "0/0")
+    sizing_n = sc.get("n", 0) or 0
+    sizing_read = f"{sc.get('sizing_edge_r')}R" if sizing_n else "not computable"
+    if 0 < sizing_n < 20:
+        sizing_read += f" over n={sizing_n} — below the n>=20 bar this metric is read at"
+    elif sizing_n:
+        sizing_read += f" over n={sizing_n}"
     return (
         "## DETERMINISTIC COUNTERFACTUALS (computed by the system, not the LLM)\n\n"
+        f"Every average below carries ITS OWN n. Readings are suppressed below "
+        f"n={MIN_INTERPRETABLE_N}: a suppressed metric may be quoted as a number, "
+        "but you may not call it positive or negative, may not contrast two "
+        "suppressed metrics against each other, and may not describe the gap "
+        "between them as a pattern to watch. At n=1 there is no divergence "
+        "between selection and management to explain — there is one trade.\n\n"
         "### Edge vs null model (naive same-name open->close, planned-risk units)\n"
-        f"- triggered trades: {m.get('triggered', 0)}; avgR={m.get('avg_r')}, "
-        f"naive baseline avgR={m.get('avg_baseline_r')}, "
-        f"EDGE VS BASELINE={m.get('edge_vs_baseline_r')} "
-        "(<= 0 means the plan machinery adds nothing over buying/shorting the same names at the open)\n"
+        f"- triggered trades: {m.get('triggered', 0)}\n"
+        f"- desk avgR: {_stat(m.get('avg_r'), m.get('avg_r_n', 0), 'realized R per triggered trade')}\n"
+        f"- naive baseline avgR: {_stat(m.get('avg_baseline_r'), m.get('avg_baseline_r_n', 0), 'same names, open->close')}\n"
+        "- EDGE VS BASELINE (paired — actual minus baseline on the SAME trades): "
+        f"{_stat(m.get('edge_vs_baseline_r'), m.get('edge_vs_baseline_n', 0), '<= 0 means the plan machinery adds nothing over buying/shorting the same names at the open')}\n"
         f"- untriggered picks with baseline: {m.get('untriggered_with_baseline', 0)}, "
         f"avg baseline R walked away from: {m.get('avg_baseline_r_untriggered')} "
         "(large positive = entries too cute)\n\n"
         "### Trade management quality\n"
-        f"- management edge (actual R minus hold-to-close R, avg): {m.get('management_edge_r')} "
-        "(negative = the stop/target pair is destroying value vs just holding)\n"
+        "- management edge (paired — actual R minus hold-to-close R): "
+        f"{_stat(m.get('management_edge_r'), m.get('management_edge_n', 0), 'negative = the stop/target pair is destroying value vs just holding')}\n"
         f"- stopped trades that hit target later same day: {stop_rate} "
-        f"(avg eod R of stopped trades: {m.get('avg_eod_r_on_stopped')}) "
-        "— a high rate means stops sit inside the noise\n\n"
+        "(avg eod R of stopped trades: "
+        f"{_stat(m.get('avg_eod_r_on_stopped'), m.get('avg_eod_r_on_stopped_n', 0), 'a high rate means stops sit inside the noise')})\n\n"
         "### Sizing counterfactual\n"
-        f"- n={sc.get('n', 0)}: actual size-weighted total {sc.get('actual_weighted_r')}R vs "
-        f"flat-size {sc.get('flat_size_weighted_r')}R -> sizing edge {sc.get('sizing_edge_r')}R "
+        f"- n={sizing_n}: actual size-weighted total {sc.get('actual_weighted_r')}R vs "
+        f"flat-size {sc.get('flat_size_weighted_r')}R -> sizing edge {sizing_read} "
         "(negative at n>=20 = sizing decisions are destroying value; feed this into the calibration verdict)"
     )
 
@@ -240,29 +277,170 @@ def _no_trade_reason_md(con) -> str:
     )
 
 
-def _v3_sections(mem: dict) -> str:
-    """Render calibration, shadow, staleness, and question-progress data for the miner."""
-    cal = mem.get("calibration", [])
-    cal_md = "\n".join(
-        f"- conviction {c['conviction']}: n={c['n']}, wr={c['win_rate']}, avgR={c['avg_r']}"
-        for c in cal
-    ) or "(no realized calibration rows yet)"
+def _calibration_md(cal: list[dict]) -> str:
+    """The calibration table, with WR/avgR suppressed below the playbook's own
+    n>=8 reporting floor.
 
-    sh = mem.get("shadow", {})
+    Suppressed buckets are still PRINTED. The table's job before it is
+    actionable is to show the desk that conviction is unproven, and a hidden
+    table cannot say that — but a bucket holding one trade rendered as
+    "wr=0.0, avgR=-0.05" says something much worse, which is that conviction 4
+    loses money. Suppression happens in ledger.calibration_aggregate; this
+    renderer only has to not re-derive what was suppressed.
+    """
+    if not cal:
+        return "(no realized calibration rows yet)"
+    lines = []
+    for c in cal:
+        if c.get("suppressed"):
+            lines.append(
+                f"- conviction {c['conviction']}: n={c['n']} — WR/avgR SUPPRESSED "
+                f"(below n={c.get('min_n', 8)}). Report this bucket as "
+                "'insufficient data'. Do not state or imply a direction for it.")
+        else:
+            lines.append(f"- conviction {c['conviction']}: n={c['n']}, "
+                         f"wr={c['win_rate']}, avgR={c['avg_r']}")
+    return "\n".join(lines)
+
+
+def _shadow_md(sh: dict) -> str:
+    """The shadow ledger, with the concentration arithmetic already done.
+
+    `net forgone R` is a SUM over a fat-tailed quantity, so a handful of rows
+    can author it outright. Reported alone it reads as the average price of the
+    filter, which is what it is not: the filter can be right on the median
+    candidate and still show a large positive net because three rejections ran.
+    So the top rows, the net WITHOUT them, and the median row are computed and
+    printed together — and when the tail and the remainder carry opposite
+    signs, that is stated as the headline finding rather than left for the
+    miner to notice.
+    """
+    # `reason` is verbatim prose, so this list is one line per rejection, not a
+    # grouping. It is kept for detail and capped, because thirty paragraphs of
+    # kill-note prose crowd out everything computed above them. The aggregate
+    # that actually answers "which reason costs the most" is by_category.
+    reasons = sh.get("by_reason", [])
     reasons_md = "\n".join(
-        f"  - \"{r['reason']}\": n={r['n']}, net forgone {r['net_forgone_r']:+.2f}R"
-        for r in sh.get("by_reason", [])
+        f"  - \"{r['reason'][:180]}\": n={r['n']}, net forgone {r['net_forgone_r']:+.2f}R"
+        for r in reasons[:12]
     ) or "  (no scored rejections yet)"
-    shadow_md = (
+    if len(reasons) > 12:
+        reasons_md += (f"\n  - ... {len(reasons) - 12} further rows not shown. This "
+                       "list is verbatim kill notes, one line per rejection — it is "
+                       "detail, NOT a grouping. Do not count lines in it to decide "
+                       "which reason is most expensive; use the category table above.")
+    cats_md = "\n".join(
+        f"  - {c['category']}: n={c['n']}, net forgone {c['net_forgone_r']:+.2f}R"
+        for c in sh.get("by_category", [])
+    ) or "  (no scored rejections yet)"
+    top_md = "\n".join(
+        f"  - {t['ticker']} ({t['eod_outcome']}, {t['reason']}): {t['forgone_r']:+.2f}R"
+        for t in sh.get("top_rows", [])
+    ) or "  (none)"
+
+    net = sh.get("net_forgone_r", 0) or 0
+    top3 = sh.get("top3_forgone_r", 0) or 0
+    ex3 = sh.get("net_forgone_r_ex_top3", 0) or 0
+    scored = sh.get("scored_rows", 0) or 0
+    rest_n = max(0, scored - len(sh.get("top_rows", [])))
+
+    if scored and (net > 0) and (ex3 < 0):
+        concentration = (
+            f"READ THIS BEFORE QUOTING THE NET: the headline {net:+.2f}R is a "
+            f"TAIL ARTIFACT. The top 3 rejections contribute {top3:+.2f}R; the "
+            f"other {rest_n} scored rejections net {ex3:+.2f}R — the filters SAVED "
+            "money on everything outside the tail. A net this shape is evidence "
+            "about three rows, not about the filter's typical cost, and it is not "
+            "grounds for loosening anything."
+        )
+    elif scored and abs(top3) > abs(net):
+        concentration = (
+            f"CONCENTRATION WARNING: the top 3 rejections contribute {top3:+.2f}R "
+            f"against a headline net of {net:+.2f}R, so the remaining {rest_n} "
+            f"scored rejections net {ex3:+.2f}R. The sum is dominated by its tail; "
+            "quote the median and the ex-tail net alongside it or not at all."
+        )
+    else:
+        concentration = (
+            f"Top-3 contribution {top3:+.2f}R; the other {rest_n} scored "
+            f"rejections net {ex3:+.2f}R."
+        )
+
+    median = sh.get("median_forgone_r")
+    median_s = f"{median:+.3f}R" if median is not None else "n/a"
+    return (
         f"- trailing sessions with shadow data: {sh.get('sessions', 0)}\n"
         f"- total rejected: {sh.get('total', 0)} "
         f"(would_have_won {sh.get('would_have_won', 0)}, "
         f"would_have_lost {sh.get('would_have_lost', 0)}, "
         f"scratch {sh.get('scratch', 0)}, unmeasurable {sh.get('unmeasurable', 0)})\n"
-        f"- NET FORGONE R (positive = filters cost us): {sh.get('net_forgone_r', 0):+.2f}\n"
+        f"- NET FORGONE R (positive = filters cost us): {net:+.2f} "
+        f"across {scored} scored rows\n"
+        f"- MEDIAN forgone R per scored rejection: {median_s} "
+        "(the typical rejection, which the sum does not describe)\n"
+        f"- NET EXCLUDING the 3 largest: {ex3:+.2f}R\n"
+        f"- {concentration}\n"
+        f"- the 3 largest forgone-R rejections (cite THESE rows, not rows carried "
+        f"over from an earlier week):\n{top_md}\n"
         f"- captured R by taken trades over same window: {sh.get('captured_r_window', 0):+.2f}\n"
-        f"- forgone R grouped by rejection reason:\n{reasons_md}"
+        "- forgone R BY REJECTION CATEGORY (the closed enum — this is the "
+        f"aggregate that answers Open Question #5):\n{cats_md}\n"
+        "  (`uncategorized` = rows written before the category column existed; "
+        "they are not evidence that no category applied, only that none was "
+        "recorded. `other` is a real category meaning the kill-check was not R:R.)\n"
+        f"- verbatim kill notes, largest first (detail, not a grouping):\n{reasons_md}"
     )
+
+
+def _participation_md(pt: dict) -> str:
+    """Is the desk taking enough trades to ever validate anything?
+
+    The shadow ledger asks whether the rejections were right and the ablation
+    asks whether the selections were right. Neither can see a filter stack that
+    is collectively too tight while no single filter is individually wrong,
+    because a desk that almost never trades produces a small, quiet, entirely
+    unremarkable ledger — which is also what a correctly patient desk in a
+    genuinely thin stretch produces. Only the funnel distinguishes them, and
+    only if someone is looking at it.
+    """
+    if not pt or not pt.get("sessions_evaluated"):
+        return "(no non-degraded sessions in the window yet)"
+    pct = lambda v: "n/a" if v is None else f"{v:.1%}"  # noqa: E731
+    per = pt.get("candidates_per_triggered_trade")
+    lines = [
+        f"- sessions evaluated (degraded sessions excluded): {pt['sessions_evaluated']}",
+        f"- sessions with at least one triggered trade: {pt['sessions_traded']} "
+        f"({pct(pt.get('session_trade_rate'))} of sessions)",
+        f"- candidates evaluated: {pt['candidates_evaluated']} "
+        f"({pt['picks_taken']} taken, {pt['rejections']} rejected)",
+        f"- take rate (taken / evaluated): {pct(pt.get('take_rate'))}",
+        f"- trigger rate (triggered / taken): {pct(pt.get('trigger_rate'))}",
+        f"- candidates evaluated per triggered trade: "
+        f"{per if per is not None else 'n/a (nothing triggered)'}",
+    ]
+    if pt.get("picks_triggered", 0) == 0 and pt["candidates_evaluated"] > 0:
+        lines.append(
+            "- STANDING QUESTION: the desk has evaluated candidates and triggered "
+            "NOTHING in this window. Every edge metric in this report is therefore "
+            "uncomputable by construction, and will stay uncomputable until "
+            "participation rises. Treat 'is the filter stack collectively too "
+            "tight?' as an open question in its own right — no single filter need "
+            "be wrong for the conjunction to be.")
+    elif per is not None and per >= 50:
+        lines.append(
+            f"- STANDING QUESTION: {per} candidates evaluated per triggered trade. "
+            "That may be correct patience in a thin stretch, or a filter stack that "
+            "is collectively too tight while no single filter is individually "
+            "wrong. The distinction is not visible in the shadow ledger or the "
+            "ablation; say which you believe and on what evidence.")
+    return "\n".join(lines)
+
+
+def _v3_sections(mem: dict) -> str:
+    """Render calibration, shadow, staleness, and question-progress data for the miner."""
+    cal_md = _calibration_md(mem.get("calibration", []))
+    shadow_md = _shadow_md(mem.get("shadow", {}))
+    participation_md = _participation_md(mem.get("participation", {}))
 
     stale = mem.get("rule_staleness", [])
     stale_md = "\n".join(
@@ -282,9 +460,41 @@ def _v3_sections(mem: dict) -> str:
     return (
         f"## CALIBRATION ROWS (aggregate by stated conviction)\n\n{cal_md}\n\n"
         f"## SHADOW LEDGER (trailing 20 sessions)\n\n{shadow_md}\n\n"
+        f"## PARTICIPATION FUNNEL (trailing 20 non-degraded sessions)\n\n{participation_md}\n\n"
         f"## RULE CONFIRMATIONS / STALENESS (decay threshold: {STALE_SESSIONS} sessions)\n\n{stale_md}\n\n"
-        f"## OPEN QUESTION PROGRESS EVENTS THIS LEDGER\n\n{qp_md}"
+        f"{open_questions.registry_md(qp)}\n\n"
+        f"## OPEN QUESTION PROGRESS EVENTS THIS LEDGER (raw event notes)\n\n{qp_md}"
     )
+
+
+# A markdown row from the Calibration table: | 4 | 1 | 0% | -0.05 | ... |
+# The prose check below keys on "n=8"-style text and never fired on the one
+# table in the playbook that reports a win rate and an avg R side by side, so
+# "conviction 4 -> 0% WR, -0.05R" over a single trade passed every gate the
+# document imposes on its own prose.
+_CAL_ROW = re.compile(
+    r"^\|\s*([1-5])\s*\|\s*(\d+)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|")
+
+
+def _check_calibration_table(playbook_md: str) -> list[str]:
+    """Flag calibration rows that show a win rate or avg R below n=8.
+
+    Same floor the rest of the document declares for itself; the table was
+    simply shaped differently from anything the prose scanner could see.
+    """
+    violations = []
+    empty = {"", "-", "—", "--", "n/a", "na", "insufficient data", "suppressed"}
+    for line in (playbook_md or "").splitlines():
+        m = _CAL_ROW.match(line.strip())
+        if not m:
+            continue
+        n = int(m.group(2))
+        wr, avg_r = m.group(3).strip().lower(), m.group(4).strip().lower()
+        if n < 8 and (wr not in empty or avg_r not in empty):
+            violations.append(
+                f"calibration row conviction {m.group(1)} shows wr={m.group(3).strip()} "
+                f"avgR={m.group(4).strip()} at n={n} (floor is n=8): {line.strip()[:160]}")
+    return violations
 
 
 def _check_wr_suppression(playbook_md: str) -> list[str]:
@@ -462,6 +672,13 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             wr_violations = _check_wr_suppression(new_pb)
             for v in wr_violations:
                 log("weekly", f"WARN WR-suppression violation (n<8 with wr/avgR shown): {v}")
+            for v in _check_calibration_table(new_pb):
+                log("weekly", f"WARN calibration-table suppression violation: {v}")
+            # A pre-registered threshold the weekly rewrite can restate is not
+            # pre-registered. agent/open_questions.py holds the declared bars;
+            # this is where a rewrite that moved one becomes visible.
+            for v in open_questions.check_playbook_questions(new_pb):
+                log("weekly", f"WARN open-question registry violation: {v}")
             for v in integrity.check_playbook(new_pb, research_block["states"]):
                 log("weekly", f"WARN playbook violation: {v}")
             version = write_playbook(new_pb, mined.get("changelog", ""), con)

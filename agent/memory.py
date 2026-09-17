@@ -19,6 +19,7 @@ from typing import Any
 
 from . import ledger
 from .config import PLAYBOOK_HISTORY_DIR, PLAYBOOK_PATH, Config
+from .util import log
 
 _HOSTED = lambda: bool(os.environ.get("DATABASE_URL"))  # noqa: E731
 
@@ -51,6 +52,27 @@ def read_playbook(con: Any = None) -> tuple[str, str]:
     return text, (m.group(1) if m else "1")
 
 
+# A "## Changelog (vN)" section, through to the next h2 or end of document,
+# together with any "---" rule immediately preceding it.
+_CHANGELOG_SECTION = re.compile(
+    r"\n+(?:-{3,}\s*\n+)?##[ \t]+Changelog\b[^\n]*\n(?:(?!\n##[ \t]).)*",
+    re.DOTALL | re.IGNORECASE)
+
+
+def _strip_changelog_sections(markdown: str) -> tuple[str, int]:
+    """Remove Changelog sections from a miner-written playbook body.
+
+    The document contract does not list a Changelog section: the `changelog`
+    field is separate, and THIS function is what turns it into one. When the
+    miner writes its own as well, both survive and the document ends with two
+    headings reading "Changelog (v5)" -- which is what shipped in v5. Stripping
+    here means a non-compliant response cannot duplicate the section, rather
+    than the duplication depending on the model following an instruction.
+    """
+    stripped, n = _CHANGELOG_SECTION.subn("", markdown)
+    return stripped.rstrip() + "\n", n
+
+
 def write_playbook(new_markdown: str, changelog: str, con: Any = None) -> str:
     """Archive current playbook, write new one with bumped version. Returns new version."""
     old_text, old_version = read_playbook(con)
@@ -60,6 +82,11 @@ def write_playbook(new_markdown: str, changelog: str, con: Any = None) -> str:
         new_markdown = re.sub(r"<!--\s*version:\s*\d+\s*-->", f"<!-- version: {new_version} -->", new_markdown)
     else:
         new_markdown = f"<!-- version: {new_version} -->\n\n" + new_markdown
+    new_markdown, n_stripped = _strip_changelog_sections(new_markdown)
+    if n_stripped:
+        log("weekly", f"Stripped {n_stripped} Changelog section(s) the miner wrote into "
+                      "playbook_markdown; the canonical changelog is appended from the "
+                      "`changelog` field")
     if changelog:
         new_markdown += f"\n\n---\n\n## Changelog (v{new_version})\n\n{changelog}\n"
 
@@ -268,6 +295,10 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         "shadow": ledger.shadow_summary(con, 20),
         "rule_staleness": ledger.rule_staleness(con),
         "question_progress": ledger.question_progress_totals(con),
+        # How much of what the desk evaluates does it act on? Neither the
+        # shadow ledger nor the ablation can see a filter stack that is
+        # collectively too tight while no single filter is wrong.
+        "participation": ledger.participation_funnel(con, 20),
         # deterministic counterfactuals: null model, trade management, sizing skill
         "management": ledger.management_quality(con),
         "sizing_cf": ledger.sizing_counterfactual(con),

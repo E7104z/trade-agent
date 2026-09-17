@@ -51,10 +51,19 @@ from __future__ import annotations
 import random
 from typing import Any
 
-__all__ = ["candidate_pool", "random_pick_ablation", "ablation_md"]
+__all__ = ["candidate_pool", "random_pick_ablation", "ablation_md",
+           "MIN_VERDICT_PICKS", "MIN_VERDICT_SESSIONS"]
 
 DEFAULT_DRAWS = 5000
 DEFAULT_SEED = 20260827
+
+# Below these the percentile is still computed and still exact -- it is simply
+# a statement about the picks in hand rather than about the risk manager, so
+# the generalizing verdict sentence is withheld. Picks matches the playbook's
+# n>=8 reporting floor; sessions is set lower because one busy session is not
+# five, but five thin ones do span different tapes.
+MIN_VERDICT_PICKS = 8
+MIN_VERDICT_SESSIONS = 5
 
 
 def candidate_pool(
@@ -225,7 +234,22 @@ def ablation_md(res: dict[str, Any]) -> str:
         )
 
     pct = res["percentile"]
-    if pct >= 95:
+    # The Monte Carlo is exact for any number of sessions -- but over one
+    # session with one pick it answers "where did this single trade rank among
+    # its peers that morning", which is a fact about one morning. The verdict
+    # sentence generalizes it to "the risk manager's selection", so the verdict
+    # waits for enough picks to be about the risk manager rather than about a
+    # trade.
+    if res["picks"] < MIN_VERDICT_PICKS or res["sessions"] < MIN_VERDICT_SESSIONS:
+        verdict = (
+            f"NO VERDICT — {res['sessions']} session(s) and {res['picks']} pick(s) "
+            f"is below the bar for reading this figure ({MIN_VERDICT_SESSIONS} "
+            f"sessions and {MIN_VERDICT_PICKS} picks). The percentile is exact and "
+            "it is about these picks, not about the risk manager. Do not describe "
+            "selection as good, bad, or indistinguishable, and do not pair it with "
+            "the management counterfactual as a contrast"
+        )
+    elif pct >= 95:
         verdict = ("the risk manager's selection is beating random draws from its "
                    "own candidate pool")
     elif pct <= 5:

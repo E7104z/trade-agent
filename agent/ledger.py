@@ -1101,36 +1101,68 @@ def trailing_weighted_r(con: duckdb.DuckDBPyConnection, n: int = 10) -> dict:
 def management_quality(con: duckdb.DuckDBPyConnection) -> dict:
     """Deterministic counterfactual aggregates: is the stop/target machinery adding
     value over just holding, are stops inside the noise, and does the desk beat
-    the naive same-name open->close baseline (the null model)?"""
+    the naive same-name open->close baseline (the null model)?
+
+    Every average here carries its OWN n, because they are computed over
+    different row sets: a trade can be triggered but ungraded, graded but
+    missing `eod_r`, or graded but missing `baseline_r`. Reporting one
+    `triggered` count beside four averages invited the reader to attach the
+    largest n to whichever number was most interesting.
+
+    `edge_vs_baseline_r` and `management_edge_r` are PAIRED differences -- the
+    mean of (actual - counterfactual) over rows that have BOTH -- not a
+    difference of two means taken over different samples. The unpaired form
+    silently compares a mean over one set of trades against a mean over
+    another, and the gap between two such means is not an edge estimate.
+    """
     row = con.execute(
         """SELECT
              SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END),
              AVG(CASE WHEN o.triggered THEN o.r_multiple END),
+             COUNT(CASE WHEN o.triggered AND o.r_multiple IS NOT NULL
+                        THEN 1 END),
              AVG(CASE WHEN o.triggered THEN o.baseline_r END),
+             COUNT(CASE WHEN o.triggered AND o.baseline_r IS NOT NULL
+                        THEN 1 END),
+             AVG(CASE WHEN o.triggered AND o.r_multiple IS NOT NULL
+                       AND o.baseline_r IS NOT NULL
+                      THEN o.r_multiple - o.baseline_r END),
+             COUNT(CASE WHEN o.triggered AND o.r_multiple IS NOT NULL
+                         AND o.baseline_r IS NOT NULL THEN 1 END),
              AVG(CASE WHEN o.triggered AND o.eod_r IS NOT NULL
                       THEN o.r_multiple - o.eod_r END),
+             COUNT(CASE WHEN o.triggered AND o.r_multiple IS NOT NULL
+                         AND o.eod_r IS NOT NULL THEN 1 END),
              SUM(CASE WHEN o.exit_reason = 'stop' THEN 1 ELSE 0 END),
              SUM(CASE WHEN o.exit_reason = 'stop' AND o.target_hit_after_stop
                       THEN 1 ELSE 0 END),
              AVG(CASE WHEN o.exit_reason = 'stop' THEN o.eod_r END),
+             COUNT(CASE WHEN o.exit_reason = 'stop' AND o.eod_r IS NOT NULL
+                        THEN 1 END),
              AVG(CASE WHEN o.triggered = FALSE AND o.baseline_r IS NOT NULL
                       THEN o.baseline_r END),
              SUM(CASE WHEN o.triggered = FALSE AND o.baseline_r IS NOT NULL
                       THEN 1 ELSE 0 END)
            FROM outcomes o"""
     ).fetchone()
-    (n_trig, avg_r, avg_base, mgmt_edge, n_stop, n_stop_then_target,
-     avg_eod_stopped, avg_base_untrig, n_untrig) = row
+    (n_trig, avg_r, n_avg_r, avg_base, n_base, edge_vs_base, n_edge,
+     mgmt_edge, n_mgmt, n_stop, n_stop_then_target, avg_eod_stopped,
+     n_eod_stopped, avg_base_untrig, n_untrig) = row
     rnd = lambda v: round(float(v), 3) if v is not None else None  # noqa: E731
     return {
         "triggered": n_trig or 0,
         "avg_r": rnd(avg_r),
+        "avg_r_n": int(n_avg_r or 0),
         "avg_baseline_r": rnd(avg_base),
-        "edge_vs_baseline_r": rnd((avg_r - avg_base) if avg_r is not None and avg_base is not None else None),
-        "management_edge_r": rnd(mgmt_edge),          # actual R minus hold-to-close R
+        "avg_baseline_r_n": int(n_base or 0),
+        "edge_vs_baseline_r": rnd(edge_vs_base),      # paired: actual minus same-name open->close
+        "edge_vs_baseline_n": int(n_edge or 0),
+        "management_edge_r": rnd(mgmt_edge),          # paired: actual minus hold-to-close
+        "management_edge_n": int(n_mgmt or 0),
         "stopped": n_stop or 0,
         "stopped_then_target": n_stop_then_target or 0,
         "avg_eod_r_on_stopped": rnd(avg_eod_stopped), # what stopped trades did by the close
+        "avg_eod_r_on_stopped_n": int(n_eod_stopped or 0),
         "untriggered_with_baseline": n_untrig or 0,
         "avg_baseline_r_untriggered": rnd(avg_base_untrig),  # what fussy entries walked away from
     }
@@ -1288,7 +1320,10 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20) 
         "ORDER BY plan_date DESC LIMIT ?", [trailing_sessions]).fetchall()]
     if not dates:
         return {"sessions": 0, "total": 0, "would_have_won": 0, "would_have_lost": 0,
-                "scratch": 0, "unmeasurable": 0, "net_forgone_r": 0.0, "by_reason": [],
+                "scratch": 0, "unmeasurable": 0, "net_forgone_r": 0.0,
+                "scored_rows": 0, "top3_forgone_r": 0.0,
+                "net_forgone_r_ex_top3": 0.0, "median_forgone_r": None,
+                "top_rows": [], "by_reason": [], "by_category": [],
                 "captured_r_window": 0.0}
     lo = min(dates)
     row = con.execute(
@@ -1314,17 +1349,127 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20) 
            FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?
              AND COALESCE(session_degraded, FALSE) = FALSE
            GROUP BY reason ORDER BY SUM(COALESCE(forgone_r,0)) DESC""", [lo]).fetchall()
+    # `reason` is the risk manager's verbatim prose, so grouping on it produces
+    # one group per rejection -- a list wearing a GROUP BY. Open Question #5
+    # ("which rejection reasons forgo the most R?") cannot be answered from it
+    # at all, and the answer that reached the playbook instead came from the
+    # miner reading free text and counting by eye. `rejection_category` is the
+    # closed enum the morning loop already writes; group on that. Rows written
+    # before the column existed are bucketed as `uncategorized` under their own
+    # name rather than folded into `other`, which is a real category meaning
+    # "we looked and it was not R:R".
+    by_category = con.execute(
+        """SELECT COALESCE(rejection_category, 'uncategorized'), COUNT(*),
+                  ROUND(CAST(SUM(COALESCE(forgone_r,0)) AS NUMERIC), 2)
+           FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?
+             AND COALESCE(session_degraded, FALSE) = FALSE
+           GROUP BY 1 ORDER BY SUM(COALESCE(forgone_r,0)) DESC""", [lo]).fetchall()
     captured = con.execute(
         """SELECT COALESCE(SUM(o.r_multiple * COALESCE(p.size_r,1)), 0)
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
            WHERE o.triggered AND o.eval_date >= ?""", [lo]).fetchone()[0]
+
+    # CONCENTRATION. `net_forgone_r` is a SUM, and a sum over a fat-tailed
+    # quantity is the one summary statistic a handful of rows can author on
+    # their own. Reported alone it reads as "the filter costs this much per
+    # rejection," which is exactly what it does not mean: a filter can be
+    # correct on the median candidate and still show a large positive net
+    # because three rejections ran. So the arithmetic that settles it is
+    # computed here rather than left to the miner's eye -- the top rows, what
+    # the net is WITHOUT them, and the median row. When the tail and the
+    # remainder disagree in SIGN, the sum is a statement about the tail and
+    # nothing else.
+    scored = [float(r[0]) for r in con.execute(
+        """SELECT forgone_r FROM rejections
+           WHERE eod_outcome IS NOT NULL AND plan_date >= ? AND forgone_r IS NOT NULL
+           ORDER BY forgone_r DESC""", [lo]).fetchall()]
+    top_rows = [
+        {"ticker": r[0], "reason": r[1], "eod_outcome": r[2],
+         "forgone_r": round(float(r[3]), 2)}
+        for r in con.execute(
+            """SELECT ticker, reason, eod_outcome, forgone_r FROM rejections
+               WHERE eod_outcome IS NOT NULL AND plan_date >= ? AND forgone_r IS NOT NULL
+               ORDER BY forgone_r DESC LIMIT 3""", [lo]).fetchall()
+    ]
+    net = round(row[5] or 0.0, 2)
+    top3 = round(sum(scored[:3]), 2)
+    median = None
+    if scored:
+        mid = sorted(scored)
+        k = len(mid) // 2
+        median = round(mid[k] if len(mid) % 2 else (mid[k - 1] + mid[k]) / 2.0, 3)
     return {
         "sessions": len(dates), "total": row[0] or 0,
         "would_have_won": row[1] or 0, "would_have_lost": row[2] or 0,
         "scratch": row[3] or 0, "unmeasurable": row[4] or 0,
-        "net_forgone_r": round(row[5] or 0.0, 2),
+        "net_forgone_r": net,
+        "scored_rows": len(scored),
+        "top3_forgone_r": top3,
+        "net_forgone_r_ex_top3": round(net - top3, 2),
+        "median_forgone_r": median,
+        "top_rows": top_rows,
         "by_reason": [{"reason": r[0], "n": r[1], "net_forgone_r": float(r[2]) if r[2] is not None else 0.0} for r in by_reason],
+        "by_category": [{"category": r[0], "n": r[1], "net_forgone_r": float(r[2]) if r[2] is not None else 0.0} for r in by_category],
         "captured_r_window": round(float(captured or 0.0), 2),
+    }
+
+
+def participation_funnel(con: duckdb.DuckDBPyConnection,
+                         trailing_sessions: int = 20) -> dict:
+    """How much of what the desk EVALUATES does it actually act on?
+
+    The shadow ledger answers "were the rejections right?" and the ablation
+    answers "were the selections right?" Neither answers "is the desk taking
+    enough trades to ever find out?" -- a filter stack where no single filter
+    is individually wrong can still be collectively so tight that the evidence
+    needed to validate anything never accumulates. That failure is invisible
+    in every other aggregate here, because a desk that trades almost never has
+    a small, quiet, entirely unremarkable ledger.
+
+    Degraded sessions are excluded, for the same reason they are excluded from
+    every other selectivity judgment: on those days the pipeline could not
+    evaluate the market, so the resulting no-trade was plumbing, not patience.
+    """
+    try:
+        dates = [r[0] for r in con.execute(
+            "SELECT plan_date FROM daily_plans "
+            "WHERE COALESCE(session_degraded, FALSE) = FALSE "
+            "ORDER BY plan_date DESC LIMIT ?", [trailing_sessions]).fetchall()]
+    except Exception:
+        dates = [r[0] for r in con.execute(
+            "SELECT plan_date FROM daily_plans ORDER BY plan_date DESC LIMIT ?",
+            [trailing_sessions]).fetchall()]
+    empty = {"sessions_evaluated": 0, "sessions_traded": 0, "candidates_evaluated": 0,
+             "picks_taken": 0, "picks_triggered": 0, "rejections": 0,
+             "take_rate": None, "trigger_rate": None, "session_trade_rate": None,
+             "candidates_per_triggered_trade": None}
+    if not dates:
+        return empty
+    lo = min(dates)
+
+    n_rej = con.execute(
+        "SELECT COUNT(*) FROM rejections WHERE plan_date >= ?", [lo]).fetchone()[0] or 0
+    n_picks = con.execute(
+        "SELECT COUNT(*) FROM picks WHERE plan_date >= ?", [lo]).fetchone()[0] or 0
+    n_trig, n_days_traded = con.execute(
+        """SELECT COUNT(*), COUNT(DISTINCT p.plan_date)
+           FROM picks p JOIN outcomes o ON o.pick_id = p.pick_id
+           WHERE p.plan_date >= ? AND o.triggered""", [lo]).fetchone()
+    n_trig, n_days_traded = int(n_trig or 0), int(n_days_traded or 0)
+
+    evaluated = n_picks + n_rej
+    pct = lambda a, b: round(a / b, 4) if b else None  # noqa: E731
+    return {
+        "sessions_evaluated": len(dates),
+        "sessions_traded": n_days_traded,
+        "candidates_evaluated": evaluated,
+        "picks_taken": n_picks,
+        "picks_triggered": n_trig,
+        "rejections": n_rej,
+        "take_rate": pct(n_picks, evaluated),
+        "trigger_rate": pct(n_trig, n_picks),
+        "session_trade_rate": pct(n_days_traded, len(dates)),
+        "candidates_per_triggered_trade": round(evaluated / n_trig, 1) if n_trig else None,
     }
 
 
@@ -1342,7 +1487,19 @@ def add_calibration_row(con: duckdb.DuckDBPyConnection, session_date: date, tick
     )
 
 
-def calibration_aggregate(con: duckdb.DuckDBPyConnection) -> list[dict]:
+# The playbook's own reporting floor: WR/avgR are shown only at n >= 8. The
+# calibration table is not exempt from it. A conviction bucket holding one
+# realized trade rendered "0% WR, -0.05R" -- three decimal places of nothing,
+# in the one table whose entire purpose is to say whether stated confidence
+# means anything. Suppression happens at the source so no renderer has to
+# remember, and so the suppressed rows are still visible AS rows: the point of
+# the table before it is actionable is to show the desk that conviction is
+# unproven, which a hidden table cannot do.
+CALIBRATION_MIN_N = 8
+
+
+def calibration_aggregate(con: duckdb.DuckDBPyConnection,
+                          min_n: int = CALIBRATION_MIN_N) -> list[dict]:
     rows = con.execute(
         """SELECT stated_conviction, COUNT(*),
                   SUM(CASE WHEN win THEN 1 ELSE 0 END),
@@ -1350,9 +1507,19 @@ def calibration_aggregate(con: duckdb.DuckDBPyConnection) -> list[dict]:
            FROM calibration WHERE realized_r IS NOT NULL
            GROUP BY stated_conviction ORDER BY stated_conviction DESC"""
     ).fetchall()
-    return [{"conviction": r[0], "n": r[1],
-             "win_rate": round((r[2] or 0) / r[1], 3) if r[1] else None,
-             "avg_r": float(r[3]) if r[3] is not None else None} for r in rows]
+    out = []
+    for r in rows:
+        n = int(r[1] or 0)
+        suppressed = n < min_n
+        out.append({
+            "conviction": r[0],
+            "n": n,
+            "win_rate": None if suppressed else (round((r[2] or 0) / n, 3) if n else None),
+            "avg_r": None if suppressed else (float(r[3]) if r[3] is not None else None),
+            "suppressed": suppressed,
+            "min_n": min_n,
+        })
+    return out
 
 
 # ------------------------------------------------- v3: rule confirmations / decay

@@ -15,6 +15,7 @@ import pytest
 
 from agent import migrations_v4
 from agent.population import (
+    MIN_VERDICT_N,
     POPULATION_SIM_VERSION,
     grade_population,
     population_md,
@@ -287,12 +288,46 @@ def test_population_md_states_the_verdict_and_the_precision_limit(con):
     d = _seed(con)
     grade_population(con, _MD({"AAAA": _bar(100, 104, 99, 103),
                                "BBBB": _bar(100, 101, 95, 96)}), d)
-    _desk(con, [0.1, 0.2, 0.1])
+    # At or above MIN_VERDICT_N, so the verdict sentence is earned.
+    _desk(con, [0.1, 0.2, 0.1, 0.1, 0.2, 0.1, 0.1, 0.2])
     md = population_md(population_stats(con))
     assert "SELECTION EDGE" in md
     assert "DESTROYING value" in md
     assert "biases the monkeys DOWNWARD" in md.replace("that biases", "biases")
     assert "CANNOT answer this question" in md
+
+
+def test_population_md_withholds_the_verdict_below_the_reporting_floor(con):
+    """The edge is computable at n=1 and meaningless there. The number is still
+    printed -- watching it accumulate is the point -- but it carries no
+    direction, because "DESTROYING value" over one trade reads as a finding
+    about the risk manager rather than as one outcome minus an average."""
+    d = _seed(con)
+    grade_population(con, _MD({"AAAA": _bar(100, 104, 99, 103),
+                               "BBBB": _bar(100, 101, 95, 96)}), d)
+    _desk(con, [0.1])
+    stats = population_stats(con)
+    md = population_md(stats)
+    assert stats["selection_edge_r"] is not None      # still computed
+    assert "SELECTION EDGE" in md                     # still shown
+    assert "NO VERDICT" in md
+    assert "DESTROYING value" not in md
+    assert "ADDING value" not in md
+    # and it names the trap the young ledger invites
+    assert "management counterfactual" in md
+
+
+def test_population_md_verdict_floor_is_the_playbook_reporting_floor(con):
+    d = _seed(con)
+    grade_population(con, _MD({"AAAA": _bar(100, 104, 99, 103),
+                               "BBBB": _bar(100, 101, 95, 96)}), d)
+    _desk(con, [0.1] * (MIN_VERDICT_N - 1))
+    assert "NO VERDICT" in population_md(population_stats(con))
+    # one more triggered trade clears the floor; _desk numbers pick_ids from 0,
+    # so this row gets an id of its own rather than reusing one.
+    con.execute("INSERT INTO outcomes (pick_id, triggered, r_multiple) VALUES (?, TRUE, ?)",
+                [999, 0.1])
+    assert "NO VERDICT" not in population_md(population_stats(con))
 
 
 def test_population_md_is_explicit_when_there_is_nothing_to_report(con):

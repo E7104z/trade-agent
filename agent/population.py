@@ -54,6 +54,7 @@ from datetime import date, datetime
 from typing import Any, Iterable
 
 __all__ = [
+    "MIN_VERDICT_N",
     "POPULATION_SIM_VERSION",
     "snapshot_universe",
     "simulate_population_row",
@@ -61,6 +62,12 @@ __all__ = [
     "population_stats",
     "population_md",
 ]
+
+# Triggered desk trades required before the selection edge is allowed to carry
+# a direction. Matches the playbook's own n>=8 reporting floor: the number is
+# computable at n=1 and meaningless there, and a computable meaningless number
+# printed beside the word "DESTROYING" is read as a finding.
+MIN_VERDICT_N = 8
 
 # Bumped independently of grading.CURRENT_SIM_VERSION: this is a different
 # simulator with different (coarser) semantics, and conflating the two version
@@ -422,16 +429,36 @@ def population_md(stats: dict[str, Any]) -> str:
         edge = stats["selection_edge_r"]
         p = stats.get("selection_edge_p")
         p_s = f"{p:.3f}" if p is not None else "n/a"
-        verdict = (
-            "the desk's name selection is ADDING value over the population"
-            if edge > 0 else
-            "the desk's name selection is DESTROYING value — a mechanical rule "
-            "over the same population did better"
-        )
-        lines.append(
-            f"\n**SELECTION EDGE = {edge:+.3f}R** (desk avgR minus the BEST monkey, "
-            f"'{stats['best_arm']}'), Welch p={p_s}. Read: {verdict}."
-        )
+        d_n = d["n"]
+        if d_n < MIN_VERDICT_N:
+            # A selection edge is a difference between the desk's MEAN and a
+            # monkey's mean. At n=1 the desk has no mean, it has a trade. The
+            # subtraction still returns a number, and that number used to
+            # arrive wearing a verdict ("DESTROYING value") that reads as a
+            # finding about the risk manager's judgment rather than as one
+            # outcome minus an average.
+            lines.append(
+                f"\n**SELECTION EDGE = {edge:+.3f}R** (desk avgR minus the BEST "
+                f"monkey, '{stats['best_arm']}'), desk n={d_n}, Welch p={p_s}.\n"
+                f"**NO VERDICT — desk n={d_n} is below n={MIN_VERDICT_N}.** This is "
+                f"the arithmetic gap between a mean over {d_n} trade(s) and a mean "
+                "over many. Quote it as an unresolved measurement or not at all. Do "
+                "not call selection good or bad, do not contrast it with the "
+                "management counterfactual, and do not present the two pointing "
+                "opposite ways as a pattern to watch: at this n they cannot agree "
+                "or disagree about anything."
+            )
+        else:
+            verdict = (
+                "the desk's name selection is ADDING value over the population"
+                if edge > 0 else
+                "the desk's name selection is DESTROYING value — a mechanical rule "
+                "over the same population did better"
+            )
+            lines.append(
+                f"\n**SELECTION EDGE = {edge:+.3f}R** (desk avgR minus the BEST monkey, "
+                f"'{stats['best_arm']}'), desk n={d_n}, Welch p={p_s}. Read: {verdict}."
+            )
         lines.append(
             "\nThis is the number that decides whether candidate selection has "
             "edge. `edge_vs_baseline_r` elsewhere in this prompt is conditioned "

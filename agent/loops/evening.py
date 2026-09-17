@@ -41,6 +41,32 @@ Q_STOP_ATR_SWEET_SPOT = 9      # do 1-2 ATR stops out-R sub-0.5 ATR stops?
 Q_BLUE_SKY_VS_OVERHEAD = 10    # gaps near the 52w high vs gaps into the 20d range
 Q_TREND_ALIGNMENT_200D = 11    # longs above vs below the 200d MA (shorts mirrored)
 Q_SHORTEDNESS = 12             # does short%float >= 15 separate squeeze winners from chop?
+# R:R threshold test -- ONE experiment, TWO arms, so two ids: a single counter
+# cannot say whether each bucket has enough rows to compare. Ids 13/14 and not
+# 7: the miner minted this as playbook "#7" in v4, which already belonged to
+# Q_RVOL_SEPARATION here, so RVOL observations were being read as progress on
+# an R:R experiment. See agent/open_questions.py.
+Q_RR_TEST_TAKEN = 13           # taken trades at planned R:R >= 2.0
+Q_RR_TEST_SHADOW = 14          # rejected candidates at 1.8 <= R:R < 2.0
+
+
+def _planned_rr(row: dict) -> float | None:
+    """Planned reward:risk from the stored level structure.
+
+    Direction-agnostic on purpose: it is |target - entry| / |entry - stop|, and
+    a row whose levels are the wrong side of entry for its direction yields a
+    number that is still the ratio the risk manager was looking at.
+    """
+    try:
+        entry = float(row["entry_price"])
+        stop = float(row["stop_price"])
+        target = float(row["target_price"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    return abs(target - entry) / risk
 
 
 def _pick_for_review(r: dict, picks: list[dict]) -> dict | None:
@@ -252,7 +278,8 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
     the rejections table), which behaves the same as a pick with no time_stop.
     """
     rejections = ledger.ungraded_rejections(con, d)
-    summary = {"scored": 0, "net_forgone_r": 0.0, "gap_fade_notes": []}
+    summary = {"scored": 0, "net_forgone_r": 0.0, "gap_fade_notes": [],
+               "rr_band_notes": []}
     for r in rejections:
         try:
             bars = md.minute_bars(r["ticker"], d)
@@ -273,6 +300,16 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
                        + (f" {forgone:+.2f}R" if forgone is not None else ""))
         if r.get("setup_type") == "gap_fade":
             summary["gap_fade_notes"].append((r, sim, bars))
+        # Arm B of the R:R threshold test. Only measurable rows count -- an
+        # unmeasurable rejection contributes nothing to the comparison, so
+        # counting it toward the threshold would let the bucket "fill" with
+        # rows that can never be compared against anything.
+        rr = r.get("planned_rr")
+        if rr is None:
+            rr = _planned_rr(r)
+        if rr is not None and 1.8 <= rr < 2.0 and eod_outcome != "unmeasurable":
+            summary["rr_band_notes"].append(
+                (r["ticker"], round(float(rr), 3), eod_outcome, forgone))
     summary["net_forgone_r"] = round(summary["net_forgone_r"], 2)
     return summary
 
@@ -466,6 +503,25 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
                 con, Q_SHORTEDNESS, d, 1,
                 f"{p['ticker']} short_pct_float={o['short_pct_float']} R={o.get('r_multiple')}")
             counts["q_increments"] += 1
+
+    # Q13 / Q14: the two arms of the R:R threshold test. Both are written here
+    # so the registry's Progress lines are observations the system recorded,
+    # not the miner's estimate from re-reading the shadow ledger each week.
+    for p in picks:
+        o = by_id.get(p["pick_id"], {})
+        rr = _planned_rr(p)
+        if o.get("triggered") and rr is not None and rr >= 2.0:
+            ledger.add_question_progress(
+                con, Q_RR_TEST_TAKEN, d, 1,
+                f"{p['ticker']} planned R:R={rr:.2f} R={o.get('r_multiple')}")
+            counts["q_increments"] += 1
+
+    for ticker, rr, eod_outcome, forgone in shadow.get("rr_band_notes", []):
+        ledger.add_question_progress(
+            con, Q_RR_TEST_SHADOW, d, 1,
+            f"{ticker} planned R:R={rr:.2f} (1.8-2.0 band) {eod_outcome} "
+            f"forgone={forgone if forgone is None else round(forgone, 2)}R")
+        counts["q_increments"] += 1
 
     counts["q_increments"] += _q1_gap_fade_mechanics(con, md, d, picks, outcomes, shadow,
                                                      slippage_bps=slippage_bps)
