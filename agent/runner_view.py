@@ -126,9 +126,20 @@ def _health_line(s: dict) -> str:
             why.append(f"feed downgraded to {gates.get('feed')}")
         return "DEGRADED - " + (", ".join(why) or "see gates") + \
                ". Treat a thin candidate list as an outage, not a stand-down."
+    # A structural outage check that does NOT depend on provider_degraded
+    # having been set. Sessions recorded before that flag existed - or by any
+    # future path that forgets to set it - would otherwise be reported as clean
+    # stand-downs. If essentially every scanned symbol returned no bars, no
+    # condition was ever evaluated, so there is nothing to stand down from.
+    no_bars = sess.get("rejected_no_bars") or 0
+    if uni and no_bars >= uni * 0.9:
+        return (f"DEGRADED - {no_bars} of {uni} symbols returned NO BARS. "
+                f"No condition was evaluated; this is a data outage, not a "
+                f"stand-down.")
     if s["n_candidates"] == 0:
-        return (f"Genuine stand-down: {uni} symbols scanned, none met the "
-                f"conditions. Not a failure.")
+        evaluated = uni - no_bars - (sess.get("rejected_too_few_bars") or 0)
+        return (f"Genuine stand-down: {uni} scanned, {evaluated} had enough "
+                f"bars to evaluate, none met the conditions. Not a failure.")
     feed = gates.get("feed", "?")
     note = ""
     if gates.get("feed_downgraded"):
