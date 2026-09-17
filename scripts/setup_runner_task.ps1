@@ -36,6 +36,28 @@ $startStr    = $startLocal.ToString("HH:mm")
 
 Write-Host "This machine is $offsetHours h from ET; 10:15 ET = $startStr local."
 
+# --- Where does the evidence land? ----------------------------------------
+# agent/ledger.py connects to Postgres when DATABASE_URL is set, and to the
+# local DuckDB file otherwise. The hosted dashboard at iwilltrade.com reads
+# Postgres. So without DATABASE_URL the scan still runs and still places the
+# same paper orders, but the dashboard shows nothing and the lane looks dead.
+$dbUrl = [Environment]::GetEnvironmentVariable("DATABASE_URL", "User")
+if (-not $dbUrl) { $dbUrl = $env:DATABASE_URL }
+if ($dbUrl) {
+    Write-Host "DATABASE_URL is set - results will appear on the web dashboard."
+} else {
+    Write-Host ""
+    Write-Host "NOTE: DATABASE_URL is not set." -ForegroundColor Yellow
+    Write-Host "  The scan will run and place orders, but its results go to the"
+    Write-Host "  LOCAL database, so iwilltrade.com will keep showing 'no scan"
+    Write-Host "  recorded'. To put them on the dashboard, copy DATABASE_URL"
+    Write-Host "  from Vercel (Project > Settings > Environment Variables) and"
+    Write-Host "  run ONCE, then re-run this script:"
+    Write-Host ""
+    Write-Host "    [Environment]::SetEnvironmentVariable('DATABASE_URL','<paste>','User')" -ForegroundColor Cyan
+    Write-Host ""
+}
+
 $taskName = "TradeAgent-Runner"
 $action = New-ScheduledTaskAction -Execute $python `
     -Argument "run.py runner --loop --every 300" `

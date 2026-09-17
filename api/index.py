@@ -227,6 +227,46 @@ function render(d) {
       <th>Stop</th><th>Target</th><th>Conv</th><th>Kill reason</th><th>Thesis</th><th>Shadow outcome</th></tr>${shadowRows}</table>`;
   }
 
+  // ── Runner lane ──────────────────────────────────────────────────────
+  const rn = d.runner || {};
+  let runnerHtml = "";
+  if (rn.ran) {
+    const bad  = /^DEGRADED|^NO SCAN/.test(rn.health || "");
+    const quiet = /stand-down/.test(rn.health || "");
+    const col  = bad ? "#f85149" : (quiet ? "#d29922" : "#3fb950");
+    const rows = (rn.rows || []).map(r => {
+      const sel = r.selected ? `<span style="color:#3fb950;font-weight:700">#${r.rank}</span>` : "";
+      const n = (v, dg) => (v==null ? "—" : Number(v).toFixed(dg==null?2:dg));
+      const rc = r.r_multiple==null ? "#8b949e" : (r.r_multiple>0 ? "#3fb950" : "#f85149");
+      return `<tr><td>${sel}</td><td><b>${r.ticker}</b></td><td>${r.detection_et||""}</td>
+        <td>${n(r.price)}</td><td>${n(r.stop)}</td><td>${n(r.target)}</td>
+        <td>${n(r.rvol)}</td><td>${n(r.vwap_pct)}</td><td>${n(r.tc,1)}</td>
+        <td>${n(r.change_pct)}</td><td style="color:${rc}">${n(r.r_multiple)}</td>
+        <td>${r.exit_reason||""}</td></tr>`;
+    }).join("");
+    const table = rows
+      ? `<table style="margin-top:12px"><tr><th></th><th>Ticker</th><th>Det ET</th>
+         <th>Price</th><th>Stop</th><th>Target</th><th>RVOL</th><th>VWAP%</th>
+         <th>TC</th><th>Chg%</th><th>R</th><th>Exit</th></tr>${rows}</table>`
+      : "";
+    runnerHtml = `<div class="card"><h2>Runner Lane — ${d.today}</h2>
+      <p style="color:${col};font-weight:600">${rn.health||""}</p>
+      ${rn.skipped_reason ? `<p style="color:#8b949e">selection: ${rn.skipped_reason}</p>` : ""}
+      <div class="grid">
+        <div class="stat"><div class="v">${rn.universe||0}</div>scanned</div>
+        <div class="stat"><div class="v">${rn.n_candidates||0}</div>candidates</div>
+        <div class="stat"><div class="v">${rn.n_selected||0}</div>selected</div>
+        <div class="stat"><div class="v">${rn.n_orders||0}</div>live orders</div>
+      </div>${table}
+      <p style="color:#8b949e;font-size:12px;margin-top:10px">
+        Every candidate is priced by the evening simulator, selected or not —
+        that is what makes “did picking help?” answerable. Rows marked #N were chosen.
+      </p></div>`;
+  } else {
+    runnerHtml = `<div class="card"><h2>Runner Lane — ${d.today}</h2>
+      <p style="color:#8b949e">${rn.health || "No scan recorded for today."}</p></div>`;
+  }
+
   el.innerHTML = `
   <div class="card"><h2>Today's Plan — ${d.today}</h2>${planHtml}</div>
   <div class="card"><h2>Performance</h2>
@@ -240,6 +280,7 @@ function render(d) {
     </div></div>
   <div class="card"><h2>By Setup</h2><table><tr><th>Setup</th><th>N</th><th>Triggered</th>
     <th>Win rate</th><th>Avg R</th><th>Total wR</th></tr>${setupRows}</table></div>
+  ${runnerHtml}
   <div class="card"><h2>Shadow Ledger — Rejected Candidates (${d.today})</h2>${shadowHtml}</div>
     <div class="card"><h2>Historical Data</h2>
         <p class="history-meta">Choose a date and data type to inspect everything saved for that session.</p>
@@ -407,6 +448,33 @@ def _pick_bars(picks: list, d) -> dict:
     return out
 
 
+def _runner_payload(con, d) -> dict:
+    """Today's runner session for the dashboard, or a marker that it never ran.
+
+    Never raises: a failure in this lane must not take down the whole status
+    endpoint the rest of the desk depends on.
+    """
+    try:
+        from agent import runner_view
+        s = runner_view.session_summary(con, d)
+        return {
+            "ran": bool(s["session"] or s["rows"]),
+            "health": runner_view._health_line(s),
+            "universe": (s["session"] or {}).get("universe_size") or 0,
+            "n_candidates": s["n_candidates"],
+            "n_selected": s["n_selected"],
+            "n_orders": len(s["orders"]),
+            "degraded": bool((s["session"] or {}).get("provider_degraded")),
+            "skipped_reason": (s["session"] or {}).get("selection_skipped_reason"),
+            "rows": sorted(s["rows"],
+                           key=lambda x: (not x["selected"], x["rank"] or 99,
+                                          x["ticker"])),
+        }
+    except Exception as e:
+        return {"ran": False, "health": f"runner view unavailable ({e})",
+                "rows": [], "n_candidates": 0, "n_selected": 0, "n_orders": 0}
+
+
 @app.route("/api/status")
 @login_required
 def api_status():
@@ -435,6 +503,10 @@ def api_status():
                 (plan_row["plan"] or {}).get("picks", []) if plan_row else [], d
             ),
             "overall": overall,
+            # Runner lane: the whole session, so the dashboard can show what was
+            # scanned, what was picked, and - critically - whether a thin
+            # candidate list was the market or a broken feed.
+            "runner": _runner_payload(con, d),
             "by_setup": by_setup,
             "streak": streak_str,
             "streak_detail": streak,
