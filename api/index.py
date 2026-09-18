@@ -249,6 +249,29 @@ function render(d) {
          <th>Price</th><th>Stop</th><th>Target</th><th>RVOL</th><th>VWAP%</th>
          <th>TC</th><th>Chg%</th><th>R</th><th>Exit</th></tr>${rows}</table>`
       : "";
+
+    const movers = rn.movers || [];
+    let moversHtml = "";
+    if (movers.length) {
+      const overlap = movers.filter(m => m.selected).length;
+      const mvRows = movers.map(m => {
+        const rc = m.r_multiple==null ? "#8b949e" : (m.r_multiple>0 ? "#3fb950" : "#f85149");
+        const tag = m.selected
+          ? `<span style="color:#3fb950;font-weight:700">#${m.rank} picked</span>`
+          : `<span style="color:#8b949e">not picked</span>`;
+        return `<tr><td><b>${m.ticker}</b></td>
+          <td style="color:${rc}">${m.r_multiple==null?"—":Number(m.r_multiple).toFixed(2)}</td>
+          <td>${m.exit_reason||""}</td><td>${tag}</td></tr>`;
+      }).join("");
+      moversHtml = `<h3 style="margin-top:18px">Top ${movers.length} movers today (by realized R)</h3>
+        <p style="color:#8b949e;font-size:12px">
+          ${overlap} of ${movers.length} were selected. Same-day eyeball check, not a
+          training signal — one day's winners are noise to retune a selector on. The
+          FDR-corrected version, across many sessions, feeds the weekly miner instead.
+        </p>
+        <table><tr><th>Ticker</th><th>R</th><th>Exit</th><th></th></tr>${mvRows}</table>`;
+    }
+
     runnerHtml = `<div class="card"><h2>Runner Lane — ${d.today}</h2>
       <p style="color:${col};font-weight:600">${rn.health||""}</p>
       ${rn.skipped_reason ? `<p style="color:#8b949e">selection: ${rn.skipped_reason}</p>` : ""}
@@ -257,7 +280,9 @@ function render(d) {
         <div class="stat"><div class="v">${rn.n_candidates||0}</div>candidates</div>
         <div class="stat"><div class="v">${rn.n_selected||0}</div>selected</div>
         <div class="stat"><div class="v">${rn.n_orders||0}</div>live orders</div>
-      </div>${table}
+      </div>
+      ${moversHtml}
+      <h3 style="margin-top:18px">All candidates</h3>${table}
       <p style="color:#8b949e;font-size:12px;margin-top:10px">
         Every candidate is priced by the evening simulator, selected or not —
         that is what makes “did picking help?” answerable. Rows marked #N were chosen.
@@ -469,6 +494,17 @@ def _runner_payload(con, d) -> dict:
             "rows": sorted(s["rows"],
                            key=lambda x: (not x["selected"], x["rank"] or 99,
                                           x["ticker"])),
+            # Same-day eyeball diagnostic, not a retuning signal -- one day's
+            # top N out of hundreds of candidates is noise as training data.
+            # The FDR-corrected, many-session version already lives in
+            # agent/runner_research.selection_edge() and feeds the weekly
+            # miner, which is the only thing allowed to write a playbook rule.
+            "movers": [
+                {"ticker": r["ticker"], "r_multiple": r["r_multiple"],
+                 "exit_reason": r["exit_reason"], "selected": r["selected"],
+                 "rank": r["rank"]}
+                for r in runner_view.top_movers(s, 10)
+            ],
         }
     except Exception as e:
         return {"ran": False, "health": f"runner view unavailable ({e})",

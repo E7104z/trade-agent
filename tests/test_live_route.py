@@ -60,3 +60,58 @@ def test_intraday_check_runner_failure_cannot_break_the_monitor(monkeypatch):
     assert body["monitor"]["reason"] == "live paper disabled"
     # ...and the runner failure is recorded rather than raised.
     assert "scan exploded" in body["runner"]["error"]
+
+def test_api_status_includes_runner_movers(monkeypatch, tmp_path):
+    """/api/status must carry the same top-movers diagnostic the CLI and
+    local dashboard show, so the hosted card has feature parity once a
+    Postgres DATABASE_URL is actually configured."""
+    import os
+    import json as _json
+    from datetime import date, datetime
+
+    from api import index
+    from agent import ledger
+
+    db_path = tmp_path / "test.duckdb"
+    monkeypatch.setattr(ledger, "DB_PATH", str(db_path))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(index, "CRON_SECRET", "test-secret")
+    monkeypatch.setattr(index, "load_config", lambda: __import__(
+        "agent.config", fromlist=["load_config"]).load_config())
+
+    session = date(2026, 9, 18)
+    con = ledger.connect()
+    for i, (ticker, r) in enumerate([("WINNER", 5.0), ("PICKED_LOSER", -1.0)]):
+        con.execute(
+            """INSERT INTO runner_candidates
+               (session_date, ticker, first_pass_et, detection_price,
+                stop_price, target_price, stop_dist, scan_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+            [session, ticker, datetime(2026, 9, 18, 10, 30),
+             10.0 + i, 9.5 + i, 11.0 + i, 0.5])
+    ledger.mark_runner_selected(con, session, "PICKED_LOSER", 1, None)
+    for ticker, r in [("WINNER", 5.0), ("PICKED_LOSER", -1.0)]:
+        ledger.save_runner_candidate_outcome(con, {
+            "session_date": session, "ticker": ticker, "eval_date": session,
+            "triggered": True, "r_multiple": r, "exit_reason": "eod",
+            "sim_version": 3,
+        })
+    ledger.upsert_runner_session(con, {
+        "session_date": session, "universe_size": 100, "candidates_found": 2,
+        "provider_degraded": False,
+    })
+    con.close()
+
+    # today_et() drives which date api_status looks up -- point it at the
+    # session date we just seeded.
+    monkeypatch.setattr(index, "today_et", lambda: session)
+
+    response = index.app.test_client().get(
+        "/api/status", headers={"Authorization": "Bearer test-secret"})
+    assert response.status_code == 200
+    body = response.get_json()
+    movers = body["runner"]["movers"]
+    assert [m["ticker"] for m in movers] == ["WINNER", "PICKED_LOSER"]
+    assert movers[0]["selected"] is False
+    assert movers[1]["selected"] is True
+    assert movers[1]["rank"] == 1
