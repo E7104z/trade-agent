@@ -11,7 +11,9 @@ which looks exactly like a lane that isn't working.
 
 These renderers read whatever ledger connection they are handed, so the same
 code serves both: `run.py runner-status` against the local DB, and the hosted
-dashboard against Postgres once the lane runs there too.
+dashboard against Postgres once the lane runs there too. `run.py dashboard`
+also uses render_html() to build a local static HTML file (agent/delivery.py),
+so nothing here requires a Postgres/Neon account to see visually.
 
 Nothing here computes a number. Every value is read back from the tables the
 scan and the selector already wrote, so the view cannot disagree with the
@@ -24,7 +26,7 @@ from datetime import date
 
 from . import ledger
 
-__all__ = ["session_summary", "render_text", "render_html"]
+__all__ = ["session_summary", "render_text", "render_html", "top_movers"]
 
 
 def _f(v, digits=2, dash="-"):
@@ -102,6 +104,29 @@ def session_summary(con, d: date) -> dict:
                    for o in orders],
         "graded": [r for r in rows if r["r_multiple"] is not None],
     }
+
+
+def top_movers(s: dict, n: int = 10) -> list[dict]:
+    """The n best-performing GRADED candidates today, by realized R,
+    regardless of whether the selector picked them.
+
+    This is a read-only diagnostic, not a training signal. One day's top
+    movers are ~n out of hundreds of candidates -- far too few to safely
+    re-derive a selection rule from without fitting noise (see the mismatch
+    on 2026-09-17: the actual top 10 movers and the 10 selected candidates
+    had ZERO overlap, and mean R for "selected" was actually LOWER than the
+    field average -- a real, single-session result, not evidence of a broken
+    selector). That comparison, done properly across many CONTESTED sessions
+    with FDR correction, already lives in
+    agent/runner_research.selection_edge() and feeds the weekly miner, which
+    is the only thing allowed to turn a pattern into a playbook rule.
+
+    This function exists so a person can eyeball "did we even scan/see what
+    won today" without waiting for that -- nothing here writes back into the
+    selector prompt or any rule table.
+    """
+    graded = [r for r in s["rows"] if r["r_multiple"] is not None]
+    return sorted(graded, key=lambda r: r["r_multiple"], reverse=True)[:n]
 
 
 def _health_line(s: dict) -> str:
@@ -200,9 +225,23 @@ def render_text(con, d: date) -> str:
             out.append(f"  passed over n={len(passed):3}  mean R "
                        f"{sum(passed)/len(passed):+.3f}")
         if picked and passed:
-            d_ = sum(picked)/len(picked) - sum(passed)/len(passed)
-            out.append(f"  selection edge today: {d_:+.3f} R "
+            edge = sum(picked) / len(picked) - sum(passed) / len(passed)
+            out.append(f"  selection edge today: {edge:+.3f} R "
                        f"(one session - not evidence on its own)")
+
+        movers = top_movers(s, 10)
+        if movers:
+            overlap = sum(1 for r in movers if r["selected"])
+            out += ["", f"TOP {len(movers)} MOVERS TODAY (by realized R, "
+                        f"regardless of selection) - {overlap} of "
+                        f"{len(movers)} were selected:"]
+            for r in movers:
+                mark = f"#{r['rank']} PICKED" if r["selected"] else "not picked"
+                out.append(f"  {r['ticker']:8}{_f(r['r_multiple'], 2):>7}R  "
+                           f"({r['exit_reason'] or ''})  {mark}")
+            out.append("  (one day's winners are noise as a training signal --")
+            out.append("   this is for eyeballing, not for retuning selection.")
+            out.append("   See the weekly miner for the FDR-corrected version.)")
     return "\n".join(out)
 
 
@@ -233,6 +272,34 @@ def render_html(con, d: date) -> str:
             f"<td style='color:{rcol}'>{_f(rmul)}</td>"
             f"<td>{r['exit_reason'] or ''}</td></tr>")
 
+    movers = top_movers(s, 10)
+    movers_html = ""
+    if movers:
+        overlap = sum(1 for r in movers if r["selected"])
+        mv_rows = []
+        for r in movers:
+            tag = (f"<span style='color:#3fb950;font-weight:700'>"
+                   f"#{r['rank']} picked</span>" if r["selected"]
+                   else "<span style='color:#8b949e'>not picked</span>")
+            rmul = r["r_multiple"]
+            rcol = "#3fb950" if rmul > 0 else "#f85149"
+            mv_rows.append(
+                f"<tr><td><b>{r['ticker']}</b></td>"
+                f"<td style='color:{rcol}'>{_f(rmul)}</td>"
+                f"<td>{r['exit_reason'] or ''}</td><td>{tag}</td></tr>")
+        movers_html = f"""
+  <h3 style="margin-top:18px">Top {len(movers)} movers today (by realized R)</h3>
+  <p style="color:#8b949e;font-size:12px">
+    {overlap} of {len(movers)} were selected. This is a same-day eyeball check,
+    not a training signal — one day's winners are far too few (~{len(movers)}
+    out of {s['n_candidates']}) to safely re-derive a selection rule from.
+    The FDR-corrected version of this comparison, across many sessions, feeds
+    the weekly miner instead.
+  </p>
+  <table><tr><th>Ticker</th><th>R</th><th>Exit</th><th></th></tr>
+    {''.join(mv_rows)}
+  </table>"""
+
     return f"""
 <div class="card">
   <h2>Runner lane — {d}</h2>
@@ -243,7 +310,9 @@ def render_html(con, d: date) -> str:
     <div class="stat"><div class="v">{s['n_selected']}</div>selected</div>
     <div class="stat"><div class="v">{len(s['orders'])}</div>live orders</div>
   </div>
-  <table style="margin-top:14px">
+  {movers_html}
+  <h3 style="margin-top:18px">All candidates</h3>
+  <table style="margin-top:6px">
     <tr><th></th><th>Ticker</th><th>Det ET</th><th>Price</th><th>Stop</th>
         <th>Target</th><th>RVOL</th><th>VWAP%</th><th>TC</th><th>Chg%</th>
         <th>R</th><th>Exit</th></tr>

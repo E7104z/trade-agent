@@ -159,6 +159,8 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   <canvas id="chart"></canvas>
 </div>
 
+{runner_html}
+
 <div class="card">
   <h2>Performance by Setup</h2>
   {setup_table}
@@ -227,11 +229,21 @@ def render_dashboard(con: duckdb.DuckDBPyConnection, cfg: Config, plan_date: dat
     curve = ledger.equity_curve(con, cfg.get("account_size", 100000), cfg.get("dollars_per_r", 500))
     runs = ledger.recent_runs(con, 12)
 
-    # Runner lane card. Returns "" when the lane never ran on this date, so the
-    # dashboard omits the section rather than rendering an empty shell.
+    # Runner lane card. Deliberately NOT keyed off plan_date: the runner
+    # lane runs on its own schedule (a local Task Scheduler job, not the
+    # morning loop) and can easily be several days ahead of the last morning
+    # run -- pinning it to plan_date silently showed a stale or empty runner
+    # card while the actual latest session had real data. Independently look
+    # up the most recent runner_sessions row instead. Returns "" when the
+    # lane has never run at all, so the dashboard omits the section rather
+    # than rendering an empty shell.
     try:
         from . import runner_view
-        runner_html = runner_view.render_html(con, plan_date or date.today())
+        latest_runner_row = con.execute(
+            "SELECT max(session_date) FROM runner_sessions").fetchone()
+        latest_runner_date = (latest_runner_row[0] if latest_runner_row
+                              and latest_runner_row[0] else date.today())
+        runner_html = runner_view.render_html(con, latest_runner_date)
     except Exception:
         runner_html = ""
 
@@ -274,6 +286,7 @@ def render_dashboard(con: duckdb.DuckDBPyConnection, cfg: Config, plan_date: dat
     equity_now = curve[-1]["equity"] if curve else cfg.get("account_size", 100000)
 
     html = _PAGE_TEMPLATE.format(
+        runner_html=runner_html,
         generated_at=str(date.today()),
         playbook_version=version,
         plan_date=plan_date.isoformat() if plan_date else "—",
