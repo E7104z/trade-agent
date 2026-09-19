@@ -457,3 +457,50 @@ def test_write_time_check_passes_a_properly_suppressed_table():
         "| 3 | 12 | 58% | +0.41 | calibrated |",
     ])
     assert _check_calibration_table(pb) == []
+
+
+def test_write_playbook_emits_exactly_one_changelog_end_to_end(con, monkeypatch, tmp_path):
+    """The end-to-end guarantee, not just the strip helper in isolation.
+
+    ROOT CAUSE THIS PINS (diagnosed 2026-09-18 from playbook v4/v5 on disk):
+    the miner LLM wrote a `## Changelog` section INSIDE `playbook_markdown`,
+    while write_playbook independently appended the canonical changelog from
+    the separate `changelog` JSON field. Two sources, two sections -- visible
+    in v4 and v5 as a rich prose block followed by a terse per-rule block,
+    same facts, different wording. v3 predates it and is clean.
+
+    It was NOT a cron double-invocation: the runs table shows exactly one
+    weekly run per version (Sep 3 -> v4, Sep 6 -> v5). Nor an append-vs-
+    overwrite bug: write_playbook overwrites, and archiving is a separate path.
+
+    Relying on the prompt alone to stop this would leave the invariant at the
+    mercy of model compliance, so the strip happens in code. This test asserts
+    the actual output contract: however many the miner writes, exactly one
+    survives.
+    """
+    from agent import memory
+
+    monkeypatch.setattr(memory, "PLAYBOOK_PATH", tmp_path / "playbook.md")
+    monkeypatch.setattr(memory, "PLAYBOOK_HISTORY_DIR", tmp_path / "history")
+    monkeypatch.setattr(memory, "_HOSTED", lambda: False)
+    (tmp_path / "playbook.md").write_text(
+        "<!-- version: 5 -->\n\n## Core Principles\n1. Risk first.\n",
+        encoding="utf-8")
+
+    # A non-compliant miner response: body carries TWO changelogs of its own.
+    miner_body = "\n".join([
+        "<!-- version: 5 -->", "", "## Setup Rules", "- gap_go: n=0",
+        "", "---", "", "## Changelog (v6)", "- rich prose the miner wrote",
+        "", "---", "", "## Changelog (v6)", "- terse list the miner wrote",
+    ])
+    version = memory.write_playbook(miner_body, "- the canonical changelog", con)
+
+    written = (tmp_path / "playbook.md").read_text(encoding="utf-8")
+    assert written.count("## Changelog") == 1, (
+        "exactly one changelog must survive regardless of what the miner wrote")
+    assert "the canonical changelog" in written
+    assert "rich prose the miner wrote" not in written
+    assert "terse list the miner wrote" not in written
+    # The rest of the document must be untouched by the strip.
+    assert "- gap_go: n=0" in written
+    assert f"## Changelog (v{version})" in written
