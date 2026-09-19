@@ -166,6 +166,7 @@ a{color:#58a6ff}
     <button onclick="runLoop('morning')">Run Morning</button>
     <button onclick="runLoop('evening')">Run Evening</button>
     <button onclick="runLoop('weekly')">Run Weekly</button>
+    <button onclick="runLoop('runner')">Run Runner Scan</button>
     <button class="secondary" onclick="loadData()">Refresh</button>
   </div>
   <p id="running" style="display:none;color:#d29922">Running — this can take 1-4 minutes for the morning loop
@@ -697,7 +698,7 @@ def api_table(name: str):
 
 # ------------------------------------------------------------------ run loops
 
-_VALID_LOOPS = {"morning", "evening", "weekly"}
+_VALID_LOOPS = {"morning", "evening", "weekly", "runner"}
 
 
 def _execute_loop(loop_name: str, cfg, force: bool) -> dict:
@@ -711,6 +712,16 @@ def _execute_loop(loop_name: str, cfg, force: bool) -> dict:
             elif loop_name == "evening":
                 from agent.loops import evening
                 evening.run(cfg, force=force)
+            elif loop_name == "runner":
+                # Runs the scan SERVER-SIDE, so its evidence lands in the same
+                # Postgres the dashboard reads. Running it locally writes to a
+                # local DuckDB the hosted dashboard cannot see -- which is the
+                # entire reason the Runner card kept showing "no scan recorded"
+                # while the lane was in fact working fine on the local machine.
+                from agent.loops import runner as runner_loop
+                from agent.util import now_et
+                result = runner_loop.tick(cfg, at=now_et())
+                print(json.dumps(result, indent=2, default=str))
             else:
                 from agent.loops import weekly
                 weekly.run(cfg)
@@ -753,13 +764,15 @@ def run_loop(loop_name: str):
 # Cron schedules are fixed UTC with no DST awareness, so we sanity-check the
 # current ET hour before spending API money. Windows are wide enough to accept
 # the one-hour EST/EDT drift (morning fires 5:45 ET in winter, 6:45 in summer).
-_CRON_WINDOWS = {"morning": (5, 10), "evening": (15, 19)}
+# runner fires at 14:30 UTC = 10:30 ET (EDT) / 09:30 ET (EST). The window
+# spans both so the DST drift does not silently skip the decision tick.
+_CRON_WINDOWS = {"morning": (5, 10), "evening": (15, 19), "runner": (9, 12)}
 
 
 @app.route("/cron/<loop_name>", methods=["GET"])
 @login_required
 def cron_loop(loop_name: str):
-    if loop_name not in ("morning", "evening"):
+    if loop_name not in ("morning", "evening", "runner"):
         return json_response({"error": f"unknown cron loop '{loop_name}'"}, 400)
     if not _is_cron_request():
         return json_response({"error": "this endpoint is for Vercel Cron only"}, 403)

@@ -115,3 +115,38 @@ def test_api_status_includes_runner_movers(monkeypatch, tmp_path):
     assert movers[0]["selected"] is False
     assert movers[1]["selected"] is True
     assert movers[1]["rank"] == 1
+
+
+def test_runner_is_a_runnable_loop_and_cron_target(monkeypatch):
+    """The runner must be triggerable SERVER-SIDE, both by the dashboard
+    button and by Vercel Cron.
+
+    This is the whole fix for "why isn't this on iwilltrade.com": running the
+    scan locally writes to a local DuckDB the hosted dashboard cannot read.
+    Running it server-side writes to the same Postgres the dashboard reads.
+    """
+    from api import index
+
+    assert "runner" in index._VALID_LOOPS
+    assert "runner" in index._CRON_WINDOWS
+
+    monkeypatch.setattr(index, "CRON_SECRET", "test-secret")
+    # Outside the ET window the cron must refuse rather than run at the wrong
+    # time -- a DST drift should skip, not silently scan a closed market.
+    lo, hi = index._CRON_WINDOWS["runner"]
+    assert lo <= 10 <= hi, "10:30 ET decision tick must fall inside the window"
+
+
+def test_runner_loop_execution_reports_skip_reason(monkeypatch):
+    """_execute_loop('runner') must surface tick()'s skip reason rather than
+    silently reporting success when the lane declined to run."""
+    from api import index
+    from agent.config import Config
+    import agent.loops.runner as runner_loop
+
+    monkeypatch.setattr(runner_loop, "tick",
+                        lambda cfg, **kw: {"skipped": "runner.enabled is false"})
+    cfg = Config(raw={"runner": {"enabled": False}})
+    result = index._execute_loop("runner", cfg, force=False)
+    assert result["error"] is None
+    assert "runner.enabled is false" in result["log"]
