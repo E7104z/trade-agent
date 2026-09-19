@@ -23,6 +23,14 @@ Fill the playbook's Calibration table from the CALIBRATION ROWS aggregate: n, re
 
 Report the table even when not actionable — visibility is the point.
 
+### Selection Edge
+
+Your input contains a `## SELECTION EDGE (tracked weekly)` block. **Reproduce that table verbatim into the playbook as `## Selection Edge`.** Every cell in it is already computed deterministically by the ablation — do not recompute, re-round, re-order, or reword any of it, and do not add rows.
+
+This table is reported EVERY week, including weeks where n did not move, exactly like Calibration's unchanged rows. A table that only appears when it has something to say cannot show a flat trend, and "still no edge" is the finding most likely to go quietly missing.
+
+Rows below the n floor arrive with their edge and percentile cells already suppressed to `—`. **Leave them suppressed.** Do not reconstruct the numbers from the ablation block elsewhere in your input, and do not state or imply a direction for a suppressed row. This is enforced at write time.
+
 **A bucket the CALIBRATION ROWS block marks `WR/avgR SUPPRESSED` is written into the table as `—` and `insufficient data`.** Do not reconstruct the suppressed numbers from the trade CSV, and do not state or imply a direction for that bucket in prose. A conviction level holding one trade tells you nothing about that conviction level, and "conviction 4: 0% WR, -0.05R" is the line a reader remembers.
 
 ## 3. Summarize the shadow ledger, flag expensive filters
@@ -97,6 +105,7 @@ Your output REPLACES the current playbook entirely. Keep the v3 skeleton exactly
 ## Regime Rules
 ## Do-Not-Trade Conditions
 ## Calibration                 (the table + verdict, per section 2)
+## Selection Edge              (the table, reproduced VERBATIM from the SELECTION EDGE block in your input)
 ## Shadow Ledger Summary       (per section 3)
 ## Open Questions (pre-registered experiments)   (per section 4 — thresholds + Progress lines)
 ## Retired Rules (graveyard)   (falsified/repeatedly-stale rules with reason + date + killing n;

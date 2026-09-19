@@ -350,6 +350,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v11.STATEMENTS
 from . import migrations_v12  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v12.STATEMENTS
 
+# --- v13 selection edge tracked per week -----------------------------------
+from . import migrations_v13  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v13.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -1855,3 +1859,35 @@ def untriggered_breakdown(con: duckdb.DuckDBPyConnection) -> list[dict]:
              "avg_gap_r": round(r[3], 3) if r[3] is not None else None,
              "avg_missed_r": round(r[4], 2) if r[4] is not None else None}
             for r in rows]
+
+
+def save_selection_edge(con: duckdb.DuckDBPyConnection, row: dict) -> None:
+    """Record one week's selection-edge measurement (v13).
+
+    Keyed on week_ending so a re-run of the same week overwrites rather than
+    double-counting -- the weekly loop is not guaranteed to run exactly once
+    (see the duplicate-changelog diagnosis), and a history table that grows a
+    spurious row on every retry would misreport the trend it exists to show.
+    """
+    con.execute("DELETE FROM selection_edge_history WHERE week_ending = ?",
+                [row["week_ending"]])
+    con.execute(
+        """INSERT INTO selection_edge_history
+           (week_ending, n_triggered, actual_total_r, random_mean_r, edge_r,
+            pct_random_beaten, p_value, sessions, verdict, sim_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        [row["week_ending"], row.get("n_triggered"), row.get("actual_total_r"),
+         row.get("random_mean_r"), row.get("edge_r"),
+         row.get("pct_random_beaten"), row.get("p_value"),
+         row.get("sessions"), row.get("verdict"), row.get("sim_version")],
+    )
+
+
+def selection_edge_history(con: duckdb.DuckDBPyConnection,
+                           limit: int = 26) -> list[dict]:
+    """Weekly selection-edge rows, oldest first so the table reads as a trend."""
+    cols = [c[0] for c in con.execute("DESCRIBE selection_edge_history").fetchall()]
+    rows = con.execute(
+        "SELECT * FROM selection_edge_history ORDER BY week_ending DESC LIMIT ?",
+        [limit]).fetchall()
+    return [dict(zip(cols, r)) for r in reversed(rows)]

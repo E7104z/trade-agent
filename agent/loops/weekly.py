@@ -65,6 +65,106 @@ def _stat(value, n: int, reading: str) -> str:
     return f"{value} over n={n} ({reading})"
 
 
+def _cfg_sim_version(cfg):
+    """The sim_version the ablation was restricted to, if any."""
+    try:
+        return cfg.get("ablation_sim_version")
+    except Exception:
+        return None
+
+
+def _selection_edge_row(abl: dict, week_ending, sim_version=None) -> dict:
+    """One week's selection-edge measurement, from the ablation result.
+
+    Every number here is computed by agent/ablation.py; this only reshapes
+    it. `edge_r` is actual minus the random baseline -- positive means
+    selection added R over drawing the same number of picks at random from
+    the same pool.
+
+    The verdict is SUPPRESSED below MIN_VERDICT_N triggered picks, matching
+    the floor the Calibration table already enforces. The percentile is
+    exact at any n; what cannot be generalized at low n is the jump from
+    "these picks" to "the selection process", which is what a verdict
+    asserts.
+    """
+    from ..migrations_v13 import MIN_VERDICT_N
+
+    n = int(abl.get("picks") or 0)
+    actual = abl.get("actual_total_r")
+    baseline = abl.get("random_mean_total_r")
+    edge = (round(actual - baseline, 3)
+            if actual is not None and baseline is not None else None)
+    pct = abl.get("percentile")
+
+    if n < MIN_VERDICT_N:
+        verdict = f"insufficient data (n={n} < {MIN_VERDICT_N})"
+    elif pct is None or edge is None:
+        verdict = "not computable"
+    elif pct >= 95.0:
+        verdict = "selection beat random"
+    elif pct <= 5.0:
+        verdict = "selection UNDERPERFORMED random"
+    else:
+        verdict = "no detectable selection edge"
+
+    return {
+        "week_ending": week_ending,
+        "n_triggered": n,
+        "actual_total_r": actual,
+        "random_mean_r": baseline,
+        "edge_r": edge,
+        "pct_random_beaten": pct,
+        "p_value": abl.get("p_value"),
+        "sessions": abl.get("sessions"),
+        "verdict": verdict,
+        "sim_version": sim_version,
+    }
+
+
+def _selection_edge_md(history: list[dict]) -> str:
+    """The Selection Edge table for the miner to reproduce into playbook.md.
+
+    Rendered in code rather than left to the miner because every cell is a
+    deterministic figure the ablation already computed -- the miner's job is
+    to carry it into the document, not to recompute or re-round it.
+
+    Reported EVERY week, including weeks where n did not move, for the same
+    reason Calibration reports its unchanged rows: a table that only appears
+    when it has something to say cannot show a flat trend, and "no edge yet,
+    still" is the finding most likely to be quietly dropped.
+    """
+    from ..migrations_v13 import MIN_VERDICT_N
+
+    header = (
+        "## SELECTION EDGE (tracked weekly — reproduce this table verbatim)\n\n"
+        "| Week | n (triggered) | Selection edge (R vs. baseline) | "
+        "% of random portfolios beaten | verdict |\n"
+        "|-----:|--:|--:|--:|:--|")
+    if not history:
+        return (header + "\n| — | 0 | — | — | insufficient data (n=0 < "
+                + str(MIN_VERDICT_N) + ") |\n\n"
+                "(no weekly selection-edge measurement recorded yet)")
+
+    lines = [header]
+    for r in history:
+        n = r.get("n_triggered") or 0
+        # Below the floor the numeric cells are suppressed too, not just the
+        # verdict -- an edge figure printed beside "insufficient data" is the
+        # number a reader remembers, exactly the failure the Calibration
+        # write-time check exists to catch.
+        if n < MIN_VERDICT_N:
+            edge_s, pct_s = "—", "—"
+        else:
+            edge_s = ("—" if r.get("edge_r") is None
+                      else f"{r['edge_r']:+.2f}R")
+            pct_s = ("—" if r.get("pct_random_beaten") is None
+                     else f"{r['pct_random_beaten']:.1f}%")
+        lines.append(
+            f"| {r['week_ending']} | {n} | {edge_s} | {pct_s} | "
+            f"{r.get('verdict') or '—'} |")
+    return "\n".join(lines)
+
+
 def _untriggered_md(mem: dict) -> str:
     """Per-setup breakdown of WHY picks never triggered (Phase 1).
 
@@ -528,6 +628,41 @@ def _check_calibration_table(playbook_md: str) -> list[str]:
     return violations
 
 
+# A markdown row from the Selection Edge table:
+# | 2026-09-18 | 25 | -18.70R | 12.6% | no detectable selection edge |
+_SE_ROW = __import__("re").compile(
+    r"^[|]\s*(\d{4}-\d{2}-\d{2})\s*[|]\s*(\d+)\s*[|]\s*([^|]+?)\s*[|]\s*([^|]+?)\s*[|]")
+
+
+def _check_selection_edge_table(playbook_md: str) -> list[str]:
+    """Flag Selection Edge rows showing an edge or percentile below the
+    n floor.
+
+    Same failure mode the Calibration table had: a real-looking number
+    printed beside "insufficient data" is the number a reader remembers.
+    The floor is enforced at write time rather than trusted to the miner,
+    because the miner is an LLM reproducing a table and a reproduction that
+    drops the suppression is indistinguishable from one that keeps it until
+    someone reads the document.
+    """
+    from ..migrations_v13 import MIN_VERDICT_N
+
+    violations = []
+    empty = {"", "-", chr(8212), "--", "n/a", "na", "insufficient data", "suppressed"}
+    for line in (playbook_md or "").splitlines():
+        m = _SE_ROW.match(line.strip())
+        if not m:
+            continue
+        n = int(m.group(2))
+        edge, pct = m.group(3).strip().lower(), m.group(4).strip().lower()
+        if n < MIN_VERDICT_N and (edge not in empty or pct not in empty):
+            violations.append(
+                f"selection-edge row {m.group(1)} shows edge={m.group(3).strip()} "
+                f"pct={m.group(4).strip()} at n={n} (floor is n={MIN_VERDICT_N}): "
+                f"{line.strip()[:160]}")
+    return violations
+
+
 def _check_wr_suppression(playbook_md: str) -> list[str]:
     """Write-time enforcement:
     (a) spec Sec5 (original check) -- flag any line carrying wr/avgR at n < 8.
@@ -590,6 +725,20 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         from .. import ledger as ledger_mod
         research_block = integrity.weekly_block(con, cfg, ledger_mod, d)
 
+        # Phase 2: record this week's selection edge as a tracked row, then
+        # hand the whole history to the miner. Persisted BEFORE the LLM call
+        # so the measurement survives even if the call fails -- the figure is
+        # deterministic and does not depend on anything the miner says.
+        try:
+            se_row = _selection_edge_row(
+                research_block.get("ablation") or {}, d,
+                sim_version=_cfg_sim_version(cfg))
+            ledger.save_selection_edge(con, se_row)
+        except Exception as e:
+            log("weekly", f"WARN could not record selection edge: {e}")
+        selection_edge_md = _selection_edge_md(
+            ledger.selection_edge_history(con))
+
         log("weekly", f"Mining ledger: {overall['picks_graded']} graded picks, "
                       f"{len(mem['lessons'])} lessons on file, playbook v{mem['playbook_version']}")
 
@@ -623,6 +772,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_fmt_stats(mem['by_mcap_bucket'], 'mcap_bucket')}\n\n"
             f"{_fmt_stats(mem['by_short_bucket'], 'short_bucket (Q12)')}\n\n"
             f"{_fmt_stats(mem['by_or_alignment'], 'or_alignment')}\n\n"
+            f"{selection_edge_md}\n\n"
+            f"{_untriggered_md(mem)}\n\n"
             f"{_counterfactuals_md(mem)}\n\n"
             f"{_v3_sections(mem)}\n\n"
             f"{_sim_version_md(mem)}\n\n"
@@ -705,6 +856,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
                 log("weekly", f"WARN WR-suppression violation (n<8 with wr/avgR shown): {v}")
             for v in _check_calibration_table(new_pb):
                 log("weekly", f"WARN calibration-table suppression violation: {v}")
+            for v in _check_selection_edge_table(new_pb):
+                log("weekly", f"WARN selection-edge suppression violation: {v}")
             # A pre-registered threshold the weekly rewrite can restate is not
             # pre-registered. agent/open_questions.py holds the declared bars;
             # this is where a rewrite that moved one becomes visible.
