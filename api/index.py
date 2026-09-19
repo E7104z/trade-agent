@@ -757,9 +757,16 @@ def run_loop(loop_name: str):
 # Bearer <CRON_SECRET> header it attaches automatically. These always run for
 # real (no mock/offline) and never force — they respect the market-day check.
 #
-# Vercel Hobby allows max TWO cron jobs (daily schedules only), so there is no
-# separate weekly cron: the evening cron runs the weekly miner after Friday's
-# grading session, which is equivalent (all of the week's data is graded by then).
+# Vercel Hobby restricts cron FREQUENCY (at most once per day per job), not the
+# NUMBER of jobs -- an earlier comment here claimed a hard max of two, which was
+# wrong and cost this project a working intraday trigger for days. Three
+# once-per-day crons deploy fine (morning / evening / runner, verified
+# 2026-09-18). A "*/5 13-20 * * 1-5" expression IS rejected, with the explicit
+# reason that it "would run more than once per day".
+#
+# There is still no separate weekly cron: the evening cron runs the weekly miner
+# after Friday's grading session, which is equivalent (all of the week's data is
+# graded by then).
 #
 # Cron schedules are fixed UTC with no DST awareness, so we sanity-check the
 # current ET hour before spending API money. Windows are wide enough to accept
