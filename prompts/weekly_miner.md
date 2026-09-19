@@ -23,6 +23,16 @@ Fill the playbook's Calibration table from the CALIBRATION ROWS aggregate: n, re
 
 Report the table even when not actionable — visibility is the point.
 
+### Sizing Policy banner
+
+`## Sizing Policy` MUST open with this banner, immediately below the heading, reproduced exactly:
+
+> **Note:** rules tagged `[UNVALIDATED prior]` below are defaults carried from inception, not derived limits. Treat as conservative guesses, not risk-proven constraints, until they accumulate confirming observations.
+
+Write it exactly ONCE. Several sizing constraints still carry `[UNVALIDATED prior]`, and that tag is easy to read past as though it were a measured limit -- it is not. These are guesses that have never been tested, sitting in the section that governs how much money each trade risks, which makes them the most consequential unvalidated content in the document.
+
+Do not reword it, do not drop it once the section has validated rules in it, and do not add a second copy. It goes away only when no `[UNVALIDATED prior]` tag remains in the section.
+
 ### Selection Edge
 
 Your input contains a `## SELECTION EDGE (tracked weekly)` block. **Reproduce that table verbatim into the playbook as `## Selection Edge`.** Every cell in it is already computed deterministically by the ablation — do not recompute, re-round, re-order, or reword any of it, and do not add rows.
@@ -99,7 +109,7 @@ Your output REPLACES the current playbook entirely. Keep the v3 skeleton exactly
                                 edge right now"; rewritten every week; says
                                 NO VALIDATED EDGE YET until something clears n>=8)
 ## Core Principles
-## Sizing Policy
+## Sizing Policy              (MUST open with the provisional-status banner, verbatim, per section 2b)
 ## Setup Rules                 (each rule line ends with metadata:
                                 [confidence: tier, n=X, last_confirmed <date|vN>, ...])
 ## Regime Rules

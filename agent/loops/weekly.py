@@ -663,6 +663,69 @@ def _check_selection_edge_table(playbook_md: str) -> list[str]:
     return violations
 
 
+# The provisional-status banner that must open ## Sizing Policy while any
+# [UNVALIDATED prior] tag remains in it. Matched on a distinctive phrase
+# rather than the whole sentence so trivial whitespace/wrapping differences
+# do not produce a false violation.
+_SIZING_BANNER_PHRASE = "defaults carried from inception, not derived limits"
+
+
+def _sizing_policy_section(playbook_md: str) -> str:
+    """The text of ## Sizing Policy, through to the next h2."""
+    lines = (playbook_md or "").splitlines()
+    out, inside = [], False
+    for line in lines:
+        if line.strip().lower().startswith("## sizing policy"):
+            inside = True
+            continue
+        if inside and line.strip().startswith("## "):
+            break
+        if inside:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _check_sizing_banner(playbook_md: str) -> list[str]:
+    """Phase 3: the UNVALIDATED banner must be present exactly once.
+
+    Two failure modes, both real:
+
+      MISSING   the section still carries [UNVALIDATED prior] constraints
+                while reading like measured policy. These govern how much
+                money each trade risks, which makes them the most
+                consequential untested content in the document.
+
+      DUPLICATE the same defect the Changelog had (Phase 0) -- a section the
+                miner writes AND the template supplies appears twice. The
+                banner is checked for duplication specifically because the
+                document has already shipped one duplicated section.
+
+    The banner is only required while an [UNVALIDATED prior] tag remains: if
+    every sizing rule earns its evidence, the warning should disappear rather
+    than becoming furniture nobody reads.
+    """
+    section = _sizing_policy_section(playbook_md)
+    if not section.strip():
+        return []
+    # Normalise before matching: the banner is a blockquote and will be
+    # line-wrapped, so "defaults carried from inception" is split across a
+    # newline and a "> " marker in the real document. Matching the raw text
+    # reported the banner missing while it sat directly above -- a checker
+    # that fires on correct input is worse than no checker.
+    flat = " ".join(section.replace(">", " ").split())
+    count = flat.count(_SIZING_BANNER_PHRASE)
+    has_unvalidated = "[UNVALIDATED prior]" in section
+    violations = []
+    if has_unvalidated and count == 0:
+        violations.append(
+            "Sizing Policy carries [UNVALIDATED prior] rules but is missing the "
+            "provisional-status banner")
+    if count > 1:
+        violations.append(
+            f"Sizing Policy banner appears {count} times; it must appear exactly once")
+    return violations
+
+
 def _check_wr_suppression(playbook_md: str) -> list[str]:
     """Write-time enforcement:
     (a) spec Sec5 (original check) -- flag any line carrying wr/avgR at n < 8.
@@ -858,6 +921,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
                 log("weekly", f"WARN calibration-table suppression violation: {v}")
             for v in _check_selection_edge_table(new_pb):
                 log("weekly", f"WARN selection-edge suppression violation: {v}")
+            for v in _check_sizing_banner(new_pb):
+                log("weekly", f"WARN sizing-policy banner violation: {v}")
             # A pre-registered threshold the weekly rewrite can restate is not
             # pre-registered. agent/open_questions.py holds the declared bars;
             # this is where a rewrite that moved one becomes visible.

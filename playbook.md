@@ -64,6 +64,11 @@ reveal where the real edge lives.
 
 ## Sizing Policy
 
+> **Note:** rules tagged `[UNVALIDATED prior]` below are defaults
+> carried from inception, not derived limits. Treat as conservative
+> guesses, not risk-proven constraints, until they accumulate
+> confirming observations.
+
 - Base unit: 1R = configured dollars_per_r.
 - Conviction 5 + fresh verifiable catalyst may take max size (1.5R). Conviction <= 3 takes minimum (0.25-0.5R).
 - Losing streak >= 3: cap 0.5R, minimum conviction 4. [UNVALIDATED prior]
