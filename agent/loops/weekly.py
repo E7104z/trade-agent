@@ -65,6 +65,37 @@ def _stat(value, n: int, reading: str) -> str:
     return f"{value} over n={n} ({reading})"
 
 
+def _untriggered_md(mem: dict) -> str:
+    """Per-setup breakdown of WHY picks never triggered (Phase 1).
+
+    Deliberately reported even when every bucket is no_setup_offered: the
+    miner needs to see that the entry mechanic was NOT the problem, not
+    merely fail to see evidence that it was.
+    """
+    rows = mem.get("untriggered") or []
+    if not rows:
+        return ("## UNTRIGGERED PICKS - WHY\n\n"
+                "(no untriggered picks on record)")
+    by_setup: dict[str, list[dict]] = {}
+    for r in rows:
+        by_setup.setdefault(r["setup_type"], []).append(r)
+    out = ["## UNTRIGGERED PICKS - WHY", "",
+           "`no_setup_offered` = the market never presented the setup (says "
+           "nothing about the rule). `entry_condition_not_met` = the setup "
+           "arrived and the entry mechanic missed it (the ONLY split that "
+           "argues an entry is too narrow). `trigger_gap_r` is how far short "
+           "price fell, in units of that pick's own planned risk.", ""]
+    for setup, items in sorted(by_setup.items()):
+        total = sum(i["n"] for i in items)
+        parts = ", ".join(
+            f"{i['n']} {i['reason']}"
+            + (f" (avg gap {i['avg_gap_r']:+.2f}R)"
+               if i["avg_gap_r"] is not None else "")
+            for i in items)
+        out.append(f"- **{setup}**: {total} untriggered - {parts}")
+    return "\n".join(out)
+
+
 def _counterfactuals_md(mem: dict) -> str:
     """Null-model, trade-management, and sizing diagnostics — computed in code,
     never by the LLM. Edge must beat the baseline; management must beat holding."""

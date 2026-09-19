@@ -299,6 +299,9 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         # shadow ledger nor the ablation can see a filter stack that is
         # collectively too tight while no single filter is wrong.
         "participation": ledger.participation_funnel(con, 20),
+        # Phase 1: WHY untriggered picks never triggered, per setup. Without
+        # this the miner cannot tell a quiet week from an over-tight entry.
+        "untriggered": ledger.untriggered_breakdown(con),
         # deterministic counterfactuals: null model, trade management, sizing skill
         "management": ledger.management_quality(con),
         "sizing_cf": ledger.sizing_counterfactual(con),

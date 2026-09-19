@@ -212,6 +212,104 @@ def _indicator_fields(bars: list[dict], adv20: float | None) -> tuple[dict, list
     return out, list(vwap)
 
 
+NEAR_TRIGGER_R = 0.25
+
+
+def _closest_approach(bars, entry, long, entry_type, min_bar_volume=0):
+    """How far price finished from firing the entry mechanic, in price terms.
+
+    Returns (shortfall, approach_price). `shortfall` is POSITIVE when the
+    trigger was never reached -- the distance price still had to travel --
+    and <= 0 when it was reached (which the caller will not see, since it
+    only calls this for untriggered picks).
+
+    Thin bars are excluded exactly as the fill loop excludes them, so a
+    trigger that was only "reached" on a bar the fill logic refused to trust
+    is not counted as reached here either.
+    """
+    usable = [b for b in bars if not _is_thin(b, min_bar_volume)]
+    if not usable:
+        return None, None
+
+    if entry_type == "limit":
+        # long limit fills on a dip to entry; short limit on a pop to entry
+        if long:
+            approach = min(b["l"] for b in usable)
+            return approach - entry, approach
+        approach = max(b["h"] for b in usable)
+        return entry - approach, approach
+    # breakout (stop-order semantics), and anything else that needs price to
+    # travel TOWARD the entry in the trade's direction
+    if long:
+        approach = max(b["h"] for b in usable)
+        return entry - approach, approach
+    approach = min(b["l"] for b in usable)
+    return approach - entry, approach
+
+
+def _would_have_triggered_after(bars, entry, long, entry_type, cutoff_idx,
+                                min_bar_volume=0):
+    """True if the entry mechanic WOULD have fired on a bar at or after
+    `cutoff_idx` -- i.e. the only thing that stopped it was the cutoff."""
+    if cutoff_idx is None or cutoff_idx >= len(bars):
+        return False
+    for b in bars[cutoff_idx:]:
+        if _is_thin(b, min_bar_volume):
+            continue
+        if entry_type == "limit":
+            if (long and b["l"] <= entry) or (not long and b["h"] >= entry):
+                return True
+        else:
+            if (long and b["h"] >= entry) or (not long and b["l"] <= entry):
+                return True
+    return False
+
+
+def classify_untriggered(bars, entry, risk, long, entry_type, *,
+                         cutoff_idx=None, min_bar_volume=0,
+                         near_threshold_r=NEAR_TRIGGER_R):
+    """Why a pick never triggered. Deterministic, from bars alone.
+
+    Returns (reason, note, trigger_gap_r) where trigger_gap_r is NEGATIVE by
+    how many R price fell short of the trigger.
+
+    The split that matters is between:
+
+      no_setup_offered         price never came near -- the market simply did
+                               not present this setup, which says nothing
+                               about the rule
+      entry_condition_not_met  price came within `near_threshold_r` of firing
+                               and the mechanic still did not catch it --
+                               the only case that would ever justify
+                               loosening an entry condition
+
+    Collapsing these into one "no_trigger" makes a systematically over-tight
+    entry indistinguishable from a quiet week.
+
+    `near_threshold_r` is a REPORTING convention, not an edge claim: it draws
+    the line for "came close" at a quarter of the trade's own planned risk,
+    so the threshold scales with each pick rather than being an absolute
+    cent value. trigger_gap_r is stored raw alongside the label so the line
+    can be redrawn later without re-simulating anything.
+    """
+    shortfall, _approach = _closest_approach(bars, entry, long, entry_type,
+                                             min_bar_volume)
+    if shortfall is None:
+        return "other", "no usable (non-thin) bars to evaluate the trigger", None
+
+    gap_r = round(-shortfall / risk, 3) if risk > 0 else None
+
+    # A cutoff that prevented an otherwise-valid trigger is its own category:
+    # the setup DID arrive, the rule simply was not allowed to take it.
+    if _would_have_triggered_after(bars, entry, long, entry_type, cutoff_idx,
+                                   min_bar_volume):
+        return "time_stop_expired_pretrigger", None, gap_r
+
+    if gap_r is not None and abs(gap_r) <= near_threshold_r:
+        return "entry_condition_not_met", None, gap_r
+    return "no_setup_offered", None, gap_r
+
+
 def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                   slippage_bps: float = 0.0, flatten_at: str | None = None,
                   min_bar_volume: float = 0, adv20: float | None = None,
@@ -244,6 +342,11 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "mfe_r": None,
         "mae_r": None,
         "missed_move_r": None,
+        # Phase 1 instrumentation: why an untriggered pick never triggered.
+        # NULL for triggered picks. See agent/migrations_v12.py.
+        "untriggered_reason": None,
+        "untriggered_note": None,
+        "trigger_gap_r": None,
         "baseline_r": None,
         "eod_r": None,
         "target_hit_after_stop": None,
@@ -384,6 +487,27 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         best = max(b["h"] for b in bars) if long else min(b["l"] for b in bars)
         move = (best - entry) if long else (entry - best)
         out["missed_move_r"] = round(move / risk, 2)
+        # ...and WHY we never got on. missed_move_r says how far the idea ran
+        # without us; it cannot distinguish "the market never offered this
+        # setup" from "the setup arrived and our entry mechanic was too
+        # narrow". Only the second is a rule defect, and only the second
+        # would ever justify loosening an entry condition.
+        cutoff_idx = None
+        for raw in (pick.get("time_stop"), flatten_at):
+            if not raw:
+                continue
+            parsed = _parse_clock(raw)
+            if parsed is None or parsed >= close_t:
+                continue
+            idx = _clock_to_bar_index(parsed, bars)
+            if idx is not None:
+                cutoff_idx = idx if cutoff_idx is None else min(cutoff_idx, idx)
+        reason, note, gap_r = classify_untriggered(
+            bars, entry, risk, long, entry_type,
+            cutoff_idx=cutoff_idx, min_bar_volume=min_bar_volume)
+        out["untriggered_reason"] = reason
+        out["untriggered_note"] = note
+        out["trigger_gap_r"] = gap_r
         return out
 
     fill_time = bars[fill_idx].get("t")

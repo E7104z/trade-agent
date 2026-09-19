@@ -346,6 +346,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v10.STATEMENTS
 from . import migrations_v11  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v11.STATEMENTS
 
+# --- v12 untriggered-pick reason tagging -----------------------------------
+from . import migrations_v12  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v12.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -622,10 +626,11 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             trend_side_200d, ext_atr_at_entry, short_pct_float, float_shares, mkt_cap,
             r_multiple_2x, r_multiple_3x, slippage_bps_used, friction_model, participation_pct,
             session_length, flatten_inert,
+            untriggered_reason, untriggered_note, trigger_gap_r,
             grade, grade_notes, graded_at, sim_version)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                   ?,?)""",
+                   ?,?,?,?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
@@ -646,6 +651,8 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             o.get("r_multiple_2x"), o.get("r_multiple_3x"), o.get("slippage_bps_used"),
             o.get("friction_model"), o.get("participation_pct"),
             o.get("session_length"), o.get("flatten_inert"),
+            o.get("untriggered_reason"), o.get("untriggered_note"),
+            o.get("trigger_gap_r"),
             o.get("grade"), o.get("grade_notes"),
             o.get("graded_at", datetime.now()), sim_version,
         ],
@@ -1819,3 +1826,32 @@ def save_runner_universe_cache(con: duckdb.DuckDBPyConnection, d: date,
         "VALUES (?,?,current_timestamp,?,?,?)",
         [d, kind, len(payload.get("liquid") or []), source, json.dumps(payload)],
     )
+
+
+def untriggered_breakdown(con: duckdb.DuckDBPyConnection) -> list[dict]:
+    """Per setup_type, why its untriggered picks never triggered (v12).
+
+    "4 untriggered" tells the miner nothing actionable. "4 untriggered - 3
+    no_setup_offered, 1 entry_condition_not_met" says the rule is fine and
+    the week was quiet. The inverse split would say the entry mechanic is
+    too narrow, which is the ONLY reading that argues for loosening it.
+
+    Rows graded before v12 carry a NULL reason and are reported as
+    `ungraded_pre_v12` rather than silently folded into a real bucket -- an
+    unknown must not inflate whichever category happens to be convenient.
+    """
+    rows = con.execute(
+        """SELECT p.setup_type,
+                  COALESCE(o.untriggered_reason, 'ungraded_pre_v12') AS reason,
+                  COUNT(*) AS n,
+                  AVG(o.trigger_gap_r) AS avg_gap_r,
+                  AVG(o.missed_move_r) AS avg_missed_r
+           FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+           WHERE o.triggered = FALSE AND o.exit_reason = 'no_trigger'
+           GROUP BY p.setup_type, COALESCE(o.untriggered_reason, 'ungraded_pre_v12')
+           ORDER BY p.setup_type, n DESC"""
+    ).fetchall()
+    return [{"setup_type": r[0] or "?", "reason": r[1], "n": r[2],
+             "avg_gap_r": round(r[3], 3) if r[3] is not None else None,
+             "avg_missed_r": round(r[4], 2) if r[4] is not None else None}
+            for r in rows]
