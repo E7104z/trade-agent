@@ -18,12 +18,17 @@ from datetime import date
 import pytest
 
 from agent import runner_research as rr
+from agent.grading import CURRENT_SIM_VERSION
 
 
 def _row(session, ticker, r, selected=False, **over):
     base = {
         "session_date": session, "ticker": ticker, "triggered": True,
         "r_multiple": r, "selected": selected, "scan_version": 1,
+        # candidate_rows fences on sim_version and feed_downgraded by default.
+        # Fixtures must opt IN to being comparable, which is the point: a row
+        # that forgets to say how it was graded is not safe to average.
+        "sim_version": CURRENT_SIM_VERSION, "feed_downgraded": False,
         "detection_minutes": 620, "rvol": 2.5, "price_tier": "20-50",
         "vwap_pct_above": 1.2, "ema9_slope": 0.03, "detection_price": 20.0,
         "trend_consistency": 70.0, "float_shares": 40.0, "regime_tag": "bullish",
@@ -207,3 +212,75 @@ def test_scan_version_filter_prevents_cross_semantics_comparison():
         assert [r["ticker"] for r in kept] == ["A"]
     finally:
         ledger_mod.runner_candidate_outcomes_since = original
+
+
+# --------------------------------------------------- v4 comparability fences
+
+def _fence_con(degraded_sessions=()):
+    """A stub connection whose runner_sessions rows mark the given dates as
+    having run on a downgraded feed."""
+    import json as _json
+
+    class _Con:
+        def execute(self, sql, *a, **k):
+            rows = [(d, _json.dumps({"feed": "iex", "feed_downgraded": True}))
+                    for d in degraded_sessions]
+            if "runner_sessions" not in sql:
+                rows = []
+
+            class _R:
+                @staticmethod
+                def fetchall():
+                    return rows
+            return _R()
+    return _Con()
+
+
+def _with_rows(rows, **kw):
+    import agent.ledger as ledger_mod
+    original = ledger_mod.runner_candidate_outcomes_since
+    ledger_mod.runner_candidate_outcomes_since = lambda con, since: rows
+    try:
+        return rr.candidate_rows(kw.pop("con", _fence_con()), **kw)
+    finally:
+        ledger_mod.runner_candidate_outcomes_since = original
+
+
+def test_sim_version_filter_prevents_cross_grading_comparison():
+    """Rows graded under the pre-v4 denominator are not in the same unit as v4
+    rows and must never enter the same mean."""
+    rows = [_row(date(2026, 9, 1), "OK", 1.0),
+            _row(date(2026, 9, 1), "OLD", 11.0, sim_version=3)]
+    kept = _with_rows(rows, scan_version=1)
+    assert [r["ticker"] for r in kept] == ["OK"]
+
+
+def test_sim_version_fence_is_on_by_default():
+    """Forgetting the fence must not silently admit stale rows -- the default
+    is the CURRENT version, not None."""
+    rows = [_row(date(2026, 9, 1), "OLD", 11.0, sim_version=3)]
+    assert _with_rows(rows) == []
+
+
+def test_degraded_feed_sessions_are_excluded_by_the_row_stamp():
+    rows = [_row(date(2026, 9, 1), "SIP", 1.0),
+            _row(date(2026, 9, 2), "IEX", 9.0, feed_downgraded=True)]
+    kept = _with_rows(rows, scan_version=1)
+    assert [r["ticker"] for r in kept] == ["SIP"]
+
+
+def test_degraded_feed_falls_back_to_the_session_flag_for_unstamped_rows():
+    """Rows written before the per-row column existed carry feed_downgraded
+    None; the session-level flag still has to fence them."""
+    rows = [_row(date(2026, 9, 1), "SIP", 1.0, feed_downgraded=None),
+            _row(date(2026, 9, 2), "IEX", 9.0, feed_downgraded=None)]
+    kept = _with_rows(rows, scan_version=1,
+                      con=_fence_con(degraded_sessions=[date(2026, 9, 2)]))
+    assert [r["ticker"] for r in kept] == ["SIP"]
+
+
+def test_degraded_feed_can_be_opted_back_in_explicitly():
+    rows = [_row(date(2026, 9, 1), "SIP", 1.0),
+            _row(date(2026, 9, 2), "IEX", 9.0, feed_downgraded=True)]
+    kept = _with_rows(rows, scan_version=1, include_degraded_feed=True)
+    assert sorted(r["ticker"] for r in kept) == ["IEX", "SIP"]

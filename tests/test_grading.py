@@ -72,13 +72,20 @@ def test_limit_long_fills_at_entry_when_touched_without_gap():
     assert out["entry_fill"] == 100.0
 
 
-def test_limit_long_fills_at_open_on_favorable_gap():
-    # open below entry -> gapped through favorably, fill at the (cheaper) open
+def test_limit_long_favorable_gap_is_clamped_to_the_plan_price():
+    # v4 (was: filled at the cheaper open). A long is never credited with a
+    # fill BELOW its own trigger -- a market or stop order at that level does
+    # not get that price, and crediting it silently shrank the fill-to-stop
+    # distance that v1-v3 used as the R denominator.
     pick = _pick(entry_type="limit", entry=100.0, stop=98.0, target=104.0)
     bars = [_bar(99.0, 99.5, 98.5, 99.2)]
-    out = simulate_pick(pick, bars, None)
+    out = simulate_pick(pick, bars, None, max_fill_deviation_r=0.0)
     assert out["triggered"] is True
-    assert out["entry_fill"] == 99.0
+    assert out["entry_fill"] == 100.0
+    # The drift is still recorded -- as raw drift, not as a credit. The
+    # conservative model charges nothing for a favorable fill; it does not pay.
+    assert out["fill_drift_r"] == pytest.approx(-0.5, abs=1e-3)
+    assert out["fill_slippage_r"] == 0
 
 
 def test_breakout_long_fills_when_high_touches_entry():
@@ -89,13 +96,15 @@ def test_breakout_long_fills_when_high_touches_entry():
     assert out["entry_fill"] == 100.0  # open (99.5) did not gap past entry
 
 
-def test_limit_short_fills_at_open_on_favorable_gap():
-    # short limit favorable gap = opening ABOVE entry (better sell price)
+def test_limit_short_favorable_gap_is_clamped_to_the_plan_price():
+    # v4, mirrored: a short is never credited with a fill ABOVE its trigger.
     pick = _pick(direction="short", entry_type="limit", entry=100.0, stop=102.0, target=96.0)
     bars = [_bar(101.0, 101.5, 100.5, 100.8)]
-    out = simulate_pick(pick, bars, None)
+    out = simulate_pick(pick, bars, None, max_fill_deviation_r=0.0)
     assert out["triggered"] is True
-    assert out["entry_fill"] == 101.0
+    assert out["entry_fill"] == 100.0
+    assert out["fill_drift_r"] == pytest.approx(-0.5, abs=1e-3)
+    assert out["fill_slippage_r"] == 0
 
 
 def test_breakout_short_fills_when_low_touches_entry():
@@ -126,21 +135,37 @@ def test_gap_through_stop_exits_at_open_not_stop():
     assert out["exit_price"] == 97.0  # the bar's open, not the stop price (98.0)
 
 
-def test_favorable_gap_fill_floors_effective_risk_at_quarter_planned():
-    # entry 100, stop 99 -> planned risk 1.0. Gap-through fill lands at 99.05,
-    # 0.05 from the stop -- far inside the 25% floor (0.25), so effective risk
-    # is floored at planned_risk * 0.25 = 0.25, not the raw 0.05.
+def test_favorable_gap_fill_no_longer_produces_fantasy_r():
+    # THE v3 REGRESSION, pinned. entry 100, stop 99 -> planned risk 1.0, and a
+    # 5R target. A gap-through fill at 99.05 sits 0.05 from the stop.
+    #
+    # v1-v3 recomputed the denominator off that fill and floored it at 25% of
+    # planned risk, scoring the trade +23.8R -- on a plan whose target was 5R
+    # away. The floor was never a fix; it only moved the ceiling from +119R to
+    # +23.8R. Both are impossible.
+    #
+    # v4: the denominator is planned risk, so a 5R target pays about 5R, and a
+    # fill that drifted 0.95R from plan is rejected outright at the default
+    # threshold (asserted separately below).
     pick = _pick(entry_type="limit", entry=100.0, stop=99.0, target=105.0)
     bars = [
         _bar(99.05, 99.5, 99.02, 99.3),   # fill @ 99.05; l=99.02 stays above stop (99)
         _bar(99.4, 105.5, 99.3, 105.2),   # touches target
     ]
-    out = simulate_pick(pick, bars, None)
-    assert out["entry_fill"] == 99.05
+    out = simulate_pick(pick, bars, None, max_fill_deviation_r=0.0)
     assert out["exit_reason"] == "target"
-    # (105 - 99.05) / 0.25 == 23.8 -- if risk had NOT been floored (0.05), this
-    # would instead be (105-99.05)/0.05 = 119.0 (fantasy R).
-    assert out["r_multiple"] == pytest.approx(23.8, abs=1e-3)
+    assert out["r_multiple"] == pytest.approx(5.0, abs=1e-3)
+
+
+def test_favorable_gap_fill_is_rejected_at_the_default_threshold():
+    pick = _pick(entry_type="limit", entry=100.0, stop=99.0, target=105.0)
+    bars = [
+        _bar(99.05, 99.5, 99.02, 99.3),
+        _bar(99.4, 105.5, 99.3, 105.2),
+    ]
+    out = simulate_pick(pick, bars, None)   # default max_fill_deviation_r=0.5
+    assert out["exit_reason"] == "invalid_fill"
+    assert out["r_multiple"] is None
 
 
 # ----------------------------------------------------------- untriggered/null
@@ -270,19 +295,21 @@ def test_target_hit_after_stop_true_on_same_bar_tie():
 
 # --------------------------------------------------------------------- eod_r
 
-def test_eod_r_uses_same_risk_denominator_as_r_multiple():
-    # Same fixture as the fantasy-R guard test: risk is floored at 0.25.
+def test_eod_r_uses_same_anchor_and_denominator_as_r_multiple():
+    # actual_r - eod_r is meant to measure "did active management add value".
+    # Both sides must therefore share an anchor AND a denominator, or the
+    # subtraction quietly absorbs execution drift instead.
     pick = _pick(entry_type="limit", entry=100.0, stop=99.0, target=105.0)
     bars = [
-        _bar(99.05, 99.5, 99.02, 99.3),
-        _bar(99.4, 105.5, 99.3, 105.2),
+        _bar(99.9, 100.2, 99.5, 100.0),   # fills at the limit (100.0)
+        _bar(100.1, 105.5, 100.0, 105.2), # touches target, closes above it
     ]
     out = simulate_pick(pick, bars, None)
     assert out["exit_reason"] == "target"
-    assert out["r_multiple"] == pytest.approx(23.8, abs=1e-3)
-    # eod_r = (last close - fill) / SAME floored risk (0.25):
-    # (105.2 - 99.05) / 0.25 == 24.6
-    assert out["eod_r"] == pytest.approx(24.6, abs=1e-3)
+    # (105 - 100) / 1.0
+    assert out["r_multiple"] == pytest.approx(5.0, abs=1e-3)
+    # (105.2 - 100) / 1.0 -- same planned entry, same planned risk
+    assert out["eod_r"] == pytest.approx(5.2, abs=1e-3)
 
 
 # ---------------------------------------------------------------- classify_shadow
@@ -450,15 +477,18 @@ def test_flatten_wins_tie_against_time_stop_on_same_bar():
 # ------------------------------------------------------------- min_bar_volume (default off, explicitly enabled here)
 
 def test_min_bar_volume_disabled_by_default_lets_thin_bar_trigger_fill():
+    # Subject is the thin-bar FILTER, not the fill price: under v4 every bar
+    # here fills at the clamped plan price, so the thin bar must be the only
+    # one that touches entry for triggering to discriminate at all.
     pick = _pick(entry_type="limit", entry=100.0, stop=98.0, target=104.0)
     bars = [
         _bar(101.0, 101.5, 100.5, 101.2, v=10_000),  # doesn't touch entry
-        _bar(99.0, 99.5, 98.5, 99.2, v=1_000),       # thin bar, gaps through favorably
-        _bar(100.0, 100.3, 99.6, 100.1, v=10_000),
+        _bar(99.0, 99.5, 98.5, 99.2, v=1_000),       # thin bar, the ONLY touch
+        _bar(101.0, 101.3, 100.6, 101.1, v=10_000),  # doesn't touch entry either
     ]
     out = simulate_pick(pick, bars, None)  # min_bar_volume not passed -> default 0
     assert out["triggered"] is True
-    assert out["entry_fill"] == 99.0  # filled on the thin bar, favorable gap honored
+    assert out["entry_fill"] == 100.0
 
 
 def test_min_bar_volume_excludes_thin_bar_from_trigger_when_enabled():
@@ -562,18 +592,30 @@ def test_invalid_fill_is_excluded_from_shadow_ledger_stats():
     assert forgone is None
 
 
-def test_valid_fill_far_from_plan_is_flagged_execution_anomaly_not_rejected():
+def test_valid_fill_far_from_plan_is_now_rejected_not_merely_flagged():
     # breakout long: entry 100, stop 98 (planned risk 2.0). Price gaps to open
-    # at 110 -- a real, valid fill (well clear of the stop) but 5R away from
-    # the planned entry level, so the "thesis at 100" was never actually tested.
+    # at 110 -- clear of the stop, so v3 graded it and only set a flag. But the
+    # target sits at 104, BELOW the fill: the trade is already past its own
+    # target before it starts. Grading that as "the plan" is what let fill drift
+    # masquerade as edge, so v4 rejects it.
     pick = _pick(direction="long", entry_type="breakout", entry=100.0, stop=98.0, target=104.0)
     bars = [_bar(110.0, 112.0, 109.5, 111.0)]
     out = simulate_pick(pick, bars, None)
-    assert out["triggered"] is True
-    assert out["exit_reason"] != "invalid_fill"
-    assert out["execution_anomaly"] is True
+    assert out["exit_reason"] == "invalid_fill"
+    assert out["triggered"] is False
+    assert out["r_multiple"] is None
     assert out["fill_vs_plan_r"] == pytest.approx(5.0, abs=1e-3)
-    assert out["r_multiple"] is not None  # still graded -- it's a real trade
+
+
+def test_far_fill_is_still_only_flagged_when_the_threshold_is_raised():
+    # The softer v3 tier survives for callers that deliberately widen the gate:
+    # execution_anomaly stays a flag at >0.5R, independent of the rejection.
+    pick = _pick(direction="long", entry_type="breakout", entry=100.0, stop=98.0, target=104.0)
+    bars = [_bar(110.0, 112.0, 109.5, 111.0)]
+    out = simulate_pick(pick, bars, None, max_fill_deviation_r=10.0)
+    assert out["triggered"] is True
+    assert out["execution_anomaly"] is True
+    assert out["r_multiple"] is not None
 
 
 def test_fill_close_to_plan_is_not_flagged_anomalous():
