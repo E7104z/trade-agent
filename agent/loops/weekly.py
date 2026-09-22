@@ -726,6 +726,75 @@ def _check_sizing_banner(playbook_md: str) -> list[str]:
     return violations
 
 
+# A row of the runner candidate-dimension table:
+# | runner_tc_bucket | 75-85 | 4 | 0.812 | 0.4400 |
+_RUNNER_ROW = re.compile(
+    r"^[|]\s*(runner_[a-z0-9_]+)\s*[|]\s*([^|]+?)\s*[|]\s*(\d+)\s*[|]\s*([^|]+?)\s*[|]")
+
+_RUNNER_MIN_N = 8
+
+
+def _check_runner_section(playbook_md: str) -> list[str]:
+    """The Runner Lane section: present, and honest at low n.
+
+    This section is checked apart from the rest of the document because it has
+    a consumer the rest does not. The intraday selector reads ONLY this
+    section and acts on it the same morning, hours before the outcome exists
+    -- so a sentence written here becomes an order before anything can
+    contradict it. Everywhere else in the playbook an unearned claim costs a
+    week; here it costs a day's trades.
+
+    Extraction deliberately calls the selector's own
+    `runner_playbook_section` rather than re-implementing it. A checker with
+    its own parser could pass a section the selector never finds, which is
+    precisely the failure being closed: the research layer computed a full
+    runner block every week and the selector read the placeholder anyway,
+    because nothing connected the two.
+
+    Three failures, all observed shapes:
+
+      MISSING       no runner heading at all -- the selector silently falls
+                    back to "no validated rules" and the week's runner
+                    research reaches nobody.
+      SMALL-N MEAN  a per-bucket mean R quoted over a handful of candidates.
+                    Same floor the Calibration and Selection Edge tables
+                    already enforce; this table was simply shaped differently
+                    from anything the existing scanners could see.
+      CONTRADICTION the section declares it has no validated rules while
+                    carrying a [rule: Rxxx] tag. One of the two is wrong, and
+                    the selector cannot tell which.
+    """
+    from ..runner_selection import NO_RUNNER_RULES, runner_playbook_section
+
+    section = runner_playbook_section(playbook_md or "")
+    if section == NO_RUNNER_RULES:
+        return ["playbook has no Runner Lane section; the intraday selector "
+                "will read the no-validated-rules placeholder and this week's "
+                "runner research reaches nothing"]
+
+    violations = []
+    empty = {"", "-", "—", "--", "n/a", "na", "suppressed",
+             "insufficient data", "not computable"}
+    for line in section.splitlines():
+        m = _RUNNER_ROW.match(line.strip())
+        if not m:
+            continue
+        n = int(m.group(3))
+        mean_r = m.group(4).strip().lower()
+        if n < _RUNNER_MIN_N and mean_r not in empty:
+            violations.append(
+                f"runner dimension {m.group(1)}/{m.group(2).strip()} shows "
+                f"mean R={m.group(4).strip()} at n={n} (floor is "
+                f"n={_RUNNER_MIN_N}): {line.strip()[:160]}")
+
+    flat = " ".join(section.split()).lower()
+    if "no validated runner rules" in flat and "[rule: r" in flat:
+        violations.append(
+            "Runner Lane declares it has no validated rules while carrying a "
+            "[rule: Rxxx] tag -- the selector cannot tell which claim to act on")
+    return violations
+
+
 def _check_wr_suppression(playbook_md: str) -> list[str]:
     """Write-time enforcement:
     (a) spec Sec5 (original check) -- flag any line carrying wr/avgR at n < 8.
@@ -923,6 +992,11 @@ def run(cfg: Config, run_date: date | None = None) -> None:
                 log("weekly", f"WARN selection-edge suppression violation: {v}")
             for v in _check_sizing_banner(new_pb):
                 log("weekly", f"WARN sizing-policy banner violation: {v}")
+            # The one section an outside loop reads and acts on the same
+            # day -- checked here because this is the only place the runner
+            # lane's text passes through before the selector trades on it.
+            for v in _check_runner_section(new_pb):
+                log("weekly", f"WARN runner-section violation: {v}")
             # A pre-registered threshold the weekly rewrite can restate is not
             # pre-registered. agent/open_questions.py holds the declared bars;
             # this is where a rewrite that moved one becomes visible.

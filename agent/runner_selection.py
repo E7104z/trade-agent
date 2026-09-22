@@ -143,27 +143,41 @@ def parse_selection(text: str, valid_tickers: set[str]) -> tuple[list[dict], lis
     return picks, hallucinated
 
 
-def _playbook_section(con=None) -> str:
-    """The playbook's runner section, if one exists yet.
+NO_RUNNER_RULES = "(no validated runner rules yet — do not assume any)"
 
-    Only the weekly miner writes playbook.md (writer isolation is unchanged),
-    so this is read-only. If no runner section exists, say so plainly rather
-    than sending the whole playbook — an unrelated section is noise the
-    selector may try to apply to a setup it was never about.
+
+def runner_playbook_section(text: str) -> str:
+    """The runner section of a playbook document, exactly as the selector sees it.
+
+    Pure text-in/text-out so the weekly loop's write-time check can call the
+    very function the selector calls. A checker that re-implemented this
+    extraction could happily pass a section the selector never finds — which is
+    the failure that kept this lane reading the placeholder while the research
+    layer computed a full runner block every week and nothing consumed it.
+
+    If no runner section exists, say so plainly rather than returning the whole
+    playbook: an unrelated section is noise the selector may try to apply to a
+    setup it was never about.
     """
-    try:
-        from .memory import read_playbook
-        text, _version = read_playbook(con)
-        text = text or ""
-    except Exception:
-        return "(no playbook available)"
+    text = text or ""
     for line in text.splitlines():
         if re.match(r"^#{1,3}\s", line) and "runner" in line.lower():
             idx = text.index(line)
             rest = text[idx:]
             nxt = re.search(r"\n#{1,3}\s", rest[len(line):])
             return rest[: len(line) + nxt.start()] if nxt else rest
-    return "(no validated runner rules yet — do not assume any)"
+    return NO_RUNNER_RULES
+
+
+def _playbook_section(con=None) -> str:
+    """The runner section of the live playbook. Read-only — only the weekly
+    miner writes playbook.md, and that writer isolation is unchanged."""
+    try:
+        from .memory import read_playbook
+        text, _version = read_playbook(con)
+    except Exception:
+        return "(no playbook available)"
+    return runner_playbook_section(text)
 
 
 def save_runner_pick(con, session_date: date, c: dict, sel: dict,

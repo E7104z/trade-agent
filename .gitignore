@@ -41,3 +41,8 @@ scripts/grep_mascot.py
 scripts/funcs.txt
 scripts/report.txt
 scripts/AUDIT_MASCOT.txt
+
+# Raw LLM responses: local crash-recovery archive, not source.
+# Also kept out of the repo because committed bulk data is what pushed the
+# Claude project over its capacity limit once already.
+llm_responses/

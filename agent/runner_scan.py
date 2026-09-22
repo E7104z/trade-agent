@@ -33,6 +33,7 @@ __all__ = [
     "evaluate_ticker",
     "market_hours_bars",
     "first_pass_index",
+    "earliest_entry_time",
 ]
 
 # Bump on ANY change to detection semantics, exactly as `sim_version` works
@@ -70,6 +71,23 @@ EXCLUDED_TICKERS: frozenset[str] = frozenset([
     # Volatility products
     "UVIX", "UVXY", "VXX", "SVIX", "SVXY", "VIXY", "VIXM", "SVOL", "UVOL",
 ])
+
+
+
+# A detection bar is a FIVE-MINUTE bar stamped with its OPEN time, so a
+# `first_pass_et` of 10:20 describes the bar covering 10:20:00-10:24:59. The
+# signal is not knowable until that bar closes at 10:25. Entering on the
+# 10:21 print would be trading four minutes of a bar that had not happened
+# yet -- look-ahead that quietly flatters every runner outcome.
+DETECTION_BAR_MINUTES = 5
+
+
+def earliest_entry_time(first_pass_et):
+    """The first moment a detection could honestly have been acted on."""
+    from datetime import timedelta
+    if first_pass_et is None:
+        return None
+    return first_pass_et + timedelta(minutes=DETECTION_BAR_MINUTES)
 
 
 def _fixed(x: float, digits: int) -> str:

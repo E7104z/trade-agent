@@ -753,7 +753,18 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
               trend_map: dict[str, dict] | None = None,
               fundamentals_map: dict[str, dict] | None = None,
               prev_close_map: dict[str, float] | None = None,
-              or_minutes: int = 15) -> list[dict]:
+              or_minutes: int = 15,
+              entry_after_map: dict[str, Any] | None = None) -> list[dict]:
+    """Grade a day's picks.
+
+    `entry_after_map` maps ticker -> the earliest datetime a pick may fill.
+    A pick detected INTRADAY cannot be simulated from the session open: an
+    entry_type of "open" fills at bars[0], which for a runner pick detected
+    at 10:20 meant buying the 09:30 print against a stop derived from a
+    10:20 EMA. The fill then sits below its own stop and the trade grades as
+    invalid_fill -- which is how an entire lane's picks became ungradeable,
+    and therefore produced no lessons, while looking like a market result.
+    """
     outcomes = []
     for p in picks:
         t = p["ticker"].upper()
@@ -762,6 +773,14 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
         except Exception as e:
             log("grade", f"minute bars failed for {p['ticker']}: {e}")
             bars = []
+        cutoff = (entry_after_map or {}).get(t)
+        if cutoff is not None and bars:
+            before = len(bars)
+            bars = [b for b in bars
+                    if b["t"].replace(tzinfo=None) >= cutoff.replace(tzinfo=None)]
+            if not bars:
+                log("grade", f"{t}: no bars at/after its {cutoff:%H:%M} entry time "
+                             f"({before} bars in the session) — cannot simulate")
         try:
             daily = md.daily_bar(p["ticker"], d)
         except Exception:

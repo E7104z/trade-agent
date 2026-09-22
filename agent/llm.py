@@ -49,6 +49,36 @@ def _estimate_cost(model: str, in_tok: int, out_tok: int, searches: int = 0) -> 
     return round(in_tok / 1e6 * price[0] + out_tok / 1e6 * price[1] + searches * 0.01, 4)
 
 
+RESPONSES_DIR = Path(__file__).resolve().parent.parent / "llm_responses"
+
+
+def _archive_response(name: str, model: str, text: str, usage: dict) -> None:
+    """Write a paid-for response to disk the moment it arrives.
+
+    The ledger records what a call COST but never what it returned, so a crash
+    anywhere downstream of the call destroys the result and leaves only the
+    bill. That is not hypothetical: a weekly mining run returned a full
+    playbook rewrite, saved its mined lessons, then died printing one of them
+    on a console that could not encode an arrow. The rewrite -- the entire
+    point of the run, and the most expensive single call this system makes --
+    was gone, and the next attempt failed on an exhausted credit balance.
+
+    So the response lands on disk before any parsing, any validation, and any
+    caller touches it. Best effort by construction: archiving must never be
+    able to fail the call it is protecting.
+    """
+    try:
+        RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = RESPONSES_DIR / f"{stamp}-{name}.json"
+        path.write_text(json.dumps({
+            "prompt_name": name, "model": model, "saved_at": stamp,
+            "usage": usage, "text": text,
+        }, indent=2), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — never fail a call over its own backup
+        pass
+
+
 class LLMClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -113,6 +143,7 @@ class LLMClient:
         resp = self._create_with_retry(kwargs)
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
         usage = self._usage(resp, model)
+        _archive_response(mock_name, model, text, usage)
 
         result = LLMResult(text=text, usage=usage)
         if expect_json:

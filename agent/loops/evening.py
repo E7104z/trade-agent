@@ -220,9 +220,15 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
             if fp is not None:
                 # Compare on naive ET wall-clock: first_pass_et is stored
                 # without a tzinfo, while provider bars carry one.
-                fp_naive = fp.replace(tzinfo=None)
+                #
+                # The cutoff is the detection BAR'S CLOSE, not its open. A
+                # first_pass_et of 10:20 labels the 5-minute bar running to
+                # 10:25, so the signal is not knowable until 10:25; entering
+                # at 10:21 traded four minutes that had not happened yet.
+                from ..runner_scan import earliest_entry_time
+                cutoff = earliest_entry_time(fp).replace(tzinfo=None)
                 entry_bars = [b for b in bars
-                              if b["t"].replace(tzinfo=None) > fp_naive]
+                              if b["t"].replace(tzinfo=None) >= cutoff]
 
         if not entry_bars:
             summary["no_bars"] += 1
@@ -549,10 +555,38 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
 
     try:
         plan_row = ledger.plan_for_date(con, d)
-        if not plan_row:
-            log("evening", f"No plan found for {d} — nothing to grade")
+        # The runner lane produces picks WITHOUT a morning plan: it detects
+        # intraday and selects at 10:30, on its own schedule. Bailing here
+        # whenever the morning loop did not produce a plan meant that on any
+        # such day the runner's candidates were never graded, never reached
+        # lesson extraction, and never reached the weekly miner -- the lane
+        # accumulated evidence into a pipeline whose back half never ran.
+        runner_enabled = bool((cfg.get("runner", {}) or {}).get("enabled"))
+        has_runner_work = False
+        if runner_enabled:
+            try:
+                has_runner_work = bool(ledger.runner_candidate_tickers(con, d))
+            except Exception as e:
+                log("evening", f"WARN could not check for runner candidates: {e}")
+        if not plan_row and not has_runner_work:
+            log("evening", f"No plan and no runner candidates for {d} — nothing to grade")
             ledger.log_run(con, "evening", d, started, "skipped")
+            # Release the lock. An early return that leaves it 'in_progress'
+            # wedges the date permanently: acquire_run_lock only re-issues a
+            # lock that is retryable, so every later attempt to grade this
+            # session is suppressed as a duplicate trigger.
+            if lock:
+                # 'failed' is the only retryable lock state the schema's CHECK
+                # constraint allows, and retryable is what a skip must be --
+                # the `runs` table already carries the honest 'skipped' label
+                # for humans. Leaving it 'in_progress' wedged 2026-09-21 so
+                # that every later attempt to grade that session was
+                # suppressed as a duplicate trigger.
+                ledger.finish_run_lock(con, d, "evening", lock["request_id"], "failed")
             return
+        if not plan_row:
+            log("evening", f"No morning plan for {d}, but {len(ledger.runner_candidate_tickers(con, d))} "
+                           f"runner candidate(s) to grade — proceeding on the runner lane alone")
 
         picks = ledger.picks_for_date(con, d)
         md = MarketData(cfg)
@@ -602,11 +636,29 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                 fundamentals_map = md.fundamentals(tickers)
             except Exception as e:
                 log("evening", f"WARN fundamentals fetch failed ({e}) — short/float/mcap fields null tonight")
+            # Picks detected INTRADAY cannot be simulated from the session
+            # open. A runner pick carries entry_type "open", which fills at
+            # bars[0] -- the 09:30 print -- against a stop derived from, say,
+            # a 10:20 EMA. The fill lands below its own stop and the trade
+            # grades invalid_fill, which is how this lane produced 7 of 10
+            # ungradeable picks and therefore zero lessons, while looking
+            # like a market outcome rather than a simulation error.
+            entry_after_map = {}
+            try:
+                from ..runner_scan import earliest_entry_time
+                for c in ledger.runner_candidates_for_date(con, d):
+                    cutoff = earliest_entry_time(c.get("first_pass_et"))
+                    if cutoff is not None:
+                        entry_after_map[c["ticker"].upper()] = cutoff
+            except Exception as e:
+                log("evening", f"WARN could not build runner entry times ({e}) — "
+                               f"runner picks would be graded from the session open")
             outcomes = grade_day(md, picks, d, slippage_bps=slippage,
                                  flatten_at=flatten_at, min_bar_volume=min_bar_volume,
                                  adv20_map=adv20_map, atr_map=atr_map, trend_map=trend_map,
                                  fundamentals_map=fundamentals_map, prev_close_map=prev_close_map,
-                                 or_minutes=int(cfg.data_cfg.get("or_minutes", 15)))
+                                 or_minutes=int(cfg.data_cfg.get("or_minutes", 15)),
+                                 entry_after_map=entry_after_map)
             for o in outcomes:
                 ledger.save_outcome(con, o)
 
@@ -686,12 +738,20 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         user = (
             f"# GRADING DATE: {d.isoformat()}\n\n"
             f"## THE MORNING PLAN\n\n"
-            f"Market stance: {plan_row['plan'].get('market_stance','')}\n"
-            f"No-trade: {plan_row['no_trade']}"
-            + (f" — reason: {plan_row['plan'].get('no_trade_reason','')}" if plan_row["no_trade"] else "")
-            + f"\nNotes for evening from the risk manager: {plan_row.get('notes_for_evening','')}\n\n"
-            f"## PICKS + COMPUTED OUTCOMES (mechanically simulated from real bars)\n\n{out_md}\n\n"
-            f"## EXECUTION GROUND TRUTH\n\n"
+            # The runner lane grades on days the morning loop never produced a
+            # plan. Say so plainly rather than rendering an empty plan block —
+            # a grader shown a blank stance would otherwise narrate one.
+            + ("(no morning plan was produced for this date — the picks below "
+               "come from the intraday runner lane, which selects at 10:30 ET "
+               "independently of the morning plan)\n\n" if not plan_row else
+               f"Market stance: {plan_row['plan'].get('market_stance','')}\n"
+               f"No-trade: {plan_row['no_trade']}"
+               + (f" — reason: {plan_row['plan'].get('no_trade_reason','')}"
+                  if plan_row["no_trade"] else "")
+               + f"\nNotes for evening from the risk manager: "
+                 f"{plan_row.get('notes_for_evening','')}\n\n")
+            + f"## PICKS + COMPUTED OUTCOMES (mechanically simulated from real bars)\n\n{out_md}\n\n"
+            + f"## EXECUTION GROUND TRUTH\n\n"
             f"Live fills recorded for {d}: "
             f"{sum(1 for o in ledger.live_orders_for_date(con, d) if o.get('entry_fill_price') is not None)}. "
             "Build the narrative from fills when present; only call this a stand-down after confirming zero fills.\n\n"

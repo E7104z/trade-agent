@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Callable
@@ -80,7 +81,38 @@ def parse_date(s: str) -> date:
 
 
 def log(loop: str, msg: str) -> None:
-    print(f"[{now_et().strftime('%H:%M:%S')}] [{loop}] {msg}", flush=True)
+    """Print a loop line, surviving a console that cannot encode the message.
+
+    Every loop logs strings the model wrote, and models write en-dashes,
+    arrows and curly quotes freely. On Windows the console defaults to cp1252,
+    which has none of them, so `print` raises UnicodeEncodeError -- from the
+    LOGGING call, not from any work. That is how a weekly run once died after
+    a successful mining call and a saved lesson but before the playbook was
+    written: a U+2192 in a lesson the model had already persisted took down
+    the run that was about to publish it.
+
+    Logging must never be able to fail a loop. Re-encode through the stream's
+    own codec with replacement when it cannot represent a character: a line
+    with a "?" in it is a complete loss of nothing, while a raised exception
+    discards the run.
+    """
+    line = f"[{now_et().strftime('%H:%M:%S')}] [{loop}] {msg}"
+    try:
+        print(line, flush=True)
+        return
+    except UnicodeEncodeError:
+        pass
+    # Re-encode through the stream's own codec. When the stream does not
+    # declare one, ASCII is the only honest choice: guessing utf-8 for an
+    # undeclared stream re-raises on exactly the console this exists for.
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
+    except Exception:  # noqa: BLE001 — a log line may never fail a loop
+        try:
+            print(line.encode("ascii", "replace").decode("ascii"), flush=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def retry(fn: Callable, attempts: int = 3, delay: float = 2.0, label: str = "op") -> Any:
