@@ -175,6 +175,29 @@ def _runner_grader_block(con, d: date) -> str:
               "decision time - not on which row happened to win.")
 
 
+def _session_feed_downgraded(con, d: date) -> bool:
+    """Did this runner session run on a degraded (non-consolidated) feed?
+
+    runner_scan already records the downgrade in runner_sessions.gates_unavailable
+    as {"feed": "iex", "feed_downgraded": true}. This reads it back so the flag
+    can ride on each outcome row, where every consumer actually looks. Unknown
+    or unreadable -> False: the flag exists to EXCLUDE data, so an ambiguous
+    session is left in rather than silently dropped.
+    """
+    try:
+        row = con.execute(
+            "SELECT gates_unavailable FROM runner_sessions WHERE session_date = ?",
+            [d]).fetchone()
+    except Exception:
+        return False
+    if not row or not row[0]:
+        return False
+    try:
+        return bool(json.loads(row[0]).get("feed_downgraded"))
+    except (TypeError, ValueError):
+        return False
+
+
 def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
     """Price EVERY runner candidate, traded or not (RUNNER_PORT_SPEC 1.5).
 
@@ -204,6 +227,18 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
     slippage = float(cfg.get("slippage_bps", 0) or 0)
     flatten_at = cfg.get("flatten_at")
     min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
+    max_fill_deviation_r = float(cfg.get("max_fill_deviation_r", 0.5) or 0)
+
+    # Feed provenance, stamped onto every outcome row this pass writes. The
+    # session-level flag already existed in runner_sessions; nothing that
+    # consumed an OUTCOME row ever joined back to it, so an IEX session --
+    # sparse prints, no RVOL, detection prices the consolidated tape never
+    # showed -- averaged straight into the same mean as a SIP session.
+    feed_downgraded = _session_feed_downgraded(con, d)
+    if feed_downgraded:
+        log("evening", f"  runner {d}: session ran on a DOWNGRADED feed; "
+                       f"outcomes stamped feed_downgraded=True and excluded "
+                       f"from cross-session aggregates")
 
     for c in candidates:
         ticker = c["ticker"]
@@ -245,8 +280,13 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
                 "target_price": c.get("target_price")}
         sim = simulate_pick(shim, entry_bars, None, slippage_bps=slippage,
                             flatten_at=flatten_at, min_bar_volume=min_bar_volume,
-                            session_date=d)
+                            session_date=d,
+                            max_fill_deviation_r=max_fill_deviation_r)
 
+        # The execution-drift columns are the whole reason sim_version 4 can
+        # keep a fixed R denominator honestly: the headline number prices the
+        # idea, these price the fill. Dropping them here (as this lane did
+        # through v3) leaves no way to tell a good setup from a good fill.
         ledger.save_runner_candidate_outcome(con, {
             "session_date": d, "ticker": ticker, "eval_date": d,
             "triggered": sim.get("triggered"),
@@ -258,6 +298,13 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
             "mae_r": sim.get("mae_r"),
             "eod_r": sim.get("eod_r"),
             "sim_version": sim.get("sim_version"),
+            "fill_slippage": sim.get("fill_slippage"),
+            "fill_slippage_r": sim.get("fill_slippage_r"),
+            "fill_drift_r": sim.get("fill_drift_r"),
+            "r_multiple_at_fill": sim.get("r_multiple_at_fill"),
+            "fill_vs_plan_r": sim.get("fill_vs_plan_r"),
+            "execution_anomaly": sim.get("execution_anomaly"),
+            "feed_downgraded": feed_downgraded,
         })
         summary["scored"] += 1
         if sim.get("triggered"):
@@ -275,7 +322,8 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
 
 
 def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
-                      flatten_at: str | None = None, min_bar_volume: float = 0) -> dict:
+                      flatten_at: str | None = None, min_bar_volume: float = 0,
+                      max_fill_deviation_r: float = 0.5) -> dict:
     """Shadow ledger: simulate every rejected candidate; never touches the equity curve.
 
     Uses the same friction and exit rules (flatten_at, min_bar_volume) as taken
@@ -296,10 +344,12 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
                 "stop_price": r["stop_price"], "target_price": r["target_price"]}
         sim = simulate_pick(shim, bars, None, slippage_bps=slippage_bps,
                             flatten_at=flatten_at, min_bar_volume=min_bar_volume,
-                            session_date=d)
+                            session_date=d,
+                            max_fill_deviation_r=max_fill_deviation_r)
         eod_outcome, forgone = classify_shadow(sim)
         ledger.save_rejection_outcome(con, r["rejection_id"], eod_outcome, forgone,
-                                      sim_version=sim.get("sim_version"))
+                                      sim_version=sim.get("sim_version"),
+                                      outcome=sim)
         summary["scored"] += 1
         summary["net_forgone_r"] += forgone or 0.0
         log("evening", f"  shadow {r['ticker']} ({r['reason'][:40]}): {eod_outcome}"
@@ -658,7 +708,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                                  adv20_map=adv20_map, atr_map=atr_map, trend_map=trend_map,
                                  fundamentals_map=fundamentals_map, prev_close_map=prev_close_map,
                                  or_minutes=int(cfg.data_cfg.get("or_minutes", 15)),
-                                 entry_after_map=entry_after_map)
+                                 entry_after_map=entry_after_map,
+                                 max_fill_deviation_r=float(
+                                     cfg.get("max_fill_deviation_r", 0.5) or 0))
             for o in outcomes:
                 ledger.save_outcome(con, o)
 
@@ -702,7 +754,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # never touches the taken-trade equity curve)
         log("evening", "Scoring rejected candidates (shadow ledger)...")
         shadow = _grade_rejections(con, md, d, slippage_bps=slippage,
-                                   flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+                                   flatten_at=flatten_at, min_bar_volume=min_bar_volume,
+                                   max_fill_deviation_r=float(
+                                       cfg.get("max_fill_deviation_r", 0.5) or 0))
 
         # v4: population monkeys + challenger arms, graded by the SAME simulator.
         from .. import integrity

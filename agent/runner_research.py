@@ -28,6 +28,7 @@ is exactly where the width lives.
 """
 from __future__ import annotations
 
+import json
 import math
 from datetime import date, timedelta
 from typing import Any
@@ -114,28 +115,82 @@ def bucket_of(dimension: str, row: dict) -> str:
 
 
 def candidate_rows(con: Any, sessions: int = 60,
-                   scan_version: int | None = None) -> list[dict]:
+                   scan_version: int | None = None,
+                   sim_version: int | None = None,
+                   include_degraded_feed: bool = False) -> list[dict]:
     """Joined candidate + outcome rows that actually triggered.
 
     Only triggered rows carry an R multiple, so only they can enter a mean-R
-    comparison. Rows are filtered by `scan_version` when one is given: never
-    compare across scan_version values, exactly as with sim_version for
-    grading — a detection-semantics change makes rows describe different rules.
+    comparison. Three fences are applied, and all three exist for the same
+    reason — an average is only meaningful over rows that measure the same
+    thing:
+
+    `scan_version` — never compare across detection-semantics changes.
+
+    `sim_version` — never compare across grading-semantics changes. This is
+    not decoration: rows graded under sim_version <= 3 used a risk denominator
+    recomputed off the actual fill and floored at 25% of planned risk, so their
+    R values are not in the same unit as a v4 row and are frequently outside
+    what the plan's geometry permits at all. Defaults to the CURRENT version
+    rather than None, because the failure mode of forgetting this fence is a
+    silently wrong edge number, not an error.
+
+    `include_degraded_feed` — a session whose bars came from IEX rather than
+    the consolidated tape is NOT comparable to a SIP session and is excluded
+    by default. IEX carries a small share of volume, so its bars are sparse
+    prints: RVOL (a primary selection discriminator) is unavailable, detection
+    prices land on levels the consolidated tape never printed, and the
+    resulting fill drift is a feed artifact rather than a fact about the
+    setup. Annotating such a session is not enough — anything that reaches
+    this function ends up inside a mean.
     """
     from . import ledger
+    from .grading import CURRENT_SIM_VERSION
+    if sim_version is None:
+        sim_version = CURRENT_SIM_VERSION
     since = date.today() - timedelta(days=sessions * 2)
     try:
         rows = ledger.runner_candidate_outcomes_since(con, since)
     except Exception:
         return []
+    degraded = _degraded_feed_sessions(con)
     out = []
     for r in rows:
         if scan_version is not None and r.get("scan_version") != scan_version:
             continue
+        if sim_version is not None and r.get("sim_version") != sim_version:
+            continue
+        if not include_degraded_feed:
+            # Prefer the per-row stamp (v14+); fall back to the session flag
+            # so rows written before that column existed are still fenced.
+            flag = r.get("feed_downgraded")
+            if flag is None:
+                flag = r.get("session_date") in degraded
+            if flag:
+                continue
         if not r.get("triggered") or r.get("r_multiple") is None:
             continue
         out.append(r)
     return _attach_regime(con, out)
+
+
+def _degraded_feed_sessions(con: Any) -> set:
+    """Session dates whose scan ran on a downgraded (non-consolidated) feed."""
+    out = set()
+    try:
+        rows = con.execute(
+            "SELECT session_date, gates_unavailable FROM runner_sessions").fetchall()
+    except Exception:
+        return out
+    for d, raw in rows:
+        if not raw:
+            continue
+        try:
+            if json.loads(raw).get("feed_downgraded"):
+                out.add(d)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _attach_regime(con: Any, rows: list[dict]) -> list[dict]:

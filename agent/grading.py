@@ -36,6 +36,9 @@ Simulation rules (documented, conservative):
   series for indexing and for the eod close — they are not deleted, just
   untrusted for level-touch decisions. Open-type fills are unconditional
   (there is no "trigger" to distrust) and are unaffected by this filter.
+  Fill model (v4): a fill is never better than the plan price. A long that
+  "fills" below its trigger because the bar opened there is an optimistic model
+  -- a market or stop order at the trigger does not get that price.
   Fill validity (v3): a gap-through fill can land on the WRONG side of its own
   stop -- e.g. a long "limit" order effectively bought at the open because price
   gapped below the limit price, with that open already under the stop. That is
@@ -46,8 +49,23 @@ Simulation rules (documented, conservative):
   from the planned entry -- still grades normally but is flagged
   execution_anomaly so the evening grader doesn't narrate a thesis test that
   never actually happened at the intended level.
-  Metrics:
-    r_multiple = signed P&L / initial risk per share
+  Metrics (v4 -- the denominator is PLANNED risk everywhere; see
+  CURRENT_SIM_VERSION for why the old fill-anchored denominator was wrong):
+    r_multiple     = (exit - PLANNED entry) / (PLANNED entry - stop). Prices the
+                     IDEA. Bounded by the plan's own geometry: a 2R plan scores
+                     about +2R at target and about -1R at stop (a little worse
+                     with slippage), and nothing else is reachable.
+    r_multiple_at_fill = same, but from the actual fill. Prices the idea AND its
+                     execution. The split is exact, on every triggered row:
+                         r_multiple - r_multiple_at_fill == fill_slippage_r
+    fill_drift_r   = what the BARS showed, signed, before any clamping.
+                     Negative = the bar offered a better price than the plan.
+    fill_slippage / fill_slippage_r = the drift actually CHARGED, in price units
+                     and in planned-risk units. Never negative: the conservative
+                     fill model declines to credit a better-than-plan fill, so a
+                     favorable bar costs nothing rather than paying out. This is
+                     what keeps the identity above true in both directions.
+    fill_vs_plan_r = |fill_drift_r|; drives the rejection gate below.
     mfe_r / mae_r = max favorable / adverse excursion in R while in the trade
     missed_move_r = for UNTRIGGERED picks, what the move from the entry level to the
                     best price would have been worth in R (measures entries that were too cute)
@@ -91,7 +109,18 @@ _CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 # v3 = fills on the wrong side of their own stop are rejected as
 # "invalid_fill" instead of being graded through the risk floor, and
 # surviving fills far from the planned entry are flagged execution_anomaly.
-CURRENT_SIM_VERSION = 3
+# v4 = FIXED RISK DENOMINATOR. Every R is now scored as
+#      (exit - planned entry) / (planned entry - stop). v1-v3 recomputed the
+#      denominator off the ACTUAL fill and floored it at 25% of planned risk,
+#      so a fill that drifted toward the stop collapsed the denominator and
+#      produced R values that the plan's own geometry made impossible (a 2R
+#      target scoring +11R). Execution drift now lives in its own columns
+#      (fill_drift_r, fill_slippage, fill_slippage_r, r_multiple_at_fill)
+#      instead of contaminating the headline number. Fills are also clamped to never be
+#      better than the plan price, and a fill that drifts more than
+#      max_fill_deviation_r of planned risk from the plan is rejected as
+#      invalid_fill rather than graded.
+CURRENT_SIM_VERSION = 4
 
 
 def _risk_per_share(entry: float, stop: float) -> float:
@@ -315,7 +344,8 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                   min_bar_volume: float = 0, adv20: float | None = None,
                   atr14: float | None = None, trend_snapshot: dict | None = None,
                   fundamentals: dict | None = None, prev_close: float | None = None,
-                  or_minutes: int = 15, session_date: date | None = None) -> dict:
+                  or_minutes: int = 15, session_date: date | None = None,
+                  max_fill_deviation_r: float = 0.5) -> dict:
     """Returns an outcome dict ready for ledger.save_outcome (minus grade fields).
 
     atr14/trend_snapshot/fundamentals/prev_close are the indicator-layer-v2
@@ -328,7 +358,13 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     close, flatten_at/time_stop cutoffs at/after the session close are inert by
     construction and are recorded as such instead of silently never firing.
     When session_date is None (legacy callers), behavior is unchanged and
-    session_length stays None."""
+    session_length stays None.
+
+    max_fill_deviation_r (v4) is the fill-drift rejection threshold, in units
+    of PLANNED risk. A fill further than this from the plan price is not the
+    planned trade -- its target sits a materially different distance away --
+    so it is rejected as invalid_fill rather than graded. Config key
+    `max_fill_deviation_r`; set to 0 to disable the rejection."""
     # Session close for cutoff clamping. Without a session_date we assume the
     # historical behavior: a full 16:00 session.
     close_t = market_close_et(session_date) if session_date else dtime(16, 0)
@@ -352,6 +388,21 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "target_hit_after_stop": None,
         "execution_anomaly": False,
         "fill_vs_plan_r": None,
+        # v4 execution-drift columns. The headline r_multiple is scored off
+        # PLANNED geometry so rows stay comparable; these carry what the fill
+        # actually cost, so nothing is lost by taking it out of the headline.
+        # Three distinct quantities, deliberately not collapsed into one:
+        #   fill_drift_r    what the BARS showed, signed, before any clamping.
+        #                   Negative = the bar offered a better price than plan.
+        #   fill_slippage_r what the conservative model actually CHARGES, i.e.
+        #                   max(fill_drift_r, 0) -- a favorable bar is not
+        #                   credited, so it costs nothing rather than paying.
+        #   fill_vs_plan_r  |fill_drift_r|; drives the rejection gate.
+        "fill_drift_r": None,       # signed, pre-clamp, in units of planned risk
+        "fill_slippage": None,      # charged drift, price units, >= 0
+        "fill_slippage_r": None,    # charged drift, planned-risk units, >= 0
+        "r_multiple_at_fill": None, # r_multiple minus the charged drift
+        "invalid_fill_detail": None,
         "sim_version": CURRENT_SIM_VERSION,
         # Phase 1c half-day calendar: a property of the SESSION, set for every
         # outcome (including no_data/invalid_plan) whenever the caller supplies
@@ -535,30 +586,56 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         log("grade", f"pick {pick.get('pick_id')}: INVALID FILL -- {out['invalid_fill_detail']}")
         return out
 
-    # Flag (but don't reject) a fill that landed far from the planned entry,
-    # in units of the ORIGINALLY PLANNED risk. Still a real, valid trade --
-    # the stop wasn't breached -- but the evening grader must not narrate a
-    # thesis test at a level the trade never actually filled near.
+    # ---- fill-drift rejection gate (v4) ------------------------------------
+    # A fill far from the plan price is not the planned trade. The stop and the
+    # target stay anchored to the plan, so a fill that drifted toward the stop
+    # is really taking a much larger reward-to-risk than the plan described,
+    # and one that drifted away is taking a much smaller one. Grading either as
+    # "the plan" mixes two different trades into one average. Rejected here,
+    # before any risk math, exactly like the wrong-side-of-stop case above.
     planned_risk = _risk_per_share(entry, stop)
+    drift = fill_price - entry                     # signed, plan-relative
+    adverse = drift if long else -drift            # positive = worse than plan
     if planned_risk > 0:
-        out["fill_vs_plan_r"] = round(abs(fill_price - entry) / planned_risk, 2)
+        out["fill_vs_plan_r"] = round(abs(drift) / planned_risk, 2)
+        out["fill_drift_r"] = round(adverse / planned_risk, 3)
+        # Only ADVERSE drift is charged: the clamp below refuses to credit a
+        # favorable fill, so crediting it here as negative slippage would
+        # double-count it in the opposite direction and break the identity
+        # r_multiple - r_multiple_at_fill == fill_slippage_r.
+        charged = max(adverse, 0.0)
+        out["fill_slippage"] = round(charged, 4)
+        out["fill_slippage_r"] = round(charged / planned_risk, 3)
         out["execution_anomaly"] = out["fill_vs_plan_r"] > 0.5
+        if max_fill_deviation_r > 0 and out["fill_vs_plan_r"] > max_fill_deviation_r:
+            out["entry_fill"] = round(fill_price, 4)
+            out["exit_reason"] = "invalid_fill"
+            out["invalid_fill_detail"] = (
+                f"{'long' if long else 'short'} fill {fill_price:.4f} drifted "
+                f"{out['fill_vs_plan_r']:.2f}R from planned entry {entry:.4f} "
+                f"(limit {max_fill_deviation_r:.2f}R) -- not the planned trade"
+            )
+            log("grade", f"pick {pick.get('pick_id')}: INVALID FILL -- {out['invalid_fill_detail']}")
+            return out
 
-    # Recompute risk off the actual fill (a limit/breakout order can fill at a
-    # more favorable price than requested when the market gaps through it).
-    # GUARD: if that gap-through fill lands very close to the stop, the
-    # fill-to-stop distance collapses toward zero and produces absurd,
-    # fantasy R-multiples (e.g. a 3-cent risk against a $12 move -> 300+R).
-    # Floor the effective risk at 25% of the ORIGINALLY PLANNED risk so a
-    # favorable fill still gets credit (smaller effective risk = bigger R)
-    # without letting the denominator run away to near-zero. The hard gate
-    # above already ruled out the case where this fill is on the wrong side
-    # of the stop entirely, so what's left here is always a genuine trade.
-    risk = _risk_per_share(fill_price, stop)
-    if risk <= 0:
-        risk = planned_risk
-    elif planned_risk > 0 and risk < planned_risk * 0.25:
-        risk = planned_risk * 0.25
+    # Conservative fill model (v4): a fill is never BETTER than the plan price.
+    # A long that "filled" below its trigger because the bar opened there is an
+    # optimistic model -- a market/stop order at the trigger does not get that
+    # price -- and crediting it silently inflated every downstream number. The
+    # raw fill is kept in fill_slippage/fill_vs_plan_r above (both computed
+    # pre-clamp, so the gates above still see reality); only the P&L anchor is
+    # clamped.
+    if adverse < 0:
+        fill_price = entry
+
+    # ---- the risk denominator is PLANNED geometry, always (v4) -------------
+    # Never recomputed off the fill. See CURRENT_SIM_VERSION notes: a
+    # fill-anchored denominator collapses when the fill drifts toward the stop
+    # and manufactures R values the plan's own geometry makes impossible. With
+    # a fixed denominator, a 2R plan can only ever score about +2R at target
+    # and about -1R at stop, and eod exits land in between -- which is the only
+    # way rows from different names and different days can be averaged at all.
+    risk = planned_risk if planned_risk > 0 else _risk_per_share(fill_price, stop)
 
     out["triggered"] = True
     out["entry_fill"] = round(fill_price, 4)
@@ -681,7 +758,13 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         exit_price = exit_price * (1 - slip) if long else exit_price * (1 + slip)
 
     sign = 1.0 if long else -1.0
-    r_mult = sign * (exit_price - fill_price) / risk
+    # Headline R is scored from the PLANNED entry against the PLANNED risk, so
+    # every row in the ledger is denominated in the same unit and the numbers
+    # stay inside the bounds the plan's geometry allows. What the fill actually
+    # cost is carried separately, and the two reconcile exactly:
+    #     r_multiple - r_multiple_at_fill == fill_slippage_r
+    r_mult = sign * (exit_price - entry) / risk
+    r_mult_at_fill = sign * (exit_price - fill_price) / risk
     mfe = sign * (best_px - fill_price) / risk
     mae = sign * (worst_px - fill_price) / risk  # negative or zero
 
@@ -697,7 +780,10 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     eod_exit = bars[-1]["c"]
     if slip > 0:
         eod_exit = eod_exit * (1 - slip) if long else eod_exit * (1 + slip)
-    out["eod_r"] = round(sign * (eod_exit - fill_price) / risk, 3)
+    # Anchored to the planned entry, matching r_multiple -- otherwise
+    # actual_r - eod_r would subtract two differently-anchored numbers and the
+    # "did management add value" read would absorb execution drift.
+    out["eod_r"] = round(sign * (eod_exit - entry) / risk, 3)
 
     # target_hit_after_stop: only meaningful for stopped trades. Scans from the
     # exit bar onward (the same-bar case counts, consistent with the conservative
@@ -715,6 +801,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "exit_reason": exit_reason,
         "exit_time": exit_time,
         "r_multiple": round(float(r_mult), 3),
+        "r_multiple_at_fill": round(float(r_mult_at_fill), 3),
         "mfe_r": round(float(mfe), 3),
         "mae_r": round(float(mae), 3),
     })
@@ -754,7 +841,8 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
               fundamentals_map: dict[str, dict] | None = None,
               prev_close_map: dict[str, float] | None = None,
               or_minutes: int = 15,
-              entry_after_map: dict[str, Any] | None = None) -> list[dict]:
+              entry_after_map: dict[str, Any] | None = None,
+              max_fill_deviation_r: float = 0.5) -> list[dict]:
     """Grade a day's picks.
 
     `entry_after_map` maps ticker -> the earliest datetime a pick may fill.
@@ -792,7 +880,8 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
                           trend_snapshot=(trend_map or {}).get(t),
                           fundamentals=(fundamentals_map or {}).get(t),
                           prev_close=(prev_close_map or {}).get(t),
-                          or_minutes=or_minutes, session_date=d)
+                          or_minutes=or_minutes, session_date=d,
+                          max_fill_deviation_r=max_fill_deviation_r)
         o["eval_date"] = d
         outcomes.append(o)
         log("grade", f"{p['ticker']} {p['direction']}: triggered={o['triggered']} "

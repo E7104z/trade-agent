@@ -34,6 +34,7 @@
     "intraday_check_secret_env": "CRON_SECRET"
   },
   "min_bar_volume": 0,
+  "max_fill_deviation_r": 0.5,
   "lesson_holdout_sessions": 0,
   "drawdown_window": 10,
   "drawdown_pause_r": -4.0,

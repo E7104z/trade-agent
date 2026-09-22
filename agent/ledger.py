@@ -354,6 +354,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v12.STATEMENTS
 from . import migrations_v13  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v13.STATEMENTS
 
+# --- v14 execution drift split out of the headline R -----------------------
+from . import migrations_v14  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v14.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -619,6 +623,7 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             r_multiple, mfe_r, mae_r, day_open, day_high, day_low, day_close,
             day_volume, missed_move_r, baseline_r, eod_r, target_hit_after_stop,
             execution_anomaly, fill_vs_plan_r,
+            fill_slippage, fill_slippage_r, fill_drift_r, r_multiple_at_fill,
             adv20, vwap_at_fill, fill_vs_vwap_pct, vwap_side_at_fill,
             first_vwap_reclaim_et, first_vwap_reject_et, vwap_crosses,
             pct_time_above_vwap, rvol_at_1000, rvol_at_1200, rvol_close,
@@ -634,7 +639,7 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             grade, grade_notes, graded_at, sim_version)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                   ?,?,?,?,?)""",
+                   ?,?,?,?,?,?,?,?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
@@ -642,6 +647,8 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             o.get("day_low"), o.get("day_close"), o.get("day_volume"),
             o.get("missed_move_r"), o.get("baseline_r"), o.get("eod_r"),
             o.get("target_hit_after_stop"), o.get("execution_anomaly"), o.get("fill_vs_plan_r"),
+            o.get("fill_slippage"), o.get("fill_slippage_r"), o.get("fill_drift_r"),
+            o.get("r_multiple_at_fill"),
             o.get("adv20"), o.get("vwap_at_fill"), o.get("fill_vs_vwap_pct"), o.get("vwap_side_at_fill"),
             o.get("first_vwap_reclaim_et"), o.get("first_vwap_reject_et"), o.get("vwap_crosses"),
             o.get("pct_time_above_vwap"), o.get("rvol_at_1000"), o.get("rvol_at_1200"), o.get("rvol_close"),
@@ -1313,14 +1320,26 @@ def rejections_for_date(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:
 
 def save_rejection_outcome(con: duckdb.DuckDBPyConnection, rejection_id: int,
                            eod_outcome: str, forgone_r: float | None,
-                           sim_version: int | None = None) -> None:
+                           sim_version: int | None = None,
+                           outcome: dict | None = None) -> None:
+    """Record a shadow-ledger result.
+
+    `outcome` is the full simulate_pick dict. The taken and rejected lanes are
+    compared directly (agent/ablation.py), so the rejected side has to carry
+    the same execution-drift columns as the taken side or the comparison is
+    between a number that accounts for fills and one that does not.
+    """
     if sim_version is None:
         from .grading import CURRENT_SIM_VERSION
         sim_version = CURRENT_SIM_VERSION
+    o = outcome or {}
     con.execute(
         "UPDATE rejections SET eod_outcome = ?, forgone_r = ?, graded_at = current_timestamp, "
-        "sim_version = ? WHERE rejection_id = ?",
-        [eod_outcome, forgone_r, sim_version, rejection_id],
+        "sim_version = ?, fill_slippage = ?, fill_slippage_r = ?, fill_drift_r = ?, "
+        "r_multiple_at_fill = ? WHERE rejection_id = ?",
+        [eod_outcome, forgone_r, sim_version, o.get("fill_slippage"),
+         o.get("fill_slippage_r"), o.get("fill_drift_r"),
+         o.get("r_multiple_at_fill"), rejection_id],
     )
 
 
@@ -1666,14 +1685,20 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
         """INSERT INTO runner_candidate_outcomes
            (session_date, ticker, eval_date, triggered, entry_fill, exit_price,
             exit_reason, r_multiple, mfe_r, mae_r, eod_r, selected,
-            selection_rank, pick_id, sim_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            selection_rank, pick_id, sim_version,
+            fill_slippage, fill_slippage_r, fill_drift_r, r_multiple_at_fill,
+            fill_vs_plan_r, execution_anomaly, feed_downgraded)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["session_date"], o["ticker"].upper(), o.get("eval_date"),
             o.get("triggered"), o.get("entry_fill"), o.get("exit_price"),
             o.get("exit_reason"), o.get("r_multiple"), o.get("mfe_r"),
             o.get("mae_r"), o.get("eod_r"), bool(selected), rank, pick_id,
             o.get("sim_version"),
+            o.get("fill_slippage"), o.get("fill_slippage_r"),
+            o.get("fill_drift_r"), o.get("r_multiple_at_fill"),
+            o.get("fill_vs_plan_r"),
+            o.get("execution_anomaly"), o.get("feed_downgraded"),
         ],
     )
 
