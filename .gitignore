@@ -46,3 +46,6 @@ scripts/AUDIT_MASCOT.txt
 # Also kept out of the repo because committed bulk data is what pushed the
 # Claude project over its capacity limit once already.
 llm_responses/
+scripts/inspect_diag.py
+scripts/inspect_runner_data.py
+scripts/inspect_runner_data2.py

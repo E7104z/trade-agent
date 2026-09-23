@@ -30,6 +30,7 @@ from flask import Flask, Response, redirect, request, session, url_for
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent import ledger  # noqa: E402
+from agent import dashboard as dashboard_lib  # noqa: E402
 from agent.config import load_config  # noqa: E402
 from agent.mascot import MASCOT_MARKER, mascot_embed  # noqa: E402
 from agent.memory import read_playbook  # noqa: E402
@@ -152,11 +153,34 @@ pre{white-space:pre-wrap;font-size:12px;background:#0d1117;border:1px solid #303
      border-radius:6px;padding:12px;max-height:400px;overflow:auto}
 a{color:#58a6ff}
 .top{display:flex;justify-content:space-between;align-items:center}
+nav.dash-nav{position:sticky;top:0;z-index:20;background:#0d1117;border-bottom:1px solid #30363d;
+  padding:8px 0;margin:0 0 8px;display:flex;gap:16px;flex-wrap:wrap}
+nav.dash-nav a{color:#8b949e;text-decoration:none;font-size:13px;font-weight:600;padding:4px 10px;border-radius:6px}
+nav.dash-nav a:hover{color:#e6edf3;background:#161b22}
+.section-banner{display:flex;align-items:baseline;gap:12px;margin:28px 0 14px;padding-bottom:8px;border-bottom:2px solid #30363d}
+.section-banner .tag{background:#238636;color:#fff;font-size:11px;font-weight:700;letter-spacing:.08em;padding:3px 9px;border-radius:12px}
+.section-banner h2{margin:0;color:#e6edf3}
+.section-banner .sub{color:#8b949e;font-size:12px}
+.pb-h{margin:18px 0 8px}
+.pb-list{margin:6px 0 12px 22px;padding:0}
+.pb-list li{margin:4px 0}
+.pb-p{margin:8px 0}
+.pb-hr{border:none;border-top:1px solid #30363d;margin:16px 0}
+.pb-table{width:auto;min-width:320px;margin:10px 0}
+.neutral{color:#8b949e}
 </style></head><body>
 <div class="top">
   <h1>Trade Agent — Live Dashboard</h1>
   <a href="/logout">Sign out</a>
 </div>
+<nav class="dash-nav">
+  <a href="#sec-loop">Loop</a>
+  <a href="#sec-runner">Runner</a>
+  <a href="#sec-conclusions">Conclusions</a>
+  <a href="#sec-playbook">Playbook</a>
+  <a href="#sec-history">History</a>
+  <a href="#sec-runs">Runs</a>
+</nav>
 <!--ARBY-->
 <p style="color:#8b949e">Loading...</p>
 <div class="card">
@@ -287,6 +311,19 @@ function render(d) {
         <table><tr><th>Ticker</th><th>R</th><th>Exit</th><th></th></tr>${mvRows}</table>`;
     }
 
+    // WHY THESE WERE PICKED — the selector's actual choices + the thesis it
+    // wrote for each. render_text has always shown this; the dashboard did not.
+    let picksHtml = "";
+    if ((rn.picks || []).length) {
+      const pRows = rn.picks.map(p => `<tr><td><b>${p.ticker}</b></td><td>${p.direction}</td>
+        <td>${p.conviction||''}</td><td>${p.size_r ?? '—'}R</td>
+        <td>${p.entry_price ?? '—'}</td><td>${p.stop_price ?? '—'}</td><td>${p.target_price ?? '—'}</td>
+        <td>${esc(p.thesis||'')}</td></tr>`).join('');
+      picksHtml = `<h3 style="margin-top:18px">Selected picks (${rn.picks.length})</h3>
+        <table><tr><th>Ticker</th><th>Dir</th><th>Conviction</th><th>Size</th>
+        <th>Entry</th><th>Stop</th><th>Target</th><th>Thesis</th></tr>${pRows}</table>`;
+    }
+
     runnerHtml = `<div class="card"><h2>Runner Lane — ${d.today}</h2>
       <p style="color:${col};font-weight:600">${rn.health||""}</p>
       ${rn.skipped_reason ? `<p style="color:#8b949e">selection: ${rn.skipped_reason}</p>` : ""}
@@ -296,6 +333,7 @@ function render(d) {
         <div class="stat"><div class="v">${rn.n_selected||0}</div>selected</div>
         <div class="stat"><div class="v">${rn.n_orders||0}</div>live orders</div>
       </div>
+      ${picksHtml}
       ${moversHtml}
       <h3 style="margin-top:18px">All candidates</h3>${table}
       <p style="color:#8b949e;font-size:12px;margin-top:10px">
@@ -307,8 +345,68 @@ function render(d) {
       <p style="color:#8b949e">${rn.health || "No scan recorded for today."}</p></div>`;
   }
 
+  // ── Conclusions & Changes ───────────────────────────────────────────
+  const cc = d.conclusions || {};
+
+  let bestEdgeHtml = "<p class='neutral'>Not enough triggered trades yet to declare a current best edge (needs ≥3 per setup).</p>";
+  if (cc.best_edge) bestEdgeHtml = `<p style="font-size:15px"><b>${esc(cc.best_edge)}</b></p>`;
+
+  let lessonsHtml = "<p class='neutral'>No active lessons yet.</p>";
+  if ((cc.lessons||[]).length) {
+    lessonsHtml = `<table><tr><th>Lesson</th><th>Setup</th><th>Confidence</th><th>+/-</th><th>Status</th></tr>` +
+      cc.lessons.map(l => `<tr><td>${esc(l.lesson)}</td><td>${esc(l.setup_type||'')}</td><td>${esc(l.confidence||'')}</td>
+        <td>+${l.confirmations??0} / -${l.contradictions??0}</td><td>${esc(l.status||'')}</td></tr>`).join('') + '</table>';
+  }
+
+  let questionsHtml = "<p class='neutral'>No open-question progress recorded yet.</p>";
+  if ((cc.open_questions||[]).length) {
+    questionsHtml = `<table><tr><th>Question</th><th>Progress</th><th>Events</th><th>Last</th><th>Recent notes</th></tr>` +
+      cc.open_questions.map(q => `<tr><td>Q${q.question_id}</td><td>${q.total}</td><td>${q.events}</td>
+        <td>${q.last_event||''}</td><td>${esc((q.recent_notes||[]).join(' · '))}</td></tr>`).join('') + '</table>';
+  }
+
+  let calHtml = "<p class='neutral'>No calibration data yet.</p>";
+  if ((cc.calibration||[]).length) {
+    calHtml = `<table><tr><th>Stated conviction</th><th>N</th><th>Win rate</th><th>Avg R</th></tr>` +
+      cc.calibration.map(c => {
+        const wr = c.suppressed ? `<span title="suppressed: n < ${c.min_n}">—</span>`
+                  : (c.win_rate!=null ? Math.round(c.win_rate*100)+'%' : '—');
+        const ar = c.suppressed ? '—' : (c.avg_r ?? '—');
+        return `<tr><td>${esc(c.conviction||'')}</td><td>${c.n}</td><td>${wr}</td><td>${ar}</td></tr>`;
+      }).join('') + '</table>';
+  }
+
+  const mg = cc.management || {};
+  let mgHtml = "<p class='neutral'>No management (counterfactual) data yet.</p>";
+  if (Object.keys(mg).length) {
+    mgHtml = `<table><tr><th>Metric</th><th>Value</th></tr>
+      <tr><td>Triggered trades</td><td>${mg.triggered??0}</td></tr>
+      <tr><td>Avg realized R</td><td>${mg.avg_r ?? '—'} (n=${mg.avg_r_n??0})</td></tr>
+      <tr><td>Avg same-name open→close (baseline)</td><td>${mg.avg_baseline_r ?? '—'} (n=${mg.avg_baseline_r_n??0})</td></tr>
+      <tr><td><b>Edge vs baseline (paired)</b></td><td><b>${mg.edge_vs_baseline_r ?? '—'}</b> R (n=${mg.edge_vs_baseline_n??0})</td></tr>
+      <tr><td><b>Management edge vs hold-to-close (paired)</b></td><td><b>${mg.management_edge_r ?? '—'}</b> R (n=${mg.management_edge_n??0})</td></tr>
+      <tr><td>Stopped</td><td>${mg.stopped??0}${mg.stopped_then_target ? ` (${mg.stopped_then_target} hit target after)` : ''}</td></tr>
+      <tr><td>Avg EOD R on stopped trades</td><td>${mg.avg_eod_r_on_stopped ?? '—'}</td></tr>
+      <tr><td>Untriggered (fussy entries) w/ baseline</td><td>${mg.untriggered_with_baseline??0} — walked away from ${mg.avg_baseline_r_untriggered ?? '—'}R</td></tr></table>`;
+  }
+
+  let seHtml = "<p class='neutral'>No weekly selection-edge history yet (the weekly miner writes this).</p>";
+  if ((cc.selection_edge||[]).length) {
+    seHtml = `<table><tr><th>Week ending</th><th>Sessions</th><th>Edge R</th><th>p</th><th>Verdict</th></tr>` +
+      cc.selection_edge.map(r => `<tr><td>${r.week_ending||''}</td><td>${r.sessions??''}</td>
+        <td>${r.edge_r ?? '—'}</td><td>${r.p_value!=null ? Number(r.p_value).toFixed(4) : '—'}</td>
+        <td>${esc(r.verdict||'')}</td></tr>`).join('') + '</table>';
+  }
+
+  // Playbook: prefer the server-rendered structured HTML (shared with the
+  // static dashboard), falling back to escaped plain text for old payloads.
+  const playbookHtml = d.playbook_html
+    ? d.playbook_html
+    : `<pre>${esc(d.playbook||'')}</pre>`;
+
   el.innerHTML = `
-  <div class="card"><h2>Today's Plan — ${d.today}</h2>${planHtml}</div>
+  <div class="section-banner"><span class="tag">LOOP</span><h2>The daily loop</h2><span class="sub">morning plan → evening grade → weekly mine</span></div>
+  <div class="card" id="sec-loop"><h2>Today's Plan — ${d.today}</h2>${planHtml}</div>
   <div class="card"><h2>Performance</h2>
     <div class="grid">
       <div class="stat"><div class="v">${overall.picks_graded ?? 0}</div>Graded trades</div>
@@ -320,8 +418,23 @@ function render(d) {
     </div></div>
   <div class="card"><h2>By Setup</h2><table><tr><th>Setup</th><th>N</th><th>Triggered</th>
     <th>Win rate</th><th>Avg R</th><th>Total wR</th></tr>${setupRows}</table></div>
-  ${runnerHtml}
   <div class="card"><h2>Shadow Ledger — Rejected Candidates (${d.today})</h2>${shadowHtml}</div>
+
+  <div class="section-banner" id="sec-runner"><span class="tag">RUNNER</span><h2>The intraday runner lane</h2><span class="sub">scan → select → grade against the shadow</span></div>
+  ${runnerHtml}
+
+  <div class="section-banner" id="sec-conclusions"><span class="tag">CONCLUSIONS</span><h2>What the desk has concluded & changed</h2><span class="sub">the numbers that actually drive future playbooks</span></div>
+  <div class="card"><h3>Current best edge</h3>${bestEdgeHtml}</div>
+  <div class="card"><h3>Active lessons</h3>${lessonsHtml}</div>
+  <div class="card"><h3>Open questions</h3>${questionsHtml}</div>
+  <div class="card"><h3>Calibration (does stated conviction track realized R?)</h3>${calHtml}</div>
+  <div class="card"><h3>Management quality (stop/target machinery vs hold-to-close)</h3>${mgHtml}</div>
+  <div class="card"><h3>Runner selection edge (weekly, FDR-corrected)</h3>${seHtml}</div>
+
+  <div class="section-banner" id="sec-playbook"><span class="tag">PLAYBOOK</span><h2>The playbook</h2><span class="sub">v${d.playbook_version}</span></div>
+  <div class="card">${playbookHtml}</div>
+
+  <div class="section-banner" id="sec-history"><span class="tag">HISTORY</span><h2>Raw data inspector</h2></div>
     <div class="card"><h2>Historical Data</h2>
         <p class="history-meta">Choose a date and data type to inspect everything saved for that session.</p>
         <div class="history-controls">
@@ -343,8 +456,8 @@ function render(d) {
         <div id="historyResult" class="history-meta">Loading available dates...</div>
         <div id="historyTableView" class="history-table"></div>
     </div>
-  <div class="card"><h2>Playbook v${d.playbook_version}</h2><pre>${d.playbook.replace(/</g,'&lt;')}</pre></div>
-  <div class="card"><h2>Recent Runs</h2><table><tr><th>Loop</th><th>Date</th><th>Status</th>
+  <div class="section-banner" id="sec-runs"><span class="tag">RUNS</span><h2>Loop run history</h2></div>
+  <div class="card"><table><tr><th>Loop</th><th>Date</th><th>Status</th>
     <th>Model</th><th>Cost</th><th>Error</th></tr>${runsRows}</table></div>
   `;
   // The Historical Data controls above just got (re)created by the innerHTML
@@ -497,6 +610,11 @@ def _runner_payload(con, d) -> dict:
     try:
         from agent import runner_view
         s = runner_view.session_summary(con, d)
+        picks = con.execute(
+            """SELECT pick_id, ticker, direction, conviction, size_r,
+                      entry_price, stop_price, target_price, thesis
+               FROM picks WHERE plan_date = ? AND setup_type = 'dto_runner'
+               ORDER BY pick_id""", [d]).fetchall()
         return {
             "ran": bool(s["session"] or s["rows"]),
             "health": runner_view._health_line(s),
@@ -506,6 +624,15 @@ def _runner_payload(con, d) -> dict:
             "n_orders": len(s["orders"]),
             "degraded": bool((s["session"] or {}).get("provider_degraded")),
             "skipped_reason": (s["session"] or {}).get("selection_skipped_reason"),
+            # The runner's actual selections, with the thesis the selector wrote
+            # — the "WHY THESE WERE PICKED" evidence that render_text shows but
+            # the dashboard never did. Flat fields only (no nested entry_plan).
+            "picks": [
+                {"ticker": p[1], "direction": p[2], "conviction": p[3],
+                 "size_r": p[4], "entry_price": p[5], "stop_price": p[6],
+                 "target_price": p[7], "thesis": p[8] or ""}
+                for p in picks
+            ],
             "rows": sorted(s["rows"],
                            key=lambda x: (not x["selected"], x["rank"] or 99,
                                           x["ticker"])),
@@ -563,6 +690,18 @@ def api_status():
             "streak_detail": streak,
             "equity": equity,
             "equity_curve": curve[-120:],
+            # Conclusions & Changes: everything the weekly miner and evening
+            # grader concluded, read back so a human can see the current best
+            # edge, the active lessons, the shadow-ledger cost, the calibration
+            # and management verdicts, and the FDR-corrected runner selection
+            # edge — the same numbers that actually drive future playbooks.
+            "conclusions": dashboard_lib.conclusions_payload(con),
+            # Arby parity: the static dashboard inlines these as boot data, so
+            # the hosted mascot gets the identical contract (playbook_bullets
+            # is the only one its JS reads directly; the rest are room dressing
+            # kept in sync so the two surfaces can't drift).
+            "playbook_bullets": dashboard_lib.playbook_bullets(playbook_text),
+            "playbook_html": dashboard_lib.playbook_html(playbook_text),
             "runs": runs,
             "run_locks": [dict(zip([c[0] for c in con.execute("DESCRIBE run_locks").fetchall()], row))
                          for row in con.execute(

@@ -298,6 +298,7 @@ class Alpaca:
             "timeframe": "1Day",
             "start": d.isoformat(),
             "end": (d + timedelta(days=1)).isoformat(),
+            "adjustment": "split",
             "feed": self.feed,
         }
         data = self._get(f"/v2/stocks/{symbol}/bars", params)
@@ -308,7 +309,8 @@ class Alpaca:
         return {"open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"], "volume": b["v"]}
 
     def multi_bars(self, symbols: list[str], timeframe: str,
-                   start: datetime, end: datetime) -> dict[str, list[dict]]:
+                   start: datetime, end: datetime, *,
+                   feed: str | None = None, adjustment: str = "raw") -> dict[str, list[dict]]:
         """One batched multi-symbol bars fetch (the /v2/stocks/bars endpoint,
         distinct from /v2/stocks/{symbol}/bars) — used for ADV20 and premarket
         VWAP/RVOL enrichment so N gappers cost one round trip, not N.
@@ -340,8 +342,8 @@ class Alpaca:
                     "start": start.isoformat(),
                     "end": end.isoformat(),
                     "limit": 10000,
-                    "adjustment": "raw",
-                    "feed": self.feed,
+                    "adjustment": adjustment,
+                    "feed": feed or self.feed,
                 }
                 if page_token:
                     params["page_token"] = page_token
@@ -365,9 +367,16 @@ class Alpaca:
         return out
 
     def multi_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[dict]]:
+        # Split-adjusted on purpose: a daily bar returned on the raw (pre-split)
+        # basis puts prev_close/prev_volume on a DIFFERENT share basis than the
+        # current session's detection price, which fabricates a phantom gap in
+        # change_pct (measured live: NBIZ 2026-09-22 showed +284% from a 1:4
+        # reverse split, not a move) and corrupts ADV20 across a split. Splits
+        # conserve dollar volume, so the dollar-volume liquidity floor this also
+        # feeds is unaffected.
         start_dt = datetime.combine(start, dtime(0, 0), tzinfo=ET)
         end_dt = datetime.combine(end, dtime(0, 0), tzinfo=ET)
-        raw = self.multi_bars(symbols, "1Day", start_dt, end_dt)
+        raw = self.multi_bars(symbols, "1Day", start_dt, end_dt, adjustment="split")
         return {sym: [{"close": r["c"], "volume": r["v"]} for r in rows] for sym, rows in raw.items()}
 
 
@@ -413,7 +422,8 @@ def yf_minute_bars(symbol: str, d: date) -> list[dict]:
 def yf_daily_bar(symbol: str, d: date) -> dict | None:
     yf = _yf()
     hist = yf.Ticker(symbol).history(
-        start=d.isoformat(), end=(d + timedelta(days=1)).isoformat(), interval="1d")
+        start=d.isoformat(), end=(d + timedelta(days=1)).isoformat(),
+        interval="1d", auto_adjust=True)
     if hist.empty:
         return None
     row = hist.iloc[0]
@@ -936,7 +946,8 @@ class MarketData:
             try:
                 start_dt = datetime.combine(start, dtime(0, 0), tzinfo=ET)
                 end_dt = datetime.combine(end, dtime(0, 0), tzinfo=ET)
-                bars_by_sym = self.alpaca.multi_bars(syms, "1Day", start_dt, end_dt)
+                bars_by_sym = self.alpaca.multi_bars(syms, "1Day", start_dt, end_dt,
+                                                     adjustment="split")
             except Exception as e:
                 log("data", f"WARN Alpaca multi_bars(1Day) failed for daily_context: {e}")
         missing = [s for s in syms if not bars_by_sym.get(s)]
