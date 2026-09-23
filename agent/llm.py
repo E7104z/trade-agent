@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .config import MOCKS_DIR, MODEL_PRICES, Config, PROMPTS_DIR
 from .util import extract_json, log
+from .failures import is_permanent_provider_error
 
 
 @dataclass
@@ -182,6 +183,16 @@ class LLMClient:
                 return self._client.messages.create(**kwargs)
             except Exception as e:  # rate limits, overloaded, transient network
                 last = e
+                # A permanent provider condition -- an exhausted credit balance,
+                # a bad key -- cannot clear inside the retry window. Backing off
+                # 15+30+45s to re-earn the identical 400 was 90 of the 128
+                # seconds each failed run on 2026-09-22 spent, out of a 300s
+                # serverless budget. Fail fast and say why.
+                if is_permanent_provider_error(e):
+                    log("llm", f"API error ({type(e).__name__}): {e} -- "
+                               f"permanent, not retrying")
+                    raise RuntimeError(
+                        f"Anthropic API failed permanently (not retried): {e}") from e
                 wait = 15 * (i + 1)
                 log("llm", f"API error ({type(e).__name__}): {e} — retrying in {wait}s")
                 time.sleep(wait)

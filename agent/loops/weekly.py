@@ -19,6 +19,7 @@ from datetime import date
 
 from .. import ledger, open_questions
 from ..config import BASE_DIR, Config
+from ..failures import classify_failure, format_failure
 from ..delivery import render_dashboard, send_email, weekly_email_html
 from ..llm import LLMClient, load_prompt
 from ..memory import build_weekly_memory, write_playbook
@@ -1027,9 +1028,14 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         render_dashboard(con, cfg, None)
 
     except Exception as e:
+        # str(e) alone loses the stack, and a bare "error" status cannot tell a
+        # provider outage from a defect in this code -- both were true of the
+        # 2026-09-22 failures. See agent/failures.py.
+        status = classify_failure(e)
+        detail = format_failure(e)
         if lock:
             ledger.finish_run_lock(con, d, "weekly", lock["request_id"], "failed")
-        ledger.log_run(con, "weekly", d, started, "error", error=str(e))
+        ledger.log_run(con, "weekly", d, started, status, error=detail)
         log("weekly", f"ERROR: {e}")
         raise
     finally:

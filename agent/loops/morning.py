@@ -16,6 +16,7 @@ from datetime import date
 from .. import ledger
 from ..config import REPORTS_DIR, Config
 from ..delivery import morning_email_html, render_dashboard, send_email
+from ..failures import classify_failure, format_failure
 from ..indicators import beta_corr
 from ..llm import LLMClient, load_prompt, merge_usage, prompt_version
 from ..memory import build_morning_memory
@@ -1116,9 +1117,14 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         ledger.finish_run_lock(con, d, "morning", lock["request_id"], "complete")
 
     except Exception as e:
+        # str(e) alone loses the stack, and a bare "error" status cannot tell a
+        # provider outage from a defect in this code -- both were true of the
+        # 2026-09-22 failures. See agent/failures.py.
+        status = classify_failure(e)
+        detail = format_failure(e)
         if lock:
             ledger.finish_run_lock(con, d, "morning", lock["request_id"], "failed")
-        ledger.log_run(con, "morning", d, started, "error", error=str(e))
+        ledger.log_run(con, "morning", d, started, status, error=detail)
         log("morning", f"ERROR: {e}")
         # arm A failed before reaching its own join point above — still wait
         # (briefly) for the background arm B thread so it isn't left running

@@ -171,6 +171,22 @@ def _health_line(s: dict) -> str:
         note = (f"  [feed={feed}: IEX prints are a few percent of consolidated "
                 f"volume, so RVOL is recorded null and this session is not "
                 f"comparable to SIP sessions]")
+
+    # The scan can be perfectly healthy while SELECTION is dead. On 2026-09-22
+    # this line read "Healthy: 4289 symbols scanned, 78 candidates" with zero
+    # picks, because the selector had failed on
+    #   selection_failed: Anthropic API failed after 3 attempts: ... credit
+    #   balance is too low
+    # An outage reported as health is the precise failure this function's
+    # docstring exists to forbid -- "none were selected" and "the selector
+    # never ran" are opposite facts about the day.
+    skipped = str(sess.get("selection_skipped_reason") or "")
+    if skipped.startswith("selection_failed:"):
+        return (f"DEGRADED - scan healthy ({uni} scanned, {s['n_candidates']} "
+                f"candidates) but SELECTION FAILED: {skipped[len('selection_failed:'):].strip()} "
+                f"No picks were made because the selector errored, not because "
+                f"the candidates were rejected.{note}")
+
     return f"Healthy: {uni} symbols scanned, {s['n_candidates']} candidates.{note}"
 
 
