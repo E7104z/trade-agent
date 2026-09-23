@@ -95,6 +95,12 @@ _DEFAULTS: dict[str, Any] = {
         # everything. On a correctly-scaled RVOL, 1.5 cuts a 57-candidate
         # list to 7 - a filter 17x stricter than the one that actually ran.
         "min_rvol": 0.0,
+        # RVOL is a core runner-screen input. When true (default in the live
+        # lane), a name whose RVOL cannot be computed (missing previous-day
+        # volume, or an IEX-downgraded session) is hard-skipped rather than
+        # traded on an unreadable participation signal. Keep true in
+        # production; set false only for a DTO-parity comparison.
+        "require_rvol": True,
         # Minimum stop distance, max(abs, pct * price). When price sits on the
         # 9 EMA at detection the stop collapses toward zero and every R against
         # it is meaningless (measured: a $0.01 stop grading -5.15R). DTO applies

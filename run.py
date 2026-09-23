@@ -121,6 +121,7 @@ def cmd_regrade(cfg, args) -> None:
     from collections import defaultdict
 
     from agent.grading import CURRENT_SIM_VERSION, grade_day
+    from agent.grading_context import build_grading_context
     from agent.providers import MarketData
 
     from_date = parse_date(args.from_date)
@@ -148,8 +149,17 @@ def cmd_regrade(cfg, args) -> None:
 
     n = 0
     for d in sorted(by_date):
-        outcomes = grade_day(md, by_date[d], d, slippage_bps=slippage,
-                             flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+        day_picks = by_date[d]
+        gctx = build_grading_context(md, con, d, [p["ticker"] for p in day_picks],
+                                     cfg, tag="regrade")
+        outcomes = grade_day(md, day_picks, d, slippage_bps=slippage,
+                             flatten_at=flatten_at, min_bar_volume=min_bar_volume,
+                             adv20_map=gctx["adv20_map"], atr_map=gctx["atr_map"],
+                             trend_map=gctx["trend_map"],
+                             fundamentals_map=gctx["fundamentals_map"],
+                             prev_close_map=gctx["prev_close_map"],
+                             or_minutes=gctx["or_minutes"],
+                             entry_after_map=gctx["entry_after_map"])
         for o in outcomes:
             ledger.save_outcome(con, o)
             n += 1

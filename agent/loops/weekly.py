@@ -796,6 +796,49 @@ def _check_runner_section(playbook_md: str) -> list[str]:
     return violations
 
 
+# A negative R quoted inside the Current Best Edge section. Matches both the
+# ASCII hyphen and the Unicode minus sign (U+2212) the miner has emitted.
+_BEST_EDGE_NEG = re.compile(r"[-\u2212]\s*\d+(?:\.\d+)?\s*R", re.IGNORECASE)
+
+
+def _current_best_edge_section(playbook_md: str) -> str:
+    """The text of ## Current Best Edge, through to the next h2."""
+    lines = (playbook_md or "").splitlines()
+    out, inside = [], False
+    for line in lines:
+        if line.strip().lower().startswith("## current best edge"):
+            inside = True
+            continue
+        if inside and line.strip().startswith("## "):
+            break
+        if inside:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _check_best_edge(playbook_md: str) -> list[str]:
+    """Flag a Current Best Edge section that names a negative R as an edge.
+
+    The miner was shown, e.g., a runner bucket with mean R = -0.773R and
+    echoed it into "current best edge". A negative mean R is the ABSENCE of
+    edge; the honest answer is "no validated edge yet" plus the leading
+    candidate and what would validate it. This is a write-time guard because
+    the same section is read by the morning agent hours before anything can
+    contradict it.
+    """
+    section = _current_best_edge_section(playbook_md)
+    if not section:
+        return []
+    violations = []
+    for line in section.splitlines():
+        if _BEST_EDGE_NEG.search(line):
+            violations.append(
+                f"Current Best Edge cites a negative R ('{line.strip()[:120]}') "
+                "- a negative mean R is not an edge; state 'no validated edge "
+                "yet' plus the leading candidate")
+    return violations
+
+
 def _check_wr_suppression(playbook_md: str) -> list[str]:
     """Write-time enforcement:
     (a) spec Sec5 (original check) -- flag any line carrying wr/avgR at n < 8.
@@ -963,6 +1006,11 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             log("weekly", f"Lesson L{lid}: {action} — {act.get('reason','')}")
 
         for l in mined.get("new_lessons", []) or []:
+            dup = ledger.find_duplicate_lesson(con, l.get("lesson", ""))
+            if dup:
+                log("weekly", f"Skipped duplicate lesson (matches L{dup}): "
+                              f"{l.get('lesson', '')[:80]}")
+                continue
             lid = ledger.insert_lesson(con, l, "weekly", d)
             log("weekly", f"New mined lesson L{lid}: {l['lesson']}")
 
@@ -998,6 +1046,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             # lane's text passes through before the selector trades on it.
             for v in _check_runner_section(new_pb):
                 log("weekly", f"WARN runner-section violation: {v}")
+            for v in _check_best_edge(new_pb):
+                log("weekly", f"WARN best-edge mislabel: {v}")
             # A pre-registered threshold the weekly rewrite can restate is not
             # pre-registered. agent/open_questions.py holds the declared bars;
             # this is where a rewrite that moved one becomes visible.
@@ -1018,6 +1068,10 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         log("weekly", f"Summary: {mined.get('summary_for_email','(none)')}")
         if mined.get("current_best_edge"):
             log("weekly", f"Current best edge: {mined['current_best_edge']}")
+            if _BEST_EDGE_NEG.search(str(mined["current_best_edge"])):
+                log("weekly", "WARN current_best_edge names a negative R - "
+                              "a negative mean R is not an edge; the playbook "
+                              "check above will have flagged the same content")
         for f in mined.get("key_findings", []) or []:
             log("weekly", f"  Finding: {f.get('finding','')} (n={f.get('n','?')}, {f.get('strength','')})")
         for ex in mined.get("experiments", []) or []:

@@ -65,7 +65,7 @@ Reply with ONLY a JSON object (```json fence allowed).
 }
 ```
 
-Extract 0–4 lessons. Zero is a legitimate answer — do not manufacture insight from noise. One clean observation beats four platitudes. New lessons start at confidence "low" unless today was a dramatic, unambiguous demonstration.
+Extract 0–4 lessons. Zero is a legitimate answer — do not manufacture insight from noise. One clean observation beats four platitudes. New lessons start at confidence "low" unless today was a dramatic, unambiguous demonstration. **A new lesson must be backed by at least 2 independent observations (today's plus at least one prior confirmed case), OR be a single dramatic, unambiguous demonstration.** A single ordinary event is NOT a lesson — it is an anecdote; fold it into an existing lesson as a confirmation instead of minting a new row. The system deduplicates near-verbatim lessons at write time, so do not re-state an existing lesson in new words.
 
 Grade semantics that feed the learning system (be aware, then grade honestly anyway):
 

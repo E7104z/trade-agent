@@ -156,7 +156,7 @@ Reply with ONLY a JSON object (```json fence allowed).
 ```json
 {
   "summary_for_email": "3-6 sentences: the week in review — record, key finding, main playbook change, calibration verdict, shadow-ledger cost",
-  "current_best_edge": "1-3 sentences mirroring the playbook's Current Best Edge section: the best setup x regime x direction by the evidence with its tier and n — or 'no validated edge yet' plus the leading candidate and what would validate it",
+  "current_best_edge": "1-3 sentences mirroring the playbook's Current Best Edge section: the best setup x regime x direction by the evidence with its tier and n — or 'no validated edge yet' plus the leading candidate and what would validate it. NEVER name a cell with a negative (or non-positive) mean R as 'best edge'; a negative mean R is the absence of edge, so say 'no validated edge yet' instead.",
   "key_findings": [
     {"finding": "gap_go in uptrend/risk_on: 6/7 winners, avg +1.4R", "n": 7, "strength": "provisional | solid"}
   ],

@@ -80,6 +80,8 @@ def session_summary(con, d: date) -> dict:
             "stop": c.get("stop_price"),
             "target": c.get("target_price"),
             "stop_dist": c.get("stop_dist"),
+            "stop_dist_atr": o.get("stop_dist_atr"),
+            "trend_side_200d": o.get("trend_side_200d"),
             "rvol": c.get("rvol"),
             "vwap_pct": c.get("vwap_pct_above"),
             "tc": c.get("trend_consistency"),
@@ -210,8 +212,8 @@ def render_text(con, d: date) -> str:
     out += ["", f"{s['n_candidates']} candidates, {s['n_selected']} selected, "
                 f"{s['n_picks']} picks written, {len(s['orders'])} live orders", ""]
     out.append(f"{'':3}{'TICKER':8}{'DET':6}{'PRICE':>9}{'STOP':>9}{'TARGET':>9}"
-               f"{'RVOL':>7}{'VWAP%':>7}{'TC':>6}{'CHG%':>8}{'R':>7}  EXIT")
-    out.append("-" * 96)
+               f"{'RVOL':>7}{'VWAP%':>7}{'TC':>6}{'CHG%':>8}{'SDA':>6}{'TRD200':>8}{'R':>7}  EXIT")
+    out.append("-" * 118)
     for r in sorted(s["rows"], key=lambda x: (not x["selected"],
                                               x["rank"] or 99, x["ticker"])):
         mark = f"#{r['rank']}" if r["selected"] else "  "
@@ -219,7 +221,8 @@ def render_text(con, d: date) -> str:
             f"{mark:3}{r['ticker']:8}{r['detection_et']:6}"
             f"{_f(r['price']):>9}{_f(r['stop']):>9}{_f(r['target']):>9}"
             f"{_f(r['rvol']):>7}{_f(r['vwap_pct']):>7}{_f(r['tc'],1):>6}"
-            f"{_f(r['change_pct']):>8}{_f(r['r_multiple'],2):>7}  "
+            f"{_f(r['change_pct']):>8}{_f(r['stop_dist_atr']):>6}"
+            f"{(r['trend_side_200d'] or ''):>8}{_f(r['r_multiple'],2):>7}  "
             f"{r['exit_reason'] or ''}")
 
     sel = [r for r in s["rows"] if r["selected"] and r["thesis"]]
@@ -285,6 +288,7 @@ def render_html(con, d: date) -> str:
             f"<td>{_f(r['stop'])}</td><td>{_f(r['target'])}</td>"
             f"<td>{_f(r['rvol'])}</td><td>{_f(r['vwap_pct'])}</td>"
             f"<td>{_f(r['tc'],1)}</td><td>{_f(r['change_pct'])}</td>"
+            f"<td>{_f(r['stop_dist_atr'])}</td><td>{r['trend_side_200d'] or ''}</td>"
             f"<td style='color:{rcol}'>{_f(rmul)}</td>"
             f"<td>{r['exit_reason'] or ''}</td></tr>")
 
@@ -331,7 +335,7 @@ def render_html(con, d: date) -> str:
   <table style="margin-top:6px">
     <tr><th></th><th>Ticker</th><th>Det ET</th><th>Price</th><th>Stop</th>
         <th>Target</th><th>RVOL</th><th>VWAP%</th><th>TC</th><th>Chg%</th>
-        <th>R</th><th>Exit</th></tr>
+        <th>StopΔATR</th><th>200d</th><th>R</th><th>Exit</th></tr>
     {''.join(rows_html)}
   </table>
   <p style="color:#8b949e;font-size:12px;margin-top:10px">

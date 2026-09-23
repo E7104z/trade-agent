@@ -142,6 +142,29 @@ def _clock_to_bar_index(target_t: dtime, bars: list[dict]) -> int | None:
     return offset
 
 
+def _index_of_timestamp(bars: list[dict], ts) -> int | None:
+    """First bar index whose timestamp is >= `ts` (tz-normalized comparison).
+
+    Used to map a fill — which lives at some bar in the SLICED (entry-time)
+    series — back to its position in the FULL session series, so
+    session-anchored fields (VWAP, RVOL checkpoints) read the right bar even
+    when the fill simulation walks an entry-time suffix. `>=` (not equality)
+    so a fill whose bar has no exact timestamp match still resolves to the
+    first bar at or after its time.
+    """
+    if ts is None:
+        return None
+    ts_n = ts.replace(tzinfo=None) if getattr(ts, "tzinfo", None) is not None else ts
+    for i, b in enumerate(bars):
+        bt = b.get("t")
+        if bt is None:
+            continue
+        bt_n = bt.replace(tzinfo=None) if getattr(bt, "tzinfo", None) is not None else bt
+        if bt_n >= ts_n:
+            return i
+    return None
+
+
 def _is_thin(bar: dict, min_bar_volume: float) -> bool:
     """True if `bar` should be distrusted for trigger/stop/target/gap logic
     under the thin-bar filter (config min_bar_volume, default 0 = disabled).
@@ -315,7 +338,8 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                   min_bar_volume: float = 0, adv20: float | None = None,
                   atr14: float | None = None, trend_snapshot: dict | None = None,
                   fundamentals: dict | None = None, prev_close: float | None = None,
-                  or_minutes: int = 15, session_date: date | None = None) -> dict:
+                  or_minutes: int = 15, session_date: date | None = None,
+                  session_bars: list[dict] | None = None) -> dict:
     """Returns an outcome dict ready for ledger.save_outcome (minus grade fields).
 
     atr14/trend_snapshot/fundamentals/prev_close are the indicator-layer-v2
@@ -328,7 +352,16 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     close, flatten_at/time_stop cutoffs at/after the session close are inert by
     construction and are recorded as such instead of silently never firing.
     When session_date is None (legacy callers), behavior is unchanged and
-    session_length stays None."""
+    session_length stays None.
+
+    session_bars (optional) is the FULL session minute series, used only for
+    session-level indicator fields (RVOL checkpoints, VWAP events, opening
+    range, gap-fill fractions). It may differ from `bars` when the caller has
+    sliced `bars` to an intraday entry time (runner picks): the fill simulation
+    must not fill before the pick existed, but session-level stats must still
+    read the whole session, or an intraday pick's "RVOL@10:00" collapses to the
+    volume of a single post-entry bar and prints a nonsense 0.00x. Defaults to
+    `bars` (legacy callers), so behavior is unchanged when no slice happened."""
     # Session close for cutoff clamping. Without a session_date we assume the
     # historical behavior: a full 16:00 session.
     close_t = market_close_et(session_date) if session_date else dtime(16, 0)
@@ -395,8 +428,15 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         out["exit_reason"] = "no_data"
         return out
 
+    # Session-level indicators describe the WHOLE session and must be computed
+    # from the full session bars, not the entry-time suffix that drives fill
+    # logic. A runner pick detected at 10:50 has no 09:30->10:00 bars in its
+    # sliced series, so "RVOL@10:00" would otherwise read a single post-entry
+    # bar and print a nonsense 0.00x (see _clock_to_bar_index first-match).
+    sb = session_bars if session_bars is not None else bars
+
     try:
-        ind_fields, vwap = _indicator_fields(bars, adv20)
+        ind_fields, vwap = _indicator_fields(sb, adv20)
         out.update(ind_fields)
     except Exception as e:
         log("grade", f"pick {pick.get('pick_id')}: indicator computation failed ({e}) — fields left null")
@@ -404,7 +444,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
 
     out["atr14"] = round(atr14, 4) if atr14 else None
     try:
-        orr = ind.opening_range(bars, minutes=or_minutes)
+        orr = ind.opening_range(sb, minutes=or_minutes)
         out["or15_high"], out["or15_low"] = orr["or_high"], orr["or_low"]
         out["or_break_dir"], out["or_break_et"] = orr["break_dir"], orr["break_et"]
     except Exception as e:
@@ -428,8 +468,8 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     # ---- null model: open->close in the pick's direction, in planned-risk units.
     # Computed for EVERY pick (triggered or not) so "edge" always has a benchmark:
     # a plan that underperforms naively holding the same name is not edge.
-    sess_open = daily["open"] if daily else bars[0]["o"]
-    sess_close = daily["close"] if daily else bars[-1]["c"]
+    sess_open = daily["open"] if daily else sb[0]["o"]
+    sess_close = daily["close"] if daily else sb[-1]["c"]
     if sess_open is not None and sess_close is not None:
         naive_sign = 1.0 if (pick["direction"] or "long").lower() == "long" else -1.0
         out["baseline_r"] = round(naive_sign * (sess_close - sess_open) / risk, 3)
@@ -448,10 +488,10 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     if prev_close and sess_open is not None and sess_open != prev_close:
         gap = sess_open - prev_close
         for key, checkpoint in (("gap_fill_frac_1000", dtime(10, 0)), ("gap_fill_frac_1200", dtime(12, 0))):
-            idx = _clock_to_bar_index(checkpoint, bars)
-            if idx is not None and idx < len(bars):
-                out[key] = round((sess_open - bars[idx]["c"]) / gap, 3)
-        out["gap_fill_frac_close"] = round((sess_open - bars[-1]["c"]) / gap, 3)
+            idx = _clock_to_bar_index(checkpoint, sb)
+            if idx is not None and idx < len(sb):
+                out[key] = round((sess_open - sb[idx]["c"]) / gap, 3)
+        out["gap_fill_frac_close"] = round((sess_open - sb[-1]["c"]) / gap, 3)
 
     # ---- find fill -------------------------------------------------------
     fill_price = None
@@ -568,8 +608,14 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     # Only meaningful once we know there IS a real fill (the invalid_fill gate
     # above already returned for fills on the wrong side of their own stop).
     try:
-        if fill_idx < len(vwap):
-            fill_vwap = vwap[fill_idx]
+        # vwap is the session-anchored series (computed off `sb`, the full
+        # session). `fill_idx` indexes the SLICED `bars`, so when the two
+        # differ, remap the fill to its full-session bar by timestamp before
+        # reading the VWAP at that moment.
+        fill_vwap_idx = (_index_of_timestamp(sb, fill_time)
+                         if session_bars is not None else fill_idx)
+        if fill_vwap_idx is not None and fill_vwap_idx < len(vwap):
+            fill_vwap = vwap[fill_vwap_idx]
             out["vwap_at_fill"] = round(fill_vwap, 4)
             out["fill_vs_vwap_pct"] = round(ind.vwap_distance(fill_price, fill_vwap), 3)
             out["vwap_side_at_fill"] = "above" if fill_price >= fill_vwap else "below"
@@ -773,6 +819,13 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
         except Exception as e:
             log("grade", f"minute bars failed for {p['ticker']}: {e}")
             bars = []
+        # Keep the FULL session series for session-level indicator fields
+        # (RVOL checkpoints, VWAP events, opening range, gap-fill fractions).
+        # The fill simulation walks `bars`, sliced to the entry time below for
+        # intraday-detected (runner) picks — but those picks' 09:30->10:00
+        # participation must still be read off the whole session, not an
+        # entry-time suffix (else "RVOL@10:00" reads a single post-entry bar).
+        full_bars = bars
         cutoff = (entry_after_map or {}).get(t)
         if cutoff is not None and bars:
             before = len(bars)
@@ -792,7 +845,8 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
                           trend_snapshot=(trend_map or {}).get(t),
                           fundamentals=(fundamentals_map or {}).get(t),
                           prev_close=(prev_close_map or {}).get(t),
-                          or_minutes=or_minutes, session_date=d)
+                          or_minutes=or_minutes, session_date=d,
+                          session_bars=full_bars)
         o["eval_date"] = d
         outcomes.append(o)
         log("grade", f"{p['ticker']} {p['direction']}: triggered={o['triggered']} "

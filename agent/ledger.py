@@ -354,6 +354,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v12.STATEMENTS
 from . import migrations_v13  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v13.STATEMENTS
 
+# --- v14 runner candidate ATR/trend context (indicator layer v2) -----------
+from . import migrations_v14  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v14.STATEMENTS
+
 
 def connect() -> Any:
     """
@@ -742,6 +746,45 @@ def all_lessons(con: duckdb.DuckDBPyConnection) -> list[dict]:
     cols = [c[0] for c in con.execute("DESCRIBE lessons").fetchall()]
     rows = con.execute("SELECT * FROM lessons ORDER BY lesson_id").fetchall()
     return [dict(zip(cols, r)) for r in rows]
+
+
+def _normalize_lesson_text(text: str) -> str:
+    import re as _re
+    return " ".join(_re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).split())
+
+
+def find_duplicate_lesson(con: duckdb.DuckDBPyConnection,
+                          lesson_text: str) -> int | None:
+    """Return the id of an active/promoted lesson that near-duplicates
+    `lesson_text`, else None.
+
+    The 2026-09-23 review found the same near-verbatim lesson minted twice
+    (the Hormuz/XLE supply-risk lesson), which inflates the lesson bank's
+    apparent support without adding information. Exact-normalized text wins
+    outright; otherwise a word-overlap (Jaccard) guard catches near-verbatim
+    variants at >= 0.8. Retired lessons are excluded: a retired lesson may be
+    re-proposed on NEW evidence, so it must not suppress a fresh mint.
+    """
+    target = _normalize_lesson_text(lesson_text)
+    if not target:
+        return None
+    target_tokens = set(target.split())
+    best_id, best_score = None, 0.0
+    for l in all_lessons(con):
+        if l.get("status") not in ("active", "promoted"):
+            continue
+        norm = _normalize_lesson_text(l.get("lesson") or "")
+        if not norm:
+            continue
+        if norm == target:
+            return l["lesson_id"]
+        tokens = set(norm.split())
+        if not target_tokens or not tokens:
+            continue
+        score = len(target_tokens & tokens) / len(target_tokens | tokens)
+        if score > best_score:
+            best_score, best_id = score, l["lesson_id"]
+    return best_id if best_score >= 0.8 else None
 
 
 # ---------------------------------------------- Task 5: lesson out-of-sample holdout
@@ -1666,14 +1709,16 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
         """INSERT INTO runner_candidate_outcomes
            (session_date, ticker, eval_date, triggered, entry_fill, exit_price,
             exit_reason, r_multiple, mfe_r, mae_r, eod_r, selected,
-            selection_rank, pick_id, sim_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            selection_rank, pick_id, sim_version, atr14, stop_dist_atr,
+            trend_side_200d)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["session_date"], o["ticker"].upper(), o.get("eval_date"),
             o.get("triggered"), o.get("entry_fill"), o.get("exit_price"),
             o.get("exit_reason"), o.get("r_multiple"), o.get("mfe_r"),
             o.get("mae_r"), o.get("eod_r"), bool(selected), rank, pick_id,
-            o.get("sim_version"),
+            o.get("sim_version"), o.get("atr14"), o.get("stop_dist_atr"),
+            o.get("trend_side_200d"),
         ],
     )
 

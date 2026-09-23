@@ -44,7 +44,7 @@ from datetime import datetime
 from . import ledger
 from .providers import is_common_stock_symbol
 from .runner_default_universe import DEFAULT_UNIVERSE
-from .runner_scan import EXCLUDED_TICKERS
+from .runner_scan import EXCLUDED_TICKERS, LANE_EXCLUDED_TICKERS
 from .util import log, prev_market_day
 
 __all__ = ["build_universe", "liquid_universe", "EXPECTED_MIN_UNIVERSE",
@@ -225,8 +225,9 @@ def build_universe(md, cfg: dict, *, at: datetime,
     common = [s for s in seen if is_common_stock_symbol(s)]
     dropped_not_common = len(seen) - len(common)
 
-    # 5. Leveraged / inverse / volatility products.
-    kept = [s for s in common if s not in EXCLUDED_TICKERS]
+    # 5. Leveraged / inverse / volatility products, plus crypto products.
+    kept = [s for s in common
+            if s not in EXCLUDED_TICKERS and s not in LANE_EXCLUDED_TICKERS]
     dropped_excluded = len(common) - len(kept)
 
     # NOTE: there is deliberately no snapshot price pre-filter here. An earlier

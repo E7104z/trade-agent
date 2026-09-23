@@ -26,6 +26,7 @@ from .util import ET, log, prev_market_day
 
 __all__ = [
     "EXCLUDED_TICKERS",
+    "LANE_EXCLUDED_TICKERS",
     "SCAN_VERSION",
     "scan",
     "apply_network_gates",
@@ -39,7 +40,19 @@ __all__ = [
 # Bump on ANY change to detection semantics, exactly as `sim_version` works
 # for grading. Never compare rows across scan_version values without
 # filtering on it.
-SCAN_VERSION = 1
+#
+# v2 (2026-09-23) tightened which rows exist at all, so a v1 row and a v2 row
+# answer different questions and must never be pooled:
+#   - require_rvol: a candidate whose RVOL could not be computed (missing
+#     prev_volume, or an IEX-downgraded session) used to pass the gate chain
+#     with rvol=None and could be selected and traded. It is now rejected.
+#   - LANE_EXCLUDED_TICKERS: crypto spot/futures/trust products now excluded.
+#   - a feed downgrade with RVOL required now stands the whole session down
+#     rather than emitting a session's worth of null-RVOL candidates.
+# Every one of those REMOVES rows that v1 admitted, so a pooled mean R would
+# be a mixture of two populations with the selector's own gate as the hidden
+# variable -- exactly the confound this counter exists to prevent.
+SCAN_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # EXCLUDED_TICKERS - ported verbatim from js/constants.js:539.
@@ -70,6 +83,33 @@ EXCLUDED_TICKERS: frozenset[str] = frozenset([
     "TARK", "BITX", "BITI", "ETHU", "ETHD", "XBTU", "MSTU", "MSTX", "MSTZ",
     # Volatility products
     "UVIX", "UVXY", "VXX", "SVIX", "SVXY", "VIXY", "VIXM", "SVOL", "UVOL",
+])
+
+# ---------------------------------------------------------------------------
+# LANE_EXCLUDED_TICKERS - crypto spot / futures / trust products.
+#
+# DTO's EXCLUDED_TICKERS (above) is a ported parity constant and cannot be
+# extended without breaking the parity harness's count assertion. Crypto
+# products post-date the DTO source this port reproduces, so they were never
+# in its list -- yet they trade like their underlying (BTC/ETH), not like an
+# accumulation candidate, so a "runner" reading on one is the same artifact
+# the leveraged/inverse list exists to exclude. This set is applied ONLY in
+# the live Phase 1 lane (universe build + gate chain), never in the parity
+# harness, so parity stays exact while the live lane stops surfacing crypto.
+#
+# Non-leveraged, non-inverse spot/futures/trust products tracking BTC/ETH.
+# (Leveraged/inverse crypto -- BITX, BITI, ETHU, ETHD, XBTU -- is already in
+# EXCLUDED_TICKERS above.) Blockchain-equity/miner ETFs are deliberately NOT
+# listed: they hold operating companies, not the coin.
+# ---------------------------------------------------------------------------
+LANE_EXCLUDED_TICKERS: frozenset[str] = frozenset([
+    # Bitcoin spot / futures / trusts
+    "IBIT", "FBTC", "BITB", "BTCO", "BRRR", "HODL", "EZBC", "BTCW", "ARKB",
+    "GBTC", "BTC", "BITO", "BITW", "BTF", "XBTF", "MAXI", "YBTC", "YBIT",
+    "BBTC",
+    # Ethereum spot / futures / trusts
+    "ETHE", "ETHW", "ETHV", "EETH", "FETH", "EZET", "CETH", "ETHA", "ETHT",
+    "QETH",
 ])
 
 
@@ -265,6 +305,8 @@ def evaluate_ticker(
     null_gates: str = "dto",
     end_et_minutes: int | None = None,
     defer_network_gates: bool = False,
+    require_rvol: bool = False,
+    extra_excluded: frozenset[str] = frozenset(),
 ) -> dict:
     """Run DTO's full gate chain over one ticker.
 
@@ -326,7 +368,7 @@ def evaluate_ticker(
     elif prev_close < min_prev_close:
         return out(False, "price", f"prev_close {prev_close} < {min_prev_close}")
 
-    if ticker in EXCLUDED_TICKERS:
+    if ticker in EXCLUDED_TICKERS or ticker in extra_excluded:
         return out(False, "conditions", "excluded ticker")
 
     # RVOL - session bars only. Premarket volume distorts the ratio and
@@ -353,6 +395,14 @@ def evaluate_ticker(
     # deciding it. Raise min_rvol once forward evidence says a threshold
     # earns its keep on THIS scale.
     rv = ri.rvol(mkt, prev_volume) if prev_volume else None
+    if require_rvol and (not prev_volume or rv is None):
+        # RVOL is a core runner-screen input. A name whose volume denominator
+        # is missing cannot have its participation read, so it has not passed
+        # the screen -- hard-skip rather than trade a name we cannot see.
+        # (IEX-downgraded sessions make every RVOL null; this gate turns that
+        # whole-session outage into a stand-down instead of an unreadable lane.)
+        unavailable.append("prev_volume")
+        return out(False, "rvol", "prev_volume unavailable (RVOL required)", rv=rv)
     if min_rvol > 0:
         if not prev_volume:
             unavailable.append("prev_volume")
@@ -601,6 +651,27 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
                           "fraction of consolidated volume, so RVOL is not "
                           "comparable and is recorded as null for this session")
 
+        # RVOL is a core runner-screen input. On a downgraded (IEX) feed every
+        # RVOL is null by construction, and trading on an unreadable volume
+        # signal is exactly the 2026-09-23 failure: the lane selected 10 names
+        # with RVOL null on every row. With require_rvol on, a null-RVOL
+        # session is a stand-down, not a scan.
+        require_rvol = bool(cfg.get("require_rvol", True))
+        if require_rvol and feed_downgraded:
+            ledger.upsert_runner_session(con, {
+                "session_date": d, "universe_size": 0, "candidates_found": 0,
+                "provider_degraded": True, "scan_version": SCAN_VERSION,
+                "gates_unavailable": json.dumps(
+                    {**unavailable, "feed": feed,
+                     "feed_downgraded": True, "rvol_required": True}),
+            })
+            log("runner", "stand-down: feed downgraded to IEX makes RVOL null "
+                          "for the whole session and require_rvol is on - "
+                          "no runner candidates will be produced")
+            return {"universe_size": 0, "candidates": 0,
+                    "provider_degraded": True,
+                    "elapsed_ms": int((time.monotonic() - t0) * 1000)}
+
         # -- 1. universe -----------------------------------------------------
         universe, ustats = runner_universe.build_universe(md, cfg, at=at, con=con)
         if not universe:
@@ -678,6 +749,8 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
                 null_gates=null_policy,
                 end_et_minutes=end_min,
                 defer_network_gates=True,
+                require_rvol=bool(cfg.get("require_rvol", True)),
+                extra_excluded=LANE_EXCLUDED_TICKERS,
             )
             for key in res["unavailable"]:
                 if key in unavailable:

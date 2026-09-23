@@ -207,3 +207,63 @@ def test_scan_version_filter_prevents_cross_semantics_comparison():
         assert [r["ticker"] for r in kept] == ["A"]
     finally:
         ledger_mod.runner_candidate_outcomes_since = original
+
+
+# ----------------------------------------------------- new v14 mining dims
+
+def test_stop_atr_and_trend_buckets():
+    assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 0.4}) == "<0.5"
+    assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 0.7}) == "0.5-1"
+    assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 1.5}) == "1-2"
+    assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 3.0}) == ">2"
+    assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": None}) == "?"
+    assert rr.bucket_of("runner_trend_side_200d", {"trend_side_200d": "above"}) == "above"
+    assert rr.bucket_of("runner_trend_side_200d", {"trend_side_200d": None}) == "?"
+
+
+def test_runner_random_ablation_no_contest():
+    res = rr.runner_random_ablation([], draws=20, seed=1)
+    assert res["sessions"] == 0
+    assert res["note"].startswith("no contested sessions")
+
+
+def test_runner_random_ablation_selected_worst_is_low_percentile():
+    # One session, three triggered candidates, the single selected one is the
+    # worst. Drawing one at random should usually beat it, so the selector
+    # sits at a low percentile.
+    rows = [
+        _row(date(2026, 9, 1), "A", -1.0, selected=True),
+        _row(date(2026, 9, 1), "B", 0.5),
+        _row(date(2026, 9, 1), "C", 0.5),
+    ]
+    res = rr.runner_random_ablation(rows, draws=1000, seed=7)
+    assert res["sessions"] == 1
+    assert res["picks"] == 1
+    assert res["actual_total_r"] == -1.0
+    # 2 of 3 random single-draws pick a positive name, so percentile ~33% max.
+    assert res["percentile"] <= 34.0
+
+
+# ------------------------------------------- scan_version / gate coupling
+
+def test_row_removing_gates_are_matched_by_a_scan_version_past_v1():
+    """A gate that removes rows changes what the candidate pool MEANS.
+
+    scan_version exists so the miner never pools rows produced under
+    different detection rules. The v1 pool admitted candidates whose RVOL
+    could not be computed; require_rvol rejects them. Pooling the two would
+    make the selector's own gate a hidden variable in every mean R the miner
+    reports -- the pre-and-post rows would differ by which names were allowed
+    to exist, not by anything the market did.
+
+    So the two facts are pinned together: while a row-removing gate is on by
+    default, the counter must be past the version that lacked it.
+    """
+    from agent.config import load_config
+    from agent.runner_scan import SCAN_VERSION
+
+    require_rvol = bool((load_config().get("runner", {}) or {}).get("require_rvol"))
+    if require_rvol:
+        assert SCAN_VERSION >= 2, (
+            "require_rvol removes candidates that scan_version 1 admitted; "
+            "bump SCAN_VERSION so the miner cannot pool the two populations")

@@ -653,6 +653,45 @@ def test_rvol_checkpoints_use_cumulative_volume_and_adv20():
     assert out["rvol_close"] == pytest.approx(35_000 / 31_000, abs=1e-3)
 
 
+def test_rvol_checkpoints_use_full_session_bars_when_entry_sliced():
+    # A runner pick detected intraday is simulated on bars sliced to start at
+    # its entry time (entry_type "open" fills at the sliced bars[0]). Its RVOL
+    # checkpoints must still read the WHOLE session: RVOL@10:00 = cumulative
+    # volume through 10:00 / ADV20, NOT the first (post-entry) bar's volume —
+    # the latter was the historical bug that printed a nonsense 0.00x for every
+    # runner pick (single bar / ADV20 ~ 0.001).
+    full = _flat_bars(9, 30, 35, 100.0, 100.5, 99.5, 100.0, v=1000)  # 9:30->10:04
+    sliced = [b for b in full if b["t"] >= datetime(2026, 1, 2, 10, 3)]
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    out = simulate_pick(pick, sliced, None, adv20=31_000.0, session_bars=full)
+    # 9:30->10:00 inclusive = 31 bars -> 31,000 shares -> exactly 1.0x ADV20.
+    assert out["rvol_at_1000"] == pytest.approx(1.0)
+    # RVOL@close = FULL session volume (35 bars), not entry->close (2 bars).
+    assert out["rvol_close"] == pytest.approx(35_000 / 31_000, abs=1e-3)
+    # The fill lands on the 10:03 bar; its VWAP must be read off the full
+    # session at that bar, not off sliced index 0.
+    assert out["vwap_at_fill"] is not None
+
+
+def test_grade_day_threads_full_session_bars_for_sliced_runner_picks():
+    class StubMD:
+        def minute_bars(self, ticker, d):
+            return _flat_bars(9, 30, 35, 100.0, 100.5, 99.5, 100.0, v=1000)
+
+        def daily_bar(self, ticker, d):
+            return None
+
+    picks = [_pick(ticker="MARA", entry_type="open", pick_id=1)]
+    outcomes = grade_day(
+        StubMD(), picks, date(2026, 1, 2), adv20_map={"MARA": 31_000.0},
+        entry_after_map={"MARA": datetime(2026, 1, 2, 10, 3)},
+    )
+    # Fill is sliced to 10:03 (2 bars), but RVOL@10:00 must read the whole
+    # session rather than collapsing to the first post-entry bar's volume.
+    assert outcomes[0]["rvol_at_1000"] == pytest.approx(1.0)
+    assert outcomes[0]["rvol_close"] == pytest.approx(35_000 / 31_000, abs=1e-3)
+
+
 def test_missing_adv20_leaves_rvol_fields_null_but_vwap_fields_populate():
     bars = _flat_bars(9, 30, 5, 100.0, 100.5, 99.5, 100.0)
     pick = _pick(entry_type="open")

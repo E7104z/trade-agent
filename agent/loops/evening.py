@@ -22,6 +22,7 @@ from ..config import Config
 from ..delivery import evening_email_html, render_dashboard, send_email
 from ..grading import (CURRENT_SIM_VERSION, classify_shadow, grade_day,
                        outcomes_md, simulate_pick)
+from ..grading_context import build_grading_context
 from ..llm import LLMClient, load_prompt, prompt_version
 from ..failures import classify_failure, format_failure
 from ..providers import MarketData
@@ -144,8 +145,8 @@ def _runner_grader_block(con, d: date) -> str:
     def _n(v, dg=2):
         return "" if v is None else f"{v:.{dg}f}"
 
-    lines = ["| sel | rank | ticker | det ET | price | rvol | vwap% | tc | stop_dist | R | exit |",
-             "|---|---|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| sel | rank | ticker | det ET | price | rvol | vwap% | tc | stop_dist | stop_atr | 200d | R | exit |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     n_sel = 0
     for c in candidates:
         o = outcomes.get(c["ticker"]) or {}
@@ -163,7 +164,8 @@ def _runner_grader_block(con, d: date) -> str:
             f"{fp.strftime('%H:%M') if isinstance(fp, datetime) else ''} | "
             f"{_n(c.get('detection_price'))} | {_n(c.get('rvol'))} | "
             f"{_n(c.get('vwap_pct_above'))} | {_n(c.get('trend_consistency'), 1)} | "
-            f"{_n(c.get('stop_dist'))} | {r_txt} | {o.get('exit_reason') or ''} |")
+            f"{_n(c.get('stop_dist'))} | {_n(o.get('stop_dist_atr'))} | "
+            f"{o.get('trend_side_200d') or ''} | {r_txt} | {o.get('exit_reason') or ''} |")
 
     skipped = session.get("selection_skipped_reason")
     header = (f"{len(candidates)} candidate(s) detected, {n_sel} selected."
@@ -206,6 +208,33 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
     flatten_at = cfg.get("flatten_at")
     min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
 
+    # Indicator layer v2 for the WHOLE runner pool, not just the picks. One
+    # batched daily_context fetch (the same the morning grader uses) yields
+    # ATR14 and the 200d trend snapshot, so stop_dist_atr and trend_side_200d
+    # can be stored per candidate and the weekly miner can test them against
+    # selected-vs-unselected the same way it already tests the morning lane.
+    atr_map: dict[str, float] = {}
+    trend_map: dict[str, dict] = {}
+    try:
+        ctx = md.daily_context([c["ticker"] for c in candidates])
+        atr_map = {t: x["atr14"] for t, x in ctx.items() if x.get("atr14")}
+        trend_map = {t: x["trend_snapshot"] for t, x in ctx.items()
+                     if x.get("trend_snapshot")}
+    except Exception as e:
+        log("evening", f"  runner daily_context fetch failed ({e}) - ATR/trend null")
+
+    def _stop_dist_atr(c: dict, atr14: float | None) -> float | None:
+        stop_dist = c.get("stop_dist")
+        if not stop_dist or not atr14:
+            return None
+        return round(stop_dist / atr14, 2)
+
+    def _trend_side(snapshot: dict | None) -> str | None:
+        if not snapshot:
+            return None
+        above = snapshot.get("above_ma200")
+        return "above" if above is True else ("below" if above is False else None)
+
     for c in candidates:
         ticker = c["ticker"]
         try:
@@ -237,6 +266,9 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
                 "session_date": d, "ticker": ticker, "eval_date": d,
                 "triggered": False, "exit_reason": "no_data",
                 "sim_version": CURRENT_SIM_VERSION,
+                "atr14": atr_map.get(ticker),
+                "stop_dist_atr": _stop_dist_atr(c, atr_map.get(ticker)),
+                "trend_side_200d": _trend_side(trend_map.get(ticker)),
             })
             continue
 
@@ -246,6 +278,8 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
                 "target_price": c.get("target_price")}
         sim = simulate_pick(shim, entry_bars, None, slippage_bps=slippage,
                             flatten_at=flatten_at, min_bar_volume=min_bar_volume,
+                            atr14=atr_map.get(ticker),
+                            trend_snapshot=trend_map.get(ticker),
                             session_date=d)
 
         ledger.save_runner_candidate_outcome(con, {
@@ -259,6 +293,9 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
             "mae_r": sim.get("mae_r"),
             "eod_r": sim.get("eod_r"),
             "sim_version": sim.get("sim_version"),
+            "atr14": sim.get("atr14"),
+            "stop_dist_atr": sim.get("stop_dist_atr"),
+            "trend_side_200d": sim.get("trend_side_200d"),
         })
         summary["scored"] += 1
         if sim.get("triggered"):
@@ -599,66 +636,20 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         if picks:
             log("evening", f"Simulating outcomes for {len(picks)} picks against intraday bars "
                            f"(slippage {slippage:.0f} bps/side)...")
-            tickers = [p["ticker"] for p in picks]
-            try:
-                adv20_map = md.adv20(tickers)
-            except Exception as e:
-                log("evening", f"WARN adv20 fetch failed ({e}) — RVOL fields will be null tonight")
-                adv20_map = {}
-            # indicator layer v2 (ATR/levels/context): one widened daily_context
-            # fetch + one fundamentals fetch for tonight's tickers, plus each
-            # ticker's prior-session close for gap-relative fields. Any failure
-            # here degrades those fields to null for the run, never crashes it
-            # (grade_day/simulate_pick already treat every one of these as
-            # optional grader-input context, not something that can fail a grade).
-            atr_map: dict[str, float] = {}
-            atr_pct_map: dict[str, float] = {}
-            trend_map: dict[str, dict] = {}
-            fundamentals_map: dict[str, dict] = {}
-            prev_close_map: dict[str, float] = {}
-            try:
-                ctx = md.daily_context(tickers)
-                atr_map = {t: c["atr14"] for t, c in ctx.items() if c.get("atr14")}
-                atr_pct_map = {t: c["atr_pct"] for t, c in ctx.items() if c.get("atr_pct") is not None}
-                trend_map = {t: c["trend_snapshot"] for t, c in ctx.items() if c.get("trend_snapshot")}
-            except Exception as e:
-                log("evening", f"WARN daily_context fetch failed ({e}) — ATR/trend fields null tonight")
-            # prev_close keyed to the GRADED date d (not "now"), same idiom as
-            # the Q4 gap-bucket lookup below — daily_context's own "today" cutoff
-            # tracks wall-clock now, which is wrong for a regrade of a past date.
-            for t in tickers:
-                try:
-                    prev = md.daily_bar(t, prev_market_day(d))
-                    if prev and prev.get("close"):
-                        prev_close_map[t] = prev["close"]
-                except Exception:
-                    pass
-            try:
-                fundamentals_map = md.fundamentals(tickers)
-            except Exception as e:
-                log("evening", f"WARN fundamentals fetch failed ({e}) — short/float/mcap fields null tonight")
-            # Picks detected INTRADAY cannot be simulated from the session
-            # open. A runner pick carries entry_type "open", which fills at
-            # bars[0] -- the 09:30 print -- against a stop derived from, say,
-            # a 10:20 EMA. The fill lands below its own stop and the trade
-            # grades invalid_fill, which is how this lane produced 7 of 10
-            # ungradeable picks and therefore zero lessons, while looking
-            # like a market outcome rather than a simulation error.
-            entry_after_map = {}
-            try:
-                from ..runner_scan import earliest_entry_time
-                for c in ledger.runner_candidates_for_date(con, d):
-                    cutoff = earliest_entry_time(c.get("first_pass_et"))
-                    if cutoff is not None:
-                        entry_after_map[c["ticker"].upper()] = cutoff
-            except Exception as e:
-                log("evening", f"WARN could not build runner entry times ({e}) — "
-                               f"runner picks would be graded from the session open")
+            gctx = build_grading_context(md, con, d, [p["ticker"] for p in picks],
+                                         cfg, tag="evening")
+            adv20_map = gctx["adv20_map"]
+            atr_map = gctx["atr_map"]
+            atr_pct_map = gctx["atr_pct_map"]
+            trend_map = gctx["trend_map"]
+            fundamentals_map = gctx["fundamentals_map"]
+            prev_close_map = gctx["prev_close_map"]
+            entry_after_map = gctx["entry_after_map"]
             outcomes = grade_day(md, picks, d, slippage_bps=slippage,
                                  flatten_at=flatten_at, min_bar_volume=min_bar_volume,
                                  adv20_map=adv20_map, atr_map=atr_map, trend_map=trend_map,
                                  fundamentals_map=fundamentals_map, prev_close_map=prev_close_map,
-                                 or_minutes=int(cfg.data_cfg.get("or_minutes", 15)),
+                                 or_minutes=gctx["or_minutes"],
                                  entry_after_map=entry_after_map)
             for o in outcomes:
                 ledger.save_outcome(con, o)
@@ -804,6 +795,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                            f"clean today to draw or confirm a thesis lesson from")
             new_lessons, lesson_updates = [], []
         for l in new_lessons:
+            dup = ledger.find_duplicate_lesson(con, l.get("lesson", ""))
+            if dup:
+                log("evening", f"Skipped duplicate lesson (matches L{dup}): "
+                               f"{l.get('lesson', '')[:80]}")
+                continue
             lid = ledger.insert_lesson(con, l, "evening", d)
             log("evening", f"New lesson L{lid}: {l['lesson']}")
         for upd in lesson_updates:

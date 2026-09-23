@@ -29,6 +29,7 @@ is exactly where the width lives.
 from __future__ import annotations
 
 import math
+import random
 from datetime import date, timedelta
 from typing import Any
 
@@ -41,6 +42,8 @@ __all__ = [
     "candidate_comparisons",
     "setup_edge",
     "selection_edge",
+    "runner_random_ablation",
+    "runner_random_ablation_md",
     "runner_md",
 ]
 
@@ -54,6 +57,8 @@ MINING_DIMENSIONS = (
     "runner_slope_bucket",
     "runner_tc_bucket",
     "runner_float_bucket",
+    "runner_stop_atr_bucket",
+    "runner_trend_side_200d",
     "runner_regime",
 )
 
@@ -108,6 +113,14 @@ def bucket_of(dimension: str, row: dict) -> str:
     if dimension == "runner_float_bucket":
         return _b(row.get("float_shares"), [20, 50, 100],
                   ["<20M", "20-50M", "50-100M", "100M+"])
+    if dimension == "runner_stop_atr_bucket":
+        # Same edges as the morning lane's stop_atr_bucket (Q9) so the runner
+        # pool and the morning picks are bucketed identically and can be read
+        # side by side.
+        return _b(row.get("stop_dist_atr"), [0.5, 1.0, 2.0],
+                  ["<0.5", "0.5-1", "1-2", ">2"])
+    if dimension == "runner_trend_side_200d":
+        return row.get("trend_side_200d") or "?"
     if dimension == "runner_regime":
         return row.get("regime_tag") or "?"
     return "?"
@@ -285,3 +298,117 @@ def runner_md(setup: dict, selection: dict, comparisons: list[Comparison]) -> st
             f"| {c.dimension} | {c.level} | {c.n} | {_fmt(c.mean_r)} | "
             f"{_fmt(c.q_value, 4)}{' *' if c.significant else ''} |")
     return "\n".join(lines)
+
+
+RUNNER_ABLATION_DRAWS = 5000
+RUNNER_ABLATION_SEED = 20260827
+
+
+def runner_random_ablation(rows: list[dict], draws: int = RUNNER_ABLATION_DRAWS,
+                           seed: int = RUNNER_ABLATION_SEED) -> dict:
+    """Did the runner selector beat drawing the same number of names at random
+    from its own candidate pool, session by session?
+
+    Complements selection_edge (the paired selected-vs-unselected comparison)
+    with the exact Monte-Carlo control the morning lane runs in
+    agent/ablation.py. For each contested session -- at least one selected AND
+    one unselected triggered candidate -- the selector's realized total R is
+    ranked against `draws` random portfolios that draw the SAME number of names
+    from that session's triggered pool.
+
+    Unweighted (size_r is identical across runner picks, so weighted ==
+    unweighted). Only triggered rows carry an R; untriggered rows are excluded
+    exactly as the morning ablation drops unmeasurable rows. Reproducible via
+    `seed`.
+    """
+    rng = random.Random(seed)
+    by_session: dict[Any, dict[str, list[float]]] = {}
+    for r in rows:
+        if not r.get("triggered") or r.get("r_multiple") is None:
+            continue
+        s = r.get("session_date")
+        by_session.setdefault(s, {"pool": [], "selected": []})
+        by_session[s]["pool"].append(float(r["r_multiple"]))
+        if r.get("selected"):
+            by_session[s]["selected"].append(float(r["r_multiple"]))
+
+    actual_total = 0.0
+    contested = 0
+    sizes: list[tuple[list[float], int]] = []
+    n_selected = 0
+    for d in by_session.values():
+        k = len(d["selected"])
+        n_selected += k
+        if k == 0 or k >= len(d["pool"]):
+            continue  # no alternative existed -> no selection to test
+        actual_total += sum(d["selected"])
+        contested += 1
+        sizes.append((d["pool"], k))
+
+    if not contested:
+        return {"sessions": 0, "picks": n_selected, "actual_total_r": None,
+                "random_mean_total_r": None, "random_p05_total_r": None,
+                "random_p95_total_r": None, "percentile": None, "p_value": None,
+                "draws": draws, "seed": seed,
+                "note": "no contested sessions (every candidate taken or none)"}
+
+    totals = []
+    for _ in range(draws):
+        t = 0.0
+        for pool, k in sizes:
+            t += sum(rng.sample(pool, k))
+        totals.append(t)
+    totals.sort()
+    # Same convention as agent/ablation.py: "beat" is a strict greater-than,
+    # and the one-sided empirical p is P(random >= actual) with the +1
+    # correction so an empirical p of exactly 0 is never claimed from finite
+    # draws.
+    beaten = sum(1 for t in totals if actual_total > t)
+    percentile = 100.0 * beaten / len(totals)
+    at_least = sum(1 for t in totals if t >= actual_total)
+    p_value = (at_least + 1) / (len(totals) + 1)
+    mean = sum(totals) / draws
+
+    return {
+        "sessions": contested,
+        "picks": n_selected,
+        "actual_total_r": round(actual_total, 3),
+        "random_mean_total_r": round(mean, 3),
+        "random_p05_total_r": round(totals[int(0.05 * len(totals))], 3),
+        "random_p95_total_r": round(totals[min(len(totals) - 1, int(0.95 * len(totals)))], 3),
+        "percentile": round(percentile, 1),
+        "p_value": round(p_value, 4),
+        "draws": draws,
+        "seed": seed,
+    }
+
+
+def runner_random_ablation_md(res: dict) -> str:
+    """Render the runner random-selection control for the weekly miner."""
+    if not res or not res.get("sessions"):
+        return ("## RUNNER SELECTION ABLATION (selector vs random)\n\n"
+                "(not computable yet -- " + str(res.get("note", "no graded candidates")) + ")")
+    pct = res["percentile"]
+    if res["sessions"] < 3:
+        verdict = ("NO VERDICT -- under 3 contested sessions; the percentile "
+                   "is about these picks, not the runner selector")
+    elif pct >= 95:
+        verdict = "the runner selector is beating random draws from its own candidate pool"
+    elif pct <= 5:
+        verdict = "the runner selector is selecting WORSE than random from its own candidate pool"
+    else:
+        verdict = "runner selection is indistinguishable from choosing at random among its own candidates"
+
+    return "\n".join([
+        "## RUNNER SELECTION ABLATION - SELECTOR vs RANDOM (computed, zero API cost)\n",
+        f"Over {res['sessions']} contested sessions and {res['picks']} selected candidates, "
+        f"the selector returned {res['actual_total_r']:+.2f}R (unweighted).",
+        f"{res['draws']} Monte Carlo portfolios drawing the SAME number of candidates at "
+        f"random from the same triggered pools returned {res['random_mean_total_r']:+.2f}R "
+        f"on average (5th pct {res['random_p05_total_r']:+.2f}R, "
+        f"95th pct {res['random_p95_total_r']:+.2f}R).",
+        f"\n**The runner selector beat {pct}% of random portfolios** (one-sided empirical "
+        f"p={res['p_value']}). Read: {verdict}.\n",
+        f"- Seed {res['seed']}: reproducible. If it moves between runs, the ledger "
+        "changed -- not the dice.",
+    ])

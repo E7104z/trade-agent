@@ -271,6 +271,9 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
                                    "n_unselected": 0, "mean_r_selected": None,
                                    "mean_r_unselected": None, "delta_r": None,
                                    "p_value": None, "verdict": "not computed"})
+    runner_random = _safe("integrity", "runner random control",
+                          lambda: runner_research.runner_random_ablation(runner_rows),
+                          {})
     # Reuse the scored comparisons from the search so the q-values shown to the
     # miner are the corrected ones, not a second uncorrected pass.
     runner_comps = [c for c in (getattr(search, "comparisons", None) or [])
@@ -285,6 +288,8 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         _safe("integrity", "runner markdown",
               lambda: runner_research.runner_md(runner_setup, runner_selection_edge,
                                                 runner_comps), ""),
+        _safe("integrity", "runner random markdown",
+              lambda: runner_research.runner_random_ablation_md(runner_random), ""),
     ]
     if paired_mod is not None:
         parts.append(paired_mod.paired_md(paired_cmp))
