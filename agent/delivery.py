@@ -128,6 +128,8 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   th,td {{ border:1px solid #30363d; padding:6px 10px; text-align:left; }}
   th {{ background:#21262d; }}
   .win {{ color:#3fb950; }} .loss {{ color:#f85149; }} .neutral {{ color:#8b949e; }}
+  .err {{ color:#f85149; font-size:12px; max-width:340px; overflow:hidden;
+          text-overflow:ellipsis; white-space:nowrap; }}
   .badge {{ display:inline-block; padding:2px 8px; border-radius:12px; font-size:12px; background:#21262d; }}
   #chart {{ width:100%; height:260px; }}
   pre {{ white-space:pre-wrap; font-size:13px; color:#c9d1d9; }}
@@ -198,6 +200,29 @@ if (points.length > 1) {{
 </script>
 </body></html>
 """
+
+
+def _error_cell(error: str | None, limit: int = 90) -> str:
+    """Render a runs.error value as a table cell.
+
+    Empty/None renders an EMPTY cell -- never the strings "None" or "undefined",
+    which is what an unguarded f-string interpolation would produce for the
+    overwhelming majority of rows.
+
+    The text is HTML-escaped because it is raw exception text: tracebacks carry
+    <module>, generic types like dict<str, int>, and & in URLs, any of which
+    would otherwise break the surrounding table or silently swallow the part of
+    the message that mattered. The full string goes in title= so hovering shows
+    everything without widening the column.
+    """
+    if not error:
+        return ""
+    safe = (str(error).replace("&", "&amp;")
+                      .replace("<", "&lt;")
+                      .replace(">", "&gt;")
+                      .replace('"', "&quot;"))
+    short = safe if len(safe) <= limit else safe[:limit] + "&hellip;"
+    return f'<span class="err" title="{safe}">{short}</span>'
 
 
 def _plan_html(plan: dict | None) -> str:
@@ -274,14 +299,19 @@ def render_dashboard(con: duckdb.DuckDBPyConnection, cfg: Config, plan_date: dat
     setup_table = ("<table><tr><th>Setup</th><th>N</th><th>Triggered</th><th>Win rate</th>"
                   "<th>Avg R</th><th>Total wR</th></tr>" + setup_rows + "</table>") if setup_stats else "<p class='neutral'>No graded trades yet.</p>"
 
+    # Error column: runs.error was already fetched and already dropped on the
+    # floor here, exactly as in the hosted renderer. A failed run that shows
+    # only a red word is indistinguishable from any other failed run, which is
+    # what turned a billing outage into a multi-hour investigation.
     runs_rows = "".join(
         f"<tr><td>{r['loop']}</td><td>{r['run_date']}</td><td>{r['status']}</td>"
         f"<td>{r['model']}</td><td>{r['input_tokens']}</td><td>{r['output_tokens']}</td>"
-        f"<td>${r['cost_usd']:.3f}</td></tr>"
+        f"<td>${r['cost_usd']:.3f}</td><td>{_error_cell(r.get('error'))}</td></tr>"
         for r in runs
     )
     runs_table = ("<table><tr><th>Loop</th><th>Date</th><th>Status</th><th>Model</th>"
-                 "<th>In tok</th><th>Out tok</th><th>Cost</th></tr>" + runs_rows + "</table>") if runs else "<p class='neutral'>No runs logged yet.</p>"
+                 "<th>In tok</th><th>Out tok</th><th>Cost</th><th>Error</th></tr>"
+                 + runs_rows + "</table>") if runs else "<p class='neutral'>No runs logged yet.</p>"
 
     equity_now = curve[-1]["equity"] if curve else cfg.get("account_size", 100000)
 

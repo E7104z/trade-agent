@@ -146,6 +146,8 @@ button.small{padding:8px 12px;font-size:13px}
 .history-meta{color:#8b949e;font-size:13px;margin:8px 0 12px}
 .history-table{overflow:auto;max-height:560px}
 .history-table table{min-width:760px}
+td.err{color:#f85149;font-size:12px;max-width:340px;overflow:hidden;
+       text-overflow:ellipsis;white-space:nowrap}
 pre{white-space:pre-wrap;font-size:12px;background:#0d1117;border:1px solid #30363d;
      border-radius:6px;padding:12px;max-height:400px;overflow:auto}
 a{color:#58a6ff}
@@ -209,8 +211,20 @@ function render(d) {
   let setupRows = (d.by_setup || []).map(s => `<tr><td>${s.dim}</td><td>${s.n}</td><td>${s.triggered}</td>
     <td>${s.win_rate!=null ? Math.round(s.win_rate*100)+'%' : '-'}</td><td>${s.avg_r ?? '-'}</td>
     <td>${s.total_weighted_r}</td></tr>`).join('');
-  let runsRows = (d.runs || []).map(r => `<tr><td>${r.loop}</td><td>${r.run_date}</td><td>${r.status}</td>
-    <td>${r.model||''}</td><td>$${(r.cost_usd||0).toFixed(3)}</td></tr>`).join('');
+  // runs.error has always been in this payload (recent_runs does SELECT *).
+  // It was simply never rendered, which is why a three-line billing failure
+  // read as an unexplained red row for hours. Escape it: it is raw exception
+  // text and routinely contains < and &.
+  const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+  let runsRows = (d.runs || []).map(r => {
+    const err = r.error ? esc(r.error) : '';
+    const short = err.length > 90 ? err.slice(0, 90) + '&hellip;' : err;
+    const cell = err
+      ? `<td class="err" title="${err}">${short}</td>`
+      : '<td></td>';
+    return `<tr><td>${r.loop}</td><td>${r.run_date}</td><td>${r.status}</td>
+    <td>${r.model||''}</td><td>$${(r.cost_usd||0).toFixed(3)}</td>${cell}</tr>`;
+  }).join('');
 
   const rejections = d.rejections_today || [];
   let shadowHtml = "<p class='neutral'>Nothing rejected today — every candidate that survived analysis made the plan.</p>";
@@ -331,7 +345,7 @@ function render(d) {
     </div>
   <div class="card"><h2>Playbook v${d.playbook_version}</h2><pre>${d.playbook.replace(/</g,'&lt;')}</pre></div>
   <div class="card"><h2>Recent Runs</h2><table><tr><th>Loop</th><th>Date</th><th>Status</th>
-    <th>Model</th><th>Cost</th></tr>${runsRows}</table></div>
+    <th>Model</th><th>Cost</th><th>Error</th></tr>${runsRows}</table></div>
   `;
   // The Historical Data controls above just got (re)created by the innerHTML
   // assignment, so their dropdown needs to be (re)populated every time render()
