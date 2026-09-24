@@ -99,15 +99,29 @@ def evening_email_html(plan_date: date, review: dict, outcomes_summary: str) -> 
     """
 
 
-def weekly_email_html(result: dict) -> str:
+def weekly_email_html(result: dict, violations: list[dict] | None = None) -> str:
     findings = "".join(f"<li>{f['finding']} (n={f['n']}, {f['strength']})</li>" for f in result.get("key_findings", []))
     edge = result.get("current_best_edge", "")
     edge_html = f'<h3>Current best edge</h3><p style="font-weight:bold">{edge}</p>' if edge else ""
+    viol_html = ""
+    if violations:
+        import html as _html
+        blocks = [v for v in violations if v.get("severity") == "block"]
+        rejected = any(v.get("action") == "rewrite_rejected" for v in violations)
+        head = (f"{len(blocks)} blocking / {len(violations) - len(blocks)} warning finding(s)"
+                + (" — REWRITE REJECTED, prior playbook kept" if rejected else
+                   " — repaired before the playbook was written"))
+        items = "".join(
+            f"<li><b>{_html.escape(str(v.get('checker')))}</b> [{v.get('severity')}/"
+            f"{v.get('action')}] {_html.escape(str(v.get('message') or '')[:220])}</li>"
+            for v in violations[:5])
+        viol_html = f"<h3>Write-time integrity</h3><p>{head}</p><ul>{items}</ul>"
     return f"""
     <html><body style="font-family:sans-serif">
       <h2>Trade Agent — Weekly Review</h2>
       <p>{result.get('summary_for_email','')}</p>
       {edge_html}
+      {viol_html}
       <h3>Key findings</h3><ul>{findings}</ul>
       <h3>Changelog</h3><pre style="white-space:pre-wrap">{result.get('changelog','')}</pre>
     </body></html>

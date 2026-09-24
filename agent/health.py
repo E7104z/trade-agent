@@ -233,9 +233,28 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
                                  f"Last successful weekly mining was {age} days ago "
                                  f"({last_ok['run_date']})", detail, last=last_w))
         else:
-            stages.append(_stage("weekly", "Weekly mining", "ok",
+            status, detail = "ok", ""
+            # WRITE_TIME_ENFORCEMENT_SPEC_v1: the last rewrite's integrity
+            # findings. Blocking findings were repaired before the write, but
+            # a miner that keeps producing them is itself worth seeing.
+            from .ledger import latest_playbook_violations
+            pv = {}
+            try:
+                pv = latest_playbook_violations(con) or {}
+            except Exception:
+                pv = {}
+            if pv.get("rejected"):
+                status = "warn"
+                detail = (f"rewrite of {pv['run_date']} REJECTED: blocking integrity "
+                          f"violations survived repair; playbook v{pv.get('version')} kept")
+            elif pv.get("block"):
+                status = "warn"
+                top = ", ".join(f"{k}={n}" for k, n in list(pv["by_checker"].items())[:4])
+                detail = (f"{pv['block']} blocking integrity finding(s) repaired before "
+                          f"playbook v{pv.get('version')} was written ({top})")
+            stages.append(_stage("weekly", "Weekly mining", status,
                                  f"Playbook mined {age} day(s) ago ({last_ok['run_date']})",
-                                 last=last_ok))
+                                 detail, last=last_ok))
 
     # --- wedged locks -----------------------------------------------------
     from .ledger import STALE_LOCK_MINUTES

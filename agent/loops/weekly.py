@@ -843,9 +843,14 @@ def _check_wr_suppression(playbook_md: str) -> list[str]:
     """Write-time enforcement:
     (a) spec Sec5 (original check) -- flag any line carrying wr/avgR at n < 8.
     (b) Task 5 #5 -- flag any line making an effect-size claim (avgR=<number>)
-        that doesn't ALSO cite n, t, and stdR. stats_by computes all three
-        deterministically; the miner must cite them, never derive its own
-        read of significance. Flagged the same way small-sample win rates are.
+        that doesn't ALSO cite n, stdR, and a significance figure. stats_by
+        computes them deterministically; the miner must cite them, never
+        derive its own read of significance.
+
+    The significance figure may be the FDR-corrected `q=` or the raw `t=`
+    (WRITE_TIME_ENFORCEMENT_SPEC_v1 Phase 3). Demanding `t=` alone enforced
+    citing the uncorrected statistic the research-integrity section tells the
+    miner not to rely on.
     """
     violations = []
     for line in playbook_md.splitlines():
@@ -855,8 +860,11 @@ def _check_wr_suppression(playbook_md: str) -> list[str]:
         if n_match and int(n_match.group(1)) < 8 and re.search(r"(wr\s*=|avgR\s*=\s*[+-]?\d)", line, re.IGNORECASE):
             violations.append(stripped)
         if has_effect_claim:
-            missing = [tok for tok in ("n", "t", "stdR")
-                      if not re.search(rf"\b{tok}\s*=\s*[+-]?\d", line, re.IGNORECASE)]
+            def _cites(tok: str) -> bool:
+                return bool(re.search(rf"\b{tok}\s*=\s*[+-]?\d", line, re.IGNORECASE))
+            missing = [tok for tok in ("n", "stdR") if not _cites(tok)]
+            if not (_cites("q") or _cites("t")):
+                missing.append("q (or t)")
             if missing:
                 violations.append(f"{stripped}  [missing: {', '.join(missing)}]")
     return violations
@@ -1035,34 +1043,36 @@ def run(cfg: Config, run_date: date | None = None) -> None:
 
         # rewrite the playbook (this loop is the SOLE writer of playbook.md)
         new_pb = mined.get("playbook_markdown", "")
+        violation_rows: list[dict] = []
         if new_pb and len(new_pb) > 200:
-            wr_violations = _check_wr_suppression(new_pb)
-            for v in wr_violations:
-                log("weekly", f"WARN WR-suppression violation (n<8 with wr/avgR shown): {v}")
-            for v in _check_calibration_table(new_pb):
-                log("weekly", f"WARN calibration-table suppression violation: {v}")
-            for v in _check_selection_edge_table(new_pb):
-                log("weekly", f"WARN selection-edge suppression violation: {v}")
-            for v in _check_sizing_banner(new_pb):
-                log("weekly", f"WARN sizing-policy banner violation: {v}")
-            # The one section an outside loop reads and acts on the same
-            # day -- checked here because this is the only place the runner
-            # lane's text passes through before the selector trades on it.
-            for v in _check_runner_section(new_pb):
-                log("weekly", f"WARN runner-section violation: {v}")
-            for v in _check_best_edge(new_pb):
-                log("weekly", f"WARN best-edge mislabel: {v}")
-            # A pre-registered threshold the weekly rewrite can restate is not
-            # pre-registered. agent/open_questions.py holds the declared bars;
-            # this is where a rewrite that moved one becomes visible.
-            for v in open_questions.check_playbook_questions(new_pb):
-                log("weekly", f"WARN open-question registry violation: {v}")
-            for v in integrity.check_playbook(new_pb, research_block["states"]):
-                log("weekly", f"WARN playbook violation: {v}")
-            version = write_playbook(new_pb, mined.get("changelog", ""), con)
-            log("weekly", f"Playbook rewritten -> v{version} (old version archived)")
-            if not os.environ.get("DATABASE_URL"):
-                _git_commit_playbook(version)
+            # WRITE_TIME_ENFORCEMENT_SPEC_v1: the checkers used to print WARN
+            # and write the document anyway. Now every finding is located,
+            # the offending line/row/section is repaired deterministically
+            # (withheld text kept in playbook_violations), the result is
+            # re-checked, and only a document with zero blocking violations is
+            # written. The Runner Lane -- read by the intraday selector the
+            # same day -- falls back to an explicit no-rules statement.
+            from .. import playbook_enforcement
+            enf = playbook_enforcement.enforce(
+                new_pb, research_block["states"], research_block)
+            for v in enf.violations:
+                label = playbook_enforcement.LOG_LABEL.get(v.checker, v.checker)
+                log("weekly", f"WARN {label}: [{v.severity}/{v.action}] {v.message[:200]}")
+            violation_rows = [v.to_row() for v in enf.violations]
+            if enf.markdown is not None:
+                version = write_playbook(enf.markdown, mined.get("changelog", ""), con)
+                log("weekly", f"Playbook rewritten -> v{version} (old version archived; "
+                              f"{enf.n_block} blocking finding(s) repaired before write)")
+                if not os.environ.get("DATABASE_URL"):
+                    _git_commit_playbook(version)
+            else:
+                version = mem["playbook_version"]
+                log("weekly", f"WARN rewrite rejected: {len(enf.remaining_blocks)} blocking "
+                              f"violation(s) survived repair -- keeping playbook v{version}")
+            try:
+                ledger.save_playbook_violations(con, d, int(version), violation_rows)
+            except Exception as e:
+                log("weekly", f"WARN could not record playbook violations: {e}")
         else:
             log("weekly", "WARN: miner returned no usable playbook — keeping current version")
 
@@ -1082,7 +1092,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             log("weekly", f"  Experiment: {ex}")
         log("weekly", f"Tokens ~${result.usage['cost_usd']:.3f}")
 
-        send_email(cfg, f"Trade Agent — Weekly Review {d.isoformat()}", weekly_email_html(mined))
+        send_email(cfg, f"Trade Agent — Weekly Review {d.isoformat()}",
+                   weekly_email_html(mined, violation_rows))
         render_dashboard(con, cfg, None)
 
     except Exception as e:

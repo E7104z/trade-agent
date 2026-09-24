@@ -560,6 +560,9 @@ _QUERYABLE_TABLES = {
     "population_universe": "plan_date",
     "population_outcomes": "plan_date",
     "paired_arm_picks": "plan_date",
+    # WRITE_TIME_ENFORCEMENT_SPEC_v1: every weekly integrity finding and what
+    # the system did about it, including the withheld text.
+    "playbook_violations": "run_date",
     # Not date-filterable, but ordered newest-first (see _TABLE_ORDER) so
     # ?limit=N returns the latest: a lost weekly rewrite is recovered from
     # llm_archive, and every playbook the miner ever wrote is in

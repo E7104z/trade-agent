@@ -370,6 +370,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v16.STATEMENTS
 from . import migrations_v17  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v17.STATEMENTS
 
+# --- v18 write-time enforcement: playbook violations are ledger rows --------
+from . import migrations_v18  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v18.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -2080,6 +2084,52 @@ def selection_edge_history(con: duckdb.DuckDBPyConnection,
         "SELECT * FROM selection_edge_history ORDER BY week_ending DESC LIMIT ?",
         [limit]).fetchall()
     return [dict(zip(cols, r)) for r in reversed(rows)]
+
+
+# ------------------------------------------------------- playbook violations (v18)
+
+def save_playbook_violations(con: Any, run_date: date, version: int | None,
+                             rows: list[dict]) -> int:
+    """Persist one weekly run's write-time findings.
+
+    Keyed on run_date: a re-run of the same week replaces its rows rather than
+    doubling them, exactly like selection_edge_history.
+    """
+    con.execute("DELETE FROM playbook_violations WHERE run_date = ?", [run_date])
+    for r in rows:
+        con.execute(
+            """INSERT INTO playbook_violations
+               (run_date, version, checker, severity, section, line, message, action)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            [run_date, version, r.get("checker"), r.get("severity"), r.get("section"),
+             r.get("line"), r.get("message"), r.get("action")])
+    return len(rows)
+
+
+def latest_playbook_violations(con: Any) -> dict:
+    """Summary of the most recent weekly run's write-time findings."""
+    try:
+        row = con.execute("SELECT MAX(run_date) FROM playbook_violations").fetchone()
+    except Exception:
+        return {}
+    if not row or row[0] is None:
+        return {}
+    d = row[0]
+    rows = con.execute(
+        """SELECT severity, action, checker, COUNT(*) FROM playbook_violations
+           WHERE run_date = ? GROUP BY 1, 2, 3 ORDER BY 4 DESC""", [d]).fetchall()
+    version = con.execute(
+        "SELECT MAX(version) FROM playbook_violations WHERE run_date = ?", [d]).fetchone()
+    out = {"run_date": d, "version": version[0] if version else None,
+           "block": 0, "warn": 0, "rejected": False, "by_checker": {}}
+    for severity, action, checker, n in rows:
+        n = int(n or 0)
+        if severity in ("block", "warn"):
+            out[severity] += n
+        if action == "rewrite_rejected":
+            out["rejected"] = True
+        out["by_checker"][checker] = out["by_checker"].get(checker, 0) + n
+    return out
 
 
 # ------------------------------------------------------------------ heartbeats
