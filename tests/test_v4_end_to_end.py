@@ -105,10 +105,10 @@ class _Ledger:
                         "t_stat": None, "baseline_avg_r": None})
         return out
 
-    def stats_by(self, con, dim):
+    def stats_by(self, con, dim, lane=None):
         return self._rows(con, dim)
 
-    def stats_by_outcome(self, con, dim):
+    def stats_by_outcome(self, con, dim, lane=None):
         return self._rows(con, dim)
 
 
@@ -116,7 +116,7 @@ class _Ledger:
 def con():
     c = duckdb.connect(":memory:")
     c.execute(_BASE_SCHEMA)
-    for stmt in migrations_v4.STATEMENTS:      # migrations do real work here
+    for stmt in migrations_v4.research_schema():      # migrations do real work here
         c.execute(stmt)
     yield c
     c.close()
@@ -347,7 +347,7 @@ def test_migrations_are_safe_to_run_repeatedly_on_a_populated_database(con):
     _season(con, weeks=1)
     before = con.execute("SELECT COUNT(*) FROM population_universe").fetchone()[0]
     for _ in range(3):
-        for stmt in migrations_v4.STATEMENTS:
+        for stmt in migrations_v4.research_schema():
             con.execute(stmt)
     assert con.execute("SELECT COUNT(*) FROM population_universe").fetchone()[0] == before
 
@@ -359,10 +359,10 @@ def test_the_whole_layer_degrades_rather_than_raising_when_everything_breaks(con
             raise RuntimeError("database on fire")
 
     class _BrokenLedger:
-        def stats_by(self, *a):
+        def stats_by(self, *a, **k):
             raise RuntimeError("nope")
 
-        def stats_by_outcome(self, *a):
+        def stats_by_outcome(self, *a, **k):
             raise RuntimeError("nope")
 
     class _BrokenMD:

@@ -40,7 +40,7 @@ def con():
     c.execute("CREATE TABLE outcomes (pick_id INTEGER, r_multiple DOUBLE)")
     c.execute("CREATE TABLE daily_plans (plan_date DATE)")
     c.execute("CREATE TABLE picks (pick_id INTEGER, ticker VARCHAR)")
-    for stmt in migrations_v4.STATEMENTS:
+    for stmt in migrations_v4.research_schema():
         c.execute(stmt)
     yield c
     c.close()
@@ -48,22 +48,22 @@ def con():
 
 def test_v4_statements_are_idempotent(con):
     # connect() runs every migration on EVERY connection. Twice must be a no-op.
-    for stmt in migrations_v4.STATEMENTS:
+    for stmt in migrations_v4.research_schema():
         con.execute(stmt)
-    for stmt in migrations_v4.STATEMENTS:
+    for stmt in migrations_v4.research_schema():
         con.execute(stmt)
 
 
 def test_v4_never_emits_the_literal_double_precision():
     # ledger.connect()'s Postgres branch rewrites DOUBLE -> DOUBLE PRECISION.
     # Writing it ourselves would produce "DOUBLE PRECISION PRECISION" there.
-    for stmt in migrations_v4.STATEMENTS:
+    for stmt in migrations_v4.research_schema():
         assert "DOUBLE PRECISION" not in stmt.upper()
 
 
 def test_v4_uses_no_sequences(con):
     # DuckDB sequences would not survive the Postgres branch unchanged.
-    for stmt in migrations_v4.STATEMENTS:
+    for stmt in migrations_v4.research_schema():
         assert "nextval" not in stmt.lower()
 
 

@@ -272,6 +272,20 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
     for l in lessons:
         l.update(ledger.lesson_holdout_stats(con, l["lesson_id"], l.get("promoted_at"),
                                             holdout_sessions))
+    # The per-dimension tables below are MORNING-lane scoped, matching the
+    # FDR batch in integrity.build_search. Unscoped, every cell pooled the
+    # runner's up-to-10-a-day picks (different $/R, different entry rules)
+    # into the morning lane's numbers, while the prompt told the miner never
+    # to pool the lanes. The runner lane reaches the miner through its own
+    # block (setup edge, selection edge, runner dimensions).
+    lane = "morning"
+
+    def _picks(dim: str) -> list[dict]:
+        return ledger.stats_by(con, dim, lane=lane)
+
+    def _outs(dim: str) -> list[dict]:
+        return ledger.stats_by_outcome(con, dim, lane=lane)
+
     return {
         "playbook": playbook,
         "playbook_version": version,
@@ -280,22 +294,22 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         "overall": ledger.overall_stats(con),
         "overall_by_lane": {lane: ledger.overall_stats(con, lane=lane)
                             for lane in ledger.LANES},
-        "by_setup": ledger.stats_by(con, "setup_type"),
-        "by_regime": ledger.stats_by(con, "regime_tag"),
-        "by_conviction": ledger.stats_by(con, "conviction"),
-        "by_direction": ledger.stats_by(con, "direction"),
+        "by_setup": _picks("setup_type"),
+        "by_regime": _picks("regime_tag"),
+        "by_conviction": _picks("conviction"),
+        "by_direction": _picks("direction"),
         # indicator layer v1 (specs/INDICATOR_LAYER_SPEC_v1.md §5): does
         # participation (RVOL) or VWAP side at fill separate winners from chop?
-        "by_rvol_bucket": ledger.stats_by_outcome(con, "rvol_bucket"),
-        "by_vwap_side": ledger.stats_by_outcome(con, "vwap_side_at_fill"),
+        "by_rvol_bucket": _outs("rvol_bucket"),
+        "by_vwap_side": _outs("vwap_side_at_fill"),
         # indicator layer v2 (specs/INDICATOR_LAYER_SPEC_v2.md §6): Q9-Q12 dims
-        "by_stop_atr_bucket": ledger.stats_by_outcome(con, "stop_atr_bucket"),
-        "by_gap_atr_bucket": ledger.stats_by_outcome(con, "gap_atr_bucket"),
-        "by_ext_bucket": ledger.stats_by_outcome(con, "ext_bucket"),
-        "by_trend_side_200d": ledger.stats_by_outcome(con, "trend_side_200d"),
-        "by_mcap_bucket": ledger.stats_by_outcome(con, "mcap_bucket"),
-        "by_short_bucket": ledger.stats_by_outcome(con, "short_bucket"),
-        "by_or_alignment": ledger.stats_by_outcome(con, "or_alignment"),
+        "by_stop_atr_bucket": _outs("stop_atr_bucket"),
+        "by_gap_atr_bucket": _outs("gap_atr_bucket"),
+        "by_ext_bucket": _outs("ext_bucket"),
+        "by_trend_side_200d": _outs("trend_side_200d"),
+        "by_mcap_bucket": _outs("mcap_bucket"),
+        "by_short_bucket": _outs("short_bucket"),
+        "by_or_alignment": _outs("or_alignment"),
         "lessons": lessons,
         "regimes": ledger.recent_regimes(con, 30),
         # v3: the self-deception closers

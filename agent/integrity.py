@@ -61,6 +61,8 @@ def _safe(scope: str, label: str, fn: Callable[[], Any], default: Any) -> Any:
 # column or an `outcomes` (indicator-layer) column. This list IS the search
 # width: adding a dimension here widens the multiple-testing correction for
 # every other dimension, which is exactly the trade-off it should make explicit.
+MORNING_LANE = "morning"
+
 STATS_DIMENSION_SPEC: tuple[tuple[str, str], ...] = (
     ("setup_type", "picks"),
     ("regime_tag", "picks"),
@@ -199,15 +201,21 @@ def build_search(con: Any, ledger_mod: Any, q: float = 0.10, min_n: int = 8):
     comps = []
     for dim, source in STATS_DIMENSION_SPEC:
         fn = ledger_mod.stats_by if source == "picks" else ledger_mod.stats_by_outcome
-        rows = _safe("integrity", f"stats_by({dim})", lambda f=fn, d=dim: f(con, d), [])
+        # MORNING lane only. With no lane these cells pooled runner picks (up
+        # to 10 a day, at the runner's own $/R and entry semantics) into every
+        # morning dimension, and counted selected runner trades a second time
+        # in the runner family below. The runner lane has its own family.
+        rows = _safe("integrity", f"stats_by({dim})",
+                     lambda f=fn, d=dim: f(con, d, lane=MORNING_LANE), [])
         comps.extend(annotate_stats_rows(rows, dim, n_dimensions=1))
 
     # Runner lane (RUNNER_PORT_SPEC §2.6). Folded into the SAME batch rather
     # than corrected separately: the runner dimensions widen the same search,
     # and correcting them apart would leave the across-family multiplicity
-    # uncontrolled — which is exactly where the width lives.
+    # uncontrolled — which is exactly where the width lives. Pinned to the
+    # current scan_version and sim_version (INTEGRITY_REPAIR_SPEC_v1 Phase 3).
     runner_rows = _safe("integrity", "runner candidate rows",
-                        lambda: runner_research.candidate_rows(con), [])
+                        lambda: runner_research.current_candidate_rows(con), [])
     if runner_rows:
         comps.extend(_safe("integrity", "runner dimensions",
                            lambda: runner_research.candidate_comparisons(runner_rows), []))
@@ -261,7 +269,9 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
                            lambda: paired_mod.paired_comparison(con), {})
 
     runner_rows = _safe("integrity", "runner candidate rows",
-                        lambda: runner_research.candidate_rows(con), [])
+                        lambda: runner_research.current_candidate_rows(con), [])
+    runner_versions = _safe("integrity", "runner version mix",
+                            lambda: runner_research.version_mix(con), [])
     runner_setup = _safe("integrity", "runner setup edge",
                          lambda: runner_research.setup_edge(runner_rows, min_n=min_n),
                          {"n": 0})
@@ -287,7 +297,7 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         ablation.ablation_md(abl),
         _safe("integrity", "runner markdown",
               lambda: runner_research.runner_md(runner_setup, runner_selection_edge,
-                                                runner_comps), ""),
+                                                runner_comps, runner_versions), ""),
         _safe("integrity", "runner random markdown",
               lambda: runner_research.runner_random_ablation_md(runner_random), ""),
     ]

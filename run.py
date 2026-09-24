@@ -13,6 +13,10 @@ Trade Agent CLI.
   python run.py regrade-runner --from YYYY-MM-DD [--force]
                                            re-price runner candidates under the
                                            CURRENT entry rule (explicit, opt-in)
+  python run.py regate-runner --from YYYY-MM-DD [--apply]
+                                           relabel scan_version 1 runner rows
+                                           that pass every v2 gate (dry run
+                                           unless --apply)
   python run.py research [--full]         research-integrity report: selection
                                            ablation + population baseline
                                            (zero API cost, read-only)
@@ -215,6 +219,37 @@ def cmd_regrade_runner(cfg, args) -> None:
     con.close()
 
 
+def cmd_regate_runner(cfg, args) -> None:
+    """Relabel scan_version 1 runner candidates whose STORED inputs pass every
+    scan_version 2 gate (agent/runner_regate.py). Dry run unless --apply.
+
+    Pair it with `regrade-runner` so the relabelled rows are also priced under
+    the current sim_version -- the weekly search mines only rows that match
+    BOTH current versions.
+    """
+    from agent import runner_regate
+
+    from_date = parse_date(args.from_date)
+    require_rvol = bool((cfg.get("runner", {}) or {}).get("require_rvol", True))
+    con = ledger.connect()
+    try:
+        res = runner_regate.plan(con, from_date, require_rvol=require_rvol)
+        log("regate", f"Checked {res['checked']} scan_version {runner_regate.REGATE_FROM} "
+                      f"row(s) on/after {from_date}: {len(res['admit'])} pass every "
+                      f"scan_version {runner_regate.REGATE_TO} gate across "
+                      f"{len(res['sessions'])} session(s)")
+        for why, n in sorted(res["rejected_by_reason"].items()):
+            log("regate", f"  stays v{runner_regate.REGATE_FROM}: {n} -- {why}")
+        if not args.apply:
+            log("regate", "Dry run -- nothing written. Re-run with --apply to relabel.")
+            return
+        n = runner_regate.apply(con, res["admit"])
+        log("regate", f"Relabelled {n} row(s) scan_version {runner_regate.REGATE_TO} "
+                      f"(regated_from={runner_regate.REGATE_FROM})")
+    finally:
+        con.close()
+
+
 def cmd_runner(cfg, args) -> None:
     """One intraday Runner tick (or a loop of them) from this machine.
 
@@ -343,6 +378,14 @@ def main() -> None:
     p_rregrade.add_argument("--force", action="store_true",
                             help="required if this would re-price more than 500 rows")
 
+    p_regate = sub.add_parser(
+        "regate-runner",
+        help="relabel scan_version 1 runner rows that pass every v2 gate (dry run unless --apply)")
+    p_regate.add_argument("--from", dest="from_date", required=True,
+                          help="YYYY-MM-DD -- check sessions on/after this date")
+    p_regate.add_argument("--apply", action="store_true",
+                          help="write the relabel (default is a dry run)")
+
     p_runner = sub.add_parser(
         "runner",
         help="run one intraday Runner scan tick (scan -> select -> place)")
@@ -387,6 +430,8 @@ def main() -> None:
         cmd_regrade(cfg, args)
     elif args.cmd == "regrade-runner":
         cmd_regrade_runner(cfg, args)
+    elif args.cmd == "regate-runner":
+        cmd_regate_runner(cfg, args)
     elif args.cmd == "research":
         cmd_research(cfg, args)
     elif args.cmd == "morning":

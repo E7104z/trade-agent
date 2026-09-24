@@ -26,7 +26,7 @@ def con():
                  ticker VARCHAR, eod_outcome VARCHAR, forgone_r DOUBLE,
                  sim_version INTEGER)""")
     c.execute("CREATE TABLE daily_plans (plan_date DATE)")
-    for stmt in migrations_v4.STATEMENTS:
+    for stmt in migrations_v4.research_schema():
         c.execute(stmt)
     yield c
     c.close()
@@ -52,10 +52,10 @@ class _Ledger:
             raise RuntimeError("query blew up")
         return self.rows.get(dim, [])
 
-    def stats_by(self, con, dim):
+    def stats_by(self, con, dim, lane=None):
         return self._get(dim)
 
-    def stats_by_outcome(self, con, dim):
+    def stats_by_outcome(self, con, dim, lane=None):
         return self._get(dim)
 
 
@@ -218,10 +218,10 @@ def test_weekly_block_renders_every_section_and_records_the_looks(con):
 
 def test_weekly_block_survives_a_completely_broken_ledger_module(con):
     class _AllBroken:
-        def stats_by(self, *a):
+        def stats_by(self, *a, **k):
             raise RuntimeError("nope")
 
-        def stats_by_outcome(self, *a):
+        def stats_by_outcome(self, *a, **k):
             raise RuntimeError("nope")
 
     res = integrity.weekly_block(con, _Cfg(), _AllBroken(), date(2026, 8, 30))

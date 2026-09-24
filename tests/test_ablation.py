@@ -31,7 +31,7 @@ def con():
         rejection_id INTEGER, plan_date DATE, ticker VARCHAR,
         eod_outcome VARCHAR, forgone_r DOUBLE, sim_version INTEGER)""")
     c.execute("CREATE TABLE daily_plans (plan_date DATE)")
-    for stmt in migrations_v4.STATEMENTS:
+    for stmt in migrations_v4.research_schema():
         c.execute(stmt)
     yield c
     c.close()

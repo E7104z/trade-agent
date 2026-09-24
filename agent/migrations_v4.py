@@ -24,9 +24,23 @@ is empty until a new code path writes to it.
 """
 from __future__ import annotations
 
-__all__ = ["STATEMENTS", "SCHEMA_VERSION"]
+__all__ = ["STATEMENTS", "SCHEMA_VERSION", "research_schema"]
 
 SCHEMA_VERSION = 4
+
+
+def research_schema() -> list[str]:
+    """The v4 statements plus every LATER additive column on the v4 tables.
+
+    For test fixtures that build only the research layer on an in-memory
+    database: `STATEMENTS` alone describes the tables as v4 created them, and
+    code written against a later migration (research_looks.test, ...) would
+    fail on it. Production never calls this -- ledger._MIGRATIONS already
+    applies every migration in order. Defined as a function so STATEMENTS,
+    and therefore the schema fingerprint, is untouched.
+    """
+    from . import migrations_v17
+    return list(STATEMENTS) + list(migrations_v17.RESEARCH_STATEMENTS)
 
 STATEMENTS: list[str] = [
 

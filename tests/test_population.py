@@ -31,7 +31,7 @@ def con():
     c.execute("CREATE TABLE outcomes (pick_id INTEGER, triggered BOOLEAN, r_multiple DOUBLE)")
     c.execute("CREATE TABLE daily_plans (plan_date DATE)")
     c.execute("CREATE TABLE picks (pick_id INTEGER, ticker VARCHAR)")
-    for stmt in migrations_v4.STATEMENTS:
+    for stmt in migrations_v4.research_schema():
         c.execute(stmt)
     yield c
     c.close()

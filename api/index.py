@@ -550,6 +550,16 @@ _QUERYABLE_TABLES = {
     "runner_candidate_outcomes": "session_date",
     "runner_sessions": "session_date",
     "live_orders": "session_date",
+    # The integrity layer's own state (INTEGRITY_REPAIR_SPEC_v1 Phase 1).
+    # Without these, whether a false survivor was recorded, or whether any
+    # rule is registered at all, could not be checked from production.
+    "research_rules": "discovered_at",
+    "research_observations": "session_date",
+    "research_looks": "session_date",
+    "selection_edge_history": "week_ending",
+    "population_universe": "plan_date",
+    "population_outcomes": "plan_date",
+    "paired_arm_picks": "plan_date",
     # Not date-filterable, but ordered newest-first (see _TABLE_ORDER) so
     # ?limit=N returns the latest: a lost weekly rewrite is recovered from
     # llm_archive, and every playbook the miner ever wrote is in

@@ -33,11 +33,15 @@ import random
 from datetime import date, timedelta
 from typing import Any
 
-from .stats import Comparison, one_sample_t, welch_t
+from .stats import (Comparison, min_detectable_effect_two_sample, one_sample_t,
+                    welch_t)
 
 __all__ = [
     "MINING_DIMENSIONS",
     "candidate_rows",
+    "current_candidate_rows",
+    "current_versions",
+    "version_mix",
     "bucket_of",
     "candidate_comparisons",
     "setup_edge",
@@ -127,13 +131,16 @@ def bucket_of(dimension: str, row: dict) -> str:
 
 
 def candidate_rows(con: Any, sessions: int = 60,
-                   scan_version: int | None = None) -> list[dict]:
+                   scan_version: int | None = None,
+                   sim_version: int | None = None) -> list[dict]:
     """Joined candidate + outcome rows that actually triggered.
 
     Only triggered rows carry an R multiple, so only they can enter a mean-R
-    comparison. Rows are filtered by `scan_version` when one is given: never
-    compare across scan_version values, exactly as with sim_version for
-    grading — a detection-semantics change makes rows describe different rules.
+    comparison. Rows are filtered by `scan_version` and `sim_version` when
+    given: never compare across either, because a detection change makes rows
+    describe different populations and a grading change makes them describe
+    different fills. Production callers go through `current_candidate_rows`,
+    which pins both to the running code's versions.
     """
     from . import ledger
     since = date.today() - timedelta(days=sessions * 2)
@@ -145,10 +152,48 @@ def candidate_rows(con: Any, sessions: int = 60,
     for r in rows:
         if scan_version is not None and r.get("scan_version") != scan_version:
             continue
+        if sim_version is not None and r.get("sim_version") != sim_version:
+            continue
         if not r.get("triggered") or r.get("r_multiple") is None:
             continue
         out.append(r)
     return _attach_regime(con, out)
+
+
+def current_versions() -> tuple[int, int]:
+    """(scan_version, sim_version) of the code that is running now."""
+    from .grading import CURRENT_SIM_VERSION
+    from .runner_scan import SCAN_VERSION
+    return SCAN_VERSION, CURRENT_SIM_VERSION
+
+
+def current_candidate_rows(con: Any, sessions: int = 60) -> list[dict]:
+    """The runner corpus the weekly search may mine: triggered rows produced
+    under the CURRENT detection and grading semantics only.
+
+    Both integrity call sites use this one helper so they cannot drift apart --
+    the filter existed on `candidate_rows` for weeks while neither caller
+    passed it, and v1/v2 rows were pooled.
+    """
+    scan_v, sim_v = current_versions()
+    return candidate_rows(con, sessions, scan_version=scan_v, sim_version=sim_v)
+
+
+def version_mix(con: Any, sessions: int = 60) -> list[dict]:
+    """Triggered runner rows by (scan_version, sim_version), current or not.
+
+    Counts only. The excluded rows' statistics are never computed, so telling
+    the miner WHY its n moved cannot leak a second, pooled reading.
+    """
+    rows = candidate_rows(con, sessions)
+    counts: dict[tuple, int] = {}
+    for r in rows:
+        key = (r.get("scan_version"), r.get("sim_version"))
+        counts[key] = counts.get(key, 0) + 1
+    scan_v, sim_v = current_versions()
+    return [{"scan_version": k[0], "sim_version": k[1], "n": n,
+             "current": k == (scan_v, sim_v)}
+            for k, n in sorted(counts.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1])))]
 
 
 def _attach_regime(con: Any, rows: list[dict]) -> list[dict]:
@@ -243,11 +288,16 @@ def selection_edge(rows: list[dict], min_n: int = 8) -> dict:
         "mean_r_selected": m_sel, "mean_r_unselected": m_unsel,
         "delta_r": delta, "t_stat": t, "df": df, "p_value": p,
         "underpowered": underpowered, "verdict": verdict,
+        # test="welch": evaluate_search keeps this t/df/p instead of re-testing
+        # the delta as a one-sample mean. std_r is None because no single
+        # standard deviation describes a two-arm comparison; n is the smaller
+        # arm so the n>=8 floor still binds on it.
         "comparison": Comparison(
             dimension="runner_selection_edge", level="selected_vs_unselected",
             n=min(len(sel), len(unsel)), mean_r=delta,
-            std_r=s_sel, t_stat=t, df=df, p_value=p,
-            note=verdict[:400]),
+            std_r=None, t_stat=t, df=df, p_value=p,
+            mde=min_detectable_effect_two_sample(len(sel), s_sel, len(unsel), s_unsel),
+            test="welch", note=verdict[:400]),
     }
 
 
@@ -255,16 +305,42 @@ def _fmt(v, digits: int = 3) -> str:
     return "n/a" if v is None else f"{v:.{digits}f}"
 
 
-def runner_md(setup: dict, selection: dict, comparisons: list[Comparison]) -> str:
-    """Markdown for the weekly miner prompt."""
+def version_mix_md(mix: list[dict] | None) -> str:
+    """One line naming the rows the version pin excluded, with counts only."""
+    if not mix:
+        return ""
+    current = [m for m in mix if m.get("current")]
+    excluded = [m for m in mix if not m.get("current")]
+    if not excluded:
+        return ""
+    cur_s = (f"scan v{current[0]['scan_version']} x sim v{current[0]['sim_version']} "
+             f"= {current[0]['n']}" if current else "none yet under the current versions")
+    exc_s = ", ".join(f"scan v{m['scan_version']} x sim v{m['sim_version']} = {m['n']}"
+                      for m in excluded)
+    return (f"Version pin: only rows produced under the current detection and grading "
+            f"semantics are mined ({cur_s}). Excluded, never pooled: {exc_s}. "
+            "Their statistics are not shown; re-price with `run.py regrade-runner` "
+            "or re-gate with `run.py regate-runner` to bring them under the current "
+            "semantics.")
+
+
+def runner_md(setup: dict, selection: dict, comparisons: list[Comparison],
+              versions: list[dict] | None = None) -> str:
+    """Markdown for the weekly miner prompt. `versions` is `version_mix()`."""
+    pin = version_mix_md(versions)
     if not setup.get("n"):
         return ("## Runner lane\n\n"
                 "No triggered runner candidates yet — no setup or selection "
-                "comparison is possible.")
+                "comparison is possible."
+                + (f"\n\n{pin}" if pin else ""))
 
     lines = [
         "## Runner lane (setup_type `dto_runner`)",
         "",
+    ]
+    if pin:
+        lines += [pin, ""]
+    lines += [
         "### 1. Setup edge — every candidate, traded or not, vs zero",
         f"- n = {setup['n']} triggered candidates",
         f"- mean R = {_fmt(setup['mean_r'])} (sd {_fmt(setup['std_r'])})",

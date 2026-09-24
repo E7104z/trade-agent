@@ -366,6 +366,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v15.STATEMENTS
 from . import migrations_v16  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v16.STATEMENTS
 
+# --- v17 integrity repair: looks record their test; regate provenance -------
+from . import migrations_v17  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v17.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -1184,7 +1188,8 @@ _OUTCOME_DIM_EXPR = {
 }
 
 
-def stats_by_outcome(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
+def stats_by_outcome(con: duckdb.DuckDBPyConnection, dim: str,
+                     lane: str | None = None) -> list[dict]:
     """Same shape as stats_by, grouped by an indicator dimension computed onto
     the outcomes table by agent/grading.py (rvol_bucket, vwap_side_at_fill)."""
     if dim not in OUTCOME_STATS_DIMENSIONS:
@@ -1192,7 +1197,7 @@ def stats_by_outcome(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
             f"stats_by_outcome: unsupported dimension {dim!r}; "
             f"expected one of {sorted(OUTCOME_STATS_DIMENSIONS)}"
         )
-    return _stats_rows(con, _OUTCOME_DIM_EXPR[dim])
+    return _stats_rows(con, _OUTCOME_DIM_EXPR[dim], lane)
 
 
 def equity_curve(con: duckdb.DuckDBPyConnection, account_size: float, dollars_per_r: float,

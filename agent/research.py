@@ -129,14 +129,15 @@ def record_looks(
         con.execute(
             """INSERT INTO research_looks
                (session_date, dimension, level, n, mean_r, std_r, t_stat,
-                p_value, q_value, significant, mde, n_dimensions, note)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                p_value, q_value, significant, mde, n_dimensions, note, test)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 session_date, r.get("dimension"), r.get("level"),
                 int(r.get("n") or 0), r.get("mean_r"), r.get("std_r"),
                 r.get("t_stat"), r.get("p_value"), r.get("q_value"),
                 bool(r.get("significant")), r.get("mde"),
                 int(r.get("n_dimensions") or 1), (r.get("note") or "")[:400],
+                r.get("test") or "one_sample",
             ],
         )
     testable = sum(1 for r in rows if r.get("p_value") is not None)

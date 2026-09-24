@@ -46,6 +46,7 @@ __all__ = [
     "benjamini_hochberg",
     "bootstrap_ci_mean",
     "min_detectable_effect",
+    "min_detectable_effect_two_sample",
     "required_n",
     "Comparison",
     "SearchResult",
@@ -289,6 +290,27 @@ def min_detectable_effect(
     return round((z_a + z_b) * float(std) / math.sqrt(int(n)), 3)
 
 
+def min_detectable_effect_two_sample(
+    n_a: int | None, std_a: float | None, n_b: int | None, std_b: float | None,
+    alpha: float = 0.05, power: float = 0.80,
+) -> float | None:
+    """Smallest true DIFFERENCE in mean R two arms of these sizes could detect.
+
+    Uses both arms' standard errors (the Welch denominator). Computing it from
+    one arm alone understates it whenever the other arm is noisier, which is
+    the usual case for an unselected runner field against a handful of picks.
+    """
+    if None in (n_a, std_a, n_b, std_b):
+        return None
+    n_a, n_b = int(n_a), int(n_b)
+    if n_a < 2 or n_b < 2 or std_a <= 0 or std_b <= 0:
+        return None
+    se = math.sqrt(float(std_a) ** 2 / n_a + float(std_b) ** 2 / n_b)
+    z_a = _ND.inv_cdf(1.0 - alpha / 2.0)
+    z_b = _ND.inv_cdf(power)
+    return round((z_a + z_b) * se, 3)
+
+
 def required_n(
     effect: float, std: float, alpha: float = 0.05, power: float = 0.80
 ) -> int | None:
@@ -306,7 +328,16 @@ def required_n(
 
 @dataclass
 class Comparison:
-    """One cell the miner is shown. Every one of these counts as a look."""
+    """One cell the miner is shown. Every one of these counts as a look.
+
+    `test` names the statistic the producer built this comparison for.
+    "one_sample" (mean R vs zero) is computed by `evaluate_search`; any other
+    value ("welch", "fisher", ...) arrives with its own t/df/p already
+    attached and `evaluate_search` must keep them. Re-testing a two-sample
+    delta as a one-sample mean, with one arm's variance, turned a Welch
+    p=0.096 into a batch p=0.003 -- a manufactured finding on exactly the
+    comparison that asks whether the selector adds anything.
+    """
     dimension: str
     level: str
     n: int
@@ -322,6 +353,7 @@ class Comparison:
     ci_high: float | None = None
     n_dimensions: int = 1
     note: str = ""
+    test: str = "one_sample"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -331,6 +363,7 @@ class Comparison:
             "significant": self.significant, "mde": self.mde,
             "ci_low": self.ci_low, "ci_high": self.ci_high,
             "n_dimensions": self.n_dimensions, "note": self.note,
+            "test": self.test,
         }
 
 
@@ -366,9 +399,14 @@ def evaluate_search(
     """
     comps = list(comparisons)
     for c in comps:
-        t, df, p = one_sample_t(c.mean_r, c.std_r, c.n)
-        c.t_stat, c.df, c.p_value = t, df, p
-        c.mde = min_detectable_effect(c.n, c.std_r)
+        # Only one-sample comparisons are tested here. Any other test was
+        # computed by its producer on the data it needs (two arms, a 2x2
+        # table) and its t/df/p/MDE are kept exactly as supplied; a missing p
+        # means untestable and passes through BH as None, like an empty cell.
+        if c.test == "one_sample":
+            t, df, p = one_sample_t(c.mean_r, c.std_r, c.n)
+            c.t_stat, c.df, c.p_value = t, df, p
+            c.mde = min_detectable_effect(c.n, c.std_r)
         if c.n < min_n:
             c.note = (c.note + f" under-powered (n={c.n} < {min_n})").strip()
 

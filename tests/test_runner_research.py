@@ -172,10 +172,10 @@ def test_runner_comparisons_join_the_same_fdr_batch(monkeypatch):
 
     class _LedgerStub:
         @staticmethod
-        def stats_by(con, dim):
+        def stats_by(con, dim, lane=None):
             return []
         @staticmethod
-        def stats_by_outcome(con, dim):
+        def stats_by_outcome(con, dim, lane=None):
             return []
 
     search = integrity.build_search(object(), _LedgerStub(), q=0.10, min_n=3)
