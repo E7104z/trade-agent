@@ -884,18 +884,34 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             return
 
     paired_thread: threading.Thread | None = None
+    # Stage timings (DATA_CONTINUITY_SPEC_v1 Phase 4). The morning run is the
+    # closest to the 300s budget of any loop -- it timed out on 2026-08-28 and
+    # 2026-09-24 -- and a killed function logs nothing, so the only warning is
+    # the timings of the runs that DO finish creeping toward the limit.
+    import time as _time
+    t_start = _time.monotonic()
+    t_last = [t_start]
+    stages: dict = {"timings_s": {}}
+
+    def _mark(name: str) -> None:
+        now = _time.monotonic()
+        stages["timings_s"][name] = round(now - t_last[0], 1)
+        t_last[0] = now
+
     try:
         # 1. data
         log("morning", "Pulling market data bundle...")
         md = MarketData(cfg)
         bundle = md.morning_bundle(d)
         bundle_md = render_bundle_md(bundle)
+        _mark("bundle")
 
         # 2. regime
         log("morning", "Computing market regime...")
         reg = compute_regime(cfg, d)
         ledger.save_regime(con, reg)
         reg_md = regime_md(reg)
+        _mark("regime")
 
         # 3. memory
         mem = build_morning_memory(con, cfg)
@@ -966,6 +982,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         candidates = analyst.parsed or {}
         n_cand = len(candidates.get("candidates", []))
         log("morning", f"Analyst produced {n_cand} candidates")
+        _mark("analyst")
 
         # Between stage 1 and stage 2: price every candidate the bundle never
         # quoted, while the risk manager can still act on it. See
@@ -995,6 +1012,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             mock_name="morning_risk", thinking=True, web_search=False,
         )
         plan = risk.parsed or {}
+        _mark("risk")
         plan["analyst_candidate_count"] = n_cand
         plan["risk_rejection_count"] = len(plan.get("rejected", []) or [])
         _add_exploration_pick(candidates, plan, cfg)
@@ -1059,6 +1077,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                            + ". This is logged as an outage, NOT as a stand-down decision.")
         ledger.log_run(con, "morning", d, started,
                        "degraded" if health.get("degraded") else "ok", model, usage)
+        _mark("persist")
 
         # Before today's orders: close anything a missed end-of-day flatten
         # left open from a previous session (queued for the open when this runs
@@ -1123,12 +1142,17 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         render_dashboard(con, cfg, d)
         log("morning", f"Done. {len(pick_ids)} picks logged, {n_rej} rejections logged to shadow ledger.")
 
-        # v4: snapshot the pre-selection gap-scan population (the unconditional
-        # null). Runs last and is internally guarded — it can never fail the
-        # morning run. was_picked reflects the final validated plan since this
-        # runs after save_daily_plan.
-        from .. import integrity
-        integrity.on_morning(con, cfg, d, bundle, plan)
+        # v4: the pre-selection gap-scan population (the unconditional null)
+        # was snapshotted before the LLM calls (step 4b); now that the plan is
+        # final, only was_picked changes. One UPDATE, guarded -- it can never
+        # fail the morning run.
+        try:
+            from .. import population
+            population.mark_picked(con, d, [p.get("ticker") for p in plan.get("picks", []) or []])
+        except Exception as e:  # noqa: BLE001
+            log("morning", f"WARN could not mark picked names in the population: {e}")
+        stages["timings_s"]["total"] = round(_time.monotonic() - t_start, 1)
+        ledger.record_run_stages(con, "morning", d, stages)
 
         # v4: paired challenger arm B — same bundle/regime/memory arm A saw,
         # context_mode ablated per config (default: aggregate_only, the ungated
@@ -1141,6 +1165,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         if paired_thread is not None:
             log("morning", "Waiting for paired challenger arm B (background)...")
             paired_thread.join()
+            _mark("arm_b_join")
+            stages["timings_s"]["total"] = round(_time.monotonic() - t_start, 1)
+            ledger.record_run_stages(con, "morning", d, stages)
             arm_b = paired_box.get("arm_b") or {"ok": False, "reason": "background thread produced no result"}
             if arm_b.get("ok"):
                 log("morning", f"Arm B ({arm_b['context_mode']}): {arm_b['picks']} pick(s), "

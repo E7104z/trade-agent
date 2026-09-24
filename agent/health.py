@@ -29,6 +29,9 @@ RUNNER_DUE = dtime(13, 0)
 EVENING_DUE = dtime(18, 0)
 WEEKLY_MAX_AGE_DAYS = 8
 LEARNING_WINDOW_DAYS = 7
+# 70% of vercel.json's 300s maxDuration (same bar as the evening loop's own
+# warning): a finished run past it is one bad provider day from a silent kill.
+BUDGET_WARN_S = 210.0
 
 
 def _q(con, sql: str, params=None, default=None):
@@ -302,19 +305,24 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
                 "session is logged degraded.")
     except Exception:
         pass
-    ev = _q(con, """SELECT run_date, stages FROM runs WHERE loop = 'evening'
-                    AND stages IS NOT NULL ORDER BY run_id DESC LIMIT 1""")
-    if ev:
+    import json as _json
+    for loop in ("morning", "evening"):
+        ev = _q(con, f"""SELECT run_date, stages FROM runs WHERE loop = '{loop}'
+                         AND stages IS NOT NULL ORDER BY run_id DESC LIMIT 1""")
+        if not ev:
+            continue
         try:
-            import json as _json
             st = _json.loads(ev[0][1] or "{}")
-            if st.get("budget_warning"):
-                warnings.append(
-                    f"The {ev[0][0]} evening run took {st.get('timings_s', {}).get('total')}s of "
-                    "a 300s function budget. A run killed at the budget logs nothing; find the "
-                    "slow stage in runs.stages before it crosses.")
         except (TypeError, ValueError):
-            pass
+            continue
+        total = (st.get("timings_s") or {}).get("total")
+        if st.get("budget_warning") or (total is not None and total > BUDGET_WARN_S):
+            slow = max(((k, v) for k, v in (st.get("timings_s") or {}).items() if k != "total"),
+                       key=lambda kv: kv[1], default=("?", None))
+            warnings.append(
+                f"The {ev[0][0]} {loop} run took {total}s of a 300s function budget "
+                f"(slowest stage: {slow[0]} {slow[1]}s). A run killed at the budget logs "
+                "nothing -- the morning timed out on 2026-08-28 and 2026-09-24.")
 
     # --- is anything actually being learned? ------------------------------
     since = now.date() - timedelta(days=LEARNING_WINDOW_DAYS)

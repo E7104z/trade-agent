@@ -181,6 +181,23 @@ def snapshot_universe(
     return written
 
 
+def mark_picked(con: Any, plan_date: date, picked_tickers: Iterable[str]) -> int:
+    """Set was_picked on an already-snapshotted population. One statement.
+
+    The snapshot is taken BEFORE the morning's LLM calls (so an outage cannot
+    cost it); once the plan is final only this flag changes, and re-inserting
+    every row a second time was pure round trips on a run that already rides
+    the 300s function budget.
+    """
+    picked = sorted({str(t).upper() for t in picked_tickers if t})
+    if not picked:
+        return 0
+    marks = ",".join("?" for _ in picked)
+    con.execute(f"UPDATE population_universe SET was_picked = TRUE "
+                f"WHERE plan_date = ? AND symbol IN ({marks})", [plan_date, *picked])
+    return len(picked)
+
+
 def _f(v: Any) -> float | None:
     try:
         return float(v) if v is not None else None

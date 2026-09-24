@@ -1510,6 +1510,22 @@ def log_run(con: duckdb.DuckDBPyConnection, loop: str, run_date: date, started: 
     )
 
 
+def record_run_stages(con: Any, loop: str, run_date: date, stages: dict) -> None:
+    """Attach stage timings to the latest runs row for (loop, run_date).
+
+    For loops whose runs row is written mid-run (the morning logs its row as
+    soon as the plan is saved, then places orders and waits for the paired
+    arm). Best effort: timing is measurement, never a reason to fail a run.
+    """
+    try:
+        con.execute(
+            """UPDATE runs SET stages = ? WHERE run_id = (
+                   SELECT MAX(run_id) FROM runs WHERE loop = ? AND run_date = ?)""",
+            [json.dumps(stages, default=str)[:4000], loop, run_date])
+    except Exception:
+        pass
+
+
 def recent_runs(con: duckdb.DuckDBPyConnection, n: int = 10) -> list[dict]:
     cols = [c[0] for c in con.execute("DESCRIBE runs").fetchall()]
     rows = con.execute("SELECT * FROM runs ORDER BY run_id DESC LIMIT ?", [n]).fetchall()

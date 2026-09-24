@@ -251,3 +251,33 @@ def test_health_surfaces_alerts_plumbing_and_budget(tmp_path, monkeypatch):
     assert "credit exhausted" in text
     assert "Data plumbing" in text
     assert "300s function budget" in text
+
+
+# ------------------------------------------------- morning budget follow-up
+
+def test_mark_picked_only_flags_the_picks(tmp_path, monkeypatch):
+    from agent import population
+    monkeypatch.setattr(ledger, "DB_PATH", tmp_path / "m.duckdb")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    con = ledger.connect()
+    gappers = [{"symbol": s, "last": 10.0, "prev_close": 9.0, "gap_pct": 11.0} for s in ("AAA", "BBB")]
+    assert population.snapshot_universe(con, D, gappers) == 2
+    assert population.mark_picked(con, D, ["bbb"]) == 1
+    rows = dict(con.execute("SELECT symbol, was_picked FROM population_universe").fetchall())
+    con.close()
+    assert rows == {"AAA": False, "BBB": True}
+
+
+def test_morning_stage_timings_reach_health(tmp_path, monkeypatch):
+    from agent import health
+    monkeypatch.setattr(ledger, "DB_PATH", tmp_path / "t.duckdb")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    con = ledger.connect()
+    now = datetime(2026, 9, 16, 12, 0, tzinfo=timezone(timedelta(hours=-4)))
+    ledger.log_run(con, "morning", now.date(), now.replace(tzinfo=None), "ok")
+    ledger.record_run_stages(con, "morning", now.date(),
+                             {"timings_s": {"bundle": 70.0, "analyst": 150.0, "total": 260.0}})
+    h = health.loop_health(con, Config(raw={}), now=now)
+    con.close()
+    warn = [w for w in h["warnings"] if "morning run took 260.0s" in w]
+    assert warn and "slowest stage: analyst 150.0s" in warn[0]
