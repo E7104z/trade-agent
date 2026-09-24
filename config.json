@@ -19,8 +19,10 @@
     "enabled": true,
     "min_rr": 1.8,
     "max_rr": 2.0,
-    "max_picks": 1,
-    "size_r": 0.25
+    "max_picks": 2,
+    "size_r": 0.25,
+    "allow_with_picks": true,
+    "backlog_probe": true
   },
   "slippage_bps": 5,
   "leveraged_gate": "warn",

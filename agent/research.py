@@ -730,6 +730,8 @@ def observe_session(con: Any, d: date) -> dict:
     if not rules:
         return out
     cache: dict[str, list[dict]] = {}
+    counterfactual: list[tuple[str, str, dict]] | None = None
+    out["counterfactual"] = 0
     for rid, lane, pred_json in rules:
         try:
             pred = json.loads(pred_json)
@@ -746,6 +748,69 @@ def observe_session(con: Any, d: date) -> dict:
                 key, source = f"runner:{row.get('session_date')}:{row.get('ticker')}", "runner_field"
             if record_rule_observation(con, rid, d, row["r_multiple"], key, source):
                 out["recorded"] += 1
+        # EVIDENCE_BACKLOG_SPEC_v1 Phase 5: the desk's counterfactual streams
+        # -- rejected candidates (shadow ledger) and the gap population's
+        # mechanical monkeys -- give every open morning thesis a confirming or
+        # disconfirming channel at no trading cost. Recorded with their source,
+        # NEVER counted: the desk did not take them, so they cannot validate a
+        # rule about what the desk takes.
+        if lane == "morning":
+            if counterfactual is None:
+                counterfactual = _counterfactual_rows(con, d)
+            for key, source, row in counterfactual:
+                if matches(pred, row) and record_rule_observation(
+                        con, rid, d, row["r_multiple"], key, source):
+                    out["counterfactual"] += 1
+    return out
+
+
+def _counterfactual_rows(con: Any, d: date) -> list[tuple[str, str, dict]]:
+    """(source_key, source, row) for session d's shadow and population rows.
+
+    Only the fields these rows actually carry can match a predicate (setup_type,
+    direction, regime_tag); an outcome-indicator condition labels as '?' and
+    never matches, which is the honest answer for a row nobody graded that way.
+    """
+    rows: list[tuple[str, str, dict]] = []
+    regime = None
+    try:
+        r = con.execute("SELECT regime_tag FROM daily_plans WHERE plan_date = ?", [d]).fetchone()
+        regime = r[0] if r else None
+    except Exception:
+        pass
+    try:
+        for rej_id, direction, setup, forgone in con.execute(
+                """SELECT rejection_id, direction, setup_type, forgone_r FROM rejections
+                   WHERE plan_date = ? AND forgone_r IS NOT NULL
+                     AND COALESCE(eod_outcome, '') <> 'unmeasurable'""", [d]).fetchall():
+            rows.append((f"shadow:{rej_id}", "shadow",
+                         {"direction": direction, "setup_type": setup, "regime_tag": regime,
+                          "r_multiple": forgone}))
+    except Exception:
+        pass
+    try:
+        for sym, arm, direction, r_mult in con.execute(
+                """SELECT symbol, arm, direction, r_multiple FROM population_outcomes
+                   WHERE plan_date = ? AND r_multiple IS NOT NULL""", [d]).fetchall():
+            rows.append((f"population:{d}:{sym}:{arm}", "population",
+                         {"direction": direction, "setup_type": None, "regime_tag": regime,
+                          "r_multiple": r_mult}))
+    except Exception:
+        pass
+    return rows
+
+
+def counterfactual_summary(con: Any) -> dict[str, dict]:
+    """Per rule: counterfactual forward n and mean, by source (for provenance_md)."""
+    out: dict[str, dict] = {}
+    try:
+        rows = con.execute(
+            """SELECT rule_id, source, COUNT(*), AVG(r_multiple) FROM research_observations
+               WHERE source IN ('shadow', 'population') GROUP BY rule_id, source""").fetchall()
+    except Exception:
+        return out
+    for rid, source, n, mean in rows:
+        out.setdefault(rid, {})[source] = {"n": int(n or 0), "mean": mean}
     return out
 
 
@@ -923,8 +988,22 @@ def check_playbook_provenance(
     return violations
 
 
-def provenance_md(states: Sequence[dict], looks: dict[str, Any]) -> str:
+def provenance_md(states: Sequence[dict], looks: dict[str, Any],
+                  counterfactual: dict[str, dict] | None = None) -> str:
     """Render the research-integrity section handed to the weekly miner."""
+    counterfactual = counterfactual or {}
+
+    def _cf(rid: str) -> str:
+        # Counterfactual forward evidence: shown as n and SIGN only, and the
+        # sign only at n >= 8 (the same floor as everything else). Never counted
+        # toward validation.
+        parts = []
+        for source, v in sorted((counterfactual.get(rid) or {}).items()):
+            sign = ("—" if v["n"] < DEFAULT_FORWARD_N or v["mean"] is None
+                    else ("+" if v["mean"] > 0 else "-"))
+            parts.append(f"{source} n={v['n']} sign {sign}")
+        return ("\n    counterfactual forward (NOT counted): " + "; ".join(parts)) if parts else ""
+
     def _fmt(r: dict) -> str:
         eff = r["forward_mean_r"]
         eff_s = f"{eff:+.2f}R" if eff is not None else "n/a"
@@ -934,7 +1013,7 @@ def provenance_md(states: Sequence[dict], looks: dict[str, Any]) -> str:
                 f"    discovered {r['discovered_at']} (n={r['discovery_n']}), "
                 f"quarantined {r['quarantined_at'] or '—'}; "
                 f"forward n={r['forward_n']}/{r['forward_n_required']}, "
-                f"mean {eff_s}, p={p_s}, MDE={mde_s}")
+                f"mean {eff_s}, p={p_s}, MDE={mde_s}" + _cf(r["rule_id"]))
 
     by_state: dict[str, list[dict]] = {}
     for r in states:

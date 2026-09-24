@@ -299,8 +299,10 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
     runner_comps = [c for c in (getattr(search, "comparisons", None) or [])
                     if str(getattr(c, "dimension", "")).startswith("runner_")]
 
+    counterfactual = _safe("integrity", "counterfactual summary",
+                           lambda: research.counterfactual_summary(con), {})
     parts = [
-        research.provenance_md(states, looks),
+        research.provenance_md(states, looks, counterfactual),
         _graduation_md(graduation),
         _cumulative_md(cumulative),
         population.population_md(pop),

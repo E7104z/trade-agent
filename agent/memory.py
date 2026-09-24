@@ -232,6 +232,19 @@ def build_morning_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
     regimes = ledger.recent_regimes(con, 5)
     setup_stats = ledger.stats_by(con, "setup_type", lane="morning")
     direction_stats = ledger.stats_by(con, "direction", lane="morning")
+    # EVIDENCE_BACKLOG_SPEC_v1 Phase 2: the evidence the desk is short of,
+    # as counts, from last evening's snapshot. It tells the analyst where to
+    # look for data, never what to conclude.
+    backlog_items: list[dict] = []
+    try:
+        from . import backlog
+        backlog_items = backlog.morning_selection(backlog.latest(con), backlog.TOP_N)
+    except Exception:
+        backlog_items = []
+    backlog_md = ""
+    if backlog_items:
+        from .backlog import morning_block
+        backlog_md = morning_block(backlog_items) + "\n\n"
 
     text = f"""## YOUR PLAYBOOK (v{version} — your accumulated, evidence-backed rules)
 
@@ -257,11 +270,12 @@ def build_morning_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
 
 {_regime_block(regimes)}
 
-## SELF-AWARENESS CHECK (computed from your ledger — obey these)
+{backlog_md}## SELF-AWARENESS CHECK (computed from your ledger — obey these)
 
 {_self_awareness(con, cfg)}
 """
-    return {"text": text, "playbook_version": version}
+    return {"text": text, "playbook_version": version,
+            "backlog_ids": [i["item_id"] for i in backlog_items]}
 
 
 def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:

@@ -386,6 +386,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v20.STATEMENTS
 from . import migrations_v21  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v21.STATEMENTS
 
+# --- v22 evidence backlog + daily diagnostics + probe attribution -----------
+from . import migrations_v22  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v22.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -601,8 +605,8 @@ def save_daily_plan(
                (plan_date, ticker, direction, setup_type, catalyst, thesis, conviction,
                 size_r, entry_type, entry_price, stop_price, target_price, target2_price,
                 time_stop, invalidation, regime_tag, prompt_version, playbook_version,
-                    in_scan_universe, exploration_lane, exploration_rr)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    in_scan_universe, exploration_lane, exploration_rr, probe_for)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                RETURNING pick_id""",
             [
                 plan_date,
@@ -626,6 +630,7 @@ def save_daily_plan(
                 ticker in SCAN_UNIVERSE or ticker in INDEX_ETFS,
                 p.get("exploration_lane"),
                 p.get("exploration_rr"),
+                p.get("probe_for"),
             ],
         ).fetchone()
         ids.append(row[0])

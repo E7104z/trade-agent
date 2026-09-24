@@ -571,6 +571,10 @@ _QUERYABLE_TABLES = {
     # lesson contradictions.
     "grader_rejections": "session_date",
     "lesson_contradictions": "session_date",
+    # EVIDENCE_BACKLOG_SPEC_v1: the nightly evidence backlog (counts only) and
+    # the daily diagnostics digest.
+    "evidence_backlog": "session_date",
+    "daily_diagnostics": "session_date",
     # Not date-filterable, but ordered newest-first (see _TABLE_ORDER) so
     # ?limit=N returns the latest: a lost weekly rewrite is recovered from
     # llm_archive, and every playbook the miner ever wrote is in

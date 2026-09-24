@@ -718,15 +718,38 @@ def _no_trade_category(plan: dict, rejections: list[dict]) -> str | None:
     return "all_failed_validator"
 
 
-def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
-    """Add one explicitly labeled R:R exploration pick, when enabled.
+# Kill-checks a backlog probe may be rescued from. Both are judgments about
+# how good the trade is, not about whether it is a valid trade: every
+# validity check (staleness, grounding, event risk, chase, entry type, stop
+# quality, correlation, crowding, regime fit) stays binding.
+_PROBE_KILL_CHECKS = {"rr", "conviction"}
 
-    This lane only reconsiders a candidate the risk manager rejected for R:R;
-    other rejection reasons remain binding. It is capped and minimum-sized so
-    its results remain a separate experiment rather than a silent policy change.
+
+def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config,
+                          backlog_ids: list[str] | None = None) -> bool:
+    """Add explicitly labeled exploration picks, when enabled.
+
+    Two types, one cap (`exploration_lane.max_picks`), both minimum-sized so
+    their results remain a separate, measured experiment rather than a silent
+    policy change:
+
+      rr_below_control  a candidate the risk manager rejected for R:R ALONE,
+                        with planned R:R inside [min_rr, max_rr). Other
+                        rejection reasons remain binding.
+      backlog_probe     (EVIDENCE_BACKLOG_SPEC_v1) a candidate the analyst
+                        tagged `probe_for` one of the top backlog items, that
+                        the risk manager killed on `rr` or `conviction` only
+                        (the structured primary_kill_check is required), and
+                        whose planned R:R still clears `min_rr`. It buys an
+                        observation the desk is short of.
+
+    By default exploration only runs on an otherwise empty plan;
+    `allow_with_picks` lets it run beside regular picks.
     """
     lane = cfg.get("exploration_lane", {}) or {}
-    if not lane.get("enabled") or plan.get("picks"):
+    if not lane.get("enabled"):
+        return False
+    if plan.get("picks") and not lane.get("allow_with_picks"):
         return False
     max_picks = max(0, int(lane.get("max_picks", 1)))
     if max_picks < 1:
@@ -747,16 +770,25 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
                "chase", "vague", "unverified", "correlation", "regime")
     low_rr = float(lane.get("min_rr", 1.8))
     high_rr = float(lane.get("max_rr", 2.0))
+    probe_ids = set(backlog_ids or []) if lane.get("backlog_probe") else set()
+    already = {str(p.get("ticker", "")).upper() for p in plan.get("picks") or []}
+    admitted: list[dict] = []
     for candidate in candidates.get("candidates", []) or []:
+        if len(admitted) >= max_picks:
+            break
         ticker = str(candidate.get("ticker", "")).upper().strip()
+        if not ticker or ticker in already:
+            continue
         rejected_row = rejected_rows.get(ticker) or {}
         reason = str(rejected_row.get("reason", ""))
         kill_check = str(rejected_row.get("primary_kill_check") or "").strip().lower() or None
         if kill_check not in _KILL_CHECK_ENUM:
             kill_check = None
-        if not ticker:
+        probe_for = str(candidate.get("probe_for") or "").strip()
+        is_probe = bool(probe_for) and probe_for in probe_ids
+        if not rejected_row:
             continue
-        if kill_check is None and "r:r" not in reason.lower():
+        if kill_check is None and "r:r" not in reason.lower() and not is_probe:
             continue
         entry_plan = candidate.get("entry_plan") or {}
         entry = entry_plan.get("price", candidate.get("entry_price"))
@@ -768,39 +800,57 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config) -> bool:
         if risk <= 0:
             continue
         rr = abs(float(target) - float(entry)) / risk
-        if not low_rr <= rr < high_rr:
+
+        tag = None
+        if is_probe and kill_check in _PROBE_KILL_CHECKS and rr >= low_rr:
+            tag = "backlog_probe"
+        elif low_rr <= rr < high_rr:
+            # Checked AFTER the R:R band so the log line can report the rr
+            # that was actually in range. Silent on a clean admit either way
+            # -- which path decided is recorded durably on the persisted
+            # rejection row itself (primary_kill_check); logging is reserved
+            # for the diagnostic case (an in-band candidate that got blocked).
+            if kill_check is not None:
+                if kill_check != "rr":
+                    log("morning", f"EXPLORATION: {ticker} in-band (R:R {rr:.2f}) but blocked "
+                                   f"by primary_kill_check={kill_check!r} - reason: {reason!r}")
+                    continue
+            else:
+                blocking = [w for w in blocked if w in reason.lower()]
+                if blocking:
+                    log("morning", f"EXPLORATION: {ticker} in-band (R:R {rr:.2f}) but blocked "
+                                   f"by legacy blocklist word(s) {blocking} - reason: {reason!r}")
+                    continue
+            tag = "rr_below_control"
+        if tag is None:
             continue
-        # Checked AFTER the R:R band so the log line can report the rr that was
-        # actually in range. Silent on a clean admit either way -- which path
-        # decided is recorded durably on the persisted rejection row itself
-        # (primary_kill_check), a stdout log line is not; logging is reserved
-        # for the diagnostic case (an in-band candidate that got blocked).
-        if kill_check is not None:
-            if kill_check != "rr":
-                log("morning", f"EXPLORATION: {ticker} in-band (R:R {rr:.2f}) but blocked "
-                               f"by primary_kill_check={kill_check!r} - reason: {reason!r}")
-                continue
-        else:
-            blocking = [w for w in blocked if w in reason.lower()]
-            if blocking:
-                log("morning", f"EXPLORATION: {ticker} in-band (R:R {rr:.2f}) but blocked "
-                               f"by legacy blocklist word(s) {blocking} - reason: {reason!r}")
-                continue
-        plan["picks"] = [{
+        pick = {
             **candidate,
             "ticker": ticker,
             "entry_plan": {"type": entry_plan.get("type", "open"), "price": entry},
             "entry_price": entry,
             "size_r": float(lane.get("size_r", cfg.get("min_size_r", 0.25))),
             "conviction": min(int(candidate.get("conviction", 3) or 3), 3),
-            "exploration_lane": "rr_below_control",
+            "exploration_lane": tag,
             "exploration_rr": round(rr, 4),
-        }]
-        plan["no_trade"] = False
-        plan.pop("no_trade_reason", None)
-        plan["exploration_pick_count"] = 1
-        return True
-    return False
+        }
+        if tag == "backlog_probe":
+            pick["probe_for"] = probe_for
+        else:
+            # Attribution follows the path a pick was admitted by, not what
+            # the analyst wrote: an R:R-control pick is not a backlog probe.
+            pick.pop("probe_for", None)
+        admitted.append(pick)
+        already.add(ticker)
+    if not admitted:
+        return False
+    if plan.get("picks") is None:
+        plan["picks"] = []
+    plan["picks"].extend(admitted)
+    plan["no_trade"] = False
+    plan.pop("no_trade_reason", None)
+    plan["exploration_pick_count"] = len(admitted)
+    return True
 
 
 def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: str,
@@ -1015,7 +1065,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         _mark("risk")
         plan["analyst_candidate_count"] = n_cand
         plan["risk_rejection_count"] = len(plan.get("rejected", []) or [])
-        _add_exploration_pick(candidates, plan, cfg)
+        _add_exploration_pick(candidates, plan, cfg, mem.get("backlog_ids"))
         plan["validator_proposed_count"] = len(plan.get("picks", []) or [])
 
         # 7. validate + persist (ref prices cover every proposed ticker — live-fetched if needed)

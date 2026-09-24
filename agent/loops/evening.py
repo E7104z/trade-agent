@@ -1020,6 +1020,14 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                                    f"against {forward['rules']} active rule(s)")
             except Exception as e:  # noqa: BLE001 -- measurement never breaks grading
                 log("evening", f"WARN forward observation pass failed: {e}")
+            # EVIDENCE_BACKLOG_SPEC_v1 Phase 1: what evidence the desk is
+            # short of, as counts, for tomorrow morning's analyst.
+            try:
+                from .. import backlog
+                n_items = len(backlog.compute(con, d))
+                stages["backlog_items"] = n_items
+            except Exception as e:  # noqa: BLE001
+                log("evening", f"WARN evidence backlog failed: {e}")
         stages["deterministic"] = "complete"
         stages["forward_observations"] = forward["recorded"]
         _mark("events")
@@ -1171,9 +1179,24 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                        f"ungrounded reviews={grounding['reviews_ungrounded']}, "
                        f"cost ~${result.usage['cost_usd']:.3f}")
 
+        # EVIDENCE_BACKLOG_SPEC_v1 Phase 4: the daily diagnostics digest --
+        # what was collected and what broke, never what worked.
+        digest_txt = ""
+        try:
+            from .. import backlog
+            digest = backlog.daily_digest(con, d, {
+                "forward_observations": forward["recorded"],
+                "plumbing": stages.get("plumbing"),
+                "lessons_rejected": grounding["lessons_rejected"],
+                "updates_rejected": grounding["updates_rejected"]})
+            digest_txt = backlog.digest_text(digest)
+        except Exception as e:  # noqa: BLE001
+            log("evening", f"WARN daily diagnostics digest failed: {e}")
+
         send_email(cfg, f"Trade Agent — Evening Review {d.isoformat()}",
                    evening_email_html(d, review, out_md + (
-                       f"\n\nCOMPUTED TAPE\n{tape_md}" if tape_md else "")))
+                       f"\n\nCOMPUTED TAPE\n{tape_md}" if tape_md else "") + (
+                       f"\n\n{digest_txt}" if digest_txt else "")))
         render_dashboard(con, cfg, d)
         ledger.finish_run_lock(con, d, "evening", lock["request_id"], "complete")
 
