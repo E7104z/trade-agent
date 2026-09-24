@@ -1,11 +1,21 @@
 .venv/
 __pycache__/
 *.pyc
-data/ledger.duckdb
-data/ledger.duckdb.wal
+data/*.duckdb
+data/*.duckdb.wal
 reports/
 playbook_history/
 .git/
 credentials.json
 .env
 tests/
+# Local-only artifacts: never part of the serverless bundle. The raw LLM
+# archive and ledger backups hold private trading data; the rest is debug
+# output and tooling state.
+llm_responses/
+inspect*.txt
+deploy_log*.txt
+.pytest_cache/
+.claude/
+.vscode/
+specs/
