@@ -89,6 +89,15 @@ def test_fingerprint_flags_an_unusual_shape():
     assert "PKIXN" not in line
 
 
+def test_fingerprint_accepts_the_current_26_44_shape():
+    # Alpaca issued 26-char key ids with 44-char secrets from 2026-09.
+    cfg = Config(alpaca_key_id="PK" + "A1" * 12, alpaca_secret_key="aB3" * 14 + "xy",
+                 alpaca_key_source="env:ALPACA_API_KEY")
+    fp = alpaca_credential_fingerprint(cfg)
+    assert fp["key_length"] == 26 and fp["secret_length"] == 44 and fp["usual_format"]
+    assert "does not match" not in describe_alpaca_fingerprint(fp)
+
+
 def test_fingerprint_names_what_is_missing():
     assert "secret not set" in describe_alpaca_fingerprint(
         alpaca_credential_fingerprint(Config(alpaca_key_id=KEY20)))

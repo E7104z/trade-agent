@@ -340,6 +340,10 @@ def load_config() -> Config:
     return cfg
 
 
+# (key id length, secret length) pairs Alpaca has issued.
+_ALPACA_KEY_SHAPES = {(20, 40), (26, 44)}
+
+
 def alpaca_credential_fingerprint(cfg: Config) -> dict:
     """A description of the Alpaca credentials in use that reveals nothing
     usable: where the key came from, lengths, the two-letter key-type prefix,
@@ -347,13 +351,15 @@ def alpaca_credential_fingerprint(cfg: Config) -> dict:
     the dashboard ("the key in Vercel is 27 chars and has a space in it")
     without anyone reading a secret.
 
-    `usual_format` compares against the shape Alpaca has issued keys in (a
-    20-character upper-case alphanumeric key id, a 40-character secret). It is
+    `usual_format` compares against the shapes Alpaca has issued keys in: an
+    upper-case alphanumeric key id with an alphanumeric secret, either 20/40
+    characters (older keys) or 26/44 (keys issued from 2026-09). It is
     informational, never a gate: if Alpaca changes its format, keys that fail
     this check still get used.
     """
     key, secret = cfg.alpaca_key_id or "", cfg.alpaca_secret_key or ""
     prefix = key[:2].upper()
+    shape_ok = (len(key), len(secret)) in _ALPACA_KEY_SHAPES
     return {
         "key_source": cfg.alpaca_key_source or "(none)",
         "key_present": bool(key),
@@ -363,8 +369,8 @@ def alpaca_credential_fingerprint(cfg: Config) -> dict:
         "secret_present": bool(secret),
         "secret_length": len(secret),
         "secret_alnum": bool(secret) and secret.isalnum(),
-        "usual_format": (len(key) == 20 and key.isalnum() and key == key.upper()
-                         and len(secret) == 40 and secret.isalnum()),
+        "usual_format": (shape_ok and key.isalnum() and key == key.upper()
+                         and secret.isalnum()),
         "cleaned": dict(cfg.credential_notes or {}),
     }
 
@@ -380,7 +386,8 @@ def describe_alpaca_fingerprint(fp: dict) -> str:
             f"secret: {fp['secret_length']} chars"
             + ("" if fp["secret_alnum"] else ", contains non-alphanumeric characters")]
     if not fp.get("usual_format"):
-        bits.append("does not match the usual Alpaca shape (20-char key id, 40-char secret)")
+        bits.append("does not match the usual Alpaca shape "
+                    "(key id / secret of 20/40 or 26/44 chars, alphanumeric)")
     for name, notes in (fp.get("cleaned") or {}).items():
         bits.append(f"{name}: {'; '.join(notes)}")
     return " · ".join(bits)
