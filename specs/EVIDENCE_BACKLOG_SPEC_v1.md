@@ -1,6 +1,6 @@
 # EVIDENCE BACKLOG SPEC v1 — work the n<8 list every day
 
-**Status:** proposed, 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P7, G3.1–G3.4, G4.4)
+**Status:** implemented 2026-09-24 (`a63fba5`), live in production; production acceptance pending. Proposed 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P7, G3.1–G3.4, G4.4)
 **Goals served:** 3 (primary), 4, 2
 **Scope:** new `agent/backlog.py`; `agent/loops/morning.py`, `agent/loops/evening.py`, `agent/memory.py`, `prompts/morning_analyst.md`, `prompts/morning_risk.md`, `config.json`, `agent/integrity.py`, `agent/delivery.py`, `api/index.py`; the next free migration; tests.
 **Depends on:** S2 (QUARANTINED rules with predicates) for the rule items; S4 (coverage) for Phase 4. Phases 1–3 can ship on open questions and cells alone.

@@ -295,3 +295,29 @@ For every future task:
 3. Run its Phase 0 against production.
 
 When a spec lands, update its row in §1 and cite the run IDs or table rows that prove the change in production. A goal moves to **FULLY MET** only on production evidence, never on merged code.
+
+---
+
+## 7. Implementation log — 2026-09-24
+
+All seven specs are implemented, tested (913 tests pass) and **live in production**. Deployments: `dpl_3c58DvKDrH4PwpWCQx3KXJWCLxea` (S1), `dpl_GCEDr2PpQfxUAkvtZCHcDAmk6ZSR` (S3+S4), `dpl_2RQ4imSPYDk1CiJs86wtoV2e9c4b` (S2+S5), `dpl_Ek268mQoGAryUdBALK5cGw7Myhdq` (S6+S7+morning fix). Scorecard rows in §1 **do not change yet**: a goal moves only on production evidence (§6), and each spec's Acceptance section says what that evidence is.
+
+| Spec | Commit | Deviation from the spec as written |
+|---|---|---|
+| S1 | `adc2c7f` | Morning dimensions keep their bare names in `research_looks`: no `morning:` prefix. The families are already unambiguous. |
+| S3 | `f6bc604` | Provenance blocks only in Current Best Edge / Setup Rules / Regime Rules, never on a line that negates edge. Run on the real v5 playbook, the unscoped checker flagged exactly those innocent lines. The Runner Lane keeps its own blocking checker. |
+| S4 | `7443b45`, `baa66da` | The plumbing rule is "null on every graded row, ≥ 5 rows" (the directive's definition). No per-field baseline threshold, because production null baselines were unreadable. |
+| S2 | `3f831f7` | Cohort BH runs at α = 0.05, not q = 0.10. A cohort of one is the old test; larger cohorts only get stricter. |
+| S5 | `f3f3fce` | A quoted number matches when an input number *rounds* to it. The ±1 draft let `9.99x` match a `10:00` timestamp. |
+| S6 | `a63fba5` | The morning block round-robins across rules, questions and cells. A straight top 8 would have been all 14 open questions. |
+| S7 | `f615261` | `pop_adv_bucket` was not built: no re-derived edges exist for it, and inventing some would break the directive's first constraint. |
+
+**Still pending (needs Jason or production access):**
+1. **Every spec's Phase 0 production check.** This session could not read `/api/*`. `research_*`, `playbook_violations`, `data_coverage`, `alerts`, `grader_rejections`, `evidence_backlog` and `daily_diagnostics` are now readable at `/api/table/<name>`.
+2. **Opt-in data recovery**, which needs `DATABASE_URL` and was not run:
+   - `run.py regate-runner --from 2026-09-11` (dry run first, then `--apply`);
+   - `run.py regrade-runner --from 2026-09-11 --force`.
+
+   Without them, the runner corpus the weekly search mines starts at 2026-09-24.
+3. **The 2026-09-24 morning run timed out** (504 at 300 s: both LLM calls returned, but the run was killed before the plan was saved). The run lock was retryable from 11:41 UTC, so a dashboard re-run can recover the day. The same timeout hit on 08-28, so the morning is at the budget independently of these changes. From tomorrow it records per-stage timings (`runs.stages`), and health warns above 210 s. The decision on trimming it (bundle size, moving arm B off the request, splitting the run) should be made from those timings.
+4. **Money, not code (T5):** Anthropic credit/auto-reload, and Vercel Pro. Credit exhaustion now emails one alert per day and no longer costs deterministic data.

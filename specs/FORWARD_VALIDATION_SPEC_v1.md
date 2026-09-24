@@ -1,6 +1,6 @@
 # FORWARD VALIDATION SPEC v1 — make "validated edge" reachable
 
-**Status:** proposed, 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P3, G1.1–G1.3)
+**Status:** implemented 2026-09-24 (`3f831f7`), live in production; production acceptance pending. Proposed 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P3, G1.1–G1.3)
 **Goals served:** 1 (primary), 5, 4
 **Scope:** new `agent/buckets.py`; `agent/research.py`, `agent/integrity.py`, `agent/ledger.py`, `agent/runner_research.py`, `agent/loops/evening.py`, `agent/loops/weekly.py`, `prompts/weekly_miner.md`; the next free migration; tests.
 **Depends on:** S1 (a correct FDR batch as the source of discovery numbers, and readable `research_*` tables).

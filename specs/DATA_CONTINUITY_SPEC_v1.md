@@ -1,6 +1,6 @@
 # DATA CONTINUITY SPEC v1 — no outage may cost data that didn't need the outage's service
 
-**Status:** proposed, 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P5, G2.1–G2.3)
+**Status:** implemented 2026-09-24 (`7443b45`, `baa66da`), live in production; production acceptance pending. Proposed 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P5, G2.1–G2.3)
 **Goals served:** 2 (primary), 4
 **Scope:** `agent/loops/morning.py`, `agent/loops/evening.py`, `agent/population.py`, `agent/ledger.py`, `agent/health.py`, `agent/failures.py`, `agent/delivery.py`, `api/index.py`, the next free migration, tests.
 **Writer isolation:** unchanged. Nothing here touches `playbook.md`.

@@ -1,6 +1,6 @@
 # STRUCTURAL MINING SPEC v1 — winners' shared attributes, long and short, all under one FDR batch
 
-**Status:** proposed, 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) G5.3–G5.6)
+**Status:** implemented 2026-09-24 (`f615261`), live in production; production acceptance pending. Proposed 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) G5.3–G5.6)
 **Goals served:** 5 (primary), 1, 3
 **Scope:** `agent/stats.py`, `agent/integrity.py`, `agent/runner_research.py`, `agent/population.py`, `agent/buckets.py` (from S2), `agent/research.py` (width reporting), `prompts/weekly_miner.md`; the next free migration; tests.
 **Depends on:** S1, because the batch must be correct before it is widened. Also S1's `Comparison.test` field, and S2's `agent/buckets.py`.

@@ -1,6 +1,6 @@
 # GRADER GROUNDING SPEC v1 — no confirmation without a computed fact behind it
 
-**Status:** proposed, 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P6, G4.2)
+**Status:** implemented 2026-09-24 (`f3f3fce`), live in production; production acceptance pending. Proposed 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P6, G4.2)
 **Goals served:** 1, 4
 **Scope:** `prompts/evening_grader.md`, `agent/loops/evening.py`, `agent/ledger.py`, `agent/grading.py` (a tape summary built from bars already fetched), `agent/delivery.py`; the next free migration; tests.
 **Depends on:** S2's predicate schema (`agent/buckets.py`) for Phase 3. Phases 1, 2 and 4 stand alone.

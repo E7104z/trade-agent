@@ -1,6 +1,6 @@
 # INTEGRITY REPAIR SPEC v1 — stop the FDR batch from manufacturing edge
 
-**Status:** proposed, 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P1, P2, P8)
+**Status:** implemented 2026-09-24 (`adc2c7f`), live in production; production acceptance pending. Proposed 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P1, P2, P8)
 **Goals served:** 5 (primary), 1, 4
 **Deadline:** ship before the weekly cron on **2026-09-26 at 14:00 UTC**, the first run that will see runner rows from two scan_versions and two sim_versions.
 **Scope:** `agent/stats.py`, `agent/runner_research.py`, `agent/integrity.py`, `agent/memory.py`, `api/index.py`, `run.py`, the next free migration (currently v17), tests.

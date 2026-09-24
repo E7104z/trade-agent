@@ -1,6 +1,6 @@
 # WRITE-TIME ENFORCEMENT SPEC v1 — integrity checks that the playbook cannot ignore
 
-**Status:** proposed, 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P4, G4.1)
+**Status:** implemented 2026-09-24 (`f6bc604`), live in production; first enforced rewrite is the 2026-09-26 weekly run. Proposed 2026-09-23 ([SELF_ASSESSMENT_2026-09-23.md](SELF_ASSESSMENT_2026-09-23.md) P4, G4.1)
 **Goals served:** 1, 4
 **Scope:** `agent/loops/weekly.py`, `agent/memory.py`, `agent/health.py`, `agent/research.py`, `prompts/weekly_miner.md`, `api/index.py`, the next free migration, tests.
 **Writer isolation:** unchanged. The weekly loop stays the sole writer of `playbook.md` and `playbook_versions`. Everything below happens inside that loop's existing write path.
