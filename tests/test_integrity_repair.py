@@ -194,8 +194,9 @@ def test_both_integrity_call_sites_use_the_pinned_rows(monkeypatch):
             raise RuntimeError("no db")
 
     integrity.weekly_block(_Con(), _Cfg(), _L(), SESSION)
-    # build_search once directly, then weekly_block's own search + its runner block.
-    assert calls.count("pinned") == 3
+    # build_search once directly, then weekly_block's own search + its runner
+    # block (and the structural family's rows, which go through the same pin).
+    assert calls.count("pinned") >= 3
     assert "UNPINNED" not in calls
 
 

@@ -68,6 +68,13 @@ MORNING_PICK_DIMS: dict[str, Any] = {
     d: _Passthrough(d, "p", cast=True)
     for d in ("setup_type", "regime_tag", "direction", "conviction", "in_scan_universe")
 }
+# STRUCTURAL_MINING_SPEC_v1 Phase 5: exploration picks (R:R controls, backlog
+# probes) are a MEASURED dimension, so their effect is seen rather than pooled
+# into the desk's record. A regular pick labels as `none`, not `?`: it was not
+# unmeasured, it simply was not exploration.
+MORNING_PICK_DIMS["exploration_lane"] = _Custom(
+    "COALESCE(p.exploration_lane, 'none')",
+    lambda row: row.get("exploration_lane") or "none")
 
 # outcomes columns (computed at grading time)
 MORNING_OUTCOME_DIMS: dict[str, Any] = {

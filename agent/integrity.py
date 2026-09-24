@@ -69,6 +69,7 @@ STATS_DIMENSION_SPEC: tuple[tuple[str, str], ...] = (
     ("direction", "picks"),
     ("conviction", "picks"),
     ("in_scan_universe", "picks"),
+    ("exploration_lane", "picks"),
     ("rvol_bucket", "outcomes"),
     ("vwap_side_at_fill", "outcomes"),
     ("stop_atr_bucket", "outcomes"),
@@ -221,7 +222,26 @@ def build_search(con: Any, ledger_mod: Any, q: float = 0.10, min_n: int = 8):
                            lambda: runner_research.candidate_comparisons(runner_rows), []))
         comps.append(runner_research.setup_edge(runner_rows, min_n=min_n)["comparison"])
         comps.append(runner_research.selection_edge(runner_rows, min_n=min_n)["comparison"])
-    return evaluate_search(comps, q=q, min_n=min_n)
+
+    # STRUCTURAL_MINING_SPEC_v1: pre-registered 2-D pairs, exact win-frequency
+    # tests, and the population family (the short side). All in THIS batch --
+    # none is corrected apart from the rest, and every one is a counted look.
+    from . import structural
+    rows_by_lane = _safe("integrity", "structural rows",
+                         lambda: structural.lane_rows(con), {})
+    pairs, pair_status = _safe("integrity", "2-D pairs",
+                               lambda: structural.pair_comparisons(rows_by_lane, min_n),
+                               ([], []))
+    comps.extend(pairs)
+    comps.extend(_safe("integrity", "win-frequency family",
+                       lambda: structural.winrate_comparisons(rows_by_lane), []))
+    comps.extend(_safe("integrity", "population family",
+                       lambda: structural.population_comparisons(structural.population_rows(con)),
+                       []))
+    result = evaluate_search(comps, q=q, min_n=min_n)
+    result.pair_status = pair_status
+    result.rows_by_lane = rows_by_lane
+    return result
 
 
 def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dict[str, Any]:
@@ -317,6 +337,13 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         parts.append(paired_mod.paired_md(paired_cmp))
     if search is not None:
         parts.append(_underpowered_md(search))
+        from . import structural
+        parts.append(_safe("integrity", "structural consistency",
+                           lambda: structural.consistency_md(structural.consistency(
+                               search, getattr(search, "rows_by_lane", {}) or {}, min_n)), ""))
+        parts.append(_safe("integrity", "search width",
+                           lambda: structural.width_md(search, getattr(search, "pair_status", None)),
+                           ""))
 
     return {
         "markdown": "\n\n".join(p for p in parts if p),

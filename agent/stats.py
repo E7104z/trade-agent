@@ -47,6 +47,7 @@ __all__ = [
     "bootstrap_ci_mean",
     "min_detectable_effect",
     "min_detectable_effect_two_sample",
+    "fisher_exact_2x2",
     "required_n",
     "Comparison",
     "SearchResult",
@@ -311,6 +312,35 @@ def min_detectable_effect_two_sample(
     return round((z_a + z_b) * se, 3)
 
 
+def fisher_exact_2x2(a: int, b: int, c: int, d: int) -> float | None:
+    """Two-sided Fisher exact p for the table [[a, b], [c, d]]. Stdlib only.
+
+    Sums the hypergeometric probability of every table with the same margins
+    that is no more likely than the observed one (the standard two-sided
+    definition, as in R's fisher.test). Exact at any n, which matters here:
+    most cells this ledger can build are small, and a normal approximation to
+    a proportion at n=9 is exactly the kind of false precision the integrity
+    layer exists to refuse. None when a margin is empty (nothing to test).
+    """
+    a, b, c, d = (int(x) for x in (a, b, c, d))
+    if min(a, b, c, d) < 0:
+        return None
+    r1, r2, c1 = a + b, c + d, a + c
+    n = r1 + r2
+    if r1 == 0 or r2 == 0 or c1 == 0 or c1 == n:
+        return None
+
+    def _lp(x: int) -> float:
+        return (math.lgamma(r1 + 1) - math.lgamma(x + 1) - math.lgamma(r1 - x + 1)
+                + math.lgamma(r2 + 1) - math.lgamma(c1 - x + 1) - math.lgamma(r2 - c1 + x + 1)
+                - (math.lgamma(n + 1) - math.lgamma(c1 + 1) - math.lgamma(n - c1 + 1)))
+
+    lo, hi = max(0, c1 - r2), min(r1, c1)
+    obs = _lp(a)
+    p = sum(math.exp(_lp(x)) for x in range(lo, hi + 1) if _lp(x) <= obs + 1e-7)
+    return min(1.0, p)
+
+
 def required_n(
     effect: float, std: float, alpha: float = 0.05, power: float = 0.80
 ) -> int | None:
@@ -374,6 +404,10 @@ class SearchResult:
     testable_looks: int = 0
     q_level: float = 0.10
     survivors: list[Comparison] = field(default_factory=list)
+    # Filled by integrity.build_search for the weekly block (structural
+    # consistency and width reporting); not part of the statistics.
+    pair_status: list[dict] = field(default_factory=list)
+    rows_by_lane: dict = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
         return {

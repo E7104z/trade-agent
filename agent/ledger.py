@@ -1173,7 +1173,8 @@ def recent_trades(con: duckdb.DuckDBPyConnection, n: int = 20,
 
 
 STATS_DIMENSIONS: frozenset[str] = frozenset(
-    {"setup_type", "regime_tag", "direction", "conviction", "in_scan_universe"}
+    {"setup_type", "regime_tag", "direction", "conviction", "in_scan_universe",
+     "exploration_lane"}
 )
 
 

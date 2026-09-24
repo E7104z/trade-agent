@@ -650,6 +650,15 @@ def discovery_stats(pred: dict, comparisons: Iterable[Any], rows: list[dict]) ->
             if getattr(c, "dimension", None) == c0["dimension"] and getattr(c, "level", None) == c0["level"]:
                 return {"n": int(c.n or 0), "effect": c.mean_r, "q": c.q_value, "note": ""}
         return {"n": 0, "effect": None, "q": None, "note": "cell not found in this run's batch"}
+    # A pre-registered, admitted pair is IN the batch (STRUCTURAL_MINING_SPEC_v1
+    # Phase 1): take its corrected numbers from there.
+    from .structural import PAIR_SEP, pair_dimension
+    pair_dim = pair_dimension([c["dimension"] for c in conds])
+    pair_level = PAIR_SEP.join(c["level"] for c in conds)   # conds sorted by dimension
+    for c in comparisons or []:
+        if getattr(c, "dimension", None) == pair_dim and getattr(c, "level", None) == pair_level:
+            return {"n": int(c.n or 0), "effect": c.mean_r, "q": c.q_value,
+                    "note": "pre-registered 2-D pair, screened in this run's batch"}
     vals = [float(r["r_multiple"]) for r in rows if matches(pred, r)]
     mean = (sum(vals) / len(vals)) if vals else None
     return {"n": len(vals), "effect": mean, "q": None,
