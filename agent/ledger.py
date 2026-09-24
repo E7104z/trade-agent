@@ -358,6 +358,53 @@ _MIGRATIONS = _MIGRATIONS + migrations_v13.STATEMENTS
 from . import migrations_v14  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v14.STATEMENTS
 
+# --- v15 runner decision timestamp (honest runner entry time) --------------
+from . import migrations_v15  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v15.STATEMENTS
+
+
+# Fingerprint of the full schema + migration list. Stored in schema_meta once
+# every statement has run, so a connection whose database already carries the
+# current fingerprint skips the DDL entirely.
+#
+# Why this matters: the schema block plus ~90 migrations used to execute on
+# EVERY connect(). Against Neon that is ~92 sequential network round trips per
+# request -- every dashboard poll, every cron -- and in Postgres an
+# `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes an ACCESS EXCLUSIVE lock on
+# the table even when the column already exists, so each poll briefly locked
+# picks/outcomes against the loops writing to them. Any change to _SCHEMA or
+# _MIGRATIONS changes the fingerprint, so a deploy that adds a migration still
+# runs the whole idempotent list exactly once.
+_SCHEMA_FINGERPRINT = __import__("hashlib").sha256(
+    (_SCHEMA + "\n".join(_MIGRATIONS)).encode("utf-8")).hexdigest()[:32]
+
+_SCHEMA_META_DDL = ("CREATE TABLE IF NOT EXISTS schema_meta ("
+                    "id INTEGER PRIMARY KEY, fingerprint VARCHAR NOT NULL, "
+                    "applied_at TIMESTAMP DEFAULT current_timestamp)")
+
+# DSNs whose schema this process has already confirmed current. Postgres only:
+# a DuckDB path can be deleted and recreated under the same name (tests do),
+# and the local fingerprint check is a microsecond query anyway.
+_SCHEMA_READY: set[str] = set()
+
+
+def _schema_is_current(con: Any) -> bool:
+    try:
+        row = con.execute("SELECT fingerprint FROM schema_meta WHERE id = 1").fetchone()
+    except Exception:  # table does not exist yet (fresh or pre-v15 database)
+        return False
+    return bool(row) and row[0] == _SCHEMA_FINGERPRINT
+
+
+def _apply_schema(con: Any, translate) -> None:
+    con.execute(translate(_SCHEMA))
+    for mig in _MIGRATIONS:
+        con.execute(translate(mig))
+    con.execute(_SCHEMA_META_DDL)
+    con.execute("DELETE FROM schema_meta WHERE id = 1")
+    con.execute("INSERT INTO schema_meta (id, fingerprint) VALUES (1, ?)",
+                [_SCHEMA_FINGERPRINT])
+
 
 def connect() -> Any:
     """
@@ -367,29 +414,46 @@ def connect() -> Any:
     persistent local disk for a DuckDB file. Both expose the same
     con.execute(sql, params).fetchone()/.fetchall() interface, so every
     query function below works unchanged in either mode.
+
+    The schema/migration DDL runs only when the database's stored fingerprint
+    differs from this code's (see _SCHEMA_FINGERPRINT). Set
+    LEDGER_FORCE_MIGRATE=1 to run it unconditionally.
     """
+    force = os.environ.get("LEDGER_FORCE_MIGRATE") == "1"
     dsn = os.environ.get("DATABASE_URL")
     if dsn:
         from .pgshim import connect_pg
         con = connect_pg(dsn)
-        # DOUBLE isn't a valid standalone Postgres type name (DuckDB accepts
-        # it as an alias for DOUBLE PRECISION) — translate for Postgres only.
-        con.execute(re.sub(r"\bDOUBLE\b", "DOUBLE PRECISION", _SCHEMA))
-        for mig in _MIGRATIONS:
-            con.execute(re.sub(r"\bDOUBLE\b", "DOUBLE PRECISION", mig))
+        if dsn in _SCHEMA_READY and not force:
+            return con
+        if force or not _schema_is_current(con):
+            # DOUBLE isn't a valid standalone Postgres type name (DuckDB accepts
+            # it as an alias for DOUBLE PRECISION) — translate for Postgres only.
+            _apply_schema(con, lambda s: re.sub(r"\bDOUBLE\b", "DOUBLE PRECISION", s))
+        _SCHEMA_READY.add(dsn)
         return con
     import duckdb
     ensure_dirs()
     con = duckdb.connect(str(DB_PATH))
-    con.execute(_SCHEMA)
-    for mig in _MIGRATIONS:
-        con.execute(mig)
+    if force or not _schema_is_current(con):
+        _apply_schema(con, lambda s: s)
     return con
+
+
+# An 'in_progress' lock older than this belongs to a run that is no longer
+# alive. The hosted function is killed at 300s (vercel.json maxDuration) and
+# the slowest local run on record took ~9 minutes, so 30 minutes is well past
+# any live run. A killed function never reaches its except-block, so without
+# this the lock stays 'in_progress' forever and every later attempt to run
+# that session -- the manual dashboard button included -- is suppressed as a
+# duplicate trigger.
+STALE_LOCK_MINUTES = 30
 
 
 def acquire_run_lock(con: Any, trading_date: date, run_type: str,
                      request_id: str | None = None) -> dict:
-    """Atomically claim one daily loop, allowing retries after failure."""
+    """Atomically claim one daily loop, allowing retries after failure or
+    after the previous holder died without releasing it (stale lock)."""
     request_id = request_id or uuid.uuid4().hex
     row = con.execute(
         """INSERT INTO run_locks (trading_date, run_type, status, request_id)
@@ -405,17 +469,29 @@ def acquire_run_lock(con: Any, trading_date: date, run_type: str,
         "SELECT status, request_id FROM run_locks WHERE trading_date = ? AND run_type = ?",
         [trading_date, run_type],
     ).fetchone()
-    if existing and existing[0] == "failed":
+    if existing and existing[0] in ("failed", "in_progress"):
+        # The WHERE clause is the lock: a failed row is always retryable, an
+        # in_progress row only once it is stale. Concurrency is resolved by
+        # the database, never by the read above.
         row = con.execute(
-            """UPDATE run_locks
+            f"""UPDATE run_locks
                SET status = 'in_progress', request_id = ?, started_at = current_timestamp,
                    completed_at = NULL
-               WHERE trading_date = ? AND run_type = ? AND status = 'failed'
+               WHERE trading_date = ? AND run_type = ?
+                 AND (status = 'failed'
+                      OR (status = 'in_progress'
+                          AND started_at < current_timestamp - INTERVAL '{STALE_LOCK_MINUTES} minutes'))
                RETURNING status, request_id""",
             [request_id, trading_date, run_type],
         ).fetchone()
         if row:
-            return {"acquired": True, "status": row[0], "request_id": row[1]}
+            if existing[0] == "in_progress":
+                from .util import log
+                log(run_type, f"Took over a stale '{run_type}' lock for {trading_date} "
+                              f"(held > {STALE_LOCK_MINUTES} min by a run that never "
+                              f"released it -- most likely killed by the function timeout)")
+            return {"acquired": True, "status": row[0], "request_id": row[1],
+                    "took_over_stale": existing[0] == "in_progress"}
     return {"acquired": False, "status": existing[0] if existing else "unknown",
             "request_id": existing[1] if existing else None}
 
@@ -577,7 +653,7 @@ def update_live_order(con: duckdb.DuckDBPyConnection, live_order_id: str, **fiel
     allowed = {
         "status", "entry_fill_price", "entry_fill_at", "exit_reason",
         "exit_fill_price", "exit_fill_at", "live_r", "reconciled", "raw_order_json",
-        "oco_order_id", "exit_legs_armed",
+        "oco_order_id", "exit_legs_armed", "close_order_id",
     }
     updates = [(key, value) for key, value in fields.items() if key in allowed]
     if not updates:
@@ -938,12 +1014,42 @@ def recent_regimes(con: duckdb.DuckDBPyConnection, n: int = 5) -> list[dict]:
 
 # ------------------------------------------------------------ analytics/memory
 
-def recent_trades(con: duckdb.DuckDBPyConnection, n: int = 20) -> list[dict]:
+# ---------------------------------------------------------------- trading lanes
+#
+# Two strategies share the picks table: the premarket MORNING lane (analyst +
+# risk manager) and the intraday RUNNER lane (setup_type 'dto_runner', up to
+# 10 picks a day at a fixed minimum size). They are different strategies with
+# different sizing ($/R), and the morning lane's mechanical discipline -- the
+# losing-streak clamp and the drawdown circuit breaker -- must read the morning
+# lane's own record. Unscoped, the last-10/last-30 windows those rules read are
+# almost entirely runner trades (runner picks land later in the day, with
+# higher pick_ids), so one lane's results were throttling another lane.
+#
+# lane=None keeps the historical all-picks behavior for every caller that has
+# not opted in.
+RUNNER_SETUP = "dto_runner"
+LANES = ("morning", "runner")
+
+
+def lane_clause(lane: str | None, alias: str = "p") -> str:
+    """SQL predicate (with leading AND) restricting picks to one lane."""
+    if lane is None:
+        return ""
+    if lane == "morning":
+        return f" AND COALESCE({alias}.setup_type, '') <> '{RUNNER_SETUP}'"
+    if lane == "runner":
+        return f" AND {alias}.setup_type = '{RUNNER_SETUP}'"
+    raise ValueError(f"unknown lane {lane!r}; expected one of {LANES} or None")
+
+
+def recent_trades(con: duckdb.DuckDBPyConnection, n: int = 20,
+                  lane: str | None = None) -> list[dict]:
     rows = con.execute(
-        """SELECT p.pick_id, p.plan_date, p.ticker, p.direction, p.setup_type, p.conviction,
+        f"""SELECT p.pick_id, p.plan_date, p.ticker, p.direction, p.setup_type, p.conviction,
                   p.size_r, o.triggered, o.exit_reason, o.r_multiple, o.mfe_r, o.mae_r,
                   o.grade, p.regime_tag, o.missed_move_r
            FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
+           WHERE 1=1{lane_clause(lane)}
            ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT ?""",
         [n],
     ).fetchall()
@@ -958,7 +1064,8 @@ STATS_DIMENSIONS: frozenset[str] = frozenset(
 )
 
 
-def _stats_rows(con: duckdb.DuckDBPyConnection, dim_expr: str) -> list[dict]:
+def _stats_rows(con: duckdb.DuckDBPyConnection, dim_expr: str,
+                lane: str | None = None) -> list[dict]:
     """Shared aggregation body for stats_by / stats_by_outcome — `dim_expr` is
     a trusted (whitelisted by the caller) SQL expression, never caller-supplied
     text, since DuckDB has no way to bind a column/expression as a parameter.
@@ -978,6 +1085,7 @@ def _stats_rows(con: duckdb.DuckDBPyConnection, dim_expr: str) -> list[dict]:
                    STDDEV_SAMP(CASE WHEN o.triggered THEN o.r_multiple END) AS std_r,
                    ROUND(CAST(AVG(CASE WHEN o.triggered THEN o.baseline_r END) AS NUMERIC), 3) AS baseline_avg_r
             FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
+            WHERE 1=1{lane_clause(lane)}
             GROUP BY 1 ORDER BY n DESC"""
     ).fetchall()
     out = []
@@ -1000,7 +1108,8 @@ def _stats_rows(con: duckdb.DuckDBPyConnection, dim_expr: str) -> list[dict]:
     return out
 
 
-def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
+def stats_by(con: duckdb.DuckDBPyConnection, dim: str,
+             lane: str | None = None) -> list[dict]:
     """Aggregate performance stats grouped by a picks column (setup_type, regime_tag, direction, conviction)."""
     if dim not in STATS_DIMENSIONS:
         raise ValueError(
@@ -1008,7 +1117,7 @@ def stats_by(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
         )
     # dim is now guaranteed to be one of the whitelisted identifiers above, so
     # f-string interpolation of a column name here is safe.
-    return _stats_rows(con, f"COALESCE(CAST(p.{dim} AS VARCHAR),'?')")
+    return _stats_rows(con, f"COALESCE(CAST(p.{dim} AS VARCHAR),'?')", lane)
 
 
 # Indicator-layer dimensions (specs/INDICATOR_LAYER_SPEC_v1.md §5) — these live
@@ -1082,28 +1191,46 @@ def stats_by_outcome(con: duckdb.DuckDBPyConnection, dim: str) -> list[dict]:
     return _stats_rows(con, _OUTCOME_DIM_EXPR[dim])
 
 
-def equity_curve(con: duckdb.DuckDBPyConnection, account_size: float, dollars_per_r: float) -> list[dict]:
+def equity_curve(con: duckdb.DuckDBPyConnection, account_size: float, dollars_per_r: float,
+                 lane: str | None = None,
+                 runner_dollars_per_r: float | None = None) -> list[dict]:
+    """Daily paper equity from triggered outcomes.
+
+    `runner_dollars_per_r`, when given, values runner-lane R at the runner's
+    own $/R (config runner.dollars_per_r) instead of the morning lane's -- the
+    two lanes size differently, so pricing runner R at the morning rate
+    overstated runner P&L by the ratio of the two (5x at the shipped config).
+    `day_r`/`cum_r` stay in size-weighted R across whichever lanes are included.
+    """
     rows = con.execute(
-        """SELECT o.eval_date, SUM(COALESCE(o.r_multiple,0) * COALESCE(p.size_r,1)) AS day_r
+        f"""SELECT o.eval_date,
+                  SUM(COALESCE(o.r_multiple,0) * COALESCE(p.size_r,1)) AS day_r,
+                  SUM(CASE WHEN p.setup_type = '{RUNNER_SETUP}'
+                           THEN COALESCE(o.r_multiple,0) * COALESCE(p.size_r,1)
+                           ELSE 0 END) AS runner_r
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered
+           WHERE o.triggered{lane_clause(lane)}
            GROUP BY o.eval_date ORDER BY o.eval_date"""
     ).fetchall()
     curve, equity, cum_r = [], float(account_size), 0.0
-    for d, day_r in rows:
+    for d, day_r, runner_r in rows:
         day_r = float(day_r or 0)
+        runner_r = float(runner_r or 0)
         cum_r += day_r
-        equity += day_r * dollars_per_r
+        if runner_dollars_per_r is None:
+            equity += day_r * dollars_per_r
+        else:
+            equity += (day_r - runner_r) * dollars_per_r + runner_r * runner_dollars_per_r
         curve.append({"date": str(d), "day_r": round(day_r, 3),
                       "cum_r": round(cum_r, 3), "equity": round(equity, 2)})
     return curve
 
 
-def current_streak(con: duckdb.DuckDBPyConnection) -> dict:
+def current_streak(con: duckdb.DuckDBPyConnection, lane: str | None = None) -> dict:
     """Consecutive win/loss streak over triggered trades, most recent first."""
     rows = con.execute(
-        """SELECT o.r_multiple FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND o.r_multiple IS NOT NULL
+        f"""SELECT o.r_multiple FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+           WHERE o.triggered AND o.r_multiple IS NOT NULL{lane_clause(lane)}
            ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT 30"""
     ).fetchall()
     if not rows:
@@ -1118,14 +1245,15 @@ def current_streak(con: duckdb.DuckDBPyConnection) -> dict:
     return {"kind": "winning" if sign == 1 else "losing", "length": length}
 
 
-def overall_stats(con: duckdb.DuckDBPyConnection) -> dict:
+def overall_stats(con: duckdb.DuckDBPyConnection, lane: str | None = None) -> dict:
     row = con.execute(
-        """SELECT COUNT(*),
+        f"""SELECT COUNT(*),
                   SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END),
                   SUM(CASE WHEN o.triggered AND o.r_multiple > 0 THEN 1 ELSE 0 END),
                   AVG(CASE WHEN o.triggered THEN o.r_multiple END),
                   SUM(CASE WHEN o.triggered THEN o.r_multiple * COALESCE(p.size_r,1) ELSE 0 END)
-           FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id"""
+           FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
+           WHERE 1=1{lane_clause(lane)}"""
     ).fetchone()
     n, trig, wins, avg_r, total_r = row
     return {
@@ -1138,13 +1266,14 @@ def overall_stats(con: duckdb.DuckDBPyConnection) -> dict:
     }
 
 
-def trailing_weighted_r(con: duckdb.DuckDBPyConnection, n: int = 10) -> dict:
+def trailing_weighted_r(con: duckdb.DuckDBPyConnection, n: int = 10,
+                        lane: str | None = None) -> dict:
     """Sum of size-weighted R over the last n triggered trades — the drawdown
     circuit breaker's input. Catches slow bleeds that never form a losing streak."""
     rows = con.execute(
-        """SELECT o.r_multiple * COALESCE(p.size_r, 1)
+        f"""SELECT o.r_multiple * COALESCE(p.size_r, 1)
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND o.r_multiple IS NOT NULL
+           WHERE o.triggered AND o.r_multiple IS NOT NULL{lane_clause(lane)}
            ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT ?""",
         [n],
     ).fetchall()
@@ -1710,15 +1839,15 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
            (session_date, ticker, eval_date, triggered, entry_fill, exit_price,
             exit_reason, r_multiple, mfe_r, mae_r, eod_r, selected,
             selection_rank, pick_id, sim_version, atr14, stop_dist_atr,
-            trend_side_200d)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            trend_side_200d, entry_after_et)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["session_date"], o["ticker"].upper(), o.get("eval_date"),
             o.get("triggered"), o.get("entry_fill"), o.get("exit_price"),
             o.get("exit_reason"), o.get("r_multiple"), o.get("mfe_r"),
             o.get("mae_r"), o.get("eod_r"), bool(selected), rank, pick_id,
             o.get("sim_version"), o.get("atr14"), o.get("stop_dist_atr"),
-            o.get("trend_side_200d"),
+            o.get("trend_side_200d"), o.get("entry_after_et"),
         ],
     )
 
@@ -1805,7 +1934,8 @@ def recent_runner_sessions(con: duckdb.DuckDBPyConnection, limit: int = 40) -> l
     return [dict(zip(cols, r)) for r in rows]
 
 
-def claim_runner_selection(con: duckdb.DuckDBPyConnection, d: date) -> bool:
+def claim_runner_selection(con: duckdb.DuckDBPyConnection, d: date,
+                           at: datetime | None = None) -> bool:
     """Atomically claim the one selection call for this session.
 
     Returns True exactly once per session. The intraday cron fires every five
@@ -1819,11 +1949,15 @@ def claim_runner_selection(con: duckdb.DuckDBPyConnection, d: date) -> bool:
            VALUES (?, FALSE) ON CONFLICT (session_date) DO NOTHING""",
         [d],
     )
+    # selection_at is the decision time every runner candidate that existed
+    # at this moment is graded from (runner_scan.honest_entry_time). Naive ET
+    # wall-clock, the same convention as first_pass_et / scan_pass_et.
+    decided = (at or now_et()).replace(tzinfo=None)
     row = con.execute(
-        """UPDATE runner_sessions SET selection_made = TRUE
+        """UPDATE runner_sessions SET selection_made = TRUE, selection_at = ?
            WHERE session_date = ? AND (selection_made IS NULL OR selection_made = FALSE)
            RETURNING session_date""",
-        [d],
+        [decided, d],
     ).fetchone()
     return bool(row)
 

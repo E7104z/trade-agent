@@ -935,6 +935,10 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         user = (
             f"# WEEKLY REVIEW — {d.isoformat()}\n\n"
             f"## OVERALL RECORD\n\n{json.dumps(overall, indent=2)}\n\n"
+            "By lane (the morning premarket lane and the intraday runner lane "
+            "are different strategies with different sizing -- never pool them "
+            "into one claim):\n\n"
+            f"{json.dumps(mem.get('overall_by_lane') or {}, indent=2)}\n\n"
             f"{_fmt_stats(mem['by_setup'], 'setup_type')}\n\n"
             f"{_fmt_stats(mem['by_regime'], 'regime_tag')}\n\n"
             f"{_fmt_stats(mem['by_conviction'], 'conviction')}\n\n"

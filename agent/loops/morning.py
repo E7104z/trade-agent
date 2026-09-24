@@ -840,8 +840,9 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
             # data_health from the shared bundle but ITS OWN MarketData (md2
             # probes the feed independently) and its own candidate population.
             return _validate_plan(
-                p, cfg, ledger.current_streak(con2),
-                ledger.trailing_weighted_r(con2, int(cfg.get("drawdown_window", 10))),
+                p, cfg, ledger.current_streak(con2, lane="morning"),
+                ledger.trailing_weighted_r(con2, int(cfg.get("drawdown_window", 10)),
+                                           lane="morning"),
                 ref_prices=_grounded_ref_prices(md2, p, bundle, d, seed=armb_quotes),
                 atr_map=_grounded_atr(md2, p, bundle),
                 earnings_map=_grounded_earnings(md2, p, bundle),
@@ -872,7 +873,10 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         con.close()
         return
 
-    if not cfg.mock:
+    # A dry run builds the prompt and stops. It must not claim the day's lock:
+    # it used to mark it 'complete', after which the REAL morning run that day
+    # was suppressed as a duplicate trigger.
+    if not cfg.mock and not cfg.dry_run:
         lock = ledger.acquire_run_lock(con, d, "morning")
         if not lock["acquired"]:
             log("morning", f"Duplicate trigger suppressed for {d} (lock status={lock['status']})")
@@ -912,7 +916,6 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             path.write_text(analyst_system + "\n\n---\n\n" + user_block, encoding="utf-8")
             log("morning", f"DRY RUN — prompt written to {path}, no API call made")
             ledger.log_run(con, "morning", d, started, "dry_run")
-            ledger.finish_run_lock(con, d, "morning", lock["request_id"], "complete")
             return
 
         # 5. stage 1: analyst
@@ -990,8 +993,12 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         session_health = {**_bundle_health(md, bundle),
                           **_candidate_grounding_health(candidates, bundle, cand_quotes)}
         plan, warnings = _validate_plan(
-            plan, cfg, ledger.current_streak(con),
-            ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10))),
+            # Lane-scoped: the streak clamp and drawdown breaker are this
+            # lane's discipline and read this lane's record only (see
+            # ledger.lane_clause -- runner picks would otherwise fill the window).
+            plan, cfg, ledger.current_streak(con, lane="morning"),
+            ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10)),
+                                       lane="morning"),
             ref_prices=_grounded_ref_prices(md, plan, bundle, d, seed=cand_quotes),
             atr_map=_grounded_atr(md, plan, bundle),
             earnings_map=_grounded_earnings(md, plan, bundle),

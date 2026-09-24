@@ -34,6 +34,7 @@ from agent import dashboard as dashboard_lib  # noqa: E402
 from agent.config import load_config  # noqa: E402
 from agent.mascot import MASCOT_MARKER, mascot_embed  # noqa: E402
 from agent.memory import read_playbook  # noqa: E402
+from agent.webui import PAGE as _PAGE  # noqa: E402
 from agent.util import parse_date, today_et  # noqa: E402
 
 app = Flask(__name__)
@@ -51,9 +52,50 @@ def _json_default(o):
     return str(o)
 
 
-def json_response(data: dict, status: int = 200) -> Response:
-    return Response(json.dumps(data, default=_json_default, indent=2),
-                    status=status, mimetype="application/json")
+def json_response(data: dict, status: int = 200, compact: bool = False) -> Response:
+    """indent=2 for the endpoints people paste into a browser; compact for the
+    ones only the dashboard reads (/api/status was ~255 KB indented, ~185 KB
+    compact, and is polled every minute)."""
+    body = (json.dumps(data, default=_json_default, separators=(",", ":")) if compact
+            else json.dumps(data, default=_json_default, indent=2))
+    return Response(body, status=status, mimetype="application/json")
+
+
+_GZIP_MIN_BYTES = 1400
+_GZIP_TYPES = ("application/json", "text/html", "text/plain")
+
+
+@app.after_request
+def _gzip(resp: Response) -> Response:
+    """Compress large text responses when the client accepts gzip.
+
+    The dashboard page (with the inlined Arby widget) and /api/status are each
+    ~200 KB of highly repetitive text; gzip cuts both by roughly 85-90%.
+    On Vercel (VERCEL=1) this steps aside: the platform edge already
+    compresses function responses (with brotli where the client supports it),
+    so app-level gzip there would only be redundant work. It applies when the
+    app is served any other way (`python api/index.py`, another host).
+    """
+    try:
+        if (os.environ.get("VERCEL")
+                or resp.status_code < 200 or resp.status_code >= 300
+                or resp.direct_passthrough
+                or "Content-Encoding" in resp.headers
+                or "gzip" not in (request.headers.get("Accept-Encoding") or "").lower()
+                or (resp.mimetype or "") not in _GZIP_TYPES):
+            return resp
+        data = resp.get_data()
+        if len(data) < _GZIP_MIN_BYTES:
+            return resp
+        import gzip
+        resp.set_data(gzip.compress(data, compresslevel=6))
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Content-Length"] = str(len(resp.get_data()))
+        vary = resp.headers.get("Vary")
+        resp.headers["Vary"] = f"{vary}, Accept-Encoding" if vary else "Accept-Encoding"
+    except Exception:  # noqa: BLE001 -- compression must never fail a response
+        pass
+    return resp
 
 
 def _is_cron_request() -> bool:
@@ -122,434 +164,10 @@ def logout():
 
 
 # ----------------------------------------------------------------- dashboard
+# The dashboard UI now lives in agent/webui.py (a multi-page SPA shell),
+# imported at the top of this module as _PAGE. The Arby mascot is injected
+# at the marker in the block just below.
 
-_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Trade Agent</title>
-<style>
-body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:24px}
-h1,h2,h3{color:#58a6ff}
-.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;margin-bottom:20px}
-table{border-collapse:collapse;width:100%;font-size:13px}
-th,td{border:1px solid #30363d;padding:6px 10px;text-align:left}
-th{background:#21262d}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
-.stat{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;text-align:center}
-.stat .v{font-size:22px;font-weight:700}
-button{padding:10px 18px;background:#238636;border:none;border-radius:6px;color:white;
-        font-weight:600;cursor:pointer;margin-right:10px}
-button:disabled{background:#30363d;cursor:not-allowed}
-button.secondary{background:#30363d}
-label{font-size:13px;color:#8b949e;margin-right:14px}
-select{padding:9px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;margin:4px 8px 4px 0}
-button.small{padding:8px 12px;font-size:13px}
-.history-controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:12px}
-.history-controls label{margin-right:0}
-.history-meta{color:#8b949e;font-size:13px;margin:8px 0 12px}
-.history-table{overflow:auto;max-height:560px}
-.history-table table{min-width:760px}
-td.err{color:#f85149;font-size:12px;max-width:340px;overflow:hidden;
-       text-overflow:ellipsis;white-space:nowrap}
-pre{white-space:pre-wrap;font-size:12px;background:#0d1117;border:1px solid #30363d;
-     border-radius:6px;padding:12px;max-height:400px;overflow:auto}
-a{color:#58a6ff}
-.top{display:flex;justify-content:space-between;align-items:center}
-nav.dash-nav{position:sticky;top:0;z-index:20;background:#0d1117;border-bottom:1px solid #30363d;
-  padding:8px 0;margin:0 0 8px;display:flex;gap:16px;flex-wrap:wrap}
-nav.dash-nav a{color:#8b949e;text-decoration:none;font-size:13px;font-weight:600;padding:4px 10px;border-radius:6px}
-nav.dash-nav a:hover{color:#e6edf3;background:#161b22}
-.section-banner{display:flex;align-items:baseline;gap:12px;margin:28px 0 14px;padding-bottom:8px;border-bottom:2px solid #30363d}
-.section-banner .tag{background:#238636;color:#fff;font-size:11px;font-weight:700;letter-spacing:.08em;padding:3px 9px;border-radius:12px}
-.section-banner h2{margin:0;color:#e6edf3}
-.section-banner .sub{color:#8b949e;font-size:12px}
-.pb-h{margin:18px 0 8px}
-.pb-list{margin:6px 0 12px 22px;padding:0}
-.pb-list li{margin:4px 0}
-.pb-p{margin:8px 0}
-.pb-hr{border:none;border-top:1px solid #30363d;margin:16px 0}
-.pb-table{width:auto;min-width:320px;margin:10px 0}
-.neutral{color:#8b949e}
-</style></head><body>
-<div class="top">
-  <h1>Trade Agent — Live Dashboard</h1>
-  <a href="/logout">Sign out</a>
-</div>
-<nav class="dash-nav">
-  <a href="#sec-loop">Loop</a>
-  <a href="#sec-runner">Runner</a>
-  <a href="#sec-conclusions">Conclusions</a>
-  <a href="#sec-playbook">Playbook</a>
-  <a href="#sec-history">History</a>
-  <a href="#sec-runs">Runs</a>
-</nav>
-<!--ARBY-->
-<p style="color:#8b949e">Loading...</p>
-<div class="card">
-  <h2>Run a loop</h2>
-  <label><input type="checkbox" id="mock"> Test mode (mock LLM, no cost)</label>
-  <label><input type="checkbox" id="offline"> Offline data (no market data calls)</label>
-  <label><input type="checkbox" id="force"> Force (ignore market-day check)</label>
-  <div style="margin-top:12px">
-    <button onclick="runLoop('morning')">Run Morning</button>
-    <button onclick="runLoop('evening')">Run Evening</button>
-    <button onclick="runLoop('weekly')">Run Weekly</button>
-    <button onclick="runLoop('runner')">Run Runner Scan</button>
-    <button class="secondary" onclick="loadData()">Refresh</button>
-  </div>
-  <p id="running" style="display:none;color:#d29922">Running — this can take 1-4 minutes for the morning loop
-     (extended thinking + web search). Do not close this tab.</p>
-  <pre id="log" style="display:none"></pre>
-</div>
-<div id="app"></div>
-
-<script>
-async function loadData() {
-  const r = await fetch('/api/status');
-  const d = await r.json();
-  render(d);
-}
-
-function render(d) {
-  const el = document.getElementById('app');
-  const overall = d.overall || {};
-  const plan = d.plan;
-  let planHtml = "<p class='neutral'>No plan yet today.</p>";
-  if (plan) {
-    if (plan.no_trade) {
-      planHtml = `<p><b>NO TRADE.</b> ${plan.no_trade_reason || ''}</p><p>${plan.market_stance || ''}</p>`;
-    } else {
-      // prefer the authoritative picks table rows (flat entry_type, always
-      // resolved) over the raw plan JSON, which may only carry a nested
-      // entry_plan.type
-      const source = (d.picks_today && d.picks_today.length) ? d.picks_today : (plan.picks || []);
-      let rows = source.map(p => {
-        const entryType = p.entry_type || (p.entry_plan && p.entry_plan.type) || 'open';
-        return `<tr><td>${p.ticker}</td><td>${p.direction}</td>
-        <td>${p.setup_type||''}</td><td>${entryType} @ ${p.entry_price}</td><td>${p.stop_price}</td>
-        <td>${p.target_price}</td><td>${p.size_r}R</td><td>${p.conviction}</td>
-        <td>${p.thesis_final||p.thesis||''}</td></tr>`;
-      }).join('');
-      planHtml = `<p>${plan.market_stance||''}</p><table><tr><th>Ticker</th><th>Dir</th><th>Setup</th>
-        <th>Entry (type @ price)</th><th>Stop</th><th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr>${rows}</table>`;
-    }
-  }
-  let setupRows = (d.by_setup || []).map(s => `<tr><td>${s.dim}</td><td>${s.n}</td><td>${s.triggered}</td>
-    <td>${s.win_rate!=null ? Math.round(s.win_rate*100)+'%' : '-'}</td><td>${s.avg_r ?? '-'}</td>
-    <td>${s.total_weighted_r}</td></tr>`).join('');
-  // runs.error has always been in this payload (recent_runs does SELECT *).
-  // It was simply never rendered, which is why a three-line billing failure
-  // read as an unexplained red row for hours. Escape it: it is raw exception
-  // text and routinely contains < and &.
-  const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
-  let runsRows = (d.runs || []).map(r => {
-    const err = r.error ? esc(r.error) : '';
-    const short = err.length > 90 ? err.slice(0, 90) + '&hellip;' : err;
-    const cell = err
-      ? `<td class="err" title="${err}">${short}</td>`
-      : '<td></td>';
-    return `<tr><td>${r.loop}</td><td>${r.run_date}</td><td>${r.status}</td>
-    <td>${r.model||''}</td><td>$${(r.cost_usd||0).toFixed(3)}</td>${cell}</tr>`;
-  }).join('');
-
-  const rejections = d.rejections_today || [];
-  let shadowHtml = "<p class='neutral'>Nothing rejected today — every candidate that survived analysis made the plan.</p>";
-  if (rejections.length) {
-    let shadowRows = rejections.map(r => {
-      const outcome = r.eod_outcome
-        ? `${r.eod_outcome}${r.forgone_r!=null ? ' (' + (r.forgone_r>=0?'+':'') + r.forgone_r + 'R)' : ''}`
-        : 'ungraded';
-      return `<tr><td>${r.ticker}</td><td>${r.direction||''}</td><td>${r.setup_type||''}</td>
-        <td>${r.entry_type||''} @ ${r.entry_price ?? '—'}</td><td>${r.stop_price ?? '—'}</td>
-        <td>${r.target_price ?? '—'}</td><td>${r.conviction ?? '—'}</td>
-        <td>${r.reason||''}</td><td>${r.thesis||''}</td><td>${outcome}</td></tr>`;
-    }).join('');
-    shadowHtml = `<table><tr><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th>
-      <th>Stop</th><th>Target</th><th>Conv</th><th>Kill reason</th><th>Thesis</th><th>Shadow outcome</th></tr>${shadowRows}</table>`;
-  }
-
-  // ── Runner lane ──────────────────────────────────────────────────────
-  const rn = d.runner || {};
-  let runnerHtml = "";
-  if (rn.ran) {
-    const bad  = /^DEGRADED|^NO SCAN/.test(rn.health || "");
-    const quiet = /stand-down/.test(rn.health || "");
-    const col  = bad ? "#f85149" : (quiet ? "#d29922" : "#3fb950");
-    const rows = (rn.rows || []).map(r => {
-      const sel = r.selected ? `<span style="color:#3fb950;font-weight:700">#${r.rank}</span>` : "";
-      const n = (v, dg) => (v==null ? "—" : Number(v).toFixed(dg==null?2:dg));
-      const rc = r.r_multiple==null ? "#8b949e" : (r.r_multiple>0 ? "#3fb950" : "#f85149");
-      return `<tr><td>${sel}</td><td><b>${r.ticker}</b></td><td>${r.detection_et||""}</td>
-        <td>${n(r.price)}</td><td>${n(r.stop)}</td><td>${n(r.target)}</td>
-        <td>${n(r.rvol)}</td><td>${n(r.vwap_pct)}</td><td>${n(r.tc,1)}</td>
-        <td>${n(r.change_pct)}</td><td style="color:${rc}">${n(r.r_multiple)}</td>
-        <td>${r.exit_reason||""}</td></tr>`;
-    }).join("");
-    const table = rows
-      ? `<table style="margin-top:12px"><tr><th></th><th>Ticker</th><th>Det ET</th>
-         <th>Price</th><th>Stop</th><th>Target</th><th>RVOL</th><th>VWAP%</th>
-         <th>TC</th><th>Chg%</th><th>R</th><th>Exit</th></tr>${rows}</table>`
-      : "";
-
-    const movers = rn.movers || [];
-    let moversHtml = "";
-    if (movers.length) {
-      const overlap = movers.filter(m => m.selected).length;
-      const mvRows = movers.map(m => {
-        const rc = m.r_multiple==null ? "#8b949e" : (m.r_multiple>0 ? "#3fb950" : "#f85149");
-        const tag = m.selected
-          ? `<span style="color:#3fb950;font-weight:700">#${m.rank} picked</span>`
-          : `<span style="color:#8b949e">not picked</span>`;
-        return `<tr><td><b>${m.ticker}</b></td>
-          <td style="color:${rc}">${m.r_multiple==null?"—":Number(m.r_multiple).toFixed(2)}</td>
-          <td>${m.exit_reason||""}</td><td>${tag}</td></tr>`;
-      }).join("");
-      moversHtml = `<h3 style="margin-top:18px">Top ${movers.length} movers today (by realized R)</h3>
-        <p style="color:#8b949e;font-size:12px">
-          ${overlap} of ${movers.length} were selected. Same-day eyeball check, not a
-          training signal — one day's winners are noise to retune a selector on. The
-          FDR-corrected version, across many sessions, feeds the weekly miner instead.
-        </p>
-        <table><tr><th>Ticker</th><th>R</th><th>Exit</th><th></th></tr>${mvRows}</table>`;
-    }
-
-    // WHY THESE WERE PICKED — the selector's actual choices + the thesis it
-    // wrote for each. render_text has always shown this; the dashboard did not.
-    let picksHtml = "";
-    if ((rn.picks || []).length) {
-      const pRows = rn.picks.map(p => `<tr><td><b>${p.ticker}</b></td><td>${p.direction}</td>
-        <td>${p.conviction||''}</td><td>${p.size_r ?? '—'}R</td>
-        <td>${p.entry_price ?? '—'}</td><td>${p.stop_price ?? '—'}</td><td>${p.target_price ?? '—'}</td>
-        <td>${esc(p.thesis||'')}</td></tr>`).join('');
-      picksHtml = `<h3 style="margin-top:18px">Selected picks (${rn.picks.length})</h3>
-        <table><tr><th>Ticker</th><th>Dir</th><th>Conviction</th><th>Size</th>
-        <th>Entry</th><th>Stop</th><th>Target</th><th>Thesis</th></tr>${pRows}</table>`;
-    }
-
-    runnerHtml = `<div class="card"><h2>Runner Lane — ${d.today}</h2>
-      <p style="color:${col};font-weight:600">${rn.health||""}</p>
-      ${rn.skipped_reason ? `<p style="color:#8b949e">selection: ${rn.skipped_reason}</p>` : ""}
-      <div class="grid">
-        <div class="stat"><div class="v">${rn.universe||0}</div>scanned</div>
-        <div class="stat"><div class="v">${rn.n_candidates||0}</div>candidates</div>
-        <div class="stat"><div class="v">${rn.n_selected||0}</div>selected</div>
-        <div class="stat"><div class="v">${rn.n_orders||0}</div>live orders</div>
-      </div>
-      ${picksHtml}
-      ${moversHtml}
-      <h3 style="margin-top:18px">All candidates</h3>${table}
-      <p style="color:#8b949e;font-size:12px;margin-top:10px">
-        Every candidate is priced by the evening simulator, selected or not —
-        that is what makes “did picking help?” answerable. Rows marked #N were chosen.
-      </p></div>`;
-  } else {
-    runnerHtml = `<div class="card"><h2>Runner Lane — ${d.today}</h2>
-      <p style="color:#8b949e">${rn.health || "No scan recorded for today."}</p></div>`;
-  }
-
-  // ── Conclusions & Changes ───────────────────────────────────────────
-  const cc = d.conclusions || {};
-
-  let bestEdgeHtml = "<p class='neutral'>Not enough triggered trades yet to declare a current best edge (needs ≥3 per setup).</p>";
-  if (cc.best_edge) bestEdgeHtml = `<p style="font-size:15px"><b>${esc(cc.best_edge)}</b></p>`;
-
-  let lessonsHtml = "<p class='neutral'>No active lessons yet.</p>";
-  if ((cc.lessons||[]).length) {
-    lessonsHtml = `<table><tr><th>Lesson</th><th>Setup</th><th>Confidence</th><th>+/-</th><th>Status</th></tr>` +
-      cc.lessons.map(l => `<tr><td>${esc(l.lesson)}</td><td>${esc(l.setup_type||'')}</td><td>${esc(l.confidence||'')}</td>
-        <td>+${l.confirmations??0} / -${l.contradictions??0}</td><td>${esc(l.status||'')}</td></tr>`).join('') + '</table>';
-  }
-
-  let questionsHtml = "<p class='neutral'>No open-question progress recorded yet.</p>";
-  if ((cc.open_questions||[]).length) {
-    questionsHtml = `<table><tr><th>Question</th><th>Progress</th><th>Events</th><th>Last</th><th>Recent notes</th></tr>` +
-      cc.open_questions.map(q => `<tr><td>Q${q.question_id}</td><td>${q.total}</td><td>${q.events}</td>
-        <td>${q.last_event||''}</td><td>${esc((q.recent_notes||[]).join(' · '))}</td></tr>`).join('') + '</table>';
-  }
-
-  let calHtml = "<p class='neutral'>No calibration data yet.</p>";
-  if ((cc.calibration||[]).length) {
-    calHtml = `<table><tr><th>Stated conviction</th><th>N</th><th>Win rate</th><th>Avg R</th></tr>` +
-      cc.calibration.map(c => {
-        const wr = c.suppressed ? `<span title="suppressed: n < ${c.min_n}">—</span>`
-                  : (c.win_rate!=null ? Math.round(c.win_rate*100)+'%' : '—');
-        const ar = c.suppressed ? '—' : (c.avg_r ?? '—');
-        return `<tr><td>${esc(c.conviction||'')}</td><td>${c.n}</td><td>${wr}</td><td>${ar}</td></tr>`;
-      }).join('') + '</table>';
-  }
-
-  const mg = cc.management || {};
-  let mgHtml = "<p class='neutral'>No management (counterfactual) data yet.</p>";
-  if (Object.keys(mg).length) {
-    mgHtml = `<table><tr><th>Metric</th><th>Value</th></tr>
-      <tr><td>Triggered trades</td><td>${mg.triggered??0}</td></tr>
-      <tr><td>Avg realized R</td><td>${mg.avg_r ?? '—'} (n=${mg.avg_r_n??0})</td></tr>
-      <tr><td>Avg same-name open→close (baseline)</td><td>${mg.avg_baseline_r ?? '—'} (n=${mg.avg_baseline_r_n??0})</td></tr>
-      <tr><td><b>Edge vs baseline (paired)</b></td><td><b>${mg.edge_vs_baseline_r ?? '—'}</b> R (n=${mg.edge_vs_baseline_n??0})</td></tr>
-      <tr><td><b>Management edge vs hold-to-close (paired)</b></td><td><b>${mg.management_edge_r ?? '—'}</b> R (n=${mg.management_edge_n??0})</td></tr>
-      <tr><td>Stopped</td><td>${mg.stopped??0}${mg.stopped_then_target ? ` (${mg.stopped_then_target} hit target after)` : ''}</td></tr>
-      <tr><td>Avg EOD R on stopped trades</td><td>${mg.avg_eod_r_on_stopped ?? '—'}</td></tr>
-      <tr><td>Untriggered (fussy entries) w/ baseline</td><td>${mg.untriggered_with_baseline??0} — walked away from ${mg.avg_baseline_r_untriggered ?? '—'}R</td></tr></table>`;
-  }
-
-  let seHtml = "<p class='neutral'>No weekly selection-edge history yet (the weekly miner writes this).</p>";
-  if ((cc.selection_edge||[]).length) {
-    seHtml = `<table><tr><th>Week ending</th><th>Sessions</th><th>Edge R</th><th>p</th><th>Verdict</th></tr>` +
-      cc.selection_edge.map(r => `<tr><td>${r.week_ending||''}</td><td>${r.sessions??''}</td>
-        <td>${r.edge_r ?? '—'}</td><td>${r.p_value!=null ? Number(r.p_value).toFixed(4) : '—'}</td>
-        <td>${esc(r.verdict||'')}</td></tr>`).join('') + '</table>';
-  }
-
-  // Playbook: prefer the server-rendered structured HTML (shared with the
-  // static dashboard), falling back to escaped plain text for old payloads.
-  const playbookHtml = d.playbook_html
-    ? d.playbook_html
-    : `<pre>${esc(d.playbook||'')}</pre>`;
-
-  el.innerHTML = `
-  <div class="section-banner"><span class="tag">LOOP</span><h2>The daily loop</h2><span class="sub">morning plan → evening grade → weekly mine</span></div>
-  <div class="card" id="sec-loop"><h2>Today's Plan — ${d.today}</h2>${planHtml}</div>
-  <div class="card"><h2>Performance</h2>
-    <div class="grid">
-      <div class="stat"><div class="v">${overall.picks_graded ?? 0}</div>Graded trades</div>
-      <div class="stat"><div class="v">${overall.win_rate!=null ? Math.round(overall.win_rate*100)+'%' : '—'}</div>Win rate</div>
-      <div class="stat"><div class="v">${overall.avg_r ?? '—'}</div>Avg R</div>
-      <div class="stat"><div class="v">${overall.total_weighted_r ?? 0}</div>Total weighted R</div>
-      <div class="stat"><div class="v">$${(d.equity||0).toLocaleString()}</div>Paper equity</div>
-      <div class="stat"><div class="v">${d.streak||'—'}</div>Streak</div>
-    </div></div>
-  <div class="card"><h2>By Setup</h2><table><tr><th>Setup</th><th>N</th><th>Triggered</th>
-    <th>Win rate</th><th>Avg R</th><th>Total wR</th></tr>${setupRows}</table></div>
-  <div class="card"><h2>Shadow Ledger — Rejected Candidates (${d.today})</h2>${shadowHtml}</div>
-
-  <div class="section-banner" id="sec-runner"><span class="tag">RUNNER</span><h2>The intraday runner lane</h2><span class="sub">scan → select → grade against the shadow</span></div>
-  ${runnerHtml}
-
-  <div class="section-banner" id="sec-conclusions"><span class="tag">CONCLUSIONS</span><h2>What the desk has concluded & changed</h2><span class="sub">the numbers that actually drive future playbooks</span></div>
-  <div class="card"><h3>Current best edge</h3>${bestEdgeHtml}</div>
-  <div class="card"><h3>Active lessons</h3>${lessonsHtml}</div>
-  <div class="card"><h3>Open questions</h3>${questionsHtml}</div>
-  <div class="card"><h3>Calibration (does stated conviction track realized R?)</h3>${calHtml}</div>
-  <div class="card"><h3>Management quality (stop/target machinery vs hold-to-close)</h3>${mgHtml}</div>
-  <div class="card"><h3>Runner selection edge (weekly, FDR-corrected)</h3>${seHtml}</div>
-
-  <div class="section-banner" id="sec-playbook"><span class="tag">PLAYBOOK</span><h2>The playbook</h2><span class="sub">v${d.playbook_version}</span></div>
-  <div class="card">${playbookHtml}</div>
-
-  <div class="section-banner" id="sec-history"><span class="tag">HISTORY</span><h2>Raw data inspector</h2></div>
-    <div class="card"><h2>Historical Data</h2>
-        <p class="history-meta">Choose a date and data type to inspect everything saved for that session.</p>
-        <div class="history-controls">
-            <label for="historyDate">Date</label><select id="historyDate"></select>
-            <label for="historyTable">Data</label><select id="historyTable">
-                <option value="rejections">Shadow ledger</option>
-                <option value="picks">Trade picks</option>
-                <option value="outcomes">Trade outcomes</option>
-                <option value="daily_plans">Daily plans</option>
-                <option value="regime_history">Market regimes</option>
-                <option value="lessons">Lessons</option>
-                <option value="calibration">Calibration</option>
-                <option value="rule_confirmations">Rule confirmations</option>
-                <option value="open_question_progress">Question progress</option>
-                <option value="runs">Run history</option>
-            </select>
-            <button class="small" onclick="loadHistory()">View</button>
-        </div>
-        <div id="historyResult" class="history-meta">Loading available dates...</div>
-        <div id="historyTableView" class="history-table"></div>
-    </div>
-  <div class="section-banner" id="sec-runs"><span class="tag">RUNS</span><h2>Loop run history</h2></div>
-  <div class="card"><table><tr><th>Loop</th><th>Date</th><th>Status</th>
-    <th>Model</th><th>Cost</th><th>Error</th></tr>${runsRows}</table></div>
-  `;
-  // The Historical Data controls above just got (re)created by the innerHTML
-  // assignment, so their dropdown needs to be (re)populated every time render()
-  // runs -- not just once at page load, or it's left empty after any refresh.
-  loadHistoryDates();
-}
-
-async function runLoop(name) {
-  document.getElementById('running').style.display = 'block';
-  document.getElementById('log').style.display = 'block';
-  document.getElementById('log').textContent = 'Starting ' + name + ' loop...';
-  document.querySelectorAll('button').forEach(b => b.disabled = true);
-  const params = new URLSearchParams({
-    mock: document.getElementById('mock').checked ? '1' : '0',
-    offline: document.getElementById('offline').checked ? '1' : '0',
-    force: document.getElementById('force').checked ? '1' : '0',
-  });
-  try {
-    const r = await fetch('/run/' + name + '?' + params.toString(), {method: 'POST'});
-    const text = await r.text();
-    // A platform-level failure (e.g. serverless function timeout) returns an
-    // HTML/plain-text error page instead of our JSON contract -- show that
-    // raw instead of crashing on JSON.parse with a cryptic "Unexpected token".
-    let d;
-    try { d = JSON.parse(text); } catch { d = null; }
-    if (d) {
-      document.getElementById('log').textContent = (d.log || '') + (d.error ? '\\n\\nERROR: ' + d.error : '');
-    } else {
-      document.getElementById('log').textContent = `Request failed (HTTP ${r.status}): ` + text.slice(0, 2000);
-    }
-  } catch (e) {
-    document.getElementById('log').textContent = 'Request failed: ' + e;
-  } finally {
-    document.querySelectorAll('button').forEach(b => b.disabled = false);
-    document.getElementById('running').style.display = 'none';
-    loadData();
-  }
-}
-
-loadData();
-
-async function loadHistoryDates() {
-    const result = document.getElementById('historyResult');
-    try {
-        const r = await fetch('/api/history/dates');
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || 'Could not load dates');
-        const select = document.getElementById('historyDate');
-        select.innerHTML = (d.dates || []).map(day => `<option value="${day}">${day}</option>`).join('');
-        if (!d.dates || !d.dates.length) {
-            result.textContent = 'No historical sessions have been recorded yet.';
-            return;
-        }
-        await loadHistory();
-    } catch (e) {
-        result.textContent = 'Could not load history: ' + e.message;
-    }
-}
-
-async function loadHistory() {
-    const date = document.getElementById('historyDate').value;
-    const table = document.getElementById('historyTable').value;
-    const result = document.getElementById('historyResult');
-    const view = document.getElementById('historyTableView');
-    if (!date) return;
-    result.textContent = 'Loading...';
-    view.innerHTML = '';
-    try {
-        const r = await fetch(`/api/table/${table}?date=${encodeURIComponent(date)}&limit=1000`);
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || 'Could not load records');
-        result.textContent = `${d.n} record${d.n === 1 ? '' : 's'} in ${table.replaceAll('_', ' ')} for ${date}`;
-        if (!d.n) {
-            view.innerHTML = '<p class="history-meta">No records for this date.</p>';
-            return;
-        }
-        const headers = d.columns || [];
-        const headerHtml = headers.map(column => `<th>${historyText(column)}</th>`).join('');
-        const rowsHtml = d.rows.map(row => '<tr>' + headers.map(column => `<td>${historyText(row[column])}</td>`).join('') + '</tr>').join('');
-        view.innerHTML = `<table><tr>${headerHtml}</tr>${rowsHtml}</table>`;
-    } catch (e) {
-        result.textContent = 'Could not load history: ' + e.message;
-    }
-}
-
-function historyText(value) {
-    if (value === null || value === undefined) return '—';
-    return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-}
-</script>
-</body></html>"""
 
 # Arby the desk mascot: a self-contained widget injected at the marker. It only
 # reads /api/status and never touches the run/loop logic above.
@@ -565,6 +183,8 @@ def dashboard():
 # ------------------------------------------------------------------------ API
 
 _PICK_BARS_CACHE: dict[tuple[str, str], tuple[float, list]] = {}
+_PICK_BARS_TTL_LIVE = 90          # seconds, while the session is trading
+_PICK_BARS_TTL_FINAL = 6 * 3600   # a finished session's bars never change
 
 
 def _pick_bars(picks: list, d) -> dict:
@@ -572,9 +192,22 @@ def _pick_bars(picks: list, d) -> dict:
 
     Returns {} on any failure so the mascot falls back to its synthetic trace.
     Cached for a short TTL so the 60s status poll doesn't re-hit the network.
+
+    Skips the fetch entirely before the 09:30 open (and on non-market days):
+    there are no bars to get, and asking anyway was the single largest source
+    of production errors -- yfinance's "possibly delisted; no price data found"
+    for today's picks, dozens of times every morning between the plan landing
+    and the open, each one a slow network miss on the status request path.
     """
     if not picks:
         return {}
+    from agent.util import is_market_day, market_close_et, now_et
+    from datetime import time as _dtime
+    now_dt = now_et()
+    if d == now_dt.date() and (not is_market_day(d) or now_dt.time() < _dtime(9, 31)):
+        return {}
+    final = d < now_dt.date() or now_dt.time() >= market_close_et(d)
+    ttl = _PICK_BARS_TTL_FINAL if final else _PICK_BARS_TTL_LIVE
     out: dict = {}
     now = time.monotonic()
     for p in picks[:3]:
@@ -583,13 +216,18 @@ def _pick_bars(picks: list, d) -> dict:
             continue
         key = (str(sym).upper(), d.isoformat())
         cached = _PICK_BARS_CACHE.get(key)
-        if cached and now - cached[0] < 90:
+        # An empty result is only trusted for the live TTL: it may have been a
+        # transient miss, and a finished session deserves another try.
+        if cached and now - cached[0] < (ttl if cached[1] else _PICK_BARS_TTL_LIVE):
             out[sym] = cached[1]
             continue
         bars: list = []
         try:
+            # MarketData: Alpaca first (window clamped to what the data plan
+            # permits), yfinance only as the fallback -- yfinance alone was
+            # returning "possibly delisted" for perfectly listed names.
             from agent import providers
-            rows = providers.yf_minute_bars(sym, d)
+            rows = providers.MarketData(load_config()).minute_bars(sym, d)
             # "v" rides along so the dashboard widget can overlay a real VWAP
             # line (agent/mascot.py computeVWAP) -- without it the chart would
             # only ever be able to draw candles, never the volume-weighted line.
@@ -633,9 +271,12 @@ def _runner_payload(con, d) -> dict:
                  "target_price": p[7], "thesis": p[8] or ""}
                 for p in picks
             ],
-            "rows": sorted(s["rows"],
-                           key=lambda x: (not x["selected"], x["rank"] or 99,
-                                          x["ticker"])),
+            # Rounded for transport only (display precision); the ledger keeps
+            # full precision. Hundreds of rows ride every status poll.
+            "rows": [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()}
+                     for r in sorted(s["rows"],
+                                     key=lambda x: (not x["selected"], x["rank"] or 99,
+                                                    x["ticker"]))],
             # Same-day eyeball diagnostic, not a retuning signal -- one day's
             # top N out of hundreds of candidates is noise as training data.
             # The FDR-corrected, many-session version already lives in
@@ -664,11 +305,29 @@ def api_status():
         overall = ledger.overall_stats(con)
         by_setup = ledger.stats_by(con, "setup_type")
         streak = ledger.current_streak(con)
-        curve = ledger.equity_curve(con, cfg.get("account_size", 100000), cfg.get("dollars_per_r", 500))
+        # Each lane priced at its own $/R: the runner lane sizes at
+        # runner.dollars_per_r, and valuing its R at the morning rate
+        # overstated its P&L several-fold.
+        runner_dpr = (cfg.get("runner", {}) or {}).get("dollars_per_r")
+        curve = ledger.equity_curve(con, cfg.get("account_size", 100000),
+                                    cfg.get("dollars_per_r", 500),
+                                    runner_dollars_per_r=runner_dpr)
         runs = ledger.recent_runs(con, 15)
         playbook_text, version = read_playbook(con)
         equity = curve[-1]["equity"] if curve else cfg.get("account_size", 100000)
         streak_str = f"{streak['length']} {streak['kind']}" if streak.get("kind") not in (None, "none") else "—"
+        lanes = {}
+        for lane in ledger.LANES:
+            lane_streak = ledger.current_streak(con, lane=lane)
+            lanes[lane] = {
+                "overall": ledger.overall_stats(con, lane=lane),
+                "streak": (f"{lane_streak['length']} {lane_streak['kind']}"
+                           if lane_streak.get("kind") not in (None, "none") else "—"),
+                "drawdown": ledger.trailing_weighted_r(
+                    con, int(cfg.get("drawdown_window", 10)), lane=lane),
+            }
+        lock_cols = [c[0] for c in con.execute("DESCRIBE run_locks").fetchall()]
+        from agent import health
         return json_response({
             "today": d.isoformat(),
             "plan": plan_row["plan"] if plan_row else None,
@@ -681,6 +340,12 @@ def api_status():
                 (plan_row["plan"] or {}).get("picks", []) if plan_row else [], d
             ),
             "overall": overall,
+            # Per-lane record: the morning lane's streak/drawdown here are the
+            # exact numbers its mechanical risk rules read.
+            "lanes": lanes,
+            "drawdown_pause_r": float(cfg.get("drawdown_pause_r", -4.0)),
+            # Is every stage of the learning loop actually completing?
+            "loop_health": health.loop_health(con, cfg),
             # Runner lane: the whole session, so the dashboard can show what was
             # scanned, what was picked, and - critically - whether a thin
             # candidate list was the market or a broken feed.
@@ -703,13 +368,13 @@ def api_status():
             "playbook_bullets": dashboard_lib.playbook_bullets(playbook_text),
             "playbook_html": dashboard_lib.playbook_html(playbook_text),
             "runs": runs,
-            "run_locks": [dict(zip([c[0] for c in con.execute("DESCRIBE run_locks").fetchall()], row))
+            "run_locks": [dict(zip(lock_cols, row))
                          for row in con.execute(
                              "SELECT * FROM run_locks WHERE trading_date = ? ORDER BY run_type", [d]
                          ).fetchall()],
             "playbook": playbook_text,
             "playbook_version": version,
-        })
+        }, compact=True)
     except Exception as e:  # noqa: BLE001
         return json_response({"error": str(e), "trace": traceback.format_exc()}, 500)
     finally:
@@ -789,7 +454,15 @@ _QUERYABLE_TABLES = {
     "runner_candidates": "session_date",
     "runner_candidate_outcomes": "session_date",
     "runner_sessions": "session_date",
+    "live_orders": "session_date",
+    # Not date-filterable, but ordered newest-first (see _TABLE_ORDER) so
+    # ?limit=N returns the latest: a lost weekly rewrite is recovered from
+    # llm_archive, and every playbook the miner ever wrote is in
+    # playbook_versions.
+    "llm_archive": None,
+    "playbook_versions": None,
 }
+_TABLE_ORDER = {"llm_archive": "saved_at", "playbook_versions": "version"}
 
 
 @app.route("/api/table")
@@ -837,8 +510,9 @@ def api_table(name: str):
         sql = f"SELECT * FROM {name}"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        if date_col:
-            sql += f" ORDER BY {date_col} DESC"
+        order_col = date_col or _TABLE_ORDER.get(name)  # trusted constants only
+        if order_col:
+            sql += f" ORDER BY {order_col} DESC"
         sql += f" LIMIT {limit}"
         rows = con.execute(sql, params).fetchall()
         return json_response({"table": name, "columns": cols, "n": len(rows),
@@ -852,6 +526,15 @@ def api_table(name: str):
 # ------------------------------------------------------------------ run loops
 
 _VALID_LOOPS = {"morning", "evening", "weekly", "runner"}
+
+
+def _weekly_run_date():
+    """The session a weekly mining run is filed under: today on a market day,
+    otherwise the most recent session. A Saturday run therefore records the
+    same Friday week_ending the Friday-evening chained run used to."""
+    from agent.util import is_market_day, prev_market_day
+    today = today_et()
+    return today if is_market_day(today) else prev_market_day(today)
 
 
 def _execute_loop(loop_name: str, cfg, force: bool) -> dict:
@@ -877,7 +560,7 @@ def _execute_loop(loop_name: str, cfg, force: bool) -> dict:
                 print(json.dumps(result, indent=2, default=str))
             else:
                 from agent.loops import weekly
-                weekly.run(cfg)
+                weekly.run(cfg, run_date=_weekly_run_date())
     except Exception as e:  # noqa: BLE001
         error = f"{type(e).__name__}: {e}"
         buf.write(f"\n\n{traceback.format_exc()}")
@@ -917,22 +600,38 @@ def run_loop(loop_name: str):
 # 2026-09-18). A "*/5 13-20 * * 1-5" expression IS rejected, with the explicit
 # reason that it "would run more than once per day".
 #
-# There is still no separate weekly cron: the evening cron runs the weekly miner
-# after Friday's grading session, which is equivalent (all of the week's data is
-# graded by then).
+# The weekly miner has its OWN cron (Saturday). It used to run chained after
+# Friday's evening grading inside the same request -- one 300s function budget
+# for a full grading pass plus the single most expensive call this system
+# makes (Opus + thinking over the whole ledger). A run killed at the budget
+# never reaches its except-block: the week's playbook rewrite is lost and the
+# lock is left 'in_progress'. A separate invocation gives the miner a whole
+# budget of its own.
 #
-# Cron schedules are fixed UTC with no DST awareness, so we sanity-check the
-# current ET hour before spending API money. Windows are wide enough to accept
-# the one-hour EST/EDT drift (morning fires 5:45 ET in winter, 6:45 in summer).
-# runner fires at 14:30 UTC = 10:30 ET (EDT) / 09:30 ET (EST). The window
-# spans both so the DST drift does not silently skip the decision tick.
-_CRON_WINDOWS = {"morning": (5, 10), "evening": (15, 19), "runner": (9, 12)}
+# Cron schedules are fixed UTC with no DST awareness, and on the Hobby plan a
+# job fires at its scheduled minute PLUS a fixed offset of up to ~59 minutes
+# (observed: "45 10" fires ~11:11 UTC, "30 14" fires ~15:18 UTC). So we
+# sanity-check the current ET hour before spending API money. Windows are wide
+# enough to accept the one-hour EST/EDT drift (morning fires ~7:11 ET in
+# summer, ~6:11 in winter).
+#
+# runner: "30 14" lands ~11:18 ET in summer but ~10:18 ET in winter -- BEFORE
+# scan_start_et (10:20) and the 10:30 decision time, which would stand the
+# lane down every day from November to March. "runner-late" ("30 15") lands
+# 11:30-12:29 ET in summer and 10:30-11:29 in winter, so every season has at
+# least one tick inside the scan window and past the decision time. Two ticks
+# are safe by construction: candidates dedupe per session and selection is
+# claimed once per session in the database.
+_CRON_WINDOWS = {"morning": (5, 10), "evening": (15, 19), "runner": (9, 12),
+                 "runner-late": (9, 12), "weekly": (6, 14)}
+_CRON_LOOP = {"morning": "morning", "evening": "evening", "runner": "runner",
+              "runner-late": "runner", "weekly": "weekly"}
 
 
 @app.route("/cron/<loop_name>", methods=["GET"])
 @login_required
 def cron_loop(loop_name: str):
-    if loop_name not in ("morning", "evening", "runner"):
+    if loop_name not in _CRON_LOOP:
         return json_response({"error": f"unknown cron loop '{loop_name}'"}, 400)
     if not _is_cron_request():
         return json_response({"error": "this endpoint is for Vercel Cron only"}, 403)
@@ -948,13 +647,8 @@ def cron_loop(loop_name: str):
         })
 
     cfg = load_config()
-    result = _execute_loop(loop_name, cfg, force=False)
-
-    # Friday evening doubles as the weekly mining session.
-    if loop_name == "evening" and now.weekday() == 4 and not result.get("error"):
-        weekly_result = _execute_loop("weekly", load_config(), force=False)
-        result["weekly"] = weekly_result
-
+    result = _execute_loop(_CRON_LOOP[loop_name], cfg, force=False)
+    result["cron"] = loop_name
     return json_response(result)
 
 

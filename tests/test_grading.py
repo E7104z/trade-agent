@@ -566,7 +566,11 @@ def test_valid_fill_far_from_plan_is_flagged_execution_anomaly_not_rejected():
     # breakout long: entry 100, stop 98 (planned risk 2.0). Price gaps to open
     # at 110 -- a real, valid fill (well clear of the stop) but 5R away from
     # the planned entry level, so the "thesis at 100" was never actually tested.
-    pick = _pick(direction="long", entry_type="breakout", entry=100.0, stop=98.0, target=104.0)
+    # The target sits above the fill: a fill already past its target is a
+    # different case (invalid_fill since sim_version 4 -- see
+    # tests/test_loop_hardening.py), and under the old semantics this very
+    # fixture with target=104 graded as a "target" exit at -0.5R.
+    pick = _pick(direction="long", entry_type="breakout", entry=100.0, stop=98.0, target=120.0)
     bars = [_bar(110.0, 112.0, 109.5, 111.0)]
     out = simulate_pick(pick, bars, None)
     assert out["triggered"] is True

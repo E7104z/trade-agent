@@ -324,7 +324,7 @@ def run_selection(cfg: Config, *, con, session_date: date,
     # Claimed BEFORE any branch that costs money or writes picks. The intraday
     # cron fires every five minutes and can retry or overlap; without this a
     # decision tick could pay for two calls and write two competing pick sets.
-    if not ledger.claim_runner_selection(con, session_date):
+    if not ledger.claim_runner_selection(con, session_date, at=at):
         return {"skipped": "selection already made for this session"}
 
     def _finish(reason: str, **extra) -> dict:

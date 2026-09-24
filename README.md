@@ -50,7 +50,7 @@ Then put your Anthropic API key in `credentials.json` (`anthropic_api_key`). Alp
 
 Live paper orders are an observation stream alongside the deterministic simulator. They are disabled by default. To enable them only after the verification checklist is complete, set `live_paper.enabled` and `live_paper.alpaca_paper` to `true` in [config.json](config.json), keep `trading_base` exactly `https://paper-api.alpaca.markets`, and provide paper-account credentials. Any other host or a missing explicit paper flag refuses placement. Breakout picks are recorded as simulator picks but are skipped for live placement until stop-entry plus OCO support is added.
 
-The intraday monitor is intentionally not in `vercel.json` because Vercel Hobby allows only two cron entries. The included route is `POST /cron/intraday-check`. A GitHub Actions scheduler can call it every five minutes:
+The intraday monitor is not in `vercel.json` because Vercel Hobby crons run at most once per day, and the monitor needs a tick every few minutes. The route is `POST /cron/intraday-check`. On each tick it records fills, cancels any entry still unfilled at its `time_stop`, closes positions at their `time_stop` (cancelling the bracket legs that hold the shares first), and flattens every open position at 15:55 ET so nothing is held overnight. Without a trigger none of that happens: the dashboard's Learning loop panel warns when live orders go unreconciled. A GitHub Actions scheduler can call it every five minutes (the shipped workflow has been failing at startup since 2026-09-09 due to an account-level Actions block; `scripts\intraday_cron.ps1` is the local stand-in):
 
 ```yaml
 on:
@@ -66,7 +66,19 @@ jobs:
                         "${{ secrets.TRADE_AGENT_URL }}/cron/intraday-check"
 ```
 
-Set `CRON_SECRET` in the Vercel project environment and create matching GitHub repository secrets `TRADE_AGENT_CRON_SECRET` and `TRADE_AGENT_URL` (the deployed HTTPS origin, without a trailing slash). The endpoint rejects missing or mismatched bearer tokens and independently skips weekends, holidays, and outside-hours calls. Keep the existing two Vercel cron entries unchanged.
+Set `CRON_SECRET` in the Vercel project environment and create matching GitHub repository secrets `TRADE_AGENT_CRON_SECRET` and `TRADE_AGENT_URL` (the deployed HTTPS origin, without a trailing slash). The endpoint rejects missing or mismatched bearer tokens and independently skips weekends, holidays, and outside-hours calls.
+
+### Hosted schedule (vercel.json, UTC)
+
+| Cron | Schedule | Fires (ET, summer / winter) | Job |
+|---|---|---|---|
+| `/cron/morning` | `45 10 * * 1-5` | ~7:11 / ~6:11 | premarket plan |
+| `/cron/runner` | `30 14 * * 1-5` | ~11:18 / ~10:18 | runner scan + selection |
+| `/cron/runner-late` | `30 15 * * 1-5` | 11:30–12:29 / 10:30–11:29 | second runner tick; the only in-window tick in winter |
+| `/cron/evening` | `30 20 * * 1-5` | ~17:xx / ~16:xx | grading, shadow ledger, lessons |
+| `/cron/weekly` | `0 14 * * 6` | Saturday morning | weekly mining + playbook rewrite (filed under Friday's session) |
+
+Hobby crons fire at the scheduled minute plus a fixed offset of up to ~59 minutes (the observed times are above). Each handler re-checks the ET hour and refuses to run outside its window. The weekly miner has its own invocation: it used to run chained after Friday's evening grading inside one 300-second function budget, where a timeout lost the week's playbook rewrite.
 
 Breakout picks have a separate `live_paper.breakout_two_step` gate. It defaults to `false`, so breakout picks remain simulator-only even when ordinary live paper orders are enabled. When deliberately testing this path, the monitor submits a plain stop entry, arms an OCO exit only after the entry fills, cancels unfilled entries at the time/flatten cutoff, and force-closes immediately if OCO arming fails. Keep this flag off until the two-step manual dry run and failsafe test in the execution spec have been observed in the paper account.
 
@@ -75,7 +87,7 @@ Breakout picks have a separate `live_paper.breakout_two_step` gate. It defaults 
 ```powershell
 .venv\Scripts\python run.py morning     # 6:45 AM ET — today's plan
 .venv\Scripts\python run.py evening     # 4:30 PM ET — grade + extract lessons
-.venv\Scripts\python run.py weekly      # Sunday — mine ledger, rewrite playbook
+.venv\Scripts\python run.py weekly      # weekend — mine ledger, rewrite playbook
 .venv\Scripts\python run.py status      # track record snapshot
 .venv\Scripts\python run.py dashboard   # regenerate reports/dashboard.html
 .venv\Scripts\python run.py regrade --from YYYY-MM-DD [--force]

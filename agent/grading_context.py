@@ -78,11 +78,18 @@ def build_grading_context(md: MarketData, con: Any, d: date,
     # print — against a stop derived from, say, a 10:20 EMA. The fill lands
     # below its own stop and the trade grades invalid_fill. Build the entry-time
     # map so those picks are simulated from when they could first be acted on.
+    #
+    # The cutoff is runner_scan.honest_entry_time: never before the scan tick
+    # that recorded the candidate or the selection decision that picked it --
+    # the same rule _grade_runner_candidates applies to the unselected field,
+    # so pick and field are priced from the same decision point.
     entry_after_map: dict[str, Any] = {}
     try:
-        from .runner_scan import earliest_entry_time
+        from .runner_scan import honest_entry_time
+        session = ledger.runner_session(con, d) or {}
         for c in ledger.runner_candidates_for_date(con, d):
-            cutoff = earliest_entry_time(c.get("first_pass_et"))
+            cutoff = honest_entry_time(c.get("first_pass_et"), c.get("scan_pass_et"),
+                                       session.get("selection_at"))
             if cutoff is not None:
                 entry_after_map[c["ticker"].upper()] = cutoff
     except Exception as e:

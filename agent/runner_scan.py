@@ -35,6 +35,7 @@ __all__ = [
     "market_hours_bars",
     "first_pass_index",
     "earliest_entry_time",
+    "honest_entry_time",
 ]
 
 # Bump on ANY change to detection semantics, exactly as `sim_version` works
@@ -123,11 +124,50 @@ DETECTION_BAR_MINUTES = 5
 
 
 def earliest_entry_time(first_pass_et):
-    """The first moment a detection could honestly have been acted on."""
+    """The close of the detection bar: the first moment the SIGNAL existed.
+
+    Not by itself an entry time -- see honest_entry_time, which also accounts
+    for when the system could first have seen and acted on that signal."""
     from datetime import timedelta
     if first_pass_et is None:
         return None
     return first_pass_et + timedelta(minutes=DETECTION_BAR_MINUTES)
+
+
+def _naive(ts):
+    return ts.replace(tzinfo=None) if getattr(ts, "tzinfo", None) is not None else ts
+
+
+def honest_entry_time(first_pass_et, scan_pass_et=None, selection_at=None):
+    """The first moment a runner candidate could actually have been entered.
+
+    The LATEST of:
+      - the detection bar's close (earliest_entry_time) -- the signal exists;
+      - scan_pass_et, the scan tick that first recorded the candidate -- the
+        system knows about it. first_pass_et is WALKED BACK up to 12 bars to
+        where conditions first held, and the pool only contains names whose
+        conditions still held at the tick, so entering at the walked-back bar
+        credits survivors with fills nobody could have taken (look-ahead);
+      - selection_at, for candidates that existed when the one-per-session
+        selection was made -- selected and unselected alike, so the
+        "did selection beat the field" comparison prices both sides at the
+        same decision point. Live runner orders go in at market at exactly
+        this moment.
+
+    All inputs are naive ET wall-clock (or tz-aware ET, normalized here).
+    Returns None when first_pass_et is None.
+    """
+    base = earliest_entry_time(_naive(first_pass_et)) if first_pass_et is not None else None
+    if base is None:
+        return None
+    cut = base
+    scan = _naive(scan_pass_et) if scan_pass_et is not None else None
+    sel = _naive(selection_at) if selection_at is not None else None
+    if scan is not None and scan > cut:
+        cut = scan
+    if sel is not None and (scan is None or scan <= sel) and sel > cut:
+        cut = sel
+    return cut
 
 
 def _fixed(x: float, digits: int) -> str:

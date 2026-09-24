@@ -151,7 +151,12 @@ def playbook_html(markdown: str) -> str:
 
 def best_edge(setup_stats: list[dict]) -> str:
     """Deterministic "current best edge": the setup with the best realized avg R
-    over at least 3 triggered trades. The LLM never derives this number."""
+    over at least 3 triggered trades. The LLM never derives this number.
+
+    Only a POSITIVE average is an edge. When the best setup still loses money
+    the honest statement is "no positive edge yet" plus the least-bad
+    candidate -- the same rule weekly._check_best_edge enforces on the
+    playbook. Printing "best edge: -0.41R" in green read as a finding."""
     candidates = [
         s for s in setup_stats
         if (s.get("triggered") or 0) >= 3 and s.get("avg_r") is not None
@@ -159,7 +164,10 @@ def best_edge(setup_stats: list[dict]) -> str:
     if not candidates:
         return ""
     top = max(candidates, key=lambda s: s["avg_r"])
-    return f"{top['dim']} \u00b7 avg {top['avg_r']}R over {top['triggered']} triggered"
+    line = f"{top['dim']} \u00b7 avg {top['avg_r']}R over {top['triggered']} triggered"
+    if top["avg_r"] <= 0:
+        return f"No positive edge yet \u2014 least negative: {line}"
+    return line
 
 
 # ----------------------------------------------------------------- conclusions

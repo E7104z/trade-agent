@@ -10,6 +10,9 @@ Trade Agent CLI.
   python run.py regrade --from YYYY-MM-DD [--force]
                                            recompute outcomes under CURRENT sim
                                            semantics (explicit, never automatic)
+  python run.py regrade-runner --from YYYY-MM-DD [--force]
+                                           re-price runner candidates under the
+                                           CURRENT entry rule (explicit, opt-in)
   python run.py research [--full]         research-integrity report: selection
                                            ablation + population baseline
                                            (zero API cost, read-only)
@@ -168,6 +171,50 @@ def cmd_regrade(cfg, args) -> None:
     con.close()
 
 
+def cmd_regrade_runner(cfg, args) -> None:
+    """Re-price every runner candidate for sessions on/after --from under the
+    CURRENT simulation semantics -- in particular the honest entry time
+    (runner_scan.honest_entry_time: never before the scan tick that recorded
+    the candidate or the selection decision). Rows graded before sim_version 4
+    entered at the walked-back detection bar, up to an hour before anything
+    could have acted on it, which flatters every runner R the weekly miner
+    reads. Explicit and opt-in, like `regrade`: never run automatically.
+    Selection stamps (selected/rank/pick_id) are preserved by the upsert.
+    Runner PICKS (setup dto_runner) are morning-style outcome rows -- re-grade
+    those with `regrade`.
+    """
+    from agent.grading import CURRENT_SIM_VERSION
+    from agent.loops.evening import _grade_runner_candidates
+    from agent.providers import MarketData
+
+    from_date = parse_date(args.from_date)
+    con = ledger.connect()
+    rows = con.execute(
+        """SELECT session_date, COUNT(*) FROM runner_candidates
+           WHERE session_date >= ? GROUP BY session_date ORDER BY session_date""",
+        [from_date]).fetchall()
+    total = sum(int(r[1]) for r in rows)
+    if not rows:
+        log("regrade", f"No runner candidates on/after {from_date} -- nothing to do")
+        con.close()
+        return
+    if total > 500 and not args.force:
+        log("regrade", f"Refusing: this would re-price {total} runner candidate rows "
+                       f"across {len(rows)} session(s) (>500). Re-run with --force.")
+        con.close()
+        sys.exit(1)
+    md = MarketData(cfg)
+    for d, n in rows:
+        tickers = ledger.runner_candidate_tickers(con, d)
+        md.prefetch_session(tickers, d, daily=False)
+        summary = _grade_runner_candidates(con, md, d, cfg)
+        log("regrade", f"{d}: re-priced {summary['scored']}/{n} candidate(s), "
+                       f"mean R {summary.get('mean_r')}")
+    log("regrade", f"Re-priced {total} runner candidate row(s) from {from_date} onward "
+                   f"under sim_version={CURRENT_SIM_VERSION}")
+    con.close()
+
+
 def cmd_runner(cfg, args) -> None:
     """One intraday Runner tick (or a loop of them) from this machine.
 
@@ -288,6 +335,14 @@ def main() -> None:
     p_regrade.add_argument("--from", dest="from_date", required=True, help="YYYY-MM-DD -- recompute picks on/after this date")
     p_regrade.add_argument("--force", action="store_true", help="required if this would rewrite more than 50 rows")
 
+    p_rregrade = sub.add_parser(
+        "regrade-runner",
+        help="re-price runner candidates under the current (honest) entry rule (explicit, opt-in)")
+    p_rregrade.add_argument("--from", dest="from_date", required=True,
+                            help="YYYY-MM-DD -- re-price sessions on/after this date")
+    p_rregrade.add_argument("--force", action="store_true",
+                            help="required if this would re-price more than 500 rows")
+
     p_runner = sub.add_parser(
         "runner",
         help="run one intraday Runner scan tick (scan -> select -> place)")
@@ -330,6 +385,8 @@ def main() -> None:
         cmd_dashboard(cfg, args)
     elif args.cmd == "regrade":
         cmd_regrade(cfg, args)
+    elif args.cmd == "regrade-runner":
+        cmd_regrade_runner(cfg, args)
     elif args.cmd == "research":
         cmd_research(cfg, args)
     elif args.cmd == "morning":

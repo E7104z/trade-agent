@@ -203,6 +203,7 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
     summary = {"scored": 0, "triggered": 0, "sum_r": 0.0, "no_bars": 0, "skipped": 0}
     if not candidates:
         return summary
+    selection_at = (ledger.runner_session(con, d) or {}).get("selection_at")
 
     slippage = float(cfg.get("slippage_bps", 0) or 0)
     flatten_at = cfg.get("flatten_at")
@@ -245,18 +246,22 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
 
         first_pass = c.get("first_pass_et")
         entry_bars = bars
+        cutoff = None
         if bars and first_pass is not None:
             fp = first_pass if isinstance(first_pass, datetime) else None
             if fp is not None:
                 # Compare on naive ET wall-clock: first_pass_et is stored
                 # without a tzinfo, while provider bars carry one.
                 #
-                # The cutoff is the detection BAR'S CLOSE, not its open. A
-                # first_pass_et of 10:20 labels the 5-minute bar running to
-                # 10:25, so the signal is not knowable until 10:25; entering
-                # at 10:21 traded four minutes that had not happened yet.
-                from ..runner_scan import earliest_entry_time
-                cutoff = earliest_entry_time(fp).replace(tzinfo=None)
+                # The cutoff is never earlier than the detection BAR'S CLOSE
+                # (a first_pass_et of 10:20 labels the 5-minute bar running to
+                # 10:25, so the signal is not knowable until 10:25), and never
+                # earlier than the scan tick that first saw the candidate or
+                # the selection decision -- first_pass_et is walked back up to
+                # an hour, and entering there credits survivors with fills
+                # nobody could have taken. See runner_scan.honest_entry_time.
+                from ..runner_scan import honest_entry_time
+                cutoff = honest_entry_time(fp, c.get("scan_pass_et"), selection_at)
                 entry_bars = [b for b in bars
                               if b["t"].replace(tzinfo=None) >= cutoff]
 
@@ -266,6 +271,7 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
                 "session_date": d, "ticker": ticker, "eval_date": d,
                 "triggered": False, "exit_reason": "no_data",
                 "sim_version": CURRENT_SIM_VERSION,
+                "entry_after_et": cutoff,
                 "atr14": atr_map.get(ticker),
                 "stop_dist_atr": _stop_dist_atr(c, atr_map.get(ticker)),
                 "trend_side_200d": _trend_side(trend_map.get(ticker)),
@@ -293,6 +299,7 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
             "mae_r": sim.get("mae_r"),
             "eod_r": sim.get("eod_r"),
             "sim_version": sim.get("sim_version"),
+            "entry_after_et": cutoff,
             "atr14": sim.get("atr14"),
             "stop_dist_atr": sim.get("stop_dist_atr"),
             "trend_side_200d": sim.get("trend_side_200d"),
@@ -572,6 +579,58 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
     return counts
 
 
+def _prefetch_grading_bars(con, md: MarketData, d: date, picks: list[dict],
+                           runner_enabled: bool) -> None:
+    """Warm MarketData's bar memo for every symbol this run will grade.
+
+    The graders below each fetch the same session's bars symbol by symbol --
+    picks, the shadow ledger, the paired challenger arm and every runner
+    candidate -- and on a runner-heavy day that sequential walk alone
+    exceeded the 300s serverless budget, killing the run before the grading
+    call, the lessons, or the calibration rows were ever written. One
+    concurrent prefetch through the SAME fetch functions makes every later
+    call a memo hit returning identical data. Best effort: anything missed is
+    fetched on demand exactly as before.
+    """
+    prefetch = getattr(md, "prefetch_session", None)
+    if prefetch is None:
+        return
+
+    def _q(sql: str) -> set[str]:
+        try:
+            return {str(r[0]).upper() for r in con.execute(sql, [d]).fetchall() if r[0]}
+        except Exception:
+            return set()
+
+    try:
+        # Each consumer group gets exactly the bars it reads:
+        #   picks      minute + session daily + previous-session daily
+        #              (grade_day, stress ladder, grading context, Q4)
+        #   arm B      minute + session daily (grade_paired_arms)
+        #   shadow +   minute only (simulated with daily=None)
+        #   runner
+        #   population session daily only (grade_population)
+        pick_syms = {str(p["ticker"]).upper() for p in picks}
+        paired = _q("""SELECT DISTINCT ticker FROM paired_arm_picks
+                       WHERE plan_date = ? AND arm <> 'A' AND graded_at IS NULL""") - pick_syms
+        minute_only = {str(r["ticker"]).upper() for r in ledger.ungraded_rejections(con, d)}
+        if runner_enabled:
+            minute_only |= {str(t).upper() for t in ledger.runner_candidate_tickers(con, d)}
+        minute_only -= pick_syms | paired
+        pop = _q("SELECT symbol FROM population_universe WHERE plan_date = ?") \
+            - pick_syms - paired - minute_only
+        if pick_syms:
+            prefetch(sorted(pick_syms), d)
+        if paired:
+            prefetch(sorted(paired), d, include_prev_daily=False)
+        if minute_only:
+            prefetch(sorted(minute_only), d, daily=False)
+        if pop:
+            prefetch(sorted(pop), d, minute=False, include_prev_daily=False)
+    except Exception as e:  # noqa: BLE001 -- an optimization must never fail a run
+        log("evening", f"WARN bar prefetch failed ({e}) -- grading fetches on demand")
+
+
 def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
     d = run_date or today_et()
     started = now_et().replace(tzinfo=None)
@@ -628,6 +687,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
 
         picks = ledger.picks_for_date(con, d)
         md = MarketData(cfg)
+        _prefetch_grading_bars(con, md, d, picks, runner_enabled)
         slippage = float(cfg.get("slippage_bps", 5))
         flatten_at = cfg.get("flatten_at")
         min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)

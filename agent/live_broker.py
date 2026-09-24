@@ -39,6 +39,10 @@ def _request(method: str, path: str, *, cfg: Config | None = None,
     try:
         response = requests.request(method, url, headers=headers, json=payload, timeout=15)
         response.raise_for_status()
+        # DELETE /v2/orders/{id} answers 204 No Content on success. Parsing
+        # that body raised, so every successful cancel read as a failure.
+        if getattr(response, "status_code", 200) == 204 or not getattr(response, "content", b"x"):
+            return {}
         return response.json()
     except Exception as exc:
         _LOG.warning("Alpaca paper API failure for %s %s: %s", method, path, exc)

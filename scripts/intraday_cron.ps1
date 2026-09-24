@@ -28,8 +28,11 @@
 # Optional:
 #   -BaseUrl        default https://iwilltrade.com
 #   -IntervalSec    default 300 (5 minutes)
-#   -StartEt/-EndEt default 09:40 / 15:05 ET, a few minutes either side of the
-#                   scan window so the first and last ticks are not clipped
+#   -StartEt/-EndEt default 09:40 / 15:59 ET. The end runs to the close, not
+#                   just the 15:00 scan window: the live monitor flattens any
+#                   open paper position at 15:55 ET (bracket legs are day
+#                   orders and expire at the close, which would otherwise
+#                   leave the position open overnight)
 #   -Once           fire a single request and exit (use this to test the secret)
 #
 # The server re-checks market day, holiday and the scan window on every call,
@@ -40,7 +43,7 @@ param(
     [string]$BaseUrl     = "https://iwilltrade.com",
     [int]   $IntervalSec = 300,
     [string]$StartEt     = "09:40",
-    [string]$EndEt       = "15:05",
+    [string]$EndEt       = "15:59",
     [switch]$Once
 )
 

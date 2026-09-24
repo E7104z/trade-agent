@@ -23,6 +23,14 @@
     {
       "path": "/cron/runner",
       "schedule": "30 14 * * 1-5"
+    },
+    {
+      "path": "/cron/runner-late",
+      "schedule": "30 15 * * 1-5"
+    },
+    {
+      "path": "/cron/weekly",
+      "schedule": "0 14 * * 6"
     }
   ]
 }

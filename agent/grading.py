@@ -9,6 +9,15 @@ Simulation rules (documented, conservative):
                  gaps through favorably); short mirrored via bar.high
     breakout  -> long fills when bar.high >= entry (stop-order semantics);
                  short mirrored via bar.low
+    A limit/breakout entry that has not filled by the pick's time_stop (or the
+    flatten cutoff, whichever is earlier) is CANCELLED: no bar at or after that
+    cutoff may fill it (sim_version 4). The plan's "by 11:00" is the window the
+    trade exists in, and the live monitor cancels unfilled entries at the same
+    cutoff; before v4 the simulator filled such entries anyway and then exited
+    them on the fill bar's close as a "time_stop" -- a trade that never existed,
+    counted as triggered. The untriggered pick is tagged
+    time_stop_expired_pretrigger when price reached the trigger only after the
+    cutoff. `open` entries fill at bars[0] unconditionally, as before.
   Exits, evaluated per bar AFTER the fill (and in the fill bar itself), in this
   conservative priority order — a bar that satisfies more than one of these
   is resolved by whichever comes FIRST in this list, not by price magnitude:
@@ -42,7 +51,9 @@ Simulation rules (documented, conservative):
   not a trade, it's a data artifact of the entry_type being mismatched to how
   the level was meant to be approached. Such fills are hard-rejected before any
   risk math: triggered stays False, exit_reason is "invalid_fill", and nothing
-  is graded. A softer case -- fill lands on the correct side of the stop but far
+  is graded. The mirror case -- a fill already at or past the TARGET, so the
+  plan has no reward left -- is invalid_fill too (v4); before, the exit walk
+  booked it as an immediate "target" exit at a loss. A softer case -- fill lands on the correct side of the stop but far
   from the planned entry -- still grades normally but is flagged
   execution_anomaly so the evening grader doesn't narrate a thesis test that
   never actually happened at the intended level.
@@ -91,7 +102,13 @@ _CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 # v3 = fills on the wrong side of their own stop are rejected as
 # "invalid_fill" instead of being graded through the risk floor, and
 # surviving fills far from the planned entry are flagged execution_anomaly.
-CURRENT_SIM_VERSION = 3
+# v4 = a limit/breakout entry cannot fill at or after the pick's time_stop /
+# flatten cutoff (the order is cancelled there, as the live monitor does);
+# a fill already at/past the target is invalid_fill (no reward left -- it was
+# booked as a "target" exit at a loss); runner candidates enter no earlier
+# than the scan tick / selection decision that could actually act on them
+# (see runner_scan.honest_entry_time).
+CURRENT_SIM_VERSION = 4
 
 
 def _risk_per_share(entry: float, stop: float) -> float:
@@ -493,6 +510,21 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                 out[key] = round((sess_open - sb[idx]["c"]) / gap, 3)
         out["gap_fill_frac_close"] = round((sess_open - sb[-1]["c"]) / gap, 3)
 
+    # ---- entry cutoff (sim_version 4) ------------------------------------
+    # The earliest of time_stop and flatten_at, clamped against the session
+    # close exactly as the exit walk clamps them. A resting limit/breakout
+    # order is cancelled at this bar: nothing at or after it may fill.
+    entry_cutoff_idx = None
+    for raw in (pick.get("time_stop"), flatten_at):
+        if not raw:
+            continue
+        parsed = _parse_clock(raw)
+        if parsed is None or parsed >= close_t:
+            continue
+        idx = _clock_to_bar_index(parsed, bars)
+        if idx is not None:
+            entry_cutoff_idx = idx if entry_cutoff_idx is None else min(entry_cutoff_idx, idx)
+
     # ---- find fill -------------------------------------------------------
     fill_price = None
     fill_idx = None
@@ -501,6 +533,8 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         fill_idx = 0
     else:
         for i, b in enumerate(bars):
+            if entry_cutoff_idx is not None and i >= entry_cutoff_idx:
+                break  # order cancelled at the cutoff -- see sim_version 4
             if _is_thin(b, min_bar_volume):
                 continue  # thin-bar filter: don't trust a quiet bar to trigger entry
             if entry_type == "limit":
@@ -531,20 +565,11 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         # without us; it cannot distinguish "the market never offered this
         # setup" from "the setup arrived and our entry mechanic was too
         # narrow". Only the second is a rule defect, and only the second
-        # would ever justify loosening an entry condition.
-        cutoff_idx = None
-        for raw in (pick.get("time_stop"), flatten_at):
-            if not raw:
-                continue
-            parsed = _parse_clock(raw)
-            if parsed is None or parsed >= close_t:
-                continue
-            idx = _clock_to_bar_index(parsed, bars)
-            if idx is not None:
-                cutoff_idx = idx if cutoff_idx is None else min(cutoff_idx, idx)
+        # would ever justify loosening an entry condition. The cutoff is the
+        # same one the fill search above honored.
         reason, note, gap_r = classify_untriggered(
             bars, entry, risk, long, entry_type,
-            cutoff_idx=cutoff_idx, min_bar_volume=min_bar_volume)
+            cutoff_idx=entry_cutoff_idx, min_bar_volume=min_bar_volume)
         out["untriggered_reason"] = reason
         out["untriggered_note"] = note
         out["trigger_gap_r"] = gap_r
@@ -571,6 +596,23 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         out["invalid_fill_detail"] = (
             f"{'long' if long else 'short'} fill {fill_price:.4f} landed on the wrong side of "
             f"stop {stop:.4f} (planned entry {entry:.4f}, type {entry_type}) -- not a real trade"
+        )
+        log("grade", f"pick {pick.get('pick_id')}: INVALID FILL -- {out['invalid_fill_detail']}")
+        return out
+    # ...and the mirror case (sim_version 4): a fill already AT or PAST the
+    # target leaves no reward in the plan. The exit walk would book it as an
+    # immediate "target" exit at a LOSS (selling below the price just paid),
+    # and a live bracket with a take-profit on the wrong side of the market is
+    # rejected by the broker -- so it is not a trade either. Seen when an open
+    # entry gaps over its target, or when a runner candidate had already run
+    # past its target before anything could act on it.
+    if (long and fill_price >= target) or (not long and fill_price <= target):
+        out["entry_fill"] = round(fill_price, 4)
+        out["exit_reason"] = "invalid_fill"
+        out["invalid_fill_detail"] = (
+            f"{'long' if long else 'short'} fill {fill_price:.4f} is already at/past "
+            f"target {target:.4f} (planned entry {entry:.4f}, type {entry_type}) -- "
+            f"no reward left in the plan; not a real trade"
         )
         log("grade", f"pick {pick.get('pick_id')}: INVALID FILL -- {out['invalid_fill_detail']}")
         return out

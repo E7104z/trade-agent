@@ -1,7 +1,7 @@
 """Intraday synchronization for the optional live paper ledger."""
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 from . import ledger, live_broker
 from .config import Config
@@ -54,14 +54,93 @@ def _live_r(pick: dict, entry: float | None, exit_price: float | None) -> float 
     return (float(exit_price) - float(entry)) * direction / risk
 
 
-def _past_cutoff(pick: dict, live_cfg: dict, current: datetime) -> str | None:
+# This desk is intraday-only: the simulator exits every open position at the
+# session close ("eod"). Bracket legs are day orders -- they EXPIRE at the
+# close, and an unmanaged position then simply stays open overnight. The
+# monitor flattens this many minutes before the close so the live account
+# holds what the simulator holds.
+EOD_FLATTEN_MINUTES = 5
+
+# Alpaca order states that still hold shares / can still fill.
+_WORKING = {"new", "accepted", "held", "pending_new", "partially_filled",
+            "accepted_for_bidding", "pending_replace", "calculated"}
+
+
+def _past_cutoff(pick: dict, live_cfg: dict, current: datetime,
+                 close: time | None = None) -> str | None:
     stop_at = _time_stop(pick.get("time_stop"))
     flatten_at = _time_stop(live_cfg.get("flatten_at"))
     if stop_at and current.time() >= stop_at:
         return "time_stop"
     if flatten_at and current.time() >= flatten_at:
         return "flatten"
+    if close is not None:
+        eod_at = (datetime.combine(date.min, close)
+                  - timedelta(minutes=EOD_FLATTEN_MINUTES)).time()
+        if current.time() >= eod_at:
+            return "eod"
     return None
+
+
+def _cancel_working_legs(order: dict | None, cfg: Config) -> int:
+    """Cancel every still-working leg of a multi-leg order.
+
+    A filled bracket's take-profit and stop legs HOLD the position's shares,
+    so a plain close_position is rejected ("insufficient qty available") until
+    they are cancelled -- which is why time-stop exits on bracket orders never
+    actually closed anything."""
+    n = 0
+    for leg in (order or {}).get("legs") or []:
+        if str(leg.get("status", "")).lower() in _WORKING and leg.get("id"):
+            live_broker.cancel_order(str(leg["id"]), cfg=cfg)
+            n += 1
+    return n
+
+
+def _record_close(con, row: dict, pick: dict, reason: str, close_order: dict,
+                  live_entry: float | None) -> bool:
+    """Persist a flatten. Returns True when the row changed.
+
+    close_position returns the market order it submitted; Alpaca fills it a
+    moment later, so its response usually carries no fill price. In that case
+    the close order's id is kept and the row stays open (status
+    "closing:<reason>") until a later tick or the evening reconcile reads the
+    fill -- instead of stamping an exit with no price, which is what happened
+    before and left live_r permanently empty."""
+    exit_price, exit_at = _fill(close_order)
+    close_id = str(close_order["id"]) if close_order.get("id") else None
+    if exit_price is not None:
+        ledger.update_live_order(
+            con, row["live_order_id"], exit_reason=reason,
+            exit_fill_price=exit_price, exit_fill_at=exit_at,
+            live_r=_live_r(pick, live_entry, exit_price),
+            reconciled=True, status="closed", close_order_id=close_id)
+        return True
+    if close_id:
+        ledger.update_live_order(con, row["live_order_id"], close_order_id=close_id,
+                                 status=f"closing:{reason}")
+        return True
+    return False  # close rejected (e.g. legs still cancelling) -- retried next tick
+
+
+def _pending_close_reason(row: dict) -> str:
+    status = str(row.get("status") or "")
+    return status.split(":", 1)[1] if status.startswith("closing:") else "closed"
+
+
+def _settle_pending_close(con, row: dict, pick: dict, cfg: Config) -> bool:
+    """Read back the fill of an in-flight flatten order. True once settled."""
+    close_order = live_broker.get_order(str(row["close_order_id"]), cfg=cfg) or {}
+    exit_price, exit_at = _fill(close_order)
+    if exit_price is None:
+        return False
+    live_r = _live_r(pick, row.get("entry_fill_price"), exit_price)
+    ledger.update_live_order(
+        con, row["live_order_id"], exit_reason=_pending_close_reason(row),
+        exit_fill_price=exit_price, exit_fill_at=exit_at, live_r=live_r,
+        reconciled=True, status="closed")
+    row["live_r"] = live_r
+    return True
 
 
 def check(cfg: Config, *, run_date: date | None = None, at: datetime | None = None) -> dict:
@@ -83,6 +162,11 @@ def check(cfg: Config, *, run_date: date | None = None, at: datetime | None = No
         for row in ledger.live_orders_for_date(con, d, open_only=True):
             pick = picks.get(row.get("pick_id"))
             if not pick:
+                continue
+            if row.get("close_order_id"):
+                # A flatten is already in flight; only its fill is missing.
+                if _settle_pending_close(con, row, pick, cfg):
+                    updated += 1
                 continue
             order = live_broker.get_order(row["live_order_id"], cfg=cfg) or {}
             entry, entry_at = _fill(order)
@@ -119,7 +203,7 @@ def check(cfg: Config, *, run_date: date | None = None, at: datetime | None = No
                         updated += 1
                         continue
 
-                    cutoff = _past_cutoff(pick, {**live_cfg, "flatten_at": live_cfg.get("flatten_at") or cfg.get("flatten_at")}, current)
+                    cutoff = _past_cutoff(pick, {**live_cfg, "flatten_at": live_cfg.get("flatten_at") or cfg.get("flatten_at")}, current, close)
                     if cutoff:
                         live_broker.cancel_order(row["live_order_id"], cfg=cfg)
                         ledger.update_live_order(con, row["live_order_id"],
@@ -140,30 +224,39 @@ def check(cfg: Config, *, run_date: date | None = None, at: datetime | None = No
                     updated += 1
                     continue
 
-                cutoff = _past_cutoff(pick, {**live_cfg, "flatten_at": live_cfg.get("flatten_at") or cfg.get("flatten_at")}, current)
+                cutoff = _past_cutoff(pick, {**live_cfg, "flatten_at": live_cfg.get("flatten_at") or cfg.get("flatten_at")}, current, close)
                 if cutoff:
                     live_broker.cancel_order(str(oco_id), cfg=cfg)
+                    _cancel_working_legs(oco_order, cfg)
                     close_order = live_broker.close_position(row["ticker"], cfg=cfg) or {}
-                    exit_price, exit_at = _fill(close_order)
-                    live_r = _live_r(pick, live_entry, exit_price)
-                    ledger.update_live_order(
-                        con, row["live_order_id"], exit_reason=cutoff,
-                        exit_fill_price=exit_price, exit_fill_at=exit_at, live_r=live_r,
-                        reconciled=True, status="closed")
-                    updated += 1
+                    if _record_close(con, row, pick, cutoff, close_order, live_entry):
+                        updated += 1
                 continue
 
             reason, exit_price, exit_at = _exit_from_order(order)
             if reason is None:
-                stop_at = _time_stop(pick.get("time_stop"))
-                flatten_at = _time_stop(live_cfg.get("flatten_at") or cfg.get("flatten_at"))
-                if stop_at and current.time() >= stop_at:
-                    reason = "time_stop"
-                elif flatten_at and current.time() >= flatten_at:
-                    reason = "flatten"
-                if reason:
-                    close_order = live_broker.close_position(row["ticker"], cfg=cfg) or {}
-                    exit_price, exit_at = _fill(close_order)
+                cutoff = _past_cutoff(
+                    pick, {**live_cfg, "flatten_at": live_cfg.get("flatten_at") or cfg.get("flatten_at")},
+                    current, close)
+                if cutoff:
+                    live_entry = entry if entry is not None else row.get("entry_fill_price")
+                    if live_entry is None and str(order.get("status", "")).lower() in _WORKING:
+                        # The entry never filled inside its window: cancel the
+                        # whole bracket (its legs go with the parent) rather
+                        # than let it fill after the plan expired -- the same
+                        # cutoff the simulator applies (sim_version 4).
+                        live_broker.cancel_order(row["live_order_id"], cfg=cfg)
+                        ledger.update_live_order(con, row["live_order_id"],
+                                                 exit_reason="cancelled_unfilled",
+                                                 reconciled=True, status="canceled")
+                        updated += 1
+                        continue
+                    if live_entry is not None:
+                        _cancel_working_legs(order, cfg)
+                        close_order = live_broker.close_position(row["ticker"], cfg=cfg) or {}
+                        if _record_close(con, row, pick, cutoff, close_order, live_entry):
+                            updated += 1
+                        continue
             if reason and exit_price is not None:
                 live_r = _live_r(pick, entry or row.get("entry_fill_price"), exit_price)
                 ledger.update_live_order(
@@ -188,6 +281,14 @@ def reconcile_evening(con, cfg: Config, d: date) -> dict:
     divergence = []
     count = 0
     for row in ledger.live_orders_for_date(con, d):
+        if row.get("live_r") is None and row.get("close_order_id"):
+            if _settle_pending_close(con, row, picks.get(row.get("pick_id"), {}), cfg):
+                ledger.set_live_r(con, row["pick_id"], row["live_r"])
+                sim_r = outcomes.get(row["pick_id"], (None, None))[1]
+                if sim_r is not None and row["live_r"] is not None:
+                    divergence.append(abs(row["live_r"] - sim_r))
+                count += 1
+            continue
         if row.get("live_r") is not None:
             ledger.set_live_r(con, row["pick_id"], row["live_r"])
             sim_r = outcomes.get(row["pick_id"], (None, None))[1]

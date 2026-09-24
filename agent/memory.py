@@ -167,9 +167,12 @@ def _regime_block(regimes: list[dict]) -> str:
 
 
 def _self_awareness(con: duckdb.DuckDBPyConnection, cfg: Config | None = None) -> str:
-    streak = ledger.current_streak(con)
-    overall = ledger.overall_stats(con)
-    setup_stats = ledger.stats_by(con, "setup_type")
+    # Everything here is the MORNING lane's own record: these lines tell the
+    # analyst/risk manager how THEY are doing, and the streak/drawdown lines
+    # mirror rules _validate_plan enforces on the same lane-scoped numbers.
+    streak = ledger.current_streak(con, lane="morning")
+    overall = ledger.overall_stats(con, lane="morning")
+    setup_stats = ledger.stats_by(con, "setup_type", lane="morning")
 
     lines = []
     if overall["picks_graded"] == 0:
@@ -194,7 +197,7 @@ def _self_awareness(con: duckdb.DuckDBPyConnection, cfg: Config | None = None) -
         )
     dd_window = int(cfg.get("drawdown_window", 10)) if cfg else 10
     dd_pause = float(cfg.get("drawdown_pause_r", -4.0)) if cfg else -4.0
-    dd = ledger.trailing_weighted_r(con, dd_window)
+    dd = ledger.trailing_weighted_r(con, dd_window, lane="morning")
     if dd["n"] >= 5 and dd["sum_weighted_r"] <= dd_pause:
         lines.append(
             f"- CAPITAL PRESERVATION MODE IS ACTIVE: your last {dd['n']} triggered trades sum to "
@@ -221,11 +224,14 @@ def build_morning_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
     """Returns {'text': <markdown block>, 'playbook_version': str}."""
     playbook, version = read_playbook(con)
     mem_cfg = cfg.memory_cfg
-    trades = ledger.recent_trades(con, mem_cfg["recent_trades_in_context"])
+    # Morning-lane scoped: the intraday runner lane trades a different
+    # strategy at a different size, and its up-to-10-a-day picks would
+    # otherwise crowd this lane's own trades out of the last-N table.
+    trades = ledger.recent_trades(con, mem_cfg["recent_trades_in_context"], lane="morning")
     lessons = ledger.active_lessons(con, mem_cfg["max_active_lessons_in_context"])
     regimes = ledger.recent_regimes(con, 5)
-    setup_stats = ledger.stats_by(con, "setup_type")
-    direction_stats = ledger.stats_by(con, "direction")
+    setup_stats = ledger.stats_by(con, "setup_type", lane="morning")
+    direction_stats = ledger.stats_by(con, "direction", lane="morning")
 
     text = f"""## YOUR PLAYBOOK (v{version} — your accumulated, evidence-backed rules)
 
@@ -272,6 +278,8 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         "trades_csv": ledger.all_trades_csv(con),
         "sim_version_breakdown": ledger.sim_version_breakdown(con),
         "overall": ledger.overall_stats(con),
+        "overall_by_lane": {lane: ledger.overall_stats(con, lane=lane)
+                            for lane in ledger.LANES},
         "by_setup": ledger.stats_by(con, "setup_type"),
         "by_regime": ledger.stats_by(con, "regime_tag"),
         "by_conviction": ledger.stats_by(con, "conviction"),

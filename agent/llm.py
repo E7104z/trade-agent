@@ -5,6 +5,7 @@ with one self-repair retry, token/cost accounting, and mock mode for offline tes
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,7 +68,14 @@ def _archive_response(name: str, model: str, text: str, usage: dict) -> None:
     So the response lands on disk before any parsing, any validation, and any
     caller touches it. Best effort by construction: archiving must never be
     able to fail the call it is protecting.
+
+    Hosted (DATABASE_URL set) the repo directory is read-only, so the archive
+    goes to the llm_archive table instead -- otherwise production, where the
+    weekly rewrite actually runs, would have no archive at all.
     """
+    if os.environ.get("DATABASE_URL"):
+        _archive_to_db(name, model, text, usage)
+        return
     try:
         RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -76,6 +84,31 @@ def _archive_response(name: str, model: str, text: str, usage: dict) -> None:
             "prompt_name": name, "model": model, "saved_at": stamp,
             "usage": usage, "text": text,
         }, indent=2), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — never fail a call over its own backup
+        pass
+
+
+ARCHIVE_RETENTION_DAYS = 60
+
+
+def _archive_to_db(name: str, model: str, text: str, usage: dict) -> None:
+    try:
+        import uuid
+        from datetime import datetime
+        from . import ledger
+        con = ledger.connect()
+        try:
+            con.execute(
+                """INSERT INTO llm_archive
+                   (archive_id, saved_at, prompt_name, model, usage_json, text)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [uuid.uuid4().hex, datetime.now(), name, model,
+                 json.dumps(usage, default=str), text])
+            con.execute(
+                f"DELETE FROM llm_archive WHERE saved_at < current_timestamp "
+                f"- INTERVAL '{ARCHIVE_RETENTION_DAYS} days'")
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001 — never fail a call over its own backup
         pass
 

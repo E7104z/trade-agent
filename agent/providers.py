@@ -275,9 +275,21 @@ class Alpaca:
         data = self._get("/v1beta1/news", {"limit": limit, "sort": "desc"})
         return data.get("news", [])
 
+    # This account's SIP entitlement excludes the most recent 15 minutes: any
+    # window whose END reaches into them is refused outright (403 "subscription
+    # does not permit querying recent SIP data") -- not truncated. Every
+    # request window is clamped to end before that.
+    _SIP_RECENT_EXCLUSION = timedelta(minutes=16)
+
+    def _clamp_end(self, end: datetime) -> datetime:
+        latest = datetime.now(tz=ET) - self._SIP_RECENT_EXCLUSION
+        return end if end <= latest else latest
+
     def minute_bars(self, symbol: str, d: date) -> list[dict]:
         start = datetime.combine(d, dtime(9, 30), tzinfo=ET)
-        end = datetime.combine(d, dtime(16, 0), tzinfo=ET)
+        end = self._clamp_end(datetime.combine(d, dtime(16, 0), tzinfo=ET))
+        if end <= start:
+            return []
         params = {
             "timeframe": "1Min",
             "start": start.isoformat(),
@@ -294,19 +306,31 @@ class Alpaca:
         return bars
 
     def daily_bar(self, symbol: str, d: date) -> dict | None:
+        # Explicit ET datetimes, not bare dates: a bare end date reads as the
+        # END of that day, which for any recent session reaches into the
+        # excluded last 15 minutes and was refused with a 403 on EVERY call --
+        # so every daily bar silently fell back to yfinance (slow, and often
+        # "possibly delisted; no price data found"), nulling day_open/close.
+        start = datetime.combine(d, dtime(0, 0), tzinfo=ET)
+        end = self._clamp_end(datetime.combine(d + timedelta(days=1), dtime(0, 0), tzinfo=ET))
+        if end <= start:
+            return None
         params = {
             "timeframe": "1Day",
-            "start": d.isoformat(),
-            "end": (d + timedelta(days=1)).isoformat(),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
             "adjustment": "split",
             "feed": self.feed,
         }
         data = self._get(f"/v2/stocks/{symbol}/bars", params)
-        bars = data.get("bars", []) or []
-        if not bars:
-            return None
-        b = bars[0]
-        return {"open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"], "volume": b["v"]}
+        for b in data.get("bars", []) or []:
+            # The window can reach the NEXT day's bar (stamped at its ET
+            # midnight); only a bar for `d` itself is the answer -- on a
+            # holiday that is "no bar", never the following session's.
+            bar_day = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET).date()
+            if bar_day == d:
+                return {"open": b["o"], "high": b["h"], "low": b["l"], "close": b["c"], "volume": b["v"]}
+        return None
 
     def multi_bars(self, symbols: list[str], timeframe: str,
                    start: datetime, end: datetime, *,
@@ -577,6 +601,14 @@ def econ_upcoming(d: date, days: int = 3) -> list[dict]:
 
 # --------------------------------------------------------------- MarketData facade
 
+# Minutes after the close before a session's bars are treated as final and
+# memoized. The evening loop runs ~16:30 ET; anything earlier just refetches,
+# exactly as before the cache existed.
+_SESSION_FINAL_AFTER_MIN = 20
+_PREFETCH_WORKERS = 8
+_PREFETCH_DEADLINE = 150  # seconds; stragglers are simply fetched on demand later
+
+
 class MarketData:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -587,6 +619,102 @@ class MarketData:
         # both build one). None = not probed yet.
         self.feed_ok: bool | None = None
         self.feed_downgraded = False
+        # Per-instance memo of COMPLETED sessions' bars. The evening loop asks
+        # for the same symbol's minute bars from grade_day, the friction
+        # stress ladder, the Q1 gap-fade study, the shadow ledger and the
+        # paired-arm grader -- each one a sequential network round trip, which
+        # together pushed a runner-heavy evening past the 300s function budget
+        # (455-518s measured locally on 2026-09-21). A finished session's bars
+        # never change, so one fetch per (symbol, date) serves every consumer
+        # with identical data. Live sessions are never cached.
+        self._minute_cache: dict[tuple[str, date], list[dict]] = {}
+        self._daily_cache: dict[tuple[str, date], dict] = {}
+        self._cache_lock = __import__("threading").Lock()
+
+    @staticmethod
+    def _session_final(d: date) -> bool:
+        from .util import market_close_et
+        now = now_et()
+        if d < now.date():
+            return True
+        if d > now.date():
+            return False
+        final_at = datetime.combine(d, market_close_et(d), tzinfo=ET) + \
+            timedelta(minutes=_SESSION_FINAL_AFTER_MIN)
+        return now >= final_at
+
+    def prefetch_session(self, symbols: list[str], d: date,
+                         include_prev_daily: bool = True,
+                         minute: bool = True, daily: bool = True) -> dict:
+        """Warm the memo for every symbol a grading run will ask about.
+
+        Two passes:
+          1. Batched: Alpaca's multi-symbol bars endpoint with the SAME
+             parameters the per-symbol calls use (1Min raw 09:30-16:00 for
+             minute bars; 1Day split-adjusted for daily bars, matched to the
+             session by its ET date). Measured 2026-09-23: 275 symbols' minute
+             bars in 23s, bar-for-bar identical to the per-symbol endpoint,
+             versus ~1.5s per symbol sequentially.
+          2. Per-symbol, on a bounded pool, for anything the batch did not
+             return -- through the SAME minute_bars/daily_bar methods every
+             consumer calls, so the yfinance fallback applies exactly as it
+             would have.
+        A symbol that fails or misses the deadline is simply not cached and is
+        fetched on demand later, as before. No-op for a live session and in
+        offline mode (synthetic bars are already free)."""
+        syms = sorted({str(s).upper().strip() for s in symbols if s})
+        if not syms or self.cfg.offline or not self._session_final(d):
+            return {"symbols": len(syms), "prefetched": 0}
+        days = [d] + ([prev_market_day(d)] if (daily and include_prev_daily) else [])
+        t0 = time.monotonic()
+
+        if self.alpaca:
+            try:
+                if minute:
+                    start = datetime.combine(d, dtime(9, 30), tzinfo=ET)
+                    end = self.alpaca._clamp_end(datetime.combine(d, dtime(16, 0), tzinfo=ET))
+                    got = self.alpaca.multi_bars(syms, "1Min", start, end)
+                    with self._cache_lock:
+                        for s, bars in got.items():
+                            if bars:
+                                self._minute_cache[(s.upper(), d)] = bars
+                if daily:
+                    start = datetime.combine(min(days), dtime(0, 0), tzinfo=ET)
+                    end = self.alpaca._clamp_end(
+                        datetime.combine(d + timedelta(days=1), dtime(0, 0), tzinfo=ET))
+                    got = self.alpaca.multi_bars(syms, "1Day", start, end, adjustment="split")
+                    with self._cache_lock:
+                        for s, rows in got.items():
+                            for b in rows:
+                                bar_day = b["t"].astimezone(ET).date()
+                                if bar_day in days and (s.upper(), bar_day) not in self._daily_cache:
+                                    self._daily_cache[(s.upper(), bar_day)] = {
+                                        "open": b["o"], "high": b["h"], "low": b["l"],
+                                        "close": b["c"], "volume": b["v"]}
+            except Exception as e:  # noqa: BLE001 -- the per-symbol pass covers it
+                log("data", f"WARN batched prefetch failed ({e}); per-symbol fetch instead")
+
+        def _missing(sym: str) -> bool:
+            with self._cache_lock:
+                if minute and (sym, d) not in self._minute_cache:
+                    return True
+                return daily and any((sym, day) not in self._daily_cache for day in days)
+
+        def _one(sym: str) -> bool:
+            if minute:
+                self.minute_bars(sym, d)
+            if daily:
+                for day in days:
+                    self.daily_bar(sym, day)
+            return True
+
+        rest = [s for s in syms if _missing(s)]
+        if rest:
+            _bounded_map(rest, _one, workers=_PREFETCH_WORKERS, deadline=_PREFETCH_DEADLINE)
+        still = sum(1 for s in syms if _missing(s))
+        log("data", f"Prefetched bars for {len(syms) - still}/{len(syms)} symbol(s) "
+                    f"in {time.monotonic() - t0:.1f}s")
+        return {"symbols": len(syms), "prefetched": len(syms) - still}
 
     # ---- feed preflight -------------------------------------------------
     def _preflight_feed(self) -> None:
@@ -1203,6 +1331,24 @@ class MarketData:
     def minute_bars(self, symbol: str, d: date) -> list[dict]:
         if self.cfg.offline:
             return synthetic_minute_bars(symbol, d)
+        key = (str(symbol).upper(), d)
+        final = self._session_final(d)
+        if final:
+            with self._cache_lock:
+                hit = self._minute_cache.get(key)
+            if hit is not None:
+                return list(hit)
+        bars = self._fetch_minute_bars(symbol, d)
+        # Only a non-empty result is memoized: an empty one may be a transient
+        # provider failure, and every later caller retries it exactly as it
+        # would have without the cache.
+        if final and bars:
+            with self._cache_lock:
+                self._minute_cache[key] = bars
+            return list(bars)
+        return bars
+
+    def _fetch_minute_bars(self, symbol: str, d: date) -> list[dict]:
         if self.alpaca:
             try:
                 bars = self.alpaca.minute_bars(symbol, d)
@@ -1220,6 +1366,21 @@ class MarketData:
             return {"open": bars[0]["o"], "high": max(b["h"] for b in bars),
                     "low": min(b["l"] for b in bars), "close": bars[-1]["c"],
                     "volume": sum(b["v"] for b in bars)}
+        key = (str(symbol).upper(), d)
+        final = self._session_final(d)
+        if final:
+            with self._cache_lock:
+                hit = self._daily_cache.get(key)
+            if hit is not None:
+                return dict(hit)
+        bar = self._fetch_daily_bar(symbol, d)
+        if final and bar:
+            with self._cache_lock:
+                self._daily_cache[key] = bar
+            return dict(bar)
+        return bar
+
+    def _fetch_daily_bar(self, symbol: str, d: date) -> dict | None:
         if self.alpaca:
             try:
                 bar = self.alpaca.daily_bar(symbol, d)
@@ -1233,15 +1394,20 @@ class MarketData:
         if self.cfg.offline:
             return {"date": d.isoformat(), "pct_change": {"SPY": 0.42, "QQQ": 0.66, "IWM": -0.31}}
         syms = INDEX_ETFS + SECTOR_ETFS + ["^VIX"]
-        recap = {}
-        for s in syms:
-            try:
-                bar = yf_daily_bar(s, d)
-                prev = yf_daily_bar(s, prev_market_day(d))
-                if bar and prev and prev["close"]:
-                    recap[s] = round((bar["close"] - prev["close"]) / prev["close"] * 100, 2)
-            except Exception:
-                continue
+        prev_d = prev_market_day(d)
+
+        # Same two yfinance daily bars per symbol as before, fetched across a
+        # bounded pool rather than ~30 sequential round trips.
+        def _pct(s: str) -> float | None:
+            bar = yf_daily_bar(s, d)
+            prev = yf_daily_bar(s, prev_d)
+            if bar and prev and prev["close"]:
+                return round((bar["close"] - prev["close"]) / prev["close"] * 100, 2)
+            return None
+
+        got = _bounded_map(syms, _pct, deadline=40)
+        # Preserve the historical key order (index ETFs, sectors, VIX).
+        recap = {s: got[s] for s in syms if s in got}
         return {"date": d.isoformat(), "pct_change": recap}
 
     # ---- offline fixtures -------------------------------------------------

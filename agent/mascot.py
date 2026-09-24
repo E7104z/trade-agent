@@ -259,8 +259,16 @@ _SNIPPET = r"""
     var hs = Array.prototype.slice.call(document.querySelectorAll('h2'));
     var h = hs.find(function(x){ return re.test(x.textContent); });
     var c = h && h.closest ? h.closest('.card') : null;
-    if (c) c.scrollIntoView({behavior:'smooth', block:'start'});
-    else if (failMsg) say(failMsg);
+    if (!c){ if (failMsg) say(failMsg); return; }
+    // Hosted multi-page dashboard: the card may sit on a page that is not
+    // showing. Switch to it first (navigation only -- the hash changes).
+    var page = c.closest ? c.closest('section[data-page]') : null;
+    if (page && window.TA && typeof window.TA.navigate === 'function'){
+      window.TA.navigate(page.getAttribute('data-page'));
+      setTimeout(function(){ c.scrollIntoView({behavior:'smooth', block:'start'}); }, 60);
+      return;
+    }
+    c.scrollIntoView({behavior:'smooth', block:'start'});
   }
 
   // ------------------------------------------------------------- mood model
@@ -485,6 +493,9 @@ _SNIPPET = r"""
   }
   var syncBusy = false;
   function syncLive(){
+    // Hosted dashboard: ask the page's shared loader (single-flight) rather
+    // than issuing a second /api/status request of our own.
+    if (window.TA && typeof window.TA.refresh === 'function'){ window.TA.refresh(); return; }
     if (syncBusy) return;
     syncBusy = true;
     fetch('/api/status', {credentials:'same-origin'})
@@ -494,9 +505,16 @@ _SNIPPET = r"""
       .then(function(){ syncBusy = false; });
   }
   if (window.MASCOT_BOOT) applyStatus(window.MASCOT_BOOT);
-  syncLive();
-  setInterval(syncLive, 60000);
-  document.addEventListener('visibilitychange', function(){ if (!document.hidden) syncLive(); });
+  if (window.TA && typeof window.TA.onStatus === 'function'){
+    // Hosted dashboard: the page already polls /api/status and publishes each
+    // payload. Subscribing instead of polling separately halves the load on
+    // the heaviest endpoint and keeps Arby and the page on the same numbers.
+    window.TA.onStatus(function(d){ try { applyStatus(d); } catch(e){} });
+  } else {
+    syncLive();
+    setInterval(syncLive, 60000);
+    document.addEventListener('visibilitychange', function(){ if (!document.hidden) syncLive(); });
+  }
 
   // ------------------------------------------------------------- WebGL guard
   var renderer = null;
