@@ -893,10 +893,24 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # them. Mock runs keep their existing contract: nothing past the
         # simulated outcomes is persisted.
         counts = {"calibration": 0, "confirmations": 0, "q_increments": 0}
+        forward = {"rules": 0, "recorded": 0}
         if not cfg.mock:
             counts = _deterministic_events(con, md, d, picks, outcomes, shadow,
                                            slippage_bps=slippage)
+            # FORWARD_VALIDATION_SPEC_v1 Phase 3: the first caller the
+            # quarantine's forward-only guard has ever had. Every fill-valid
+            # row from today that falls in a quarantined (or validated) rule's
+            # cell is one forward observation; idempotent on source_key.
+            try:
+                from .. import research
+                forward = research.observe_session(con, d)
+                if forward["recorded"]:
+                    log("evening", f"Forward observations: {forward['recorded']} recorded "
+                                   f"against {forward['rules']} active rule(s)")
+            except Exception as e:  # noqa: BLE001 -- measurement never breaks grading
+                log("evening", f"WARN forward observation pass failed: {e}")
         stages["deterministic"] = "complete"
+        stages["forward_observations"] = forward["recorded"]
         _mark("events")
 
         out_md = outcomes_md(picks, outcomes) if picks else "(no picks today — no-trade day)"
@@ -1025,6 +1039,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                        f"calibration rows={counts['calibration']}, "
                        f"rule confirmations={counts['confirmations']}, "
                        f"open-question increments={counts['q_increments']}, "
+                       f"forward observations={forward['recorded']}, "
                        f"live reconciled={live_summary['reconciled']}, "
                        f"lessons extracted={len(new_lessons)}, "
                        f"cost ~${result.usage['cost_usd']:.3f}")

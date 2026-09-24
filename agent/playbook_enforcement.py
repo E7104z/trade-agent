@@ -190,7 +190,15 @@ def _withheld(checker: str, detail: str = "") -> str:
 # Detection: the existing checkers, called on smaller inputs
 # --------------------------------------------------------------------------
 
-def _line_hits(heading: str, body: list[str], states: Sequence[dict]) -> list[tuple[int, Violation]]:
+_SETUP_LINE = re.compile(r"^\s*[-*]\s+\**\s*([A-Za-z0-9_]+)\s*\**\s*:")
+
+
+def _stale_map(stale: Sequence[dict] | None) -> dict[str, dict]:
+    return {str(s.get("rule_id") or "").lower(): s for s in (stale or [])}
+
+
+def _line_hits(heading: str, body: list[str], states: Sequence[dict],
+               stale: Sequence[dict] | None = None) -> list[tuple[int, Violation]]:
     """Per-line violations inside one section, located by index into `body`."""
     from .loops import weekly as wk
     from .research import check_playbook_provenance
@@ -198,9 +206,23 @@ def _line_hits(heading: str, body: list[str], states: Sequence[dict]) -> list[tu
     hits: list[tuple[int, Violation]] = []
     sec = _name(heading)
     rule_sec = _is_rule_section(heading)
+    stale_by_setup = _stale_map(stale) if sec.startswith("setup rules") else {}
     for i, line in enumerate(body):
         if not line.strip():
             continue
+        # Decay, enforced (FORWARD_VALIDATION_SPEC_v1 Phase 4): a setup rule
+        # with no confirmation for >= 30 market sessions may still be listed,
+        # but never as if it were live.
+        m = _SETUP_LINE.match(line)
+        if m and stale_by_setup:
+            s = stale_by_setup.get(m.group(1).lower())
+            low = line.lower()
+            if s and "auto-demoted" not in low and "unvalidated" not in low:
+                hits.append((i, Violation(
+                    "stale_setup_rule", "block", sec, line,
+                    f"{m.group(1)} last confirmed {s.get('last_confirmed')}, "
+                    f"{s.get('sessions_since')} market sessions ago: it must be marked "
+                    f"auto-demoted")))
         for msg in wk._check_wr_suppression(line):
             citation = "[missing:" in msg
             hits.append((i, Violation("wr_citation" if citation else "wr_suppression",
@@ -224,7 +246,8 @@ def _line_hits(heading: str, body: list[str], states: Sequence[dict]) -> list[tu
     return hits
 
 
-def collect(md: str, states: Sequence[dict] | None = None) -> list[Violation]:
+def collect(md: str, states: Sequence[dict] | None = None,
+            stale: Sequence[dict] | None = None) -> list[Violation]:
     """Every violation in `md`, located, without changing anything."""
     from .loops import weekly as wk
     from . import open_questions
@@ -233,7 +256,7 @@ def collect(md: str, states: Sequence[dict] | None = None) -> list[Violation]:
     pre, sections = _split(md)
     out: list[Violation] = []
     for heading, body in [("## (preamble)", pre)] + sections:
-        out.extend(v for _, v in _line_hits(heading, body, states))
+        out.extend(v for _, v in _line_hits(heading, body, states, stale))
 
     for msg in wk._check_sizing_banner(md):
         out.append(Violation("sizing_banner", "warn", "sizing policy", "", msg))
@@ -369,7 +392,8 @@ def _fix_banner(sections: list[tuple[str, list[str]]]) -> list[Violation]:
 
 
 def enforce(md: str, states: Sequence[dict] | None = None,
-            runner: dict | None = None) -> EnforcementResult:
+            runner: dict | None = None,
+            stale: Sequence[dict] | None = None) -> EnforcementResult:
     """Repair `md` at the line/section level and re-check it.
 
     `states` is research.rule_states() as the miner was shown it; `runner` is
@@ -390,7 +414,7 @@ def enforce(md: str, states: Sequence[dict] | None = None,
         if _name(heading).startswith("reading this file"):
             continue   # system-owned; just rewritten from the template
         new_body = list(body)
-        for i, v in _line_hits(heading, body, states):
+        for i, v in _line_hits(heading, body, states, stale):
             violations.append(v)
             if v.severity != "block":
                 continue
@@ -408,6 +432,10 @@ def enforce(md: str, states: Sequence[dict] | None = None,
                 v.action = "replaced"
             elif v.checker == "selection_edge_table":
                 new_body[i] = _suppress_row(body[i], _SE_ROW, "insufficient data")
+                v.action = "replaced"
+            elif v.checker == "stale_setup_rule":
+                n = (_stale_map(stale).get(_SETUP_LINE.match(body[i]).group(1).lower()) or {}).get("sessions_since")
+                new_body[i] = f"{body[i].rstrip()} [auto-demoted: stale {n} sessions]"
                 v.action = "replaced"
             else:
                 new_body[i] = _withheld(v.checker)
@@ -452,7 +480,7 @@ def enforce(md: str, states: Sequence[dict] | None = None,
     violations.extend(_fix_banner(sections))
 
     repaired = _join(pre, sections)
-    remaining = [v for v in collect(repaired, states) if v.severity == "block"]
+    remaining = [v for v in collect(repaired, states, stale) if v.severity == "block"]
     if remaining:
         violations.append(Violation(
             "rewrite_rejected", "block", "(document)", "",

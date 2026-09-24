@@ -236,7 +236,7 @@ def test_a_miner_written_changelog_is_stripped_before_checking():
 
 def test_an_unrepairable_document_is_rejected(monkeypatch):
     stuck = pe.Violation("provenance", "block", "setup rules", "x", "cannot repair")
-    monkeypatch.setattr(pe, "collect", lambda md, states=None: [stuck])
+    monkeypatch.setattr(pe, "collect", lambda md, states=None, stale=None: [stuck])
     res = pe.enforce(_doc())
     assert res.markdown is None
     assert res.remaining_blocks == [stuck]
@@ -334,7 +334,7 @@ def test_a_rejected_rewrite_keeps_the_prior_version(wired, monkeypatch):
     con.close()
 
     stuck = pe.Violation("provenance", "block", "setup rules", "x", "cannot repair")
-    monkeypatch.setattr(pe, "collect", lambda md, states=None: [stuck])
+    monkeypatch.setattr(pe, "collect", lambda md, states=None, stale=None: [stuck])
     weekly.run(cfg, run_date=date(2026, 9, 25))
 
     con = ledger.connect()

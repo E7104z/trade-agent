@@ -112,7 +112,7 @@ Tests:
 
 1. **Cohort FDR.** In `eligible_for_production`:
    - gather every QUARANTINED rule that meets both its forward-n target and its time floor this run;
-   - BH-correct their forward p-values at `research.fdr_q`, the same q as discovery;
+   - BH-correct their forward p-values at level `alpha` (0.05, the existing per-rule bar). A cohort of one is then exactly the old test, and larger cohorts are only stricter. (As implemented: an earlier draft said `research.fdr_q` = 0.10, which would have *loosened* a lone rule's bar from 0.05 to 0.10.)
    - graduate only the BH-rejected rules whose effect has the same sign as at discovery.
 
    Rules that reach target without surviving are RETIRED, as today. Untestable samples (p is None) keep waiting, as today. **This is a tightening, not a relaxation.**
@@ -121,9 +121,11 @@ Tests:
 4. All transitions are applied in code inside `integrity.weekly_block`, before the miner call. The miner receives them as facts in `_graduation_md`, which already says "do not re-decide them; state them".
 5. Setup-rule staleness (`ledger.rule_staleness`) is recomputed with the same market-calendar session count, and its STALE list is handed to the miner as applied fact. S3's line-level enforcement gains a ninth checker: a Setup Rules line for a setup that is stale must carry `[auto-demoted: stale N sessions]` or `UNVALIDATED`; otherwise the line is replaced.
 
-Tests (the BH arithmetic is exact; don't approximate it):
-- m = 2, p = (0.04, 0.30), q = 0.10: the rank-1 bound is 0.05 and 0.04 ≤ 0.05, so the 0.04 rule graduates. The 0.30 rule fails its rank-2 bound of 0.10, so it retires.
-- m = 3, p = (0.04, 0.60, 0.70), q = 0.10: the rank-1 bound is 0.0333, so **nothing** graduates. Uncorrected, the 0.04 rule would have passed at α = 0.05. This case is the reason for the phase.
+Tests (the BH arithmetic is exact at level α = 0.05; don't approximate it):
+- m = 1, p = 0.04: the bound is 0.05, so it graduates. This is identical to the old per-rule test.
+- m = 2, p = (0.04, 0.30): the rank-1 bound is 0.025 and the rank-2 bound 0.05, so **neither** graduates.
+- m = 3, p = (0.04, 0.60, 0.70): the rank-1 bound is 0.0167, so **nothing** graduates. Uncorrected, the 0.04 rule would have passed at α = 0.05. This case is the reason for the phase.
+- m = 2, p = (0.001, 0.60): the strong rule still graduates.
 - Decay counts market sessions across a holiday correctly.
 - Second decay retires.
 - Reversal retires.

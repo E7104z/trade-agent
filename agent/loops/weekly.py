@@ -1052,16 +1052,31 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         # Nomination only — the miner cannot promote a rule to tradable status;
         # only research.eligible_for_production (already applied inside
         # integrity.weekly_block, above) graduates a rule out of quarantine.
+        # FORWARD_VALIDATION_SPEC_v1 Phase 2: a candidate must name the CELL it
+        # is about (a predicate over the system's own bucket labels); its
+        # discovery numbers are computed here from the FDR-corrected batch,
+        # not taken from the miner; and one that cannot be matched to trades
+        # is recorded as REJECTED_UNMATCHABLE instead of waiting forever.
         from .. import research
-        for c in mined.get("rule_candidates", []) or []:
-            reg = research.register_rule(
-                con, c.get("statement", ""), c.get("dimensions", []), d,
-                discovery_n=c.get("discovery_n", 0),
-                discovery_effect=c.get("discovery_effect"),
-                discovery_q=c.get("discovery_q"))
-            if reg["state"] == "DISCOVERED":
-                research.advance_quarantine(con, reg["rule_id"], d)
-            log("weekly", f"Rule {reg['rule_id']}: {reg['state']} — {c.get('statement','')[:80]}")
+        candidates = mined.get("rule_candidates", []) or []
+        if candidates:
+            comps = list(getattr(research_block.get("search"), "comparisons", None) or [])
+            rows_by_lane = {}
+            try:
+                rows_by_lane = {"morning": research.morning_rows(con),
+                                "runner": research.runner_rows(con)}
+            except Exception as e:
+                log("weekly", f"WARN could not load rows for 2-D discovery stats: {e}")
+            for c in candidates:
+                try:
+                    reg = research.register_candidate(con, c, d, comps, rows_by_lane)
+                except Exception as e:
+                    log("weekly", f"WARN rule candidate not registered ({e}): "
+                                  f"{str(c.get('statement', ''))[:80]}")
+                    continue
+                log("weekly", f"Rule {reg['rule_id']}: {reg['state']} — "
+                              f"{str(c.get('statement', ''))[:80]}"
+                              + (f" ({reg['note']})" if reg.get("note") else ""))
 
         # rewrite the playbook (this loop is the SOLE writer of playbook.md)
         new_pb = mined.get("playbook_markdown", "")
@@ -1075,8 +1090,10 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             # written. The Runner Lane -- read by the intraday selector the
             # same day -- falls back to an explicit no-rules statement.
             from .. import playbook_enforcement
+            stale_rules = [r for r in mem.get("rule_staleness", []) or []
+                           if (r.get("sessions_since") or 0) >= STALE_SESSIONS]
             enf = playbook_enforcement.enforce(
-                new_pb, research_block["states"], research_block)
+                new_pb, research_block["states"], research_block, stale_rules)
             for v in enf.violations:
                 label = playbook_enforcement.LOG_LABEL.get(v.checker, v.checker)
                 log("weekly", f"WARN {label}: [{v.severity}/{v.action}] {v.message[:200]}")

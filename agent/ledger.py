@@ -378,6 +378,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v18.STATEMENTS
 from . import migrations_v19  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v19.STATEMENTS
 
+# --- v20 forward validation: rule predicates, decay, observation sources ----
+from . import migrations_v20  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v20.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -1133,7 +1137,7 @@ def stats_by(con: duckdb.DuckDBPyConnection, dim: str,
         )
     # dim is now guaranteed to be one of the whitelisted identifiers above, so
     # f-string interpolation of a column name here is safe.
-    return _stats_rows(con, f"COALESCE(CAST(p.{dim} AS VARCHAR),'?')", lane)
+    return _stats_rows(con, _buckets.sql(dim), lane)
 
 
 # Indicator-layer dimensions (specs/INDICATOR_LAYER_SPEC_v1.md §5) — these live
@@ -1147,53 +1151,14 @@ OUTCOME_STATS_DIMENSIONS: frozenset[str] = frozenset({
     "mcap_bucket", "short_bucket", "or_alignment",
 })
 
-_OUTCOME_DIM_EXPR = {
-    "rvol_bucket": (
-        "CASE WHEN o.rvol_at_1000 IS NULL THEN '?' "
-        "WHEN o.rvol_at_1000 < 1 THEN '<1x' "
-        "WHEN o.rvol_at_1000 < 2 THEN '1-2x' ELSE '>2x' END"
-    ),
-    "vwap_side_at_fill": "COALESCE(o.vwap_side_at_fill, '?')",
-    # Q9: stop distance sweet spot
-    "stop_atr_bucket": (
-        "CASE WHEN o.stop_dist_atr IS NULL THEN '?' "
-        "WHEN o.stop_dist_atr < 0.5 THEN '<0.5' "
-        "WHEN o.stop_dist_atr < 1 THEN '0.5-1' "
-        "WHEN o.stop_dist_atr < 2 THEN '1-2' ELSE '>2' END"
-    ),
-    # Q10: blue-sky (small gap/ATR) vs overhead-supply (large gap/ATR)
-    "gap_atr_bucket": (
-        "CASE WHEN o.gap_atr IS NULL THEN '?' "
-        "WHEN o.gap_atr < 1 THEN '<1' "
-        "WHEN o.gap_atr < 2 THEN '1-2' ELSE '>2' END"
-    ),
-    "ext_bucket": (
-        "CASE WHEN o.ext_atr_at_entry IS NULL THEN '?' "
-        "WHEN o.ext_atr_at_entry < -2 THEN '<-2' "
-        "WHEN o.ext_atr_at_entry <= 2 THEN '-2..+2' ELSE '>+2' END"
-    ),
-    # Q11: trend alignment (the 200d question)
-    "trend_side_200d": "COALESCE(o.trend_side_200d, '?')",
-    "mcap_bucket": (
-        "CASE WHEN o.mkt_cap IS NULL THEN '?' "
-        "WHEN o.mkt_cap < 2e9 THEN '<2B' "
-        "WHEN o.mkt_cap < 10e9 THEN '2-10B' ELSE '>10B' END"
-    ),
-    # Q12: shortedness
-    "short_bucket": (
-        "CASE WHEN o.short_pct_float IS NULL THEN '?' "
-        "WHEN o.short_pct_float < 5 THEN '<5%' "
-        "WHEN o.short_pct_float < 15 THEN '5-15%' ELSE '>15%' END"
-    ),
-    "or_alignment": (
-        "CASE WHEN o.or_break_dir IS NULL OR o.fill_vs_or IS NULL THEN '?' "
-        "WHEN (p.direction='long' AND o.or_break_dir='up') "
-        "  OR (p.direction='short' AND o.or_break_dir='down') THEN 'with' "
-        "WHEN (p.direction='long' AND o.or_break_dir='down') "
-        "  OR (p.direction='short' AND o.or_break_dir='up') THEN 'against' "
-        "ELSE '?' END"
-    ),
-}
+# Derived from agent/buckets.py -- the ONE declaration of every mined bucket,
+# shared with the evening's forward-observation matcher so a trade is always
+# put in the same cell the weekly search counted it in
+# (FORWARD_VALIDATION_SPEC_v1 Phase 1). A parity test pins the generated SQL
+# against the hand-written expressions this replaced.
+from . import buckets as _buckets  # noqa: E402
+
+_OUTCOME_DIM_EXPR = {d: _buckets.sql(d) for d in _buckets.MORNING_OUTCOME_DIMS}
 
 
 def stats_by_outcome(con: duckdb.DuckDBPyConnection, dim: str,
@@ -1737,16 +1702,27 @@ def add_rule_confirmation(con: duckdb.DuckDBPyConnection, rule_id: str,
     )
 
 
-def rule_staleness(con: duckdb.DuckDBPyConnection) -> list[dict]:
-    """Per rule: latest confirmation date + sessions of desk operation since."""
+def rule_staleness(con: duckdb.DuckDBPyConnection, as_of: date | None = None) -> list[dict]:
+    """Per rule: latest confirmation date + MARKET sessions since.
+
+    Counted on the market calendar, not on daily_plans rows: a day the
+    morning loop failed (credit outage, a killed function) produced no plan
+    row, so counting plans let a rule age more slowly exactly when the desk
+    was not observing anything. Silence is silence either way.
+    """
+    from .research import market_sessions_between
+    from .util import today_et
+    as_of = as_of or today_et()
     rows = con.execute(
-        """SELECT rc.rule_id, MAX(rc.session_date) AS last_confirmed,
-                  (SELECT COUNT(DISTINCT dp.plan_date) FROM daily_plans dp
-                   WHERE dp.plan_date > MAX(rc.session_date)) AS sessions_since
-           FROM rule_confirmations rc GROUP BY rc.rule_id ORDER BY rc.rule_id"""
+        """SELECT rule_id, MAX(session_date) FROM rule_confirmations
+           GROUP BY rule_id ORDER BY rule_id"""
     ).fetchall()
-    return [{"rule_id": r[0], "last_confirmed": str(r[1]), "sessions_since": r[2] or 0}
-            for r in rows]
+    out = []
+    for rule_id, last in rows:
+        last_d = last.date() if hasattr(last, "date") and not isinstance(last, date) else last
+        out.append({"rule_id": rule_id, "last_confirmed": str(last),
+                    "sessions_since": market_sessions_between(last_d, as_of)})
+    return out
 
 
 # --------------------------------------------------- v3: open question progress

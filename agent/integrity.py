@@ -248,9 +248,19 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
                                                     search.comparisons, q),
                       looks)
 
+    # Decay FIRST, in code (FORWARD_VALIDATION_SPEC_v1 Phase 4): a validated
+    # rule gone silent for 30 market sessions returns to quarantine, a reversed
+    # one retires. Then the quarantine is evaluated with cohort FDR. Both are
+    # applied before the miner call and handed to it as facts.
+    decay = _safe("integrity", "rule decay",
+                  lambda: research.apply_decay(con, session_date),
+                  {"decayed": [], "retired": []})
     graduation = _safe("integrity", "quarantine evaluation",
                        lambda: research.eligible_for_production(con, session_date),
                        {"graduated": [], "failed": [], "waiting": []})
+    graduation = {**graduation,
+                  "decayed": decay.get("decayed", []),
+                  "failed": list(graduation.get("failed", [])) + list(decay.get("retired", []))}
     states = _safe("integrity", "rule states", lambda: research.rule_states(con), [])
     cumulative = _safe("integrity", "looks summary", lambda: research.looks_summary(con), {})
 
@@ -332,9 +342,10 @@ def check_playbook(playbook_md: str, states: list[dict]) -> list[str]:
 
 def _graduation_md(g: dict) -> str:
     lines = ["## QUARANTINE DECISIONS THIS RUN (applied by the system)\n"]
-    if not any(g.get(k) for k in ("graduated", "failed", "waiting")):
+    if not any(g.get(k) for k in ("graduated", "failed", "waiting", "decayed")):
         return lines[0] + "(no rules are currently in quarantine)"
     for label, key in (("GRADUATED to VALIDATED", "graduated"),
+                       ("DECAYED back to QUARANTINED", "decayed"),
                        ("RETIRED", "failed"),
                        ("STILL WAITING", "waiting")):
         rows = g.get(key) or []

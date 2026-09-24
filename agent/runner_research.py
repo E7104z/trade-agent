@@ -51,20 +51,12 @@ __all__ = [
     "runner_md",
 ]
 
-# Mining dimensions (spec 2.6). Each is a deterministic bucketing of a stored
-# candidate column — no LLM derives any of these.
-MINING_DIMENSIONS = (
-    "runner_detection_bucket",
-    "runner_rvol_bucket",
-    "runner_price_tier",
-    "runner_vwap_bucket",
-    "runner_slope_bucket",
-    "runner_tc_bucket",
-    "runner_float_bucket",
-    "runner_stop_atr_bucket",
-    "runner_trend_side_200d",
-    "runner_regime",
-)
+# Mining dimensions (spec 2.6) and their bucketing live in agent/buckets.py,
+# the single declaration the weekly search AND the evening forward-observation
+# matcher both read (FORWARD_VALIDATION_SPEC_v1 Phase 1). Re-exported here
+# under their established names.
+from .buckets import RUNNER_DIMS as MINING_DIMENSIONS  # noqa: E402
+from .buckets import runner_label as bucket_of  # noqa: E402
 
 
 def _mean_std(values: list[float]) -> tuple[float | None, float | None]:
@@ -76,58 +68,6 @@ def _mean_std(values: list[float]) -> tuple[float | None, float | None]:
         return mean, None
     var = sum((v - mean) ** 2 for v in values) / (n - 1)
     return mean, math.sqrt(var)
-
-
-def bucket_of(dimension: str, row: dict) -> str:
-    """Deterministic bucket label for one candidate row.
-
-    '?' is the null/unmeasured bucket and is kept rather than dropped — a large
-    '?' bucket is itself a finding about data coverage, and silently discarding
-    it would make coverage gaps invisible.
-    """
-    def _b(value, edges, labels):
-        if value is None:
-            return "?"
-        for edge, label in zip(edges, labels):
-            if value < edge:
-                return label
-        return labels[-1]
-
-    if dimension == "runner_detection_bucket":
-        return _b(row.get("detection_minutes"), [600, 630, 660, 720],
-                  ["pre-10:00", "10:00-10:30", "10:30-11:00", "11:00-12:00", "12:00+"])
-    if dimension == "runner_rvol_bucket":
-        return _b(row.get("rvol"), [2.0, 3.0, 5.0],
-                  ["1.5-2", "2-3", "3-5", "5+"])
-    if dimension == "runner_price_tier":
-        return row.get("price_tier") or "?"
-    if dimension == "runner_vwap_bucket":
-        return _b(row.get("vwap_pct_above"), [1.0, 1.5, 2.5],
-                  ["0.5-1", "1-1.5", "1.5-2.5", "2.5+"])
-    if dimension == "runner_slope_bucket":
-        # Slope normalized by price: a $0.04 slope means something different on
-        # a $6 stock than on a $45 one, so the raw dollar value is not
-        # comparable across the price band.
-        slope, price = row.get("ema9_slope"), row.get("detection_price")
-        norm = (slope / price * 100) if (slope is not None and price) else None
-        return _b(norm, [0.05, 0.10, 0.20], ["<0.05%", "0.05-0.10%", "0.10-0.20%", "0.20%+"])
-    if dimension == "runner_tc_bucket":
-        return _b(row.get("trend_consistency"), [55, 65, 75, 85],
-                  ["45-55", "55-65", "65-75", "75-85", "85+"])
-    if dimension == "runner_float_bucket":
-        return _b(row.get("float_shares"), [20, 50, 100],
-                  ["<20M", "20-50M", "50-100M", "100M+"])
-    if dimension == "runner_stop_atr_bucket":
-        # Same edges as the morning lane's stop_atr_bucket (Q9) so the runner
-        # pool and the morning picks are bucketed identically and can be read
-        # side by side.
-        return _b(row.get("stop_dist_atr"), [0.5, 1.0, 2.0],
-                  ["<0.5", "0.5-1", "1-2", ">2"])
-    if dimension == "runner_trend_side_200d":
-        return row.get("trend_side_200d") or "?"
-    if dimension == "runner_regime":
-        return row.get("regime_tag") or "?"
-    return "?"
 
 
 def candidate_rows(con: Any, sessions: int = 60,
