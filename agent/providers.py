@@ -171,6 +171,18 @@ def is_common_stock_symbol(sym: str) -> bool:
 
 # ------------------------------------------------------------------ Alpaca API
 
+class AlpacaAuthError(requests.exceptions.HTTPError):
+    """Alpaca rejected the API credentials themselves (HTTP 401).
+
+    Kept distinct from every other data failure because it means something
+    different: not "this symbol has no data" or "the feed hiccuped" but "no
+    Alpaca call can succeed until the keys are fixed". On 2026-09-24 a 401 on
+    every Alpaca route surfaced only as "premarket gap scan returned no rows",
+    which is true and says nothing about the cause. Subclasses HTTPError so
+    every existing handler still catches it.
+    """
+
+
 class Alpaca:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -179,6 +191,15 @@ class Alpaca:
             "APCA-API-KEY-ID": cfg.alpaca_key_id,
             "APCA-API-SECRET-KEY": cfg.alpaca_secret_key,
         }
+        # First credential rejection this instance saw: {"status", "path",
+        # "message"}. None while the credentials have not been refused.
+        self.auth_error: dict | None = None
+
+    def _record_auth_error(self, status: int, path: str, body: str) -> None:
+        if self.auth_error is None:
+            self.auth_error = {"status": status, "path": path, "message": (body or "")[:200]}
+            log("data", f"ALPACA CREDENTIALS REJECTED: HTTP {status} on {path} -- every "
+                        f"Alpaca call will fail until the key pair is fixed")
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         # One retry on transient failures (timeout/connection/429/5xx) so a single
@@ -200,6 +221,13 @@ class Alpaca:
                 if attempt == 0:
                     time.sleep(0.75)
                     continue
+            if r.status_code == 401:
+                # Never retried: a rejected key pair does not un-reject.
+                body = getattr(r, "text", "") or ""
+                self._record_auth_error(401, path, body)
+                raise AlpacaAuthError(
+                    f"401 Unauthorized for {path}: Alpaca rejected the API credentials "
+                    f"({body[:120]})", response=r)
             r.raise_for_status()
             return r.json()
         raise last_exc
@@ -242,11 +270,21 @@ class Alpaca:
         hosts = ["https://paper-api.alpaca.markets", "https://api.alpaca.markets"]
         params = {"status": "active", "asset_class": "us_equity",
                   "exchange": "NYSE,NASDAQ,ARCA,BATS"}
+        refused_401: list[str] = []
         for host in hosts:
             try:
                 r = requests.get(f"{host}/v2/assets", headers=self.h,
                                  params=params, timeout=60)
                 if r.status_code in (401, 403):
+                    if r.status_code == 401:
+                        refused_401.append(host)
+                        # Refused by BOTH hosts means the key pair is valid for
+                        # neither account type. One host refusing is normal:
+                        # paper keys 401 on the live host and vice versa.
+                        if len(refused_401) == len(hosts):
+                            self._record_auth_error(
+                                401, "/v2/assets (paper and live hosts)",
+                                getattr(r, "text", "") or "")
                     continue
                 r.raise_for_status()
                 data = r.json()
@@ -680,6 +718,11 @@ class MarketData:
         self._daily_cache: dict[tuple[str, date], dict] = {}
         self._cache_lock = __import__("threading").Lock()
 
+    @property
+    def alpaca_auth_error(self) -> dict | None:
+        """The first Alpaca credential rejection this run saw, or None."""
+        return getattr(self.alpaca, "auth_error", None) if self.alpaca else None
+
     @staticmethod
     def _session_final(d: date) -> bool:
         from .util import market_close_et
@@ -807,6 +850,12 @@ class MarketData:
             return
         self._preflight_feed()
         if self.feed_ok or self.alpaca.feed == "iex":
+            return
+        if self.alpaca_auth_error:
+            # A 401 is the key pair, not the entitlement: IEX would refuse the
+            # same keys, and a "downgrade" would only record the wrong cause.
+            log("data", "WARN feed preflight refused the CREDENTIALS (401) -- no IEX "
+                        "fallback; fix ALPACA_API_KEY / ALPACA_SECRET_KEY")
             return
         original = self.alpaca.feed
         log("data", f"Feed '{original}' unusable — retrying preflight on 'iex'")

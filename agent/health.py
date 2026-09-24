@@ -146,7 +146,15 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
                 gates = _json.loads(gates) if gates else {}
             except (TypeError, ValueError):
                 gates = {}
-            if degraded and gates.get("feed_downgraded") and gates.get("rvol_required"):
+            if degraded and gates.get("auth_failed"):
+                stages.append(_stage(
+                    "runner", "Runner scan", "bad",
+                    f"Runner could not scan {r_session}: Alpaca rejected the credentials (401)",
+                    f"Refused at {gates.get('auth_path') or '?'}. The same key pair serves every "
+                    "Alpaca feed and the paper broker; this is a credentials outage, not a "
+                    "stand-down. Fix ALPACA_API_KEY / ALPACA_SECRET_KEY and redeploy.",
+                    last=last))
+            elif degraded and gates.get("feed_downgraded") and gates.get("rvol_required"):
                 stages.append(_stage(
                     "runner", "Runner scan", "bad",
                     f"Runner stood down for {r_session}: no real-time SIP feed",
@@ -286,6 +294,14 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
     try:
         from .ledger import plumbing_sessions, recent_alerts
         for a in recent_alerts(con, now.date() - timedelta(days=2)):
+            if a["kind"] == "alpaca_auth_failed":
+                warnings.append(
+                    f"Alpaca rejected the API credentials (HTTP 401) during the {a['loop']} "
+                    f"run on {a['alert_date']}. Every Alpaca feed (gap scan, movers, news, "
+                    "quotes, bars) and the paper broker are down: sessions are recorded as "
+                    "data outages, not stand-downs. Fix ALPACA_API_KEY / ALPACA_SECRET_KEY "
+                    f"(Production) and redeploy. In use: {(a.get('detail') or '').split(' -- ')[-1][:300]}")
+                continue
             warnings.append(
                 f"LLM provider refused requests ({a['kind'].replace('_', ' ')}) during the "
                 f"{a['loop']} run on {a['alert_date']}. Deterministic data is still being "

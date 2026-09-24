@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -216,6 +217,10 @@ class Config:
     anthropic_api_key: str = ""
     alpaca_key_id: str = ""
     alpaca_secret_key: str = ""
+    # Where the Alpaca key came from, and anything load_config had to clean off
+    # a pasted value. Never the values themselves.
+    alpaca_key_source: str = ""
+    credential_notes: dict = field(default_factory=dict)
     smtp: dict = field(default_factory=dict)
     # runtime flags (set by CLI)
     mock: bool = False
@@ -258,23 +263,66 @@ class Config:
         )
 
 
+# An env-style NAME (upper case) followed by = or : and a value that does not
+# itself start with '='. The value rule keeps base64-style secrets that END in
+# "==" from being misread as NAME=VALUE.
+_NAME_EQUALS_VALUE = re.compile(r"^[A-Z][A-Z0-9_]*\s*[:=]\s*([^\s=]\S*)$")
+
+
+def clean_credential(value: str | None) -> tuple[str, list[str]]:
+    """Undo what pasting a credential into a settings form typically adds.
+
+    Returns (cleaned value, notes describing what was removed). The notes
+    never contain the value. A real API key contains no whitespace, quotes,
+    '=' or ':', so removing these can only turn a corrupted paste back into
+    the key; it cannot damage a correct one. Handled: surrounding whitespace
+    and newlines, surrounding quotes, and a whole `NAME = value` line pasted
+    into the value field (the shape these keys were shared in on 2026-09-24).
+    """
+    raw = value or ""
+    notes: list[str] = []
+    v = raw.strip()
+    if v != raw:
+        notes.append("surrounding whitespace/newline removed")
+    m = _NAME_EQUALS_VALUE.match(v)
+    if m:
+        v = m.group(1)
+        notes.append("a 'NAME = value' line was pasted; the value was extracted")
+    elif v[:1] in ("=", ":"):
+        v = v[1:].strip()
+        notes.append("leading '=' removed")
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1].strip()
+        notes.append("surrounding quotes removed")
+    if any(ch.isspace() for ch in v):
+        notes.append("still contains internal whitespace (not removed)")
+    return v, notes
+
+
 def load_config() -> Config:
     merged = _deep_merge(_DEFAULTS, _load_json(CONFIG_PATH))
     creds = _load_json(CREDENTIALS_PATH)
 
     cfg = Config(raw=merged)
-    cfg.anthropic_api_key = (
+    cfg.anthropic_api_key, _ = clean_credential(
         os.getenv("ANTHROPIC_API_KEY") or creds.get("anthropic_api_key", "") or ""
     )
-    cfg.alpaca_key_id = (
-        os.getenv("ALPACA_API_KEY")
-        or os.getenv("ALPACA_KEY_ID")
-        or creds.get("alpaca_key_id", "")
-        or ""
-    )
-    cfg.alpaca_secret_key = (
-        os.getenv("ALPACA_SECRET_KEY") or creds.get("alpaca_secret_key", "") or ""
-    )
+    # Key id precedence: ALPACA_API_KEY, then ALPACA_KEY_ID, then
+    # credentials.json. The source is recorded so a rejected key can be traced
+    # to the setting that supplied it.
+    for source, raw in (("env:ALPACA_API_KEY", os.getenv("ALPACA_API_KEY")),
+                        ("env:ALPACA_KEY_ID", os.getenv("ALPACA_KEY_ID")),
+                        ("credentials.json", creds.get("alpaca_key_id", ""))):
+        if raw:
+            cfg.alpaca_key_id, notes = clean_credential(raw)
+            cfg.alpaca_key_source = source
+            if notes:
+                cfg.credential_notes["alpaca_key_id"] = notes
+            break
+    raw_secret = os.getenv("ALPACA_SECRET_KEY") or creds.get("alpaca_secret_key", "") or ""
+    cfg.alpaca_secret_key, notes = clean_credential(raw_secret)
+    if notes:
+        cfg.credential_notes["alpaca_secret_key"] = notes
     smtp = dict(creds.get("smtp", {}) or {})
     if os.getenv("SMTP_HOST"):
         smtp["host"] = os.environ["SMTP_HOST"]
@@ -290,6 +338,52 @@ def load_config() -> Config:
         smtp["to_addrs"] = [a.strip() for a in os.environ["SMTP_TO"].split(",") if a.strip()]
     cfg.smtp = smtp
     return cfg
+
+
+def alpaca_credential_fingerprint(cfg: Config) -> dict:
+    """A description of the Alpaca credentials in use that reveals nothing
+    usable: where the key came from, lengths, the two-letter key-type prefix,
+    character classes, and what was cleaned off. Lets a 401 be diagnosed from
+    the dashboard ("the key in Vercel is 27 chars and has a space in it")
+    without anyone reading a secret.
+
+    `usual_format` compares against the shape Alpaca has issued keys in (a
+    20-character upper-case alphanumeric key id, a 40-character secret). It is
+    informational, never a gate: if Alpaca changes its format, keys that fail
+    this check still get used.
+    """
+    key, secret = cfg.alpaca_key_id or "", cfg.alpaca_secret_key or ""
+    prefix = key[:2].upper()
+    return {
+        "key_source": cfg.alpaca_key_source or "(none)",
+        "key_present": bool(key),
+        "key_length": len(key),
+        "key_type": {"PK": "paper", "AK": "live"}.get(prefix, "unrecognized"),
+        "key_upper_alnum": bool(key) and key.isalnum() and key == key.upper(),
+        "secret_present": bool(secret),
+        "secret_length": len(secret),
+        "secret_alnum": bool(secret) and secret.isalnum(),
+        "usual_format": (len(key) == 20 and key.isalnum() and key == key.upper()
+                         and len(secret) == 40 and secret.isalnum()),
+        "cleaned": dict(cfg.credential_notes or {}),
+    }
+
+
+def describe_alpaca_fingerprint(fp: dict) -> str:
+    """One human line for the dashboard and alerts. Contains no secret."""
+    if not fp.get("key_present") or not fp.get("secret_present"):
+        missing = [n for n, ok in (("key id", fp.get("key_present")),
+                                   ("secret", fp.get("secret_present"))) if not ok]
+        return f"Alpaca {' and '.join(missing)} not set (key source: {fp.get('key_source')})"
+    bits = [f"key from {fp['key_source']}: {fp['key_length']} chars, {fp['key_type']} "
+            f"({'upper-case alphanumeric' if fp['key_upper_alnum'] else 'NOT upper-case alphanumeric'})",
+            f"secret: {fp['secret_length']} chars"
+            + ("" if fp["secret_alnum"] else ", contains non-alphanumeric characters")]
+    if not fp.get("usual_format"):
+        bits.append("does not match the usual Alpaca shape (20-char key id, 40-char secret)")
+    for name, notes in (fp.get("cleaned") or {}).items():
+        bits.append(f"{name}: {'; '.join(notes)}")
+    return " · ".join(bits)
 
 
 def ensure_dirs() -> None:

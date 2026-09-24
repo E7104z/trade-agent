@@ -737,11 +737,26 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
         if not universe:
             # An empty universe is a pipeline failure, not a market condition.
             # Record it loudly; do NOT silently no-op into "zero candidates".
+            # When the cause is rejected credentials, say so: that outage has
+            # one fix, and it is not in this code.
+            auth_error = getattr(md, "alpaca_auth_error", None)
             ledger.upsert_runner_session(con, {
                 "session_date": d, "universe_size": 0, "candidates_found": 0,
                 "provider_degraded": True, "scan_version": SCAN_VERSION,
-                "gates_unavailable": json.dumps(unavailable),
+                "gates_unavailable": json.dumps(
+                    {**unavailable, **({"auth_failed": True,
+                                        "auth_path": auth_error.get("path")}
+                                       if auth_error else {})}),
             })
+            if auth_error:
+                log("runner", f"universe empty - Alpaca REJECTED THE CREDENTIALS "
+                              f"(401 on {auth_error.get('path')}); recorded provider_degraded")
+                try:
+                    from .config import load_config
+                    from .failures import alert_alpaca_auth
+                    alert_alpaca_auth(con, load_config(), "runner", auth_error.get("path", "?"))
+                except Exception:  # noqa: BLE001 -- an alert never breaks a scan
+                    pass
             log("runner", "universe empty - recorded provider_degraded, no scan performed")
             return {"universe_size": 0, "candidates": 0, "provider_degraded": True,
                     "elapsed_ms": int((time.monotonic() - t0) * 1000)}

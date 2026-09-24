@@ -646,7 +646,7 @@ function paperHtml(){
         <td>${(o.legs||[]).map(l => `${esc(l.type)}: ${esc(l.status)}${l.filled_avg_price!=null?' @ '+px(l.filled_avg_price):''}`).join('<br>') || '—'}</td></tr>`).join('')
     }</tbody></table></div>` : empty('No orders on the paper account yet.');
   return `
-    ${p.error ? `<ul class="lh-warn"><li>Broker: ${esc(p.error)}</li></ul>` : ''}
+    ${p.error ? `<ul class="lh-warn"><li>Broker: ${esc(p.error)}</li>${p.credentials ? `<li>Credentials this deployment is sending: ${esc(p.credentials)}. Alpaca rejected them — set ALPACA_API_KEY / ALPACA_SECRET_KEY (Production) to the pair on the Alpaca paper dashboard, then redeploy.</li>` : ''}</ul>` : ''}
     <div class="stat-grid">
       ${kpi('Paper equity', a.equity!=null ? fmtMoney(a.equity) : '—', 'Alpaca paper account')}
       ${kpi('Today', dayPl==null ? '—' : (dayPl>=0?'+':'-') + fmtMoney(Math.abs(dayPl)), 'vs. prior close', dayPl>0?'ok':(dayPl<0?'bad':''))}

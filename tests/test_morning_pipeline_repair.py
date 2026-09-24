@@ -201,7 +201,8 @@ def test_bundle_health_reads_coverage_and_catalyst_failure():
     }
     h = _bundle_health(SimpleNamespace(feed_downgraded=True), bundle)
     assert h == {"bundle_gappers": 1, "bundle_catalyst_quotes": 1,
-                 "catalyst_quotes_failed": True, "feed_downgraded": True}
+                 "catalyst_quotes_failed": True, "feed_downgraded": True,
+                 "provider_auth_error": None}
 
 
 def test_candidate_grounding_health_counts_over_the_analyst_population():

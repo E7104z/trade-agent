@@ -18,10 +18,18 @@ _LOG = logging.getLogger(__name__)
 # rejection was swallowed into a bare None, which is how every runner order
 # was refused for weeks without a single visible error.
 _last_error: str | None = None
+# Set when the broker answers 401: the credentials, not the order, were
+# refused. Cleared by the next successful call.
+_auth_rejected: bool = False
 
 
 def last_error() -> str | None:
     return _last_error
+
+
+def auth_rejected() -> bool:
+    """True when the most recent broker call was refused for its credentials."""
+    return _auth_rejected
 
 
 def tick_price(price: float) -> float:
@@ -49,7 +57,7 @@ def _request(method: str, path: str, *, cfg: Config | None = None,
              payload: dict | None = None) -> dict | list | None:
     """Call Alpaca and return JSON; API/network failures fail soft (None), with
     the reason kept in last_error() and logged where the loop can see it."""
-    global _last_error
+    global _last_error, _auth_rejected
     config = _cfg(cfg)
     if not _enabled(config):
         _last_error = "live paper trading is not enabled/configured"
@@ -65,12 +73,14 @@ def _request(method: str, path: str, *, cfg: Config | None = None,
         if isinstance(status, int) and status >= 400:
             body = (getattr(response, "text", "") or "")[:300]
             _last_error = f"HTTP {status} {method} {path}: {body}"
+            _auth_rejected = status == 401
             _LOG.warning("Alpaca paper API failure: %s", _last_error)
             from .util import log
             log("live", f"broker refused: {_last_error}")
             return None
         response.raise_for_status()
         _last_error = None
+        _auth_rejected = False
         # DELETE /v2/orders/{id} answers 204 No Content on success. Parsing
         # that body raised, so every successful cancel read as a failure.
         if status == 204 or not getattr(response, "content", b"x"):

@@ -35,7 +35,8 @@ have helped.
 from __future__ import annotations
 
 __all__ = ["STATUS_ERROR", "STATUS_API_ERROR", "classify_failure",
-           "is_permanent_provider_error", "format_failure", "alert_provider_outage"]
+           "is_permanent_provider_error", "format_failure", "alert_provider_outage",
+           "alert_once", "alert_alpaca_auth"]
 
 import traceback as _traceback
 
@@ -110,6 +111,51 @@ def _alert_kind(exc: BaseException | str) -> str | None:
     return None
 
 
+def alert_once(con, cfg, kind: str, loop: str, detail: str, subject: str, body_html: str) -> bool:
+    """Email one alert per `kind` per day, recorded in `alerts`. Never raises."""
+    try:
+        from .ledger import alert_already_sent, record_alert
+        from .util import today_et
+        today = today_et()
+        if alert_already_sent(con, today, kind):
+            return False
+        record_alert(con, today, kind, loop, detail)
+        from .delivery import send_email
+        send_email(cfg, subject, body_html)
+        return True
+    except Exception:
+        return False
+
+
+def alert_alpaca_auth(con, cfg, loop: str, where: str) -> bool:
+    """One email per day when Alpaca rejects the API credentials (HTTP 401).
+
+    Every Alpaca feed (gap scan, movers, news, quotes, bars) and the paper
+    broker share one key pair, so a 401 is a full data-and-execution outage:
+    the desk can still reason, but about nothing. The email carries the
+    credential FINGERPRINT (source, lengths, key type, what was cleaned off),
+    never a key.
+    """
+    import html as _html
+    from .config import alpaca_credential_fingerprint, describe_alpaca_fingerprint
+    fp_line = describe_alpaca_fingerprint(alpaca_credential_fingerprint(cfg))
+    detail = f"{loop}: {where} -- {fp_line}"
+    return alert_once(
+        con, cfg, "alpaca_auth_failed", loop, detail,
+        "Trade Agent — Alpaca rejected the API credentials (401): data and paper broker down",
+        "<html><body style='font-family:sans-serif'>"
+        "<h2>Alpaca credentials rejected (HTTP 401)</h2>"
+        f"<p>The <b>{_html.escape(loop)}</b> loop was refused at "
+        f"<code>{_html.escape(where)}</code>. Every Alpaca data feed and the paper broker "
+        "use this one key pair, so the session is recorded as a data outage, not a "
+        "market stand-down.</p>"
+        f"<p><b>Credentials in use:</b> {_html.escape(fp_line)}</p>"
+        "<p>Fix: in Vercel → trade-agent → Settings → Environment Variables (Production), "
+        "set <code>ALPACA_API_KEY</code> and <code>ALPACA_SECRET_KEY</code> to the pair "
+        "shown on the Alpaca paper dashboard, then redeploy.</p>"
+        "</body></html>")
+
+
 def alert_provider_outage(con, cfg, loop: str, run_date, exc: BaseException | str) -> bool:
     """Email ONE alert per permanent provider condition per day. Never raises.
 
@@ -123,29 +169,19 @@ def alert_provider_outage(con, cfg, loop: str, run_date, exc: BaseException | st
     kind = _alert_kind(exc)
     if kind is None:
         return False
-    try:
-        from .ledger import alert_already_sent, record_alert
-        from .util import today_et
-        today = today_et()
-        if alert_already_sent(con, today, kind):
-            return False
-        detail = f"{loop} run for {run_date}: {str(exc)[:600]}"
-        record_alert(con, today, kind, loop, detail)
-        from .delivery import send_email
-        import html as _html
-        send_email(cfg, "Trade Agent — LLM provider refusing requests "
-                        "(deterministic data still collected)",
-                   f"<html><body style='font-family:sans-serif'>"
-                   f"<h2>{_html.escape(kind.replace('_', ' '))}</h2>"
-                   f"<p>The <b>{_html.escape(loop)}</b> loop's LLM call failed with a "
-                   f"condition retrying cannot fix. Market data, simulated outcomes, the "
-                   f"shadow ledger, population and runner pricing are still collected; "
-                   f"grading, lessons and plans need the provider back.</p>"
-                   f"<pre style='white-space:pre-wrap'>{_html.escape(detail)}</pre>"
-                   f"</body></html>")
-        return True
-    except Exception:
-        return False
+    import html as _html
+    detail = f"{loop} run for {run_date}: {str(exc)[:600]}"
+    return alert_once(
+        con, cfg, kind, loop, detail,
+        "Trade Agent — LLM provider refusing requests (deterministic data still collected)",
+        f"<html><body style='font-family:sans-serif'>"
+        f"<h2>{_html.escape(kind.replace('_', ' '))}</h2>"
+        f"<p>The <b>{_html.escape(loop)}</b> loop's LLM call failed with a "
+        f"condition retrying cannot fix. Market data, simulated outcomes, the "
+        f"shadow ledger, population and runner pricing are still collected; "
+        f"grading, lessons and plans need the provider back.</p>"
+        f"<pre style='white-space:pre-wrap'>{_html.escape(detail)}</pre>"
+        f"</body></html>")
 
 
 def format_failure(exc: BaseException) -> str:

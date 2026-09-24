@@ -191,6 +191,9 @@ def _bundle_health(md: MarketData, bundle: dict) -> dict:
         "bundle_catalyst_quotes": len(bundle.get("catalyst_quotes") or []),
         "catalyst_quotes_failed": any(str(m).startswith("catalyst_quotes:") for m in missing),
         "feed_downgraded": bool(getattr(md, "feed_downgraded", False)),
+        # A 401 is the credentials, not the market: recorded as its own cause
+        # so a no-trade on this session reads as a credentials outage.
+        "provider_auth_error": getattr(md, "alpaca_auth_error", None),
     }
 
 
@@ -264,6 +267,7 @@ def _data_health(gate_counts: dict[str, int], n_proposed: int,
         "bundle_catalyst_quotes": sh.get("bundle_catalyst_quotes"),
         "catalyst_quotes_failed": sh.get("catalyst_quotes_failed"),
         "feed_downgraded": sh.get("feed_downgraded"),
+        "provider_auth_failed": bool(sh.get("provider_auth_error")),
     }
 
     # Ungrounded ratio: measured over the ANALYST's candidates when the
@@ -278,6 +282,14 @@ def _data_health(gate_counts: dict[str, int], n_proposed: int,
     out["ungrounded_basis"] = "candidates" if by_candidate else "picks"
 
     reasons: list[str] = []
+    # Named first and on its own: when Alpaca rejects the key pair, every feed
+    # below fails for that one reason, and "gap scan returned no rows" alone
+    # would record the symptom instead of the cause.
+    auth = sh.get("provider_auth_error")
+    if auth:
+        reasons.append(f"Alpaca rejected the API credentials (HTTP {auth.get('status', 401)} "
+                       f"on {auth.get('path', '?')}): every Alpaca feed was down — a "
+                       "credentials outage, not a market read")
     # A gap scan that returned NOTHING is a feed failure, not a flat tape: the
     # scan folds in INDEX_ETFS unconditionally, so a healthy call cannot come
     # back empty.
@@ -955,6 +967,10 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         bundle = md.morning_bundle(d)
         bundle_md = render_bundle_md(bundle)
         _mark("bundle")
+        auth_error = getattr(md, "alpaca_auth_error", None)
+        if auth_error and not cfg.mock:
+            from ..failures import alert_alpaca_auth
+            alert_alpaca_auth(con, cfg, "morning", auth_error.get("path", "?"))
 
         # 2. regime
         log("morning", "Computing market regime...")

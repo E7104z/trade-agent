@@ -433,6 +433,11 @@ def api_paper():
     acct = live_broker.get_account(cfg=cfg)
     if acct is None:
         out["error"] = live_broker.last_error() or "account not readable"
+        if live_broker.auth_rejected():
+            # What the deployment is actually sending, described without the
+            # secret: source, lengths, key type, what was cleaned off a paste.
+            from agent.config import alpaca_credential_fingerprint, describe_alpaca_fingerprint
+            out["credentials"] = describe_alpaca_fingerprint(alpaca_credential_fingerprint(cfg))
     else:
         out["account"] = {k: _num(acct.get(k)) for k in
                           ("equity", "last_equity", "cash", "buying_power")}
@@ -817,6 +822,19 @@ def intraday_check():
         except Exception as e:
             log("runner", f"WARN runner tick failed; monitor unaffected: {e}")
             result["runner"] = {"error": str(e)}
+    # A broker 401 is the credentials, not an order: every live position is
+    # unmanaged until the key pair is fixed, so the owner hears about it once.
+    try:
+        from agent import live_broker
+        if live_broker.auth_rejected():
+            from agent.failures import alert_alpaca_auth
+            con = ledger.connect()
+            try:
+                alert_alpaca_auth(con, cfg, "intraday", "paper broker (/v2 trading API)")
+            finally:
+                con.close()
+    except Exception as e:  # noqa: BLE001 -- an alert never breaks the monitor
+        log("intraday", f"WARN credential alert failed: {e}")
     # Heartbeat: the dashboard's only proof that something is actually
     # managing live positions intraday.
     try:
