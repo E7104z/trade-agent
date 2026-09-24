@@ -567,6 +567,10 @@ _QUERYABLE_TABLES = {
     # alerts already emailed.
     "data_coverage": "session_date",
     "alerts": "alert_date",
+    # GRADER_GROUNDING_SPEC_v1: what the grounding checks refused, and dated
+    # lesson contradictions.
+    "grader_rejections": "session_date",
+    "lesson_contradictions": "session_date",
     # Not date-filterable, but ordered newest-first (see _TABLE_ORDER) so
     # ?limit=N returns the latest: a lost weekly rewrite is recovered from
     # llm_archive, and every playbook the miner ever wrote is in

@@ -382,6 +382,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v19.STATEMENTS
 from . import migrations_v20  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v20.STATEMENTS
 
+# --- v21 grader grounding: computed tape, grounded flag, dated contradictions
+from . import migrations_v21  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v21.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -795,31 +799,96 @@ def ungraded_picks(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:
 # -------------------------------------------------------------------- lessons
 
 def insert_lesson(con: duckdb.DuckDBPyConnection, l: dict, source: str, created: date) -> int:
+    pred = l.get("predicate")
     row = con.execute(
         """INSERT INTO lessons
-           (created_date, lesson, setup_type, regime, tags, confidence, evidence, source, promoted_at)
-           VALUES (?,?,?,?,?,?,?,?,?) RETURNING lesson_id""",
+           (created_date, lesson, setup_type, regime, tags, confidence, evidence, source,
+            promoted_at, predicate_json)
+           VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING lesson_id""",
         [
             created, l["lesson"], l.get("setup_type"), l.get("regime"),
             ",".join(l.get("tags", [])) if isinstance(l.get("tags"), list) else l.get("tags"),
             l.get("confidence", "low"), l.get("evidence"), source, created,
+            json.dumps(pred) if isinstance(pred, dict) else None,
         ],
     ).fetchone()
     return row[0]
 
 
+def get_lesson(con: Any, lesson_id: int) -> dict | None:
+    cols = [c[0] for c in con.execute("DESCRIBE lessons").fetchall()]
+    row = con.execute("SELECT * FROM lessons WHERE lesson_id = ?", [lesson_id]).fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
 def update_lesson_feedback(con: duckdb.DuckDBPyConnection, lesson_id: int, action: str,
-                          session_date: date | None = None) -> None:
-    if action == "confirm":
-        con.execute("UPDATE lessons SET confirmations = confirmations + 1 WHERE lesson_id = ?", [lesson_id])
-        # Task 5: log the event date too (in addition to, not instead of, the
-        # running counter above) so the weekly loop can split in-sample vs
-        # out-of-sample confirmations relative to lessons.promoted_at.
-        if session_date is not None:
-            con.execute("INSERT INTO lesson_confirmations (lesson_id, session_date) VALUES (?, ?)",
-                       [lesson_id, session_date])
-    elif action == "contradict":
-        con.execute("UPDATE lessons SET contradictions = contradictions + 1 WHERE lesson_id = ?", [lesson_id])
+                          session_date: date | None = None) -> bool:
+    """Apply one confirm/contradict. Returns False when it was already applied.
+
+    Idempotent per (lesson, session, action) when a session date is given
+    (GRADER_GROUNDING_SPEC_v1 Phase 3): an evening retry, or a grader that
+    lists the same lesson twice, used to add a second +1. Contradictions are
+    now DATED too (lesson_contradictions, v21), so the holdout split can see
+    them out-of-sample exactly as it sees confirmations.
+    """
+    if action not in ("confirm", "contradict"):
+        return False
+    table = "lesson_confirmations" if action == "confirm" else "lesson_contradictions"
+    if session_date is not None:
+        dup = con.execute(f"SELECT COUNT(*) FROM {table} WHERE lesson_id = ? AND session_date = ?",
+                          [lesson_id, session_date]).fetchone()
+        if dup and dup[0]:
+            return False
+    col = "confirmations" if action == "confirm" else "contradictions"
+    con.execute(f"UPDATE lessons SET {col} = {col} + 1 WHERE lesson_id = ?", [lesson_id])
+    if session_date is not None:
+        con.execute(f"INSERT INTO {table} (lesson_id, session_date) VALUES (?, ?)",
+                    [lesson_id, session_date])
+    return True
+
+
+def save_grader_rejection(con: Any, session_date: date, kind: str, text: str,
+                          unmatched: str = "", lesson_id: int | None = None,
+                          ticker: str | None = None) -> None:
+    con.execute(
+        """INSERT INTO grader_rejections (session_date, kind, lesson_id, ticker, text, unmatched)
+           VALUES (?,?,?,?,?,?)""",
+        [session_date, kind, lesson_id, ticker, (text or "")[:2000], (unmatched or "")[:500]])
+
+
+def grade_inflation(con: Any) -> list[dict]:
+    """A/B grade share by lane x setup, beside the system's own process proxies.
+
+    GRADER_GROUNDING_SPEC_v1 Phase 4. Descriptive only -- no action is taken
+    on it. An A/B grade is a process-pass that confirms a setup's rule, so a
+    grader whose A/Bs keep landing on stops inside the noise (the system's Q9
+    `<0.5` ATR bucket), on execution anomalies, or on reviews that cited
+    unsupported numbers is drifting, and the miner should see it.
+    """
+    rows = con.execute(
+        f"""SELECT CASE WHEN p.setup_type = '{RUNNER_SETUP}' THEN 'runner' ELSE 'morning' END,
+                  COALESCE(p.setup_type, '?'),
+                  COUNT(*),
+                  SUM(CASE WHEN o.grade IN ('A','B') THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN o.grade IN ('A','B') AND o.stop_dist_atr < 0.5 THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN o.grade IN ('A','B') AND o.execution_anomaly THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN o.grade IN ('A','B') AND o.grounded = FALSE THEN 1 ELSE 0 END)
+           FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+           WHERE o.grade IS NOT NULL
+           GROUP BY 1, 2 ORDER BY 1, 3 DESC"""
+    ).fetchall()
+    return [{"lane": r[0], "setup_type": r[1], "graded": int(r[2] or 0), "ab": int(r[3] or 0),
+             "ab_stop_inside_noise": int(r[4] or 0), "ab_on_anomaly": int(r[5] or 0),
+             "ab_ungrounded": int(r[6] or 0)} for r in rows]
+
+
+def set_outcome_grounding(con: Any, pick_id: int, tape_summary: str | None = None,
+                          grounded: bool | None = None) -> None:
+    if tape_summary is not None:
+        con.execute("UPDATE outcomes SET tape_summary = ? WHERE pick_id = ?",
+                    [tape_summary[:1000], pick_id])
+    if grounded is not None:
+        con.execute("UPDATE outcomes SET grounded = ? WHERE pick_id = ?", [bool(grounded), pick_id])
 
 
 def set_lesson_status(con: duckdb.DuckDBPyConnection, lesson_id: int, status: str) -> None:
@@ -934,6 +1003,15 @@ def lesson_holdout_stats(con: duckdb.DuckDBPyConnection, lesson_id: int,
     dates = [r[0] for r in con.execute(
         "SELECT session_date FROM lesson_confirmations WHERE lesson_id = ?", [lesson_id]
     ).fetchall()]
+    # Dated contradictions (v21). Pre-v21 contradictions exist only as the
+    # lessons.contradictions counter and carry no date, so they cannot be
+    # split and are not subtracted here -- the counter still reaches the miner.
+    try:
+        c_dates = [r[0] for r in con.execute(
+            "SELECT session_date FROM lesson_contradictions WHERE lesson_id = ?", [lesson_id]
+        ).fetchall()]
+    except Exception:
+        c_dates = []
 
     if holdout_sessions:
         recent = con.execute(
@@ -943,19 +1021,29 @@ def lesson_holdout_stats(con: duckdb.DuckDBPyConnection, lesson_id: int,
         if len(recent) == holdout_sessions:
             cutoff = min(r[0] for r in recent)  # earliest date inside the withheld window
             dates = [d for d in dates if d < cutoff]
+            c_dates = [d for d in c_dates if d < cutoff]
 
     if promoted_at is not None:
         n_in = sum(1 for d in dates if d <= promoted_at)
         n_out = sum(1 for d in dates if d > promoted_at)
+        c_in = sum(1 for d in c_dates if d <= promoted_at)
+        c_out = sum(1 for d in c_dates if d > promoted_at)
     else:
         # no promoted_at on record (shouldn't happen post-migration) -- treat
         # everything as in-sample rather than overclaiming out-of-sample rigor.
         n_in, n_out = len(dates), 0
+        c_in, c_out = len(c_dates), 0
 
+    # The tier is earned on NET evidence in each window (GRADER_GROUNDING_SPEC
+    # _v1 Phase 3): a lesson confirmed eight times out-of-sample and
+    # contradicted five times has three net out-of-sample confirmations, not
+    # eight. This can only lower a tier, never raise one.
     return {
         "confirmations_in_sample": n_in,
         "confirmations_out_of_sample": n_out,
-        "tier": lesson_confidence_tier(n_in, n_out),
+        "contradictions_in_sample": c_in,
+        "contradictions_out_of_sample": c_out,
+        "tier": lesson_confidence_tier(max(0, n_in - c_in), max(0, n_out - c_out)),
     }
 
 

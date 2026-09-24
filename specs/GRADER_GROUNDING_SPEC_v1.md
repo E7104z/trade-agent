@@ -75,7 +75,7 @@ Test: a fixture pick renders the same tape summary twice (deterministic), and th
    - extracts `-?\d+(\.\d+)?\s?(R|ATR|x|%)` and `\b\d{1,2}:\d{2}\b`;
    - checks each token against the set of strings **as they were rendered to the grader that day**: outcomes lines, indicator lines, tape summaries, the runner table.
 
-   Matching is on the rendered string, ±1 in the last printed digit. Nothing is re-rounded.
+   A quoted number matches when some number in the input **rounds** to it at the precision it was quoted (half a unit of its last digit). Clock times are compared as times and never feed the number set. As implemented: an earlier draft allowed ±1 in the last digit, which let an invented `9.99x` match a `10` taken from a `10:00` timestamp.
 2. **Lessons** (new or updated) containing an unmatched token are **not written**. Each is recorded in a new table `grader_rejections(session_date, kind, lesson_id, text, unmatched)`, which is added to `_QUERYABLE_TABLES`.
 3. **Pick reviews** with an unmatched token keep their grade. They are marked `outcomes.grounded = FALSE`, and **an ungrounded review cannot stamp a rule confirmation**.
 4. The RUN SUMMARY gains `lessons rejected (ungrounded)=N`.

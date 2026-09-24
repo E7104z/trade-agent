@@ -392,6 +392,31 @@ def _plumbing_md(con) -> str:
         "no_data row as a no-trigger.\n\n" + "\n".join(lines))
 
 
+def _grade_inflation_md(con) -> str:
+    """GRADER_GROUNDING_SPEC_v1 Phase 4: how the grader's A/Bs sit against the
+    system's own process proxies. Counts only; nothing is automated on it."""
+    try:
+        rows = ledger.grade_inflation(con)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    lines = ["| lane | setup | graded | A/B | A/B with stop <0.5 ATR | A/B on execution anomaly "
+             "| A/B on ungrounded review |", "|---|---|--:|--:|--:|--:|--:|"]
+    for r in rows:
+        lines.append(f"| {r['lane']} | {r['setup_type']} | {r['graded']} | {r['ab']} | "
+                     f"{r['ab_stop_inside_noise']} | {r['ab_on_anomaly']} | {r['ab_ungrounded']} |")
+    return (
+        "## GRADER CALIBRATION (process proxies, computed — descriptive only)\n\n"
+        "An A/B grade is a process-pass and confirms the setup's rule. These columns set "
+        "the grader's A/Bs beside process defects the system measures itself: a stop "
+        "inside the noise (Q9's <0.5 ATR bucket), an execution anomaly (which may never "
+        "confirm a rule), and a review that quoted numbers nothing computed supports. A "
+        "rising share in those columns is grade inflation; report it, and discount "
+        "confirmations accordingly. Counts only; suppression below n=8 applies to any "
+        "rate you derive.\n\n" + "\n".join(lines))
+
+
 def _no_trade_reason_md(con) -> str:
     """PARTICIPATION_UNBLOCK_SPEC_v2 Phase 3: no-trade days classified by a
     closed enum (`daily_plans.no_trade_category`) instead of only free
@@ -952,7 +977,9 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"+{l['confirmations']}/-{l['contradictions']}, source={l['source']}, "
             f"setup={l['setup_type'] or 'any'}, "
             f"holdout_tier={l['tier']} (n={l['confirmations_in_sample'] + l['confirmations_out_of_sample']} "
-            f"({l['confirmations_out_of_sample']} out-of-sample), promoted_at={l['promoted_at']}): {l['lesson']}"
+            f"({l['confirmations_out_of_sample']} out-of-sample), dated contradictions "
+            f"{l.get('contradictions_in_sample', 0)}+{l.get('contradictions_out_of_sample', 0)} "
+            f"(in+out), promoted_at={l['promoted_at']}): {l['lesson']}"
             for l in mem["lessons"]
         ) or "(no lessons recorded yet)"
 
@@ -990,6 +1017,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_data_quality_md(con)}\n\n"
             f"{_degraded_sessions_md(con)}\n\n"
             f"{_plumbing_md(con)}\n\n"
+            f"{_grade_inflation_md(con)}\n\n"
             f"{_no_trade_reason_md(con)}\n\n"
             f"{research_block['markdown']}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"

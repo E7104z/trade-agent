@@ -28,6 +28,8 @@ from ..coverage import (OUTCOME_FIELDS, RUNNER_FIELDS, lane_of, outcome_coverage
                         plumbing)
 from ..coverage import describe as describe_plumbing
 from ..failures import classify_failure, format_failure
+from ..grounding import (lesson_in_scope, tape_summary, ungrounded_tokens,
+                         validate_lesson_predicate)
 from ..providers import MarketData
 from ..util import is_market_day, log, now_et, prev_market_day, today_et
 
@@ -625,6 +627,97 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
     return counts
 
 
+def _fill_valid_rows(picks: list[dict], outcomes: list[dict]) -> list[dict]:
+    """Today's triggered, fill-valid trades (both lanes), as merged pick+outcome rows."""
+    by_id = {o["pick_id"]: o for o in outcomes}
+    rows = []
+    for p in picks:
+        o = by_id.get(p["pick_id"]) or {}
+        if (o.get("triggered") and o.get("exit_reason") != "invalid_fill"
+                and not o.get("execution_anomaly")):
+            rows.append({**p, **o})
+    return rows
+
+
+def _ground_review(con, d: date, review: dict, picks: list[dict],
+                   outcomes: list[dict], corpus: str) -> dict:
+    """Mark each pick review grounded or not (GRADER_GROUNDING_SPEC_v1 Phase 2).
+
+    A review that quotes a number or time found nowhere in what the grader was
+    shown keeps its letter grade -- that judgment stays with the grader -- but
+    is flagged `_ungrounded`, recorded, and can no longer stamp a rule
+    confirmation (see _llm_events).
+    """
+    counts = {"reviews_ungrounded": 0, "lessons_rejected": 0, "updates_rejected": 0}
+    for r in review.get("pick_reviews", []) or []:
+        bad = ungrounded_tokens(str(r.get("why") or ""), corpus)
+        p = _pick_for_review(r, picks)
+        if bad:
+            r["_ungrounded"] = True
+            counts["reviews_ungrounded"] += 1
+            ledger.save_grader_rejection(con, d, "review_ungrounded", str(r.get("why") or ""),
+                                         ", ".join(bad), ticker=r.get("ticker"))
+            log("evening", f"Review of {r.get('ticker', '?')} cites values nothing computed "
+                           f"supports ({', '.join(bad)}); grade kept, cannot confirm a rule")
+        if p is not None:
+            ledger.set_outcome_grounding(con, p["pick_id"], grounded=not bad)
+    return counts
+
+
+def _ground_lessons(con, d: date, new_lessons: list[dict], lesson_updates: list[dict],
+                    picks: list[dict], outcomes: list[dict], corpus: str,
+                    counts: dict) -> tuple[list[dict], list[dict]]:
+    """Filter the grader's lessons and lesson updates down to grounded ones.
+
+    New lessons (Phase 2): every quoted number/time must appear in the input,
+    and an optional predicate must be one the system can match. Lesson
+    updates (Phase 3): a confirm or contradict is accepted only when at least
+    one of today's fill-valid trades fell inside the lesson (its predicate
+    cell, or its setup_type/regime). Everything refused is recorded.
+    """
+    kept_lessons = []
+    for l in new_lessons or []:
+        text = f"{l.get('lesson', '')} {l.get('evidence', '')}"
+        bad = ungrounded_tokens(text, corpus)
+        if bad:
+            counts["lessons_rejected"] += 1
+            ledger.save_grader_rejection(con, d, "lesson_ungrounded", text, ", ".join(bad))
+            log("evening", f"Rejected lesson (cites {', '.join(bad)}, found nowhere in the "
+                           f"computed input): {str(l.get('lesson', ''))[:80]}")
+            continue
+        if l.get("predicate") is not None:
+            l = dict(l, predicate=validate_lesson_predicate(l.get("predicate")))
+        kept_lessons.append(l)
+
+    pick_rows = _fill_valid_rows(picks, outcomes)
+    try:
+        from .. import research
+        runner_rows = research.runner_rows(con, d)
+    except Exception:  # noqa: BLE001
+        runner_rows = []
+    kept_updates = []
+    seen = set()
+    for upd in lesson_updates or []:
+        lid, action = upd.get("lesson_id"), upd.get("action", "")
+        if not isinstance(lid, int) or action not in ("confirm", "contradict"):
+            continue
+        if (lid, action) in seen:
+            continue            # the same lesson listed twice is one event
+        seen.add((lid, action))
+        lesson = ledger.get_lesson(con, lid)
+        if lesson is None:
+            continue
+        ok, why = lesson_in_scope(lesson, pick_rows, runner_rows)
+        if not ok:
+            counts["updates_rejected"] += 1
+            ledger.save_grader_rejection(con, d, "update_out_of_scope",
+                                         str(upd.get("note") or ""), why, lesson_id=lid)
+            log("evening", f"Rejected {action} of L{lid}: {why}")
+            continue
+        kept_updates.append(upd)
+    return kept_lessons, kept_updates
+
+
 def _record_coverage(con, d: date, picks: list[dict], outcomes: list[dict]) -> list[dict]:
     """Write this session's grading coverage and return the plumbing rows.
 
@@ -879,6 +972,24 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                 runner_summary = {"scored": 0, "error": str(e)}
         _mark("runner")
 
+        # GRADER_GROUNDING_SPEC_v1 Phase 1: a COMPUTED tape per pick, from the
+        # bars already fetched (memoized). It replaces the "tape narrative" the
+        # grader used to be asked for without being shown a single bar, and it
+        # is stored on the outcome so the email and dashboard show facts.
+        tapes: dict[int, str] = {}
+        by_pick = {o["pick_id"]: o for o in outcomes}
+        for p in picks:
+            o = by_pick.get(p["pick_id"])
+            if o is None:
+                continue
+            try:
+                tapes[p["pick_id"]] = tape_summary(md.minute_bars(p["ticker"], d), o)
+                if not cfg.mock:
+                    ledger.set_outcome_grounding(con, p["pick_id"],
+                                                 tape_summary=tapes[p["pick_id"]])
+            except Exception as e:  # noqa: BLE001
+                log("evening", f"WARN tape summary for {p['ticker']} failed: {e}")
+
         # DATA_CONTINUITY_SPEC_v1 Phase 3: per-field coverage, and the
         # plumbing rule -- a field null on EVERY graded row is the pipe, not
         # the market. Recorded before the LLM so an outage still leaves it.
@@ -914,6 +1025,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         _mark("events")
 
         out_md = outcomes_md(picks, outcomes) if picks else "(no picks today — no-trade day)"
+        tape_md = "\n".join(f"- {p['ticker']} (pick_id={p['pick_id']}): {tapes[p['pick_id']]}"
+                            for p in picks if p["pick_id"] in tapes)
         recap = md.market_recap(d)
         recap_md = ", ".join(f"{k} {v:+.2f}%" for k, v in (recap.get("pct_change") or {}).items())
 
@@ -943,6 +1056,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                + f"\nNotes for evening from the risk manager: "
                  f"{plan_row.get('notes_for_evening','')}\n\n")
             + f"## PICKS + COMPUTED OUTCOMES (mechanically simulated from real bars)\n\n{out_md}\n\n"
+            + (f"## COMPUTED TAPE (from the real bars — the ONLY tape facts you may cite)\n\n"
+               f"{tape_md}\n\n" if tape_md else "")
             + f"## EXECUTION GROUND TRUTH\n\n"
             f"Live fills recorded for {d}: "
             f"{sum(1 for o in ledger.live_orders_for_date(con, d) if o.get('entry_fill_price') is not None)}. "
@@ -1009,6 +1124,16 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                            f"{len(lesson_updates)} lesson update(s) -- the picks' intraday "
                            f"bars never arrived (plumbing), so nothing was observed to learn from")
             new_lessons, lesson_updates = [], []
+        # GRADER_GROUNDING_SPEC_v1: nothing the grader asserts becomes memory
+        # unless something computed supports it. `corpus` is exactly what it
+        # was shown; a number it quotes (R, ATR, x, %) or a clock time it
+        # cites must appear there.
+        grounding = _ground_review(con, d, review, picks, outcomes,
+                                   corpus=f"{system}\n{user}")
+        new_lessons, lesson_updates = _ground_lessons(
+            con, d, new_lessons, lesson_updates, picks, outcomes,
+            corpus=f"{system}\n{user}", counts=grounding)
+
         for l in new_lessons:
             dup = ledger.find_duplicate_lesson(con, l.get("lesson", ""))
             if dup:
@@ -1018,8 +1143,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             lid = ledger.insert_lesson(con, l, "evening", d)
             log("evening", f"New lesson L{lid}: {l['lesson']}")
         for upd in lesson_updates:
-            if isinstance(upd.get("lesson_id"), int):
-                ledger.update_lesson_feedback(con, upd["lesson_id"], upd.get("action", ""), d)
+            ledger.update_lesson_feedback(con, upd["lesson_id"], upd.get("action", ""), d)
 
         # v3: rule confirmations -- the one v3 event that needs the grader.
         # (Calibration and open-question progress were written before the call.)
@@ -1042,10 +1166,14 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                        f"forward observations={forward['recorded']}, "
                        f"live reconciled={live_summary['reconciled']}, "
                        f"lessons extracted={len(new_lessons)}, "
+                       f"lessons rejected (ungrounded)={grounding['lessons_rejected']}, "
+                       f"lesson updates rejected (out of scope)={grounding['updates_rejected']}, "
+                       f"ungrounded reviews={grounding['reviews_ungrounded']}, "
                        f"cost ~${result.usage['cost_usd']:.3f}")
 
         send_email(cfg, f"Trade Agent — Evening Review {d.isoformat()}",
-                   evening_email_html(d, review, out_md))
+                   evening_email_html(d, review, out_md + (
+                       f"\n\nCOMPUTED TAPE\n{tape_md}" if tape_md else "")))
         render_dashboard(con, cfg, d)
         ledger.finish_run_lock(con, d, "evening", lock["request_id"], "complete")
 
