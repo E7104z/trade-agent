@@ -24,9 +24,19 @@ from ..grading import (CURRENT_SIM_VERSION, classify_shadow, grade_day,
                        outcomes_md, simulate_pick)
 from ..grading_context import build_grading_context
 from ..llm import LLMClient, load_prompt, prompt_version
+from ..coverage import (OUTCOME_FIELDS, RUNNER_FIELDS, lane_of, outcome_coverage,
+                        plumbing)
+from ..coverage import describe as describe_plumbing
 from ..failures import classify_failure, format_failure
 from ..providers import MarketData
 from ..util import is_market_day, log, now_et, prev_market_day, today_et
+
+# vercel.json functions.maxDuration. A run killed at the budget logs nothing,
+# so the warning fires on the runs that DO finish, while there is still room:
+# runner-heavy evenings took 455-518s before the prefetch fix (85a7993).
+FUNCTION_BUDGET_S = 300
+BUDGET_WARN_FRACTION = 0.70
+BUDGET_WARN_S = FUNCTION_BUDGET_S * BUDGET_WARN_FRACTION
 
 # Open-question registry (ids match playbook.md "Open Questions" numbering)
 Q_GAP_FADE_MECHANICS = 1
@@ -402,9 +412,65 @@ def _q1_gap_fade_mechanics(con, md: MarketData, d: date, picks: list[dict],
 
 def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[dict],
                review: dict, shadow: dict, slippage_bps: float = 0.0) -> dict:
-    """Calibration rows, rule confirmations, open-question progress. DB writes only."""
+    """Calibration rows, rule confirmations, open-question progress. DB writes only.
+
+    Kept for callers that run both halves at once. The evening loop itself
+    calls `_deterministic_events` BEFORE the grader call and `_llm_events`
+    after it, so an LLM outage no longer costs the deterministic rows.
+    """
+    counts = _deterministic_events(con, md, d, picks, outcomes, shadow, slippage_bps)
+    counts["confirmations"] = _llm_events(con, d, picks, outcomes, review)
+    return counts
+
+
+def _llm_events(con, d: date, picks: list[dict], outcomes: list[dict], review: dict) -> int:
+    """Rule confirmations: the only v3 event that depends on the grader.
+
+    Process-pass (A/B) confirms the setup's rule — regardless of P&L. A
+    process-FAIL does not confirm a rule even if it made money. An
+    execution_anomaly pick never confirms a rule either, no matter what grade
+    the LLM assigned — the fill landed far enough from the planned entry that
+    the thesis at the intended level was never actually tested (enforced here
+    in code rather than trusted to prompt compliance; see grading.py).
+
+    Idempotent per session: a retried evening replaces this session's
+    confirmations instead of stamping them twice (runs 64-66 on 09-22 were
+    three attempts at one session).
+    """
+    by_id = {o["pick_id"]: o for o in outcomes}
+    con.execute("DELETE FROM rule_confirmations WHERE session_date = ?", [d])
+    n = 0
+    tick_to_pick = {p["ticker"].upper(): p for p in picks}
+    for r in review.get("pick_reviews", []) or []:
+        p = None
+        if isinstance(r.get("pick_id"), int):
+            p = next((x for x in picks if x["pick_id"] == r["pick_id"]), None)
+        if p is None:
+            p = tick_to_pick.get(str(r.get("ticker", "")).upper())
+        o = by_id.get(p["pick_id"], {}) if p else {}
+        if (p and str(r.get("grade", "")).upper() in ("A", "B") and p.get("setup_type")
+                and not o.get("execution_anomaly") and not r.get("_ungrounded")):
+            ledger.add_rule_confirmation(con, p["setup_type"], d, p["pick_id"])
+            n += 1
+    return n
+
+
+def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
+                          outcomes: list[dict], shadow: dict,
+                          slippage_bps: float = 0.0) -> dict:
+    """Calibration rows and every open-question increment. No LLM involved.
+
+    Runs BEFORE the grader call (DATA_CONTINUITY_SPEC_v1 Phase 1): these rows
+    are computed from outcomes and bars alone, and an Anthropic outage used
+    to cost them because they were written after the call. Idempotent per
+    session: calibration rows already replace by (session_date, ticker), and
+    this session's question-progress rows are cleared first -- every
+    open_question_progress row is written by this function, so a retry
+    replaces them rather than counting the same observation twice.
+    """
     counts = {"calibration": 0, "confirmations": 0, "q_increments": 0}
     by_id = {o["pick_id"]: o for o in outcomes}
+    con.execute("DELETE FROM open_question_progress WHERE session_date = ?", [d])
 
     # calibration rows (taken picks only; conviction as stated in the morning, never adjusted)
     for p in picks:
@@ -416,26 +482,6 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
             ledger.add_question_progress(con, Q_CONVICTION, d, 1,
                                          f"{p['ticker']} conv={p.get('conviction')} R={realized:+.2f}")
             counts["q_increments"] += 1
-
-    # rule confirmations: process-pass (A/B) confirms the setup's rule — regardless of P&L.
-    # A process-FAIL does not confirm a rule even if it made money. An
-    # execution_anomaly pick never confirms a rule either, no matter what grade
-    # the LLM assigned — the fill landed far enough from the planned entry that
-    # the thesis at the intended level was never actually tested (enforced here
-    # in code rather than trusted to prompt compliance; see grading.py).
-    graded = {}
-    tick_to_pick = {p["ticker"].upper(): p for p in picks}
-    for r in review.get("pick_reviews", []) or []:
-        p = None
-        if isinstance(r.get("pick_id"), int):
-            p = next((x for x in picks if x["pick_id"] == r["pick_id"]), None)
-        if p is None:
-            p = tick_to_pick.get(str(r.get("ticker", "")).upper())
-        o = by_id.get(p["pick_id"], {}) if p else {}
-        if (p and str(r.get("grade", "")).upper() in ("A", "B") and p.get("setup_type")
-                and not o.get("execution_anomaly")):
-            ledger.add_rule_confirmation(con, p["setup_type"], d, p["pick_id"])
-            counts["confirmations"] += 1
 
     # Q2: sympathy standalone — only when the sympathy pick is the day's sole pick
     # (approximation of "leader not concurrently held"; noted for the miner)
@@ -579,6 +625,38 @@ def _v3_events(con, md: MarketData, d: date, picks: list[dict], outcomes: list[d
     return counts
 
 
+def _record_coverage(con, d: date, picks: list[dict], outcomes: list[dict]) -> list[dict]:
+    """Write this session's grading coverage and return the plumbing rows.
+
+    One row per lane and field: how many rows were graded, how many had the
+    field null. Picks are split by lane (a runner day grades ten picks the
+    morning lane never saw); every runner candidate the evening priced is its
+    own lane. Never raises -- measurement must not cost the run.
+    """
+    try:
+        by_pick = {o["pick_id"]: o for o in outcomes}
+        lanes: dict[str, list[dict]] = {}
+        for p in picks:
+            o = by_pick.get(p["pick_id"])
+            if o is not None:
+                lanes.setdefault(lane_of(p), []).append(o)
+        cov: list[dict] = []
+        for lane, rows in lanes.items():
+            cov += outcome_coverage(rows, f"{lane}_picks", OUTCOME_FIELDS, "grade_day")
+        try:
+            cand = ledger.runner_outcomes_for_date(con, d)
+        except Exception:
+            cand = []
+        if cand:
+            cov += outcome_coverage(cand, "runner_candidates", RUNNER_FIELDS,
+                                    "grade_runner_candidates")
+        ledger.save_data_coverage(con, d, "evening", cov)
+        return plumbing(cov)
+    except Exception as e:  # noqa: BLE001
+        log("evening", f"WARN coverage accounting failed ({e}) -- grading unaffected")
+        return []
+
+
 def _prefetch_grading_bars(con, md: MarketData, d: date, picks: list[dict],
                            runner_enabled: bool) -> None:
     """Warm MarketData's bar memo for every symbol this run will grade.
@@ -650,6 +728,29 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             con.close()
             return
 
+    # DATA_CONTINUITY_SPEC_v1: per-stage outcome and elapsed seconds, written
+    # to runs.stages on success AND on failure. "Deterministic data collected,
+    # grading LLM failed" must never read like "no evening recorded", and a
+    # run creeping toward the 300s kill is visible on the runs that finish.
+    import time as _time
+    t_start = _time.monotonic()
+    t_last = [t_start]
+    stages: dict = {"deterministic": "pending", "llm": "pending", "timings_s": {}}
+
+    def _mark(name: str) -> None:
+        now = _time.monotonic()
+        stages["timings_s"][name] = round(now - t_last[0], 1)
+        t_last[0] = now
+
+    def _finish_stages() -> dict:
+        total = round(_time.monotonic() - t_start, 1)
+        stages["timings_s"]["total"] = total
+        if total > BUDGET_WARN_S:
+            stages["budget_warning"] = True
+            log("evening", f"WARN run took {total}s -- over {BUDGET_WARN_S:.0f}s, "
+                           f"{BUDGET_WARN_FRACTION:.0%} of the {FUNCTION_BUDGET_S}s function budget")
+        return stages
+
     try:
         plan_row = ledger.plan_for_date(con, d)
         # The runner lane produces picks WITHOUT a morning plan: it detects
@@ -688,6 +789,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         picks = ledger.picks_for_date(con, d)
         md = MarketData(cfg)
         _prefetch_grading_bars(con, md, d, picks, runner_enabled)
+        _mark("prefetch")
         slippage = float(cfg.get("slippage_bps", 5))
         flatten_at = cfg.get("flatten_at")
         min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
@@ -749,16 +851,19 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             log("evening", "No simulated picks; confirmed no live fills exist."
                 if not live_fills else
                 f"No simulated picks, but found {len(live_fills)} live fill(s); grading execution evidence.")
+        _mark("simulate")
 
         # v3: shadow ledger — grade what the desk REJECTED (counterfactual only,
         # never touches the taken-trade equity curve)
         log("evening", "Scoring rejected candidates (shadow ledger)...")
         shadow = _grade_rejections(con, md, d, slippage_bps=slippage,
                                    flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+        _mark("shadow")
 
         # v4: population monkeys + challenger arms, graded by the SAME simulator.
         from .. import integrity
         integrity.on_evening(con, cfg, md, d, simulate=simulate_pick)
+        _mark("population")
 
         # v10: DTO Runner lane — price EVERY candidate the intraday scan found,
         # selected or not. Additive and fully isolated: it runs after all
@@ -772,6 +877,27 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                 log("evening", f"WARN runner candidate grading failed; "
                                f"existing grading unaffected: {e}")
                 runner_summary = {"scored": 0, "error": str(e)}
+        _mark("runner")
+
+        # DATA_CONTINUITY_SPEC_v1 Phase 3: per-field coverage, and the
+        # plumbing rule -- a field null on EVERY graded row is the pipe, not
+        # the market. Recorded before the LLM so an outage still leaves it.
+        plumbing_bad = _record_coverage(con, d, picks, outcomes)
+        if plumbing_bad:
+            stages["plumbing"] = describe_plumbing(plumbing_bad)
+            log("evening", f"DATA PLUMBING: {stages['plumbing']} -- this session's grading "
+                           "is logged as degraded, not as a normal day")
+
+        # Phase 1: every deterministic event (calibration, open-question
+        # progress) BEFORE the grader call, so a provider outage cannot cost
+        # them. Mock runs keep their existing contract: nothing past the
+        # simulated outcomes is persisted.
+        counts = {"calibration": 0, "confirmations": 0, "q_increments": 0}
+        if not cfg.mock:
+            counts = _deterministic_events(con, md, d, picks, outcomes, shadow,
+                                           slippage_bps=slippage)
+        stages["deterministic"] = "complete"
+        _mark("events")
 
         out_md = outcomes_md(picks, outcomes) if picks else "(no picks today — no-trade day)"
         recap = md.market_recap(d)
@@ -817,8 +943,14 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         model = cfg.models["evening"]
         log("evening", f"Grading call ({model})...")
         llm = LLMClient(cfg)
-        result = llm.call(system=system, user=user, model=model,
-                          mock_name="evening_grader", thinking=False, web_search=False)
+        try:
+            result = llm.call(system=system, user=user, model=model,
+                              mock_name="evening_grader", thinking=False, web_search=False)
+        except Exception:
+            stages["llm"] = "failed"
+            raise
+        stages["llm"] = "complete"
+        _mark("llm")
         review = result.parsed or {}
         review = _drop_invalid_fill_reviews(review, picks, outcomes)
 
@@ -854,6 +986,15 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                            f"activity today was invalid_fill or execution_anomaly; nothing "
                            f"clean today to draw or confirm a thesis lesson from")
             new_lessons, lesson_updates = [], []
+        # A session whose picks had no intraday bars at all was not observed:
+        # any lesson drawn from it is narrative about data that never arrived.
+        pick_lanes = {f"{lane_of(p)}_picks" for p in picks}
+        if any(c["field"] == "minute_bars" and c["lane"] in pick_lanes
+               for c in plumbing_bad) and (new_lessons or lesson_updates):
+            log("evening", f"Skipping {len(new_lessons)} new lesson(s) and "
+                           f"{len(lesson_updates)} lesson update(s) -- the picks' intraday "
+                           f"bars never arrived (plumbing), so nothing was observed to learn from")
+            new_lessons, lesson_updates = [], []
         for l in new_lessons:
             dup = ledger.find_duplicate_lesson(con, l.get("lesson", ""))
             if dup:
@@ -866,10 +1007,13 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             if isinstance(upd.get("lesson_id"), int):
                 ledger.update_lesson_feedback(con, upd["lesson_id"], upd.get("action", ""), d)
 
-        # v3: calibration rows, rule confirmations, open-question progress
-        counts = _v3_events(con, md, d, picks, outcomes, review, shadow, slippage_bps=slippage)
+        # v3: rule confirmations -- the one v3 event that needs the grader.
+        # (Calibration and open-question progress were written before the call.)
+        counts["confirmations"] = _llm_events(con, d, picks, outcomes, review)
+        _mark("persist")
 
-        ledger.log_run(con, "evening", d, started, "ok", model, result.usage)
+        ledger.log_run(con, "evening", d, started, "degraded" if plumbing_bad else "ok",
+                       model, result.usage, stages=_finish_stages())
 
         # 4. console + delivery — the nightly eyeball summary (spec §5)
         log("evening", f"Plan grade: {review.get('plan_grade','?')} — {review.get('plan_notes','')}")
@@ -898,8 +1042,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         detail = format_failure(e)
         if lock:
             ledger.finish_run_lock(con, d, "evening", lock["request_id"], "failed")
-        ledger.log_run(con, "evening", d, started, status, error=detail)
+        ledger.log_run(con, "evening", d, started, status, error=detail,
+                       stages=_finish_stages())
         log("evening", f"ERROR: {e}")
+        from ..failures import alert_provider_outage
+        alert_provider_outage(con, cfg, "evening", d, e)
         raise
     finally:
         con.close()

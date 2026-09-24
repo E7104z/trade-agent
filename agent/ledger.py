@@ -374,6 +374,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v17.STATEMENTS
 from . import migrations_v18  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v18.STATEMENTS
 
+# --- v19 data continuity: run stages, provider alerts, data coverage -------
+from . import migrations_v19  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v19.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -1435,16 +1439,21 @@ def graded_picks_since(con: duckdb.DuckDBPyConnection, from_date: date) -> list[
 
 
 def log_run(con: duckdb.DuckDBPyConnection, loop: str, run_date: date, started: datetime,
-            status: str, model: str = "", usage: dict | None = None, error: str = "") -> None:
+            status: str, model: str = "", usage: dict | None = None, error: str = "",
+            stages: dict | None = None) -> None:
+    """One runs row. `stages` (v19) is per-stage outcome and elapsed seconds,
+    e.g. {"deterministic": "complete", "llm": "failed", "timings_s": {...}}."""
     u = usage or {}
     finished = now_et().replace(tzinfo=None)  # same naive ET clock as `started`
     con.execute(
         """INSERT INTO runs (loop, run_date, started_at, finished_at, status, model,
-                             input_tokens, output_tokens, web_searches, cost_usd, error)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                             input_tokens, output_tokens, web_searches, cost_usd, error,
+                             stages)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         [loop, run_date, started, finished, status, model,
          u.get("input_tokens", 0), u.get("output_tokens", 0),
-         u.get("web_searches", 0), u.get("cost_usd", 0.0), error[:2000]],
+         u.get("web_searches", 0), u.get("cost_usd", 0.0), error[:2000],
+         json.dumps(stages, default=str)[:4000] if stages else None],
     )
 
 
@@ -2130,6 +2139,57 @@ def latest_playbook_violations(con: Any) -> dict:
             out["rejected"] = True
         out["by_checker"][checker] = out["by_checker"].get(checker, 0) + n
     return out
+
+
+# ------------------------------------------------------- data continuity (v19)
+
+def alert_already_sent(con: Any, alert_date: date, kind: str) -> bool:
+    row = con.execute("SELECT COUNT(*) FROM alerts WHERE alert_date = ? AND kind = ?",
+                      [alert_date, kind]).fetchone()
+    return bool(row and row[0])
+
+
+def record_alert(con: Any, alert_date: date, kind: str, loop: str, detail: str) -> None:
+    con.execute("INSERT INTO alerts (alert_date, kind, loop, detail) VALUES (?,?,?,?)",
+                [alert_date, kind, loop, (detail or "")[:1000]])
+
+
+def recent_alerts(con: Any, since: date) -> list[dict]:
+    rows = con.execute(
+        """SELECT alert_date, kind, loop, detail FROM alerts
+           WHERE alert_date >= ? ORDER BY alert_date DESC""", [since]).fetchall()
+    return [{"alert_date": r[0], "kind": r[1], "loop": r[2], "detail": r[3]} for r in rows]
+
+
+def save_data_coverage(con: Any, session_date: date, stage: str, rows: list[dict]) -> None:
+    """Replace one session+stage's coverage rows (retries overwrite, never add)."""
+    con.execute("DELETE FROM data_coverage WHERE session_date = ? AND stage = ?",
+                [session_date, stage])
+    for r in rows:
+        con.execute(
+            """INSERT INTO data_coverage (session_date, lane, stage, field, n_total, n_null, source)
+               VALUES (?,?,?,?,?,?,?)""",
+            [session_date, r.get("lane"), stage, r.get("field"), int(r.get("n_total") or 0),
+             int(r.get("n_null") or 0), r.get("source")])
+
+
+def coverage_for(con: Any, session_date: date) -> list[dict]:
+    rows = con.execute(
+        """SELECT lane, stage, field, n_total, n_null, source FROM data_coverage
+           WHERE session_date = ? ORDER BY lane, stage, field""", [session_date]).fetchall()
+    return [{"lane": r[0], "stage": r[1], "field": r[2], "n_total": r[3], "n_null": r[4],
+             "source": r[5]} for r in rows]
+
+
+def plumbing_sessions(con: Any, limit: int = 30) -> list[dict]:
+    """Sessions where some graded field was null on EVERY row (plumbing)."""
+    from .coverage import PLUMBING_MIN_ROWS
+    rows = con.execute(
+        f"""SELECT session_date, lane, stage, field, n_total FROM data_coverage
+            WHERE n_total >= {int(PLUMBING_MIN_ROWS)} AND n_null = n_total
+            ORDER BY session_date DESC LIMIT ?""", [limit]).fetchall()
+    return [{"session_date": r[0], "lane": r[1], "stage": r[2], "field": r[3],
+             "n_total": r[4]} for r in rows]
 
 
 # ------------------------------------------------------------------ heartbeats

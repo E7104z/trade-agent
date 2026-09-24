@@ -371,6 +371,27 @@ def _degraded_sessions_md(con) -> str:
     )
 
 
+def _plumbing_md(con) -> str:
+    """Sessions where the EVENING grading inputs never arrived (DATA_CONTINUITY
+    _SPEC_v1 Phase 3): a field null on every graded row is the pipe, not the
+    market. The morning lane's own outage flag is DEGRADED SESSIONS above;
+    this is the same distinction on the grading side."""
+    try:
+        rows = ledger.plumbing_sessions(con, 60)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    lines = [f"- {r['session_date']}: {r['lane']} {r['field']} null on all "
+             f"{r['n_total']} graded rows" for r in rows]
+    return (
+        "## GRADING DATA OUTAGES (plumbing, not market behaviour)\n\n"
+        "On the sessions below a grading input was null on EVERY graded row. Those "
+        "outcomes were not observed: exclude them from any claim about triggers, "
+        "exits, indicator buckets or stand-downs on those dates, and never read a "
+        "no_data row as a no-trigger.\n\n" + "\n".join(lines))
+
+
 def _no_trade_reason_md(con) -> str:
     """PARTICIPATION_UNBLOCK_SPEC_v2 Phase 3: no-trade days classified by a
     closed enum (`daily_plans.no_trade_category`) instead of only free
@@ -968,6 +989,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"{_half_day_md(con)}\n\n"
             f"{_data_quality_md(con)}\n\n"
             f"{_degraded_sessions_md(con)}\n\n"
+            f"{_plumbing_md(con)}\n\n"
             f"{_no_trade_reason_md(con)}\n\n"
             f"{research_block['markdown']}\n\n"
             f"## FULL TRADE LEDGER (CSV)\n\n```\n{mem['trades_csv']}\n```\n\n"
@@ -1106,6 +1128,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             ledger.finish_run_lock(con, d, "weekly", lock["request_id"], "failed")
         ledger.log_run(con, "weekly", d, started, status, error=detail)
         log("weekly", f"ERROR: {e}")
+        from ..failures import alert_provider_outage
+        alert_provider_outage(con, cfg, "weekly", d, e)
         raise
     finally:
         con.close()

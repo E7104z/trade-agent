@@ -35,7 +35,7 @@ have helped.
 from __future__ import annotations
 
 __all__ = ["STATUS_ERROR", "STATUS_API_ERROR", "classify_failure",
-           "is_permanent_provider_error", "format_failure"]
+           "is_permanent_provider_error", "format_failure", "alert_provider_outage"]
 
 import traceback as _traceback
 
@@ -97,6 +97,55 @@ def classify_failure(exc: BaseException | str) -> str:
     only costs the investigation this module exists to shorten.
     """
     return STATUS_API_ERROR if any(m in _text(exc) for m in _PROVIDER_MARKERS) else STATUS_ERROR
+
+
+def _alert_kind(exc: BaseException | str) -> str | None:
+    t = _text(exc)
+    if "credit balance is too low" in t:
+        return "llm_credit_exhausted"
+    if any(m in t for m in ("authentication_error", "invalid_x_api_key", "invalid api key")):
+        return "llm_auth_failed"
+    if "permission_error" in t:
+        return "llm_permission_denied"
+    return None
+
+
+def alert_provider_outage(con, cfg, loop: str, run_date, exc: BaseException | str) -> bool:
+    """Email ONE alert per permanent provider condition per day. Never raises.
+
+    DATA_CONTINUITY_SPEC_v1 Phase 2. Credit ran out on 09-02, 09-04 and 09-22,
+    and every time it was found after the fact by reading a failed run. The
+    deterministic half of each loop still collects its data through an outage
+    (Phase 1), but the LLM half cannot run until someone tops up -- which is a
+    decision only the account owner can make, so the system's job is to make
+    sure they hear about it on the FIRST failure, not the fourth.
+    """
+    kind = _alert_kind(exc)
+    if kind is None:
+        return False
+    try:
+        from .ledger import alert_already_sent, record_alert
+        from .util import today_et
+        today = today_et()
+        if alert_already_sent(con, today, kind):
+            return False
+        detail = f"{loop} run for {run_date}: {str(exc)[:600]}"
+        record_alert(con, today, kind, loop, detail)
+        from .delivery import send_email
+        import html as _html
+        send_email(cfg, "Trade Agent — LLM provider refusing requests "
+                        "(deterministic data still collected)",
+                   f"<html><body style='font-family:sans-serif'>"
+                   f"<h2>{_html.escape(kind.replace('_', ' '))}</h2>"
+                   f"<p>The <b>{_html.escape(loop)}</b> loop's LLM call failed with a "
+                   f"condition retrying cannot fix. Market data, simulated outcomes, the "
+                   f"shadow ledger, population and runner pricing are still collected; "
+                   f"grading, lessons and plans need the provider back.</p>"
+                   f"<pre style='white-space:pre-wrap'>{_html.escape(detail)}</pre>"
+                   f"</body></html>")
+        return True
+    except Exception:
+        return False
 
 
 def format_failure(exc: BaseException) -> str:

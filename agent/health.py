@@ -277,6 +277,45 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
                 "(no intraday tick reached them before the close). The next intraday tick "
                 "or morning run settles them, closing any position still open.")
 
+    # --- data continuity (DATA_CONTINUITY_SPEC_v1) -------------------------
+    # A provider refusing requests, a session whose data never arrived, and a
+    # run creeping toward the function budget are each silent until counted.
+    try:
+        from .ledger import plumbing_sessions, recent_alerts
+        for a in recent_alerts(con, now.date() - timedelta(days=2)):
+            warnings.append(
+                f"LLM provider refused requests ({a['kind'].replace('_', ' ')}) during the "
+                f"{a['loop']} run on {a['alert_date']}. Deterministic data is still being "
+                "collected; plans, grading and lessons need the provider back (an account "
+                "decision, not a code fix).")
+        seen = set()
+        for p in plumbing_sessions(con, 20):
+            if _as_date(p["session_date"]) < now.date() - timedelta(days=LEARNING_WINDOW_DAYS):
+                continue
+            key = (p["session_date"], p["lane"])
+            if key in seen:
+                continue
+            seen.add(key)
+            warnings.append(
+                f"Data plumbing on {p['session_date']}: {p['lane']} {p['field']} was null on "
+                f"all {p['n_total']} graded rows -- an outage, not a market read; that "
+                "session is logged degraded.")
+    except Exception:
+        pass
+    ev = _q(con, """SELECT run_date, stages FROM runs WHERE loop = 'evening'
+                    AND stages IS NOT NULL ORDER BY run_id DESC LIMIT 1""")
+    if ev:
+        try:
+            import json as _json
+            st = _json.loads(ev[0][1] or "{}")
+            if st.get("budget_warning"):
+                warnings.append(
+                    f"The {ev[0][0]} evening run took {st.get('timings_s', {}).get('total')}s of "
+                    "a 300s function budget. A run killed at the budget logs nothing; find the "
+                    "slow stage in runs.stages before it crosses.")
+        except (TypeError, ValueError):
+            pass
+
     # --- is anything actually being learned? ------------------------------
     since = now.date() - timedelta(days=LEARNING_WINDOW_DAYS)
 

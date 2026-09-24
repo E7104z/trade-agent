@@ -918,6 +918,17 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             ledger.log_run(con, "morning", d, started, "dry_run")
             return
 
+        # 4b. Deterministic collection BEFORE any LLM call (DATA_CONTINUITY_SPEC
+        # _v1 Phase 1). The gap-scan population needs no model: it is the input
+        # to the long/short population monkeys the evening grades. Snapshotted
+        # here, an LLM outage no longer costs that day's population. The call
+        # at the end of the run re-snapshots with the final picks
+        # (snapshot_universe is DELETE-then-INSERT per plan_date), which only
+        # sets was_picked.
+        if not cfg.mock:
+            from .. import integrity
+            integrity.on_morning(con, cfg, d, bundle, {"picks": []})
+
         # 5. stage 1: analyst
         llm = LLMClient(cfg)
         model = cfg.models["morning"]
@@ -1148,6 +1159,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             ledger.finish_run_lock(con, d, "morning", lock["request_id"], "failed")
         ledger.log_run(con, "morning", d, started, status, error=detail)
         log("morning", f"ERROR: {e}")
+        from ..failures import alert_provider_outage
+        alert_provider_outage(con, cfg, "morning", d, e)
         # arm A failed before reaching its own join point above — still wait
         # (briefly) for the background arm B thread so it isn't left running
         # against a connection this function is about to close out from under it.

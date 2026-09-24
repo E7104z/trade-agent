@@ -367,8 +367,12 @@ def run_selection(cfg: Config, *, con, session_date: date,
                           model=model, mock_name="runner_selector",
                           expect_json=False)
     except Exception as e:
-        ledger.log_run(con, "runner", session_date, started, "error",
+        # Classified like the other loops (a provider outage is api_error, not
+        # a code defect), and a permanent provider condition emails one alert.
+        from .failures import alert_provider_outage, classify_failure
+        ledger.log_run(con, "runner", session_date, started, classify_failure(e),
                        model=model, error=str(e))
+        alert_provider_outage(con, cfg, "runner", session_date, e)
         # A failed selection is a NO-TRADE session. Never fall back to a
         # heuristic: a silent heuristic would contaminate the baseline-vs-
         # selection comparison this whole design exists to produce.
