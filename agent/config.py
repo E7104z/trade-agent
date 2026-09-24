@@ -147,6 +147,9 @@ _DEFAULTS: dict[str, Any] = {
         "context_enrich": True,            # ATR/levels/trend/fundamentals/earnings ticker cards (v2)
         "or_minutes": 15,                  # opening-range window, minutes
         "gap_scan_price_band": [None, None],  # optional [min, max] last-price hard filter, default OFF
+        # Concurrent batched Alpaca data requests. Algo Trader Plus allows
+        # 10,000 calls/min; set to 1 on the free plan (~200/min).
+        "alpaca_concurrency": 8,
     },
     "memory": {
         "recent_trades_in_context": 20,

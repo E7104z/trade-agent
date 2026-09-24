@@ -13,6 +13,26 @@ from .config import Config, load_config
 PAPER_BASE = "https://paper-api.alpaca.markets"
 _LOG = logging.getLogger(__name__)
 
+# The most recent broker rejection, verbatim (e.g. Alpaca's 422 body). Callers
+# record it next to the order they meant to place: before this existed every
+# rejection was swallowed into a bare None, which is how every runner order
+# was refused for weeks without a single visible error.
+_last_error: str | None = None
+
+
+def last_error() -> str | None:
+    return _last_error
+
+
+def tick_price(price: float) -> float:
+    """Round to a price Alpaca accepts: whole cents at/above $1.00, four
+    decimals below. Anything finer is rejected outright ("sub-penny increment
+    does not fulfill minimum pricing criteria") -- runner levels are computed
+    (detection price +/- EMA distance) and carry float noise like
+    27.995591111111104, so every runner bracket was rejected on its price."""
+    p = float(price)
+    return round(p, 2) if abs(p) >= 1.0 else round(p, 4)
+
 
 def _cfg(cfg: Config | None = None) -> Config:
     return cfg or load_config()
@@ -27,9 +47,12 @@ def _enabled(cfg: Config) -> bool:
 
 def _request(method: str, path: str, *, cfg: Config | None = None,
              payload: dict | None = None) -> dict | list | None:
-    """Call Alpaca and return JSON; API/network failures fail soft."""
+    """Call Alpaca and return JSON; API/network failures fail soft (None), with
+    the reason kept in last_error() and logged where the loop can see it."""
+    global _last_error
     config = _cfg(cfg)
     if not _enabled(config):
+        _last_error = "live paper trading is not enabled/configured"
         return None
     live = config.get("live_paper", {})
     url = str(live["trading_base"]).rstrip("/") + path
@@ -38,13 +61,23 @@ def _request(method: str, path: str, *, cfg: Config | None = None,
                "Content-Type": "application/json"}
     try:
         response = requests.request(method, url, headers=headers, json=payload, timeout=15)
+        status = getattr(response, "status_code", 200)
+        if isinstance(status, int) and status >= 400:
+            body = (getattr(response, "text", "") or "")[:300]
+            _last_error = f"HTTP {status} {method} {path}: {body}"
+            _LOG.warning("Alpaca paper API failure: %s", _last_error)
+            from .util import log
+            log("live", f"broker refused: {_last_error}")
+            return None
         response.raise_for_status()
+        _last_error = None
         # DELETE /v2/orders/{id} answers 204 No Content on success. Parsing
         # that body raised, so every successful cancel read as a failure.
-        if getattr(response, "status_code", 200) == 204 or not getattr(response, "content", b"x"):
+        if status == 204 or not getattr(response, "content", b"x"):
             return {}
         return response.json()
     except Exception as exc:
+        _last_error = f"{method} {path}: {type(exc).__name__}: {exc}"[:300]
         _LOG.warning("Alpaca paper API failure for %s %s: %s", method, path, exc)
         return None
 
@@ -54,11 +87,11 @@ def entry_order_params(entry_type: str, entry_price: float | None) -> tuple[str,
     if kind == "limit":
         if entry_price is None:
             raise ValueError("limit entry requires entry_price")
-        return "limit", {"limit_price": float(entry_price)}
+        return "limit", {"limit_price": tick_price(entry_price)}
     if kind == "breakout":
         if entry_price is None:
             raise ValueError("breakout entry requires entry_price")
-        return "stop", {"stop_price": float(entry_price)}
+        return "stop", {"stop_price": tick_price(entry_price)}
     return "market", {}
 
 
@@ -88,8 +121,8 @@ def submit_bracket_order(ticker: str, qty: int, side: str, entry_type: str,
     payload = {
         "symbol": str(ticker).upper(), "qty": str(int(qty)), "side": side.lower(),
         "type": order_type, "time_in_force": "day", "order_class": "bracket",
-        "take_profit": {"limit_price": float(target_price)},
-        "stop_loss": {"stop_price": float(stop_price)},
+        "take_profit": {"limit_price": tick_price(target_price)},
+        "stop_loss": {"stop_price": tick_price(stop_price)},
         **entry_params,
     }
     result = _request("POST", "/v2/orders", cfg=cfg, payload=payload)
@@ -104,7 +137,7 @@ def submit_stop_entry_order(ticker: str, qty: int, side: str, stop_price: float,
         return None
     payload = {
         "symbol": str(ticker).upper(), "qty": str(int(qty)), "side": side.lower(),
-        "type": "stop", "time_in_force": "day", "stop_price": float(stop_price),
+        "type": "stop", "time_in_force": "day", "stop_price": tick_price(stop_price),
     }
     result = _request("POST", "/v2/orders", cfg=cfg, payload=payload)
     return result if isinstance(result, dict) else None
@@ -118,8 +151,8 @@ def submit_oco_exit(ticker: str, qty: int, side: str, stop_loss_price: float,
     payload = {
         "symbol": str(ticker).upper(), "qty": str(int(qty)), "side": side.lower(),
         "type": "limit", "time_in_force": "day", "order_class": "oco",
-        "take_profit": {"limit_price": float(target_price)},
-        "stop_loss": {"stop_price": float(stop_loss_price)},
+        "take_profit": {"limit_price": tick_price(target_price)},
+        "stop_loss": {"stop_price": tick_price(stop_loss_price)},
     }
     result = _request("POST", "/v2/orders", cfg=cfg, payload=payload)
     return result if isinstance(result, dict) else None
@@ -142,6 +175,24 @@ def list_open_orders(*, cfg: Config | None = None) -> list[dict]:
 def close_position(ticker: str, *, cfg: Config | None = None) -> dict | None:
     result = _request("DELETE", f"/v2/positions/{str(ticker).upper()}", cfg=cfg)
     return result if isinstance(result, dict) else None
+
+
+def list_positions(*, cfg: Config | None = None) -> list[dict] | None:
+    """Open positions, or None when the account could not be read (which is
+    NOT the same as holding nothing)."""
+    result = _request("GET", "/v2/positions", cfg=cfg)
+    return result if isinstance(result, list) else None
+
+
+def get_account(*, cfg: Config | None = None) -> dict | None:
+    result = _request("GET", "/v2/account", cfg=cfg)
+    return result if isinstance(result, dict) else None
+
+
+def recent_orders(limit: int = 50, *, cfg: Config | None = None) -> list[dict]:
+    result = _request("GET", f"/v2/orders?status=all&limit={int(limit)}&direction=desc&nested=true",
+                      cfg=cfg)
+    return result if isinstance(result, list) else []
 
 
 def raw_order_json(order: dict) -> str:

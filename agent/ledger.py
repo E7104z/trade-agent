@@ -362,6 +362,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v14.STATEMENTS
 from . import migrations_v15  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v15.STATEMENTS
 
+# --- v16 live-trading observability + earnings cache -----------------------
+from . import migrations_v16  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v16.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -1890,6 +1894,7 @@ _RUNNER_SESSION_FIELDS = [
     "rejected_earnings", "rejected_excluded", "rejected_no_bars",
     "rejected_too_few_bars", "gates_unavailable", "provider_degraded",
     "selection_made", "selection_skipped_reason", "scan_version",
+    "live_orders_note",
 ]
 
 
@@ -2070,3 +2075,55 @@ def selection_edge_history(con: duckdb.DuckDBPyConnection,
         "SELECT * FROM selection_edge_history ORDER BY week_ending DESC LIMIT ?",
         [limit]).fetchall()
     return [dict(zip(cols, r)) for r in reversed(rows)]
+
+
+# ------------------------------------------------------------------ heartbeats
+
+def beat(con: Any, name: str, detail: str | None = None) -> None:
+    """Record that an unattended job just ran (naive ET wall clock). Best
+    effort: a heartbeat must never fail the job it reports on."""
+    try:
+        con.execute(
+            """INSERT INTO heartbeats (name, last_at, detail) VALUES (?, ?, ?)
+               ON CONFLICT (name) DO UPDATE SET last_at = excluded.last_at,
+                                                detail = excluded.detail""",
+            [name, now_et().replace(tzinfo=None), (detail or "")[:500]])
+    except Exception:
+        pass
+
+
+def last_beat(con: Any, name: str) -> dict | None:
+    try:
+        row = con.execute("SELECT last_at, detail FROM heartbeats WHERE name = ?",
+                          [name]).fetchone()
+    except Exception:
+        return None
+    return {"last_at": row[0], "detail": row[1]} if row else None
+
+
+# -------------------------------------------------------------- earnings cache
+
+def cached_earnings(con: Any, symbols: list[str], today: date) -> dict[str, date | None]:
+    """{symbol: next earnings date or None} for symbols already checked TODAY.
+    A symbol absent from the result has not been checked today."""
+    syms = sorted({str(s).upper() for s in symbols if s})
+    if not syms:
+        return {}
+    out: dict[str, date | None] = {}
+    for i in range(0, len(syms), 500):
+        chunk = syms[i:i + 500]
+        marks = ",".join("?" for _ in chunk)
+        rows = con.execute(
+            f"SELECT symbol, next_date FROM earnings_cache "
+            f"WHERE checked_date = ? AND symbol IN ({marks})", [today] + chunk).fetchall()
+        out.update({r[0]: r[1] for r in rows})
+    return out
+
+
+def save_earnings(con: Any, rows: dict[str, date | None], today: date) -> None:
+    for sym, next_date in rows.items():
+        con.execute(
+            """INSERT INTO earnings_cache (symbol, next_date, checked_date) VALUES (?, ?, ?)
+               ON CONFLICT (symbol) DO UPDATE SET next_date = excluded.next_date,
+                                                  checked_date = excluded.checked_date""",
+            [str(sym).upper(), next_date, today])

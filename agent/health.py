@@ -164,9 +164,50 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
                 sel = ("selection made" if selected
                        else f"no selection ({skip or 'decision tick not reached'})")
                 status = "ok" if selected else "warn"
+                detail = ""
+                note_row = _q(con, "SELECT live_orders_note FROM runner_sessions "
+                                   "WHERE session_date = ?", [r_session])
+                note = (note_row[0][0] if note_row else None) or ""
+                if note:
+                    detail = f"live paper: {note[:300]}"
+                    if note.startswith("placed 0/") and not note.startswith("placed 0/0"):
+                        status = "bad"
                 stages.append(_stage("runner", "Runner scan", status,
                                      f"{found} candidate(s) from {universe:,} names "
-                                     f"for {r_session}; {sel}", last=last))
+                                     f"for {r_session}; {sel}", detail, last=last))
+
+    # --- 2b. intraday monitor (live paper) ---------------------------------
+    if ((cfg.get("live_paper", {}) or {}) if cfg else {}).get("enabled"):
+        from .ledger import last_beat
+        hb = last_beat(con, "intraday_check")
+        in_session = (is_market_day(now.date())
+                      and dtime(9, 45) <= now.time() <= dtime(16, 0))
+        if not hb or not hb.get("last_at"):
+            stages.append(_stage(
+                "intraday", "Intraday monitor", "bad",
+                "The intraday monitor has never run",
+                "Nothing calls /cron/intraday-check, so live paper time stops and the "
+                "15:55 flatten are not enforced (positions can be held overnight)."))
+        else:
+            last_at = hb["last_at"]
+            age_min = (now.replace(tzinfo=None) - last_at).total_seconds() / 60
+            age_txt = (f"{age_min:.0f} min ago" if age_min < 120
+                       else f"{age_min / 60:.1f} h ago" if age_min < 48 * 60
+                       else f"{age_min / 1440:.0f} days ago")
+            if in_session and age_min > 15:
+                stages.append(_stage(
+                    "intraday", "Intraday monitor", "bad",
+                    f"Intraday monitor last ran {age_txt}",
+                    "It should tick every 5 minutes during the session -- the trigger "
+                    "machine is off or its task stopped."))
+            elif not in_session and _as_date(last_at) != _expected_session(now, dtime(16, 0)) \
+                    and is_market_day(_expected_session(now, dtime(16, 0))):
+                stages.append(_stage(
+                    "intraday", "Intraday monitor", "warn",
+                    f"Intraday monitor did not run last session (last {age_txt})"))
+            else:
+                stages.append(_stage("intraday", "Intraday monitor", "ok",
+                                     f"Intraday monitor ran {age_txt}"))
 
     # --- 3. evening grading ---------------------------------------------
     e_session = _expected_session(now, EVENING_DUE)
@@ -213,10 +254,9 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
         n_orphan = int(orphan[0][0]) if orphan else 0
         if n_orphan:
             warnings.append(
-                f"{n_orphan} live paper order(s) from past sessions were never reconciled. "
-                "Nothing is calling /cron/intraday-check (the GitHub Actions scheduler has "
-                "been failing at startup), so time stops are not enforced live and bracket "
-                "legs expire at the close, leaving positions open overnight.")
+                f"{n_orphan} live paper order(s) from past sessions have no recorded exit "
+                "(no intraday tick reached them before the close). The next intraday tick "
+                "or morning run settles them, closing any position still open.")
 
     # --- is anything actually being learned? ------------------------------
     since = now.date() - timedelta(days=LEARNING_WINDOW_DAYS)

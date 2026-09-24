@@ -271,6 +271,100 @@ def check(cfg: Config, *, run_date: date | None = None, at: datetime | None = No
         con.close()
 
 
+def carry_cleanup(con, cfg: Config, today: date) -> dict:
+    """Settle live orders from PAST sessions that never got an exit.
+
+    The end-of-day flatten only happens when something triggers the monitor
+    near the close. When nothing did (the machine was off, the scheduler
+    failed), a filled position simply stayed open: UBER was bought 2026-09-10,
+    its day legs expired at the close, and it sat until a manual close on
+    09-15. This runs before the day's work and:
+
+      - closes a position still open at the broker (cancelling its legs
+        first), recorded as exit_reason "overnight_carry";
+      - records a leg exit (stop/target) that filled before the legs expired;
+      - marks an entry that never filled as "expired_unfilled".
+
+    Never acts blind: if the account's positions cannot be read, nothing is
+    closed. Never touches a ticker that also has an order TODAY -- closing
+    that position would close today's trade too.
+    """
+    live_cfg = cfg.get("live_paper", {}) or {}
+    if not live_cfg.get("enabled"):
+        return {"skipped": "live paper disabled"}
+    cols = [c[0] for c in con.execute("DESCRIBE live_orders").fetchall()]
+    stale = [dict(zip(cols, r)) for r in con.execute(
+        "SELECT * FROM live_orders WHERE exit_reason IS NULL AND session_date < ? "
+        "ORDER BY session_date, live_order_id", [today]).fetchall()]
+    if not stale:
+        return {"stale": 0}
+    positions = live_broker.list_positions(cfg=cfg)
+    if positions is None:
+        return {"stale": len(stale), "error": "could not read positions -- nothing closed"}
+    held = {str(p.get("symbol", "")).upper() for p in positions}
+    today_tickers = {str(r["ticker"]).upper() for r in ledger.live_orders_for_date(con, today)}
+    picks: dict = {}
+    for d in {r["session_date"] for r in stale}:
+        picks.update({p["pick_id"]: p for p in ledger.picks_for_date(con, d)})
+
+    out = {"stale": len(stale), "closed": 0, "settled": 0, "expired": 0, "skipped": []}
+    for row in stale:
+        pick = picks.get(row.get("pick_id"), {})
+        ticker = str(row["ticker"]).upper()
+        if row.get("close_order_id"):
+            if _settle_pending_close(con, row, pick, cfg):
+                out["settled"] += 1
+            continue
+        order = live_broker.get_order(row["live_order_id"], cfg=cfg) or {}
+        if not order:
+            out["skipped"].append(f"{ticker}: order not readable")
+            continue
+        entry, entry_at = _fill(order)
+        entry = entry if entry is not None else row.get("entry_fill_price")
+        if entry is None:
+            if str(order.get("status", "")).lower() in _WORKING:
+                live_broker.cancel_order(row["live_order_id"], cfg=cfg)
+            ledger.update_live_order(con, row["live_order_id"], exit_reason="expired_unfilled",
+                                     reconciled=True, status=order.get("status") or "expired")
+            out["expired"] += 1
+            continue
+        exit_src = order
+        if row.get("oco_order_id"):
+            exit_src = live_broker.get_order(str(row["oco_order_id"]), cfg=cfg) or {}
+        reason, exit_price, exit_at = _exit_from_order(exit_src)
+        if reason and exit_price is not None:
+            ledger.update_live_order(
+                con, row["live_order_id"], exit_reason=reason, exit_fill_price=exit_price,
+                exit_fill_at=exit_at, live_r=_live_r(pick, entry, exit_price),
+                entry_fill_price=entry, reconciled=True, status="closed")
+            out["settled"] += 1
+            continue
+        if ticker in today_tickers:
+            out["skipped"].append(f"{ticker}: also traded today -- left for the EOD flatten")
+            continue
+        if ticker not in held:
+            ledger.update_live_order(con, row["live_order_id"], exit_reason="closed_externally",
+                                     entry_fill_price=entry, reconciled=True, status="closed")
+            out["settled"] += 1
+            continue
+        if row.get("entry_fill_price") is None:
+            # The close fills asynchronously and is settled on a later call,
+            # which computes live R from the ROW -- so the entry read from the
+            # broker must be on the row before the close goes out.
+            ledger.update_live_order(con, row["live_order_id"], entry_fill_price=entry,
+                                     entry_fill_at=entry_at)
+            row["entry_fill_price"] = entry
+        _cancel_working_legs(exit_src, cfg)
+        close_order = live_broker.close_position(ticker, cfg=cfg) or {}
+        if _record_close(con, row, pick, "overnight_carry", close_order, entry):
+            out["closed"] += 1
+            log("intraday", f"{ticker}: position from {row['session_date']} was still open "
+                            f"(missed end-of-day flatten) -- closing now")
+        else:
+            out["skipped"].append(f"{ticker}: close refused ({live_broker.last_error()})")
+    return out
+
+
 def reconcile_evening(con, cfg: Config, d: date) -> dict:
     """Poll today's orders and copy known live R into outcomes only."""
     if not (cfg.get("live_paper", {}) or {}).get("enabled"):

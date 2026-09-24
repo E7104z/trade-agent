@@ -275,30 +275,55 @@ class Alpaca:
         data = self._get("/v1beta1/news", {"limit": limit, "sort": "desc"})
         return data.get("news", [])
 
-    # This account's SIP entitlement excludes the most recent 15 minutes: any
-    # window whose END reaches into them is refused outright (403 "subscription
-    # does not permit querying recent SIP data") -- not truncated. Every
-    # request window is clamped to end before that.
+    # A SIP subscription WITHOUT real-time entitlement (the free/basic plan)
+    # refuses any window whose END reaches into the last 15 minutes: 403
+    # "subscription does not permit querying recent SIP data" -- refused
+    # outright, not truncated. Real-time plans (Algo Trader Plus, the plan on
+    # this account since 2026-09-23) accept it. So windows are sent as asked;
+    # the first such refusal flips this process to clamping every window to
+    # end 16 minutes back, which keeps a lapsed subscription working instead
+    # of failing every bar request.
     _SIP_RECENT_EXCLUSION = timedelta(minutes=16)
+    _realtime_refused = False  # class-wide: learned once per process
 
     def _clamp_end(self, end: datetime) -> datetime:
+        if not Alpaca._realtime_refused:
+            return end
         latest = datetime.now(tz=ET) - self._SIP_RECENT_EXCLUSION
         return end if end <= latest else latest
 
+    @staticmethod
+    def _is_recent_sip_refusal(exc: Exception) -> bool:
+        resp = getattr(exc, "response", None)
+        return bool(resp is not None and getattr(resp, "status_code", None) == 403
+                    and "recent" in (getattr(resp, "text", "") or "").lower())
+
+    def _get_windowed(self, path: str, params: dict, end: datetime) -> dict:
+        """_get with the window's end clamped per entitlement, retrying once
+        clamped if the plan turns out to refuse real-time SIP."""
+        try:
+            return self._get(path, {**params, "end": self._clamp_end(end).isoformat()})
+        except requests.exceptions.HTTPError as e:
+            if Alpaca._realtime_refused or not self._is_recent_sip_refusal(e):
+                raise
+            Alpaca._realtime_refused = True
+            log("data", "SIP real-time data refused by the subscription -- clamping "
+                        "bar windows to end 16 minutes back for this process")
+            return self._get(path, {**params, "end": self._clamp_end(end).isoformat()})
+
     def minute_bars(self, symbol: str, d: date) -> list[dict]:
         start = datetime.combine(d, dtime(9, 30), tzinfo=ET)
-        end = self._clamp_end(datetime.combine(d, dtime(16, 0), tzinfo=ET))
-        if end <= start:
+        end = datetime.combine(d, dtime(16, 0), tzinfo=ET)
+        if self._clamp_end(end) <= start:
             return []
         params = {
             "timeframe": "1Min",
             "start": start.isoformat(),
-            "end": end.isoformat(),
             "limit": 10000,
             "adjustment": "raw",
             "feed": self.feed,
         }
-        data = self._get(f"/v2/stocks/{symbol}/bars", params)
+        data = self._get_windowed(f"/v2/stocks/{symbol}/bars", params, end)
         bars = []
         for b in data.get("bars", []) or []:
             ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
@@ -312,17 +337,16 @@ class Alpaca:
         # so every daily bar silently fell back to yfinance (slow, and often
         # "possibly delisted; no price data found"), nulling day_open/close.
         start = datetime.combine(d, dtime(0, 0), tzinfo=ET)
-        end = self._clamp_end(datetime.combine(d + timedelta(days=1), dtime(0, 0), tzinfo=ET))
-        if end <= start:
+        end = datetime.combine(d + timedelta(days=1), dtime(0, 0), tzinfo=ET)
+        if self._clamp_end(end) <= start:
             return None
         params = {
             "timeframe": "1Day",
             "start": start.isoformat(),
-            "end": end.isoformat(),
             "adjustment": "split",
             "feed": self.feed,
         }
-        data = self._get(f"/v2/stocks/{symbol}/bars", params)
+        data = self._get_windowed(f"/v2/stocks/{symbol}/bars", params, end)
         for b in data.get("bars", []) or []:
             # The window can reach the NEXT day's bar (stamped at its ET
             # midnight); only a bar for `d` itself is the answer -- on a
@@ -334,7 +358,8 @@ class Alpaca:
 
     def multi_bars(self, symbols: list[str], timeframe: str,
                    start: datetime, end: datetime, *,
-                   feed: str | None = None, adjustment: str = "raw") -> dict[str, list[dict]]:
+                   feed: str | None = None, adjustment: str = "raw",
+                   workers: int = 1) -> dict[str, list[dict]]:
         """One batched multi-symbol bars fetch (the /v2/stocks/bars endpoint,
         distinct from /v2/stocks/{symbol}/bars) — used for ADV20 and premarket
         VWAP/RVOL enrichment so N gappers cost one round trip, not N.
@@ -353,9 +378,8 @@ class Alpaca:
         The 09:30–11:30 window fit in one page, which is why this stayed
         invisible: it only bites as the window or the symbol count grows.
         """
-        out: dict[str, list[dict]] = {}
-        for i in range(0, len(symbols), 100):
-            batch = symbols[i : i + 100]
+        def _batch(batch: list[str]) -> dict[str, list[dict]]:
+            got: dict[str, list[dict]] = {}
             page_token: str | None = None
             # Bounded so a malformed/cyclic token can never spin forever; 10k
             # bars/page over a 100-symbol batch is far more than a session holds.
@@ -373,7 +397,7 @@ class Alpaca:
                     params["page_token"] = page_token
                 data = self._get("/v2/stocks/bars", params)
                 for sym, bars in (data.get("bars") or {}).items():
-                    rows = out.setdefault(sym, [])
+                    rows = got.setdefault(sym, [])
                     for b in bars or []:
                         ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(ET)
                         rows.append({"t": ts, "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]})
@@ -387,8 +411,32 @@ class Alpaca:
             # has no bars — keep the empty list so callers can tell "asked and got
             # nothing" from "never asked."
             for sym in batch:
-                out.setdefault(sym, [])
+                got.setdefault(sym, [])
+            return got
+
+        batches = [symbols[i: i + 100] for i in range(0, len(symbols), 100)]
+        out: dict[str, list[dict]] = {}
+        if workers <= 1 or len(batches) <= 1:
+            for batch in batches:
+                out.update(_batch(batch))
+            return out
+        # Batches are independent (disjoint symbol sets, each paginated on
+        # its own token), so they can run concurrently. Any batch failure
+        # raises exactly as the sequential path would.
+        with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as pool:
+            for got in pool.map(_batch, batches):
+                out.update(got)
         return out
+
+    @property
+    def concurrency(self) -> int:
+        """Concurrent batched requests allowed (config data.alpaca_concurrency).
+        Algo Trader Plus allows 10,000 calls/min; the free plan ~200/min, where
+        this should be set back to 1."""
+        try:
+            return max(1, int(self.cfg.data_cfg.get("alpaca_concurrency", 8)))
+        except Exception:
+            return 1
 
     def multi_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[dict]]:
         # Split-adjusted on purpose: a daily bar returned on the raw (pre-split)
@@ -400,7 +448,8 @@ class Alpaca:
         # feeds is unaffected.
         start_dt = datetime.combine(start, dtime(0, 0), tzinfo=ET)
         end_dt = datetime.combine(end, dtime(0, 0), tzinfo=ET)
-        raw = self.multi_bars(symbols, "1Day", start_dt, end_dt, adjustment="split")
+        raw = self.multi_bars(symbols, "1Day", start_dt, end_dt, adjustment="split",
+                              workers=self.concurrency)
         return {sym: [{"close": r["c"], "volume": r["v"]} for r in rows] for sym, rows in raw.items()}
 
 
@@ -605,7 +654,7 @@ def econ_upcoming(d: date, days: int = 3) -> list[dict]:
 # memoized. The evening loop runs ~16:30 ET; anything earlier just refetches,
 # exactly as before the cache existed.
 _SESSION_FINAL_AFTER_MIN = 20
-_PREFETCH_WORKERS = 8
+_PREFETCH_WORKERS = 12   # per-symbol fallback pass (rate-limit headroom on Algo Trader Plus)
 _PREFETCH_DEADLINE = 150  # seconds; stragglers are simply fetched on demand later
 
 
@@ -673,7 +722,8 @@ class MarketData:
                 if minute:
                     start = datetime.combine(d, dtime(9, 30), tzinfo=ET)
                     end = self.alpaca._clamp_end(datetime.combine(d, dtime(16, 0), tzinfo=ET))
-                    got = self.alpaca.multi_bars(syms, "1Min", start, end)
+                    got = self.alpaca.multi_bars(syms, "1Min", start, end,
+                                                 workers=self.alpaca.concurrency)
                     with self._cache_lock:
                         for s, bars in got.items():
                             if bars:
@@ -682,7 +732,8 @@ class MarketData:
                     start = datetime.combine(min(days), dtime(0, 0), tzinfo=ET)
                     end = self.alpaca._clamp_end(
                         datetime.combine(d + timedelta(days=1), dtime(0, 0), tzinfo=ET))
-                    got = self.alpaca.multi_bars(syms, "1Day", start, end, adjustment="split")
+                    got = self.alpaca.multi_bars(syms, "1Day", start, end, adjustment="split",
+                                                 workers=self.alpaca.concurrency)
                     with self._cache_lock:
                         for s, rows in got.items():
                             for b in rows:
@@ -1198,21 +1249,26 @@ class MarketData:
             return out
         yf = _yf()
         today = now_et().date()
+        no_date = object()  # "checked: no upcoming date" -- distinct from a failed lookup
 
-        def _fetch_one(s: str) -> int | None:
+        def _fetch_one(s: str):
             try:
                 cal = yf.Ticker(s).get_earnings_dates(limit=4)
                 if cal is None or cal.empty:
-                    return None
+                    return no_date
                 future = [ts.date() for ts in cal.index if ts.date() >= today]
                 if not future:
-                    return None
+                    return no_date
                 return (min(future) - today).days
             except Exception as e:
                 log("data", f"WARN next_earnings fetch failed for {s}: {e}")
                 return None
 
-        out.update(_bounded_map(syms, _fetch_one))
+        # A symbol that was checked and has no upcoming date maps to None; a
+        # symbol whose lookup failed or timed out is ABSENT, so a caller
+        # caching these results never caches a failure as "no earnings".
+        for s, v in _bounded_map(syms, _fetch_one).items():
+            out[s] = None if v is no_date else v
         return out
 
     def _enrich_indicators(self, quotes: list[dict]) -> None:

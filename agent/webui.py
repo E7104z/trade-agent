@@ -331,7 +331,7 @@ let state = null;
 
 const PAGES = {
   overview:{t:'Overview', s:'Equity, edge, and today at a glance'},
-  today:{t:"Today's Plan", s:'The morning call, validated picks, and the shadow ledger'},
+  today:{t:"Today's Plan", s:'The paper account, the morning call, and the shadow ledger'},
   runner:{t:'Runner', s:'The intraday scan, select, grade lane'},
   playbook:{t:'Playbook', s:"The desk's accumulated rules"},
   research:{t:'Research', s:'What the desk has concluded & changed'},
@@ -347,6 +347,7 @@ function renderRoute(){
   $('page-title').textContent = PAGES[p].t;
   $('page-sub').textContent = PAGES[p].s;
   if(p === 'history' && !historyDatesLoaded) loadHistoryDates();
+  if(p === 'today') loadPaper();
 }
 let historyDatesLoaded = false;
 window.addEventListener('hashchange', renderRoute);
@@ -587,10 +588,83 @@ function shadowHtml(){
   return `<div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th><th>Stop</th><th>Target</th><th>Conv</th><th>Kill reason</th><th>Thesis</th><th>Shadow outcome</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
+// ---------------------------------------------------------- paper account
+// Loaded only while the Today page is open (it calls the broker), refreshed
+// with the page's regular refresh.
+let paperState = null, paperLoading = null;
+
+function loadPaper(){
+  if(paperLoading) return paperLoading;
+  paperLoading = (async () => {
+    try {
+      const r = await fetch('/api/paper', {credentials:'same-origin'});
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      paperState = await r.json();
+    } catch(e) {
+      paperState = {error: e.message};
+    } finally {
+      paperLoading = null;
+    }
+    const box = $('paper-body');
+    if(box) box.innerHTML = paperHtml();
+  })();
+  return paperLoading;
+}
+
+const etTime = iso => {
+  if(!iso) return '—';
+  const t = new Date(iso);
+  return isNaN(t) ? esc(iso) : t.toLocaleString('en-US', {timeZone:'America/New_York', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) + ' ET';
+};
+const STATUS_PILL = s => ({filled:'ok', partially_filled:'info', new:'info', accepted:'info', held:'info',
+  pending_new:'info', canceled:'neutral', expired:'neutral', rejected:'bad', replaced:'neutral'}[String(s||'').toLowerCase()] || 'neutral');
+
+function paperHtml(){
+  const p = paperState;
+  if(!p) return empty('Loading the paper account…');
+  if(p.enabled === false) return empty('Live paper trading is off (config.json → live_paper.enabled).');
+  const a = p.account || {};
+  const dayPl = (a.equity!=null && a.last_equity!=null) ? a.equity - a.last_equity : null;
+  const age = p.heartbeat_age_min;
+  const mon = (age == null)
+    ? `<span class="pill bad">MONITOR NEVER RAN</span><span>Nothing is enforcing time stops or the 15:55 flatten on live positions.</span>`
+    : (age <= 15
+        ? `<span class="pill ok">MONITOR LIVE</span><span>last intraday tick ${age < 1 ? 'under a minute' : Math.round(age) + ' min'} ago</span>`
+        : `<span class="pill warn">MONITOR IDLE</span><span>last intraday tick ${age < 120 ? Math.round(age) + ' min' : (age/60).toFixed(1) + ' h'} ago — expected every 5 min during the session</span>`);
+  const pos = p.positions || [];
+  const posHtml = pos.length ? `<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Avg entry</th><th class="num">Last</th><th class="num">Unrealized</th></tr></thead><tbody>${
+      pos.map(x => `<tr><td><b>${esc(x.symbol)}</b></td><td>${esc(x.side)}</td><td class="num">${esc(x.qty)}</td>
+        <td class="num">${px(x.avg_entry_price)}</td><td class="num">${px(x.current_price)}</td>
+        <td class="num ${rCls(x.unrealized_pl)}">${x.unrealized_pl==null?'—':fmtMoney(x.unrealized_pl).replace('$-','-$')} ${x.unrealized_plpc==null?'':'('+(x.unrealized_plpc*100).toFixed(2)+'%)'}</td></tr>`).join('')
+    }</tbody></table></div>` : empty('No open positions.');
+  const ords = p.orders || [];
+  const ordHtml = ords.length ? `<div class="table-wrap" style="max-height:420px"><table><thead><tr><th>Submitted</th><th>Symbol</th><th>Side</th><th class="num">Qty</th><th>Type</th><th>Status</th><th class="num">Fill</th><th>Exit legs</th></tr></thead><tbody>${
+      ords.map(o => `<tr><td>${etTime(o.submitted_at)}</td><td><b>${esc(o.symbol)}</b></td><td>${esc(o.side)}</td><td class="num">${esc(o.qty)}</td>
+        <td>${esc(o.type)}${o.order_class && o.order_class!=='simple' ? ' · '+esc(o.order_class) : ''}${o.limit_price!=null?' @ '+px(o.limit_price):''}</td>
+        <td><span class="pill ${STATUS_PILL(o.status)}">${esc(o.status)}</span></td>
+        <td class="num">${px(o.filled_avg_price)}</td>
+        <td>${(o.legs||[]).map(l => `${esc(l.type)}: ${esc(l.status)}${l.filled_avg_price!=null?' @ '+px(l.filled_avg_price):''}`).join('<br>') || '—'}</td></tr>`).join('')
+    }</tbody></table></div>` : empty('No orders on the paper account yet.');
+  return `
+    ${p.error ? `<ul class="lh-warn"><li>Broker: ${esc(p.error)}</li></ul>` : ''}
+    <div class="stat-grid">
+      ${kpi('Paper equity', a.equity!=null ? fmtMoney(a.equity) : '—', 'Alpaca paper account')}
+      ${kpi('Today', dayPl==null ? '—' : (dayPl>=0?'+':'-') + fmtMoney(Math.abs(dayPl)), 'vs. prior close', dayPl>0?'ok':(dayPl<0?'bad':''))}
+      ${kpi('Open positions', pos.length, pos.length ? pos.map(x => x.symbol).join(', ') : 'flat')}
+      ${kpi('Buying power', a.buying_power!=null ? fmtMoney(a.buying_power) : '—', a.status || '')}
+    </div>
+    <div class="kpi-line" style="margin-bottom:12px">${mon}</div>
+    ${p.runner_note ? `<p class="muted-note">Runner orders today: ${esc(p.runner_note)}</p>` : ''}
+    <h3>Open positions</h3>${posHtml}
+    <h3>Recent broker orders</h3>${ordHtml}
+    <p class="muted-note">Straight from the broker. Morning picks go in as bracket orders at the open; runner picks at the 10:30 selection. The intraday monitor cancels entries still unfilled at their time stop and flattens every position at 15:55 ET.</p>`;
+}
+
 function renderToday(){
   const b = $('today-body');
   if(!state){ b.innerHTML = empty('Loading…'); return; }
   b.innerHTML = `
+    <div class="card"><div class="card-head"><h2>Paper account</h2><span class="card-sub">live Alpaca paper trading — what the broker actually holds</span></div><div id="paper-body">${paperHtml()}</div></div>
     <div class="card"><div class="card-head"><h2>Today's plan — ${esc(state.today)}</h2>${state.plan?`<span class="pill neutral">playbook v${esc(state.playbook_version||'')}</span>`:''}</div>${planHtml()}</div>
     <div class="card"><div class="card-head"><h2>Shadow ledger</h2><span class="card-sub">candidates the desk killed, and what they did anyway</span></div>${shadowHtml()}</div>
   `;
@@ -861,7 +935,11 @@ renderRoute();
 // Live desk: refresh every minute while the tab is visible and no loop is
 // running (a run refreshes on completion anyway), and immediately on return
 // to a tab that has gone stale.
-setInterval(() => { if(!document.hidden && !busy) loadData(); }, REFRESH_MS);
+setInterval(() => {
+  if(document.hidden || busy) return;
+  loadData();
+  if(currentPage() === 'today') loadPaper();
+}, REFRESH_MS);
 setInterval(tickUpdated, 5000);
 document.addEventListener('visibilitychange', () => {
   if(!document.hidden && !busy && Date.now() - lastLoaded > 20000) loadData();

@@ -10,7 +10,15 @@ def test_intraday_check_rejects_missing_bearer(monkeypatch):
     assert response.status_code == 401
 
 
-def test_intraday_check_is_noop_when_disabled(monkeypatch):
+def _tmp_ledger(monkeypatch, tmp_path):
+    """The endpoint now records a heartbeat: never let it touch the real ledger."""
+    from agent import ledger
+    monkeypatch.setattr(ledger, "DB_PATH", str(tmp_path / "route.duckdb"))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+
+def test_intraday_check_is_noop_when_disabled(monkeypatch, tmp_path):
+    _tmp_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(index, "CRON_SECRET", "test-secret")
     monkeypatch.setattr(index, "load_config", lambda: Config(raw={
         "live_paper": {"enabled": False},
@@ -30,12 +38,13 @@ def test_intraday_check_is_noop_when_disabled(monkeypatch):
     assert "runner" not in body
 
 
-def test_intraday_check_runner_failure_cannot_break_the_monitor(monkeypatch):
+def test_intraday_check_runner_failure_cannot_break_the_monitor(monkeypatch, tmp_path):
     """The runner lane must never take down the live position monitor.
 
     A monitor that silently stops running leaves a real paper position
     unwatched, so the guard is a correctness requirement, not defensive habit.
     """
+    _tmp_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(index, "CRON_SECRET", "test-secret")
     monkeypatch.setattr(index, "load_config", lambda: Config(raw={
         "live_paper": {"enabled": False},

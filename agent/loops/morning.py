@@ -1049,6 +1049,18 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         ledger.log_run(con, "morning", d, started,
                        "degraded" if health.get("degraded") else "ok", model, usage)
 
+        # Before today's orders: close anything a missed end-of-day flatten
+        # left open from a previous session (queued for the open when this runs
+        # pre-market). Guarded -- it must never cost the day's plan.
+        if (cfg.get("live_paper", {}) or {}).get("enabled"):
+            try:
+                from ..live_monitor import carry_cleanup
+                carry = carry_cleanup(con, cfg, d)
+                if carry.get("stale"):
+                    log("morning", f"Live paper carry cleanup: {carry}")
+            except Exception as e:
+                log("morning", f"WARN live paper carry cleanup failed: {e}")
+
         # Live paper orders are a separate ledger concern. The simulator's
         # picks are already locked above; a broker failure cannot change them.
         if cfg.get("live_paper", {}).get("enabled") and plan.get("picks"):
@@ -1069,6 +1081,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                         p["ticker"], qty, "buy" if p["direction"] == "long" else "sell",
                         p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open"),
                         entry, stop, float(p["target_price"]), cfg=cfg)
+                    if not order:
+                        log("morning", f"WARN live paper order for {p['ticker']} not placed: "
+                                       f"{live_broker.last_error() or 'qty < 1 or breakout skipped'}")
                     if order:
                         if ((p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open")).lower()
                                 == "breakout" and cfg["live_paper"].get("breakout_two_step")):

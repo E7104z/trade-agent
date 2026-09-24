@@ -627,12 +627,32 @@ def _fetch_gate_inputs(md, symbols: list[str], d, con=None) -> tuple[dict, dict]
                 floats[s] = (float(fs) / 1e6) if fs else None
         except Exception as e:
             log("runner", f"WARN fundamentals fetch failed for {len(need)} symbols: {e}")
+        # Earnings dates do not move intraday: read today's already-checked
+        # symbols from the ledger and look up only the rest. Without this every
+        # tick re-queried yfinance for every survivor and abandoned dozens of
+        # lookups at the batch deadline -- candidates passing an unmeasured gate.
+        cached: dict = {}
+        if con is not None:
+            try:
+                from . import ledger as _ledger
+                cached = _ledger.cached_earnings(con, need, d)
+            except Exception as e:
+                log("runner", f"WARN earnings cache read failed: {e}")
+        for s, next_date in cached.items():
+            earnings[s] = (next_date - d).days if next_date else None
+        fetch = [s for s in need if s not in cached]
         try:
-            earn = md.next_earnings(need)
+            earn = md.next_earnings(fetch) if fetch else {}
             for s, days in (earn or {}).items():
                 earnings[s] = days
+            if con is not None and earn:
+                from datetime import timedelta as _td
+                from . import ledger as _ledger
+                _ledger.save_earnings(
+                    con, {s: (d + _td(days=int(days))) if days is not None else None
+                          for s, days in earn.items()}, d)
         except Exception as e:
-            log("runner", f"WARN next_earnings fetch failed for {len(need)} symbols: {e}")
+            log("runner", f"WARN next_earnings fetch failed for {len(fetch)} symbols: {e}")
         for s in need:
             cache[(d, s)] = {"float_m": floats.get(s), "earnings_days_away": earnings.get(s)}
 
@@ -735,7 +755,10 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
         bars_by_sym: dict[str, list[dict]] = {}
         bars_failed = False
         try:
-            bars_by_sym = md.alpaca.multi_bars(universe, "5Min", start, at)
+            workers = getattr(md.alpaca, "concurrency", 1)
+            bars_by_sym = (md.alpaca.multi_bars(universe, "5Min", start, at, workers=workers)
+                           if isinstance(workers, int) and workers > 1
+                           else md.alpaca.multi_bars(universe, "5Min", start, at))
         except Exception as e:
             bars_failed = True
             log("runner", f"WARN 5Min bar fetch failed: {e}")

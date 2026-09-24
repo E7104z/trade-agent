@@ -298,7 +298,11 @@ def _place_live_orders(cfg: Config, con, session_date: date,
             out["skipped"].append(f"{c['ticker']}: {e}")
             continue
         if not order:
-            out["skipped"].append(f"{c['ticker']}: broker returned no order")
+            # Keep the broker's own reason: a bare "no order" hid a 422 on
+            # every runner order for weeks (sub-penny prices).
+            reason = live_broker.last_error() or "no detail"
+            out["skipped"].append(f"{c['ticker']}: broker refused ({reason})"[:400])
+            log("runner", f"  live paper order {c['ticker']} REFUSED: {reason}")
             continue
         try:
             ledger.save_live_order(con, pick_id, order, session_date,
@@ -415,5 +419,14 @@ def _write_picks(cfg: Config, con, session_date: date,
     log("runner", f"selected {len(selected)} of {len(candidates)} candidates: "
                   + ", ".join(s["ticker"] for s in selected))
     orders = _place_live_orders(cfg, con, session_date, placements)
+    # Durable record of what reached the broker (and why the rest did not).
+    note = f"placed {orders.get('placed', 0)}/{len(placements)}"
+    if orders.get("skipped"):
+        note += " | " + " ; ".join(orders["skipped"])
+    try:
+        ledger.upsert_runner_session(con, {"session_date": session_date,
+                                           "live_orders_note": note[:2000]})
+    except Exception as e:
+        log("runner", f"WARN could not record live order note: {e}")
     return {"selected": [s["ticker"] for s in selected],
             "candidates": len(candidates), "orders": orders}

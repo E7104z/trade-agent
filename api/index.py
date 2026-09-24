@@ -102,6 +102,24 @@ def _is_cron_request() -> bool:
     return bool(CRON_SECRET) and request.headers.get("Authorization") == f"Bearer {CRON_SECRET}"
 
 
+# A narrower secret for the every-5-minutes intraday trigger, which runs on a
+# machine outside Vercel (Hobby crons cannot fire more than once a day).
+# Unlike CRON_SECRET -- which passes login_required on EVERY endpoint -- this
+# one authorizes /cron/intraday-check and nothing else, so the credential that
+# has to live on another machine cannot read the ledger or start a paid loop.
+INTRADAY_TRIGGER_SECRET = os.environ.get("INTRADAY_TRIGGER_SECRET", "")
+
+
+def _is_intraday_trigger() -> bool:
+    if _is_cron_request():
+        return True
+    if not INTRADAY_TRIGGER_SECRET:
+        return False
+    import hmac
+    return hmac.compare_digest(request.headers.get("Authorization") or "",
+                               f"Bearer {INTRADAY_TRIGGER_SECRET}")
+
+
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -381,6 +399,83 @@ def api_status():
         con.close()
 
 
+_PAPER_CACHE: dict = {"at": 0.0, "data": None}
+_PAPER_TTL = 20  # seconds
+
+
+def _num(v):
+    try:
+        return round(float(v), 4) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+@app.route("/api/paper")
+@login_required
+def api_paper():
+    """The live Alpaca PAPER account as the broker sees it, next to the
+    ledger's own live-order rows: is the desk actually trading, what is open
+    right now, and is anything managing it intraday. Read-only; cached briefly
+    because the dashboard polls."""
+    cfg = load_config()
+    live = cfg.get("live_paper", {}) or {}
+    rcfg = cfg.get("runner", {}) or {}
+    now = time.monotonic()
+    cached = _PAPER_CACHE.get("data")
+    if cached is not None and now - _PAPER_CACHE["at"] < _PAPER_TTL:
+        return json_response(cached, compact=True)
+    out: dict = {"enabled": bool(live.get("enabled")),
+                 "runner_orders_enabled": bool(rcfg.get("live_orders_enabled")),
+                 "breakout_two_step": bool(live.get("breakout_two_step"))}
+    if not out["enabled"]:
+        return json_response(out, compact=True)
+    from agent import live_broker
+    acct = live_broker.get_account(cfg=cfg)
+    if acct is None:
+        out["error"] = live_broker.last_error() or "account not readable"
+    else:
+        out["account"] = {k: _num(acct.get(k)) for k in
+                          ("equity", "last_equity", "cash", "buying_power")}
+        out["account"]["status"] = acct.get("status")
+    positions = live_broker.list_positions(cfg=cfg) or []
+    out["positions"] = [{
+        "symbol": p.get("symbol"), "qty": _num(p.get("qty")), "side": p.get("side"),
+        "avg_entry_price": _num(p.get("avg_entry_price")),
+        "current_price": _num(p.get("current_price")),
+        "unrealized_pl": _num(p.get("unrealized_pl")),
+        "unrealized_plpc": _num(p.get("unrealized_plpc"))} for p in positions]
+    out["orders"] = [{
+        "symbol": o.get("symbol"), "side": o.get("side"), "qty": _num(o.get("qty")),
+        "type": o.get("type"), "order_class": o.get("order_class") or "simple",
+        "status": o.get("status"), "submitted_at": o.get("submitted_at"),
+        "filled_avg_price": _num(o.get("filled_avg_price")),
+        "limit_price": _num(o.get("limit_price")), "stop_price": _num(o.get("stop_price")),
+        "legs": [{"type": leg.get("type"), "status": leg.get("status"),
+                  "filled_avg_price": _num(leg.get("filled_avg_price"))}
+                 for leg in (o.get("legs") or [])],
+    } for o in live_broker.recent_orders(25, cfg=cfg)]
+    con = ledger.connect()
+    try:
+        d = today_et()
+        out["ledger_today"] = ledger.live_orders_for_date(con, d)
+        for row in out["ledger_today"]:
+            row.pop("raw_order_json", None)
+        sess = ledger.runner_session(con, d) or {}
+        out["runner_note"] = sess.get("live_orders_note")
+        hb = ledger.last_beat(con, "intraday_check")
+        out["heartbeat"] = hb
+        if hb and hb.get("last_at"):
+            # Age computed here: last_at is naive ET, and a browser in another
+            # timezone would parse it an hour or more off.
+            from agent.util import now_et
+            out["heartbeat_age_min"] = round(
+                (now_et().replace(tzinfo=None) - hb["last_at"]).total_seconds() / 60, 1)
+    finally:
+        con.close()
+    _PAPER_CACHE.update(at=now, data=out)
+    return json_response(out, compact=True)
+
+
 @app.route("/api/playbook")
 @login_required
 def api_playbook():
@@ -657,7 +752,7 @@ def cron_loop(loop_name: str):
 # the GitHub Actions workflow (and any external caller) keeps working.
 @app.route("/cron/intraday-check", methods=["GET", "POST"])
 def intraday_check():
-    if not _is_cron_request():
+    if not _is_intraday_trigger():
         return json_response({"error": "unauthorized"}, 401)
     cfg = load_config()
     from agent.live_monitor import check
@@ -675,14 +770,42 @@ def intraday_check():
     # defensive habit: the runner lane must never be able to break the live
     # position monitor, and a monitor that stops running is a real position
     # left unwatched.
+    from agent.util import is_market_day, log
+    # Positions a missed end-of-day flatten left open overnight are closed on
+    # the first tick of the next session. Guarded like the runner: it must
+    # never break the monitor that already ran above.
+    if ((cfg.get("live_paper", {}) or {}).get("enabled") and is_market_day(today_et())):
+        try:
+            from agent.live_monitor import carry_cleanup
+            con = ledger.connect()
+            try:
+                result["carry"] = carry_cleanup(con, cfg, today_et())
+            finally:
+                con.close()
+        except Exception as e:
+            log("intraday", f"WARN carry cleanup failed; monitor unaffected: {e}")
+            result["carry"] = {"error": str(e)}
     if (cfg.get("runner", {}) or {}).get("enabled"):
-        from agent.util import log
         try:
             from agent.loops.runner import tick
             result["runner"] = tick(cfg)
         except Exception as e:
             log("runner", f"WARN runner tick failed; monitor unaffected: {e}")
             result["runner"] = {"error": str(e)}
+    # Heartbeat: the dashboard's only proof that something is actually
+    # managing live positions intraday.
+    try:
+        con = ledger.connect()
+        try:
+            ledger.beat(con, "intraday_check", json.dumps(
+                {"monitor": {k: monitor.get(k) for k in ("skipped", "reason", "updated")},
+                 "runner": {k: (result.get("runner") or {}).get(k)
+                            for k in ("skipped", "candidates", "universe_size", "error")}},
+                default=str))
+        finally:
+            con.close()
+    except Exception as e:
+        log("intraday", f"WARN heartbeat not recorded: {e}")
     return json_response(result)
 
 
