@@ -141,6 +141,36 @@ def test_favorable_gap_fill_floors_effective_risk_at_quarter_planned():
     # (105 - 99.05) / 0.25 == 23.8 -- if risk had NOT been floored (0.05), this
     # would instead be (105-99.05)/0.05 = 119.0 (fantasy R).
     assert out["r_multiple"] == pytest.approx(23.8, abs=1e-3)
+    # r_planned is bounded by the PLAN's geometry, not the fill: a 5R plan
+    # (target 105 - entry 100 over risk 1) scores 5.0R even though the favorable
+    # gap fill at 99.05 would have made a fill-anchored P&L 5.95R.
+    assert out["r_planned"] == pytest.approx(5.0, abs=1e-3)
+
+
+# ----------------------------------------------------------- target-exit boundary
+
+def test_target_exit_scores_plan_geometry_regardless_of_fill_drift():
+    # A 2R plan (entry 100, stop 98, target 104). Sweep the fill across the whole
+    # legal band: r_planned must stay pinned to the plan's reward:risk (2.0)
+    # instead of moving with the fill. This is the "target-exit boundary" the
+    # planned-R metric exists to enforce.
+    pick = _pick(entry_type="limit", entry=100.0, stop=98.0, target=104.0)
+    for open_px in (98.3, 98.7, 99.0, 99.5, 100.0, 100.5, 101.0, 102.0, 103.0):
+        bars = [_bar(open_px, 104.5, min(open_px, 99.8), 104.2)]
+        out = simulate_pick(pick, bars, None)
+        if out["exit_reason"] != "target":
+            continue
+        assert out["r_planned"] == pytest.approx(2.0, abs=1e-3), \
+            "fill {} moved r_planned to {}".format(open_px, out["r_planned"])
+
+
+def test_short_target_exit_scores_about_planned_r():
+    pick = _pick(direction="short", entry_type="open", entry=100.0,
+                 stop=102.0, target=96.0)
+    bars = [_bar(100.0, 100.2, 99.8, 100.0), _bar(99.9, 100.0, 95.5, 95.8)]
+    out = simulate_pick(pick, bars, None)
+    assert out["exit_reason"] == "target"
+    assert out["r_planned"] == pytest.approx(2.0, abs=1e-3)  # (100 - 96) / 2
 
 
 # ----------------------------------------------------------- untriggered/null
@@ -280,9 +310,13 @@ def test_eod_r_uses_same_risk_denominator_as_r_multiple():
     out = simulate_pick(pick, bars, None)
     assert out["exit_reason"] == "target"
     assert out["r_multiple"] == pytest.approx(23.8, abs=1e-3)
+    assert out["r_planned"] == pytest.approx(5.0, abs=1e-3)   # (105 - 100) / 1
     # eod_r = (last close - fill) / SAME floored risk (0.25):
     # (105.2 - 99.05) / 0.25 == 24.6
     assert out["eod_r"] == pytest.approx(24.6, abs=1e-3)
+    # eod_r_planned twins r_planned in planned-risk units, against the entry:
+    # (105.2 - 100) / 1 == 5.2
+    assert out["eod_r_planned"] == pytest.approx(5.2, abs=1e-3)
 
 
 # ---------------------------------------------------------------- classify_shadow

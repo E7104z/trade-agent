@@ -109,8 +109,15 @@ def session_summary(con, d: date) -> dict:
 
 
 def top_movers(s: dict, n: int = 10) -> list[dict]:
-    """The n best-performing GRADED candidates today, by realized R,
-    regardless of whether the selector picked them.
+    """The n biggest price movers today, by detection-time `change_pct`,
+    regardless of whether the selector picked them or whether they triggered.
+
+    A "mover" is a price move, not a realized R. `change_pct` is measured on
+    every candidate the scan saw, so names that moved hard but never filled an
+    entry still appear here -- which is exactly the point: the question this
+    view answers is "did we even scan/see what moved today". An R-sort cannot
+    answer that (a stop-out that still gapped is invisible to it, and a name
+    that moved without triggering has no R at all).
 
     This is a read-only diagnostic, not a training signal. One day's top
     movers are ~n out of hundreds of candidates -- far too few to safely
@@ -124,11 +131,11 @@ def top_movers(s: dict, n: int = 10) -> list[dict]:
     is the only thing allowed to turn a pattern into a playbook rule.
 
     This function exists so a person can eyeball "did we even scan/see what
-    won today" without waiting for that -- nothing here writes back into the
+    moved today" without waiting for that -- nothing here writes back into the
     selector prompt or any rule table.
     """
-    graded = [r for r in s["rows"] if r["r_multiple"] is not None]
-    return sorted(graded, key=lambda r: r["r_multiple"], reverse=True)[:n]
+    ranked = [r for r in s["rows"] if r.get("change_pct") is not None]
+    return sorted(ranked, key=lambda r: r["change_pct"], reverse=True)[:n]
 
 
 def _health_line(s: dict) -> str:
@@ -251,13 +258,13 @@ def render_text(con, d: date) -> str:
         movers = top_movers(s, 10)
         if movers:
             overlap = sum(1 for r in movers if r["selected"])
-            out += ["", f"TOP {len(movers)} MOVERS TODAY (by realized R, "
+            out += ["", f"TOP {len(movers)} MOVERS TODAY (by % move, "
                         f"regardless of selection) - {overlap} of "
                         f"{len(movers)} were selected:"]
             for r in movers:
                 mark = f"#{r['rank']} PICKED" if r["selected"] else "not picked"
-                out.append(f"  {r['ticker']:8}{_f(r['r_multiple'], 2):>7}R  "
-                           f"({r['exit_reason'] or ''})  {mark}")
+                out.append(f"  {r['ticker']:8}{_f(r['change_pct'], 1):>7}%  "
+                           f"({r['exit_reason'] or 'no fill'})  {mark}")
             out.append("  (one day's winners are noise as a training signal --")
             out.append("   this is for eyeballing, not for retuning selection.")
             out.append("   See the weekly miner for the FDR-corrected version.)")
@@ -301,14 +308,14 @@ def render_html(con, d: date) -> str:
             tag = (f"<span style='color:#3fb950;font-weight:700'>"
                    f"#{r['rank']} picked</span>" if r["selected"]
                    else "<span style='color:#8b949e'>not picked</span>")
-            rmul = r["r_multiple"]
-            rcol = "#3fb950" if rmul > 0 else "#f85149"
+            chg = r["change_pct"]
+            ccol = "#3fb950" if (chg or 0) >= 0 else "#f85149"
             mv_rows.append(
                 f"<tr><td><b>{r['ticker']}</b></td>"
-                f"<td style='color:{rcol}'>{_f(rmul)}</td>"
-                f"<td>{r['exit_reason'] or ''}</td><td>{tag}</td></tr>")
+                f"<td style='color:{ccol}'>{_f(chg, 1)}%</td>"
+                f"<td>{r['exit_reason'] or 'no fill'}</td><td>{tag}</td></tr>")
         movers_html = f"""
-  <h3 style="margin-top:18px">Top {len(movers)} movers today (by realized R)</h3>
+  <h3 style="margin-top:18px">Top {len(movers)} movers today (by % move)</h3>
   <p style="color:#8b949e;font-size:12px">
     {overlap} of {len(movers)} were selected. This is a same-day eyeball check,
     not a training signal — one day's winners are far too few (~{len(movers)}
@@ -316,7 +323,7 @@ def render_html(con, d: date) -> str:
     The FDR-corrected version of this comparison, across many sessions, feeds
     the weekly miner instead.
   </p>
-  <table><tr><th>Ticker</th><th>R</th><th>Exit</th><th></th></tr>
+  <table><tr><th>Ticker</th><th>% move</th><th>Exit</th><th></th></tr>
     {''.join(mv_rows)}
   </table>"""
 

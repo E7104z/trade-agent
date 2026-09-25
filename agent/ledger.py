@@ -390,6 +390,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v21.STATEMENTS
 from . import migrations_v22  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v22.STATEMENTS
 
+# --- v23 planned-R realized metrics (honest R, never floored) ---------------
+from . import migrations_v23  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v23.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -725,7 +729,7 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
     con.execute(
         """INSERT INTO outcomes
            (pick_id, eval_date, triggered, entry_fill, exit_price, exit_reason,
-            r_multiple, mfe_r, mae_r, day_open, day_high, day_low, day_close,
+            r_multiple, r_planned, eod_r_planned, mfe_r, mae_r, day_open, day_high, day_low, day_close,
             day_volume, missed_move_r, baseline_r, eod_r, target_hit_after_stop,
             execution_anomaly, fill_vs_plan_r,
             adv20, vwap_at_fill, fill_vs_vwap_pct, vwap_side_at_fill,
@@ -743,10 +747,11 @@ def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
             grade, grade_notes, graded_at, sim_version)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                   ?,?,?,?,?)""",
+                   ?,?,?,?,?,?,?)""",
         [
             o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
             o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
+            o.get("r_planned"), o.get("eod_r_planned"),
             o.get("mfe_r"), o.get("mae_r"), o.get("day_open"), o.get("day_high"),
             o.get("day_low"), o.get("day_close"), o.get("day_volume"),
             o.get("missed_move_r"), o.get("baseline_r"), o.get("eod_r"),
@@ -1188,15 +1193,28 @@ def _stats_rows(con: duckdb.DuckDBPyConnection, dim_expr: str,
     HERE, deterministically — the LLM must never be trusted to derive significance
     from a CSV. |t| < ~1.5 means the average is statistically indistinguishable
     from zero at that sample size, regardless of how big n looks.
+
+    avg_r/total_weighted_r/std_r read COALESCE(r_planned, r_multiple): this feeds
+    dashboard.best_edge -- the single headline "Current best edge" claim -- and a
+    setup's realized R here must be the honest planned-risk number (r_multiple's
+    floored-fill denominator can inflate it up to ~4x on a favorable gap-through
+    fill), not the raw diagnostic. Legacy (pre-v23) rows fall back to r_multiple
+    until re-graded, same as management_quality / runner_research.py.
     """
     rows = con.execute(
         f"""SELECT {dim_expr} AS dim,
                    COUNT(*) AS n,
                    SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END) AS triggered,
-                   SUM(CASE WHEN o.triggered AND o.r_multiple > 0 THEN 1 ELSE 0 END) AS wins,
-                   ROUND(CAST(AVG(CASE WHEN o.triggered THEN o.r_multiple END) AS NUMERIC), 3) AS avg_r,
-                   ROUND(CAST(SUM(CASE WHEN o.triggered THEN o.r_multiple * COALESCE(p.size_r, 1) ELSE 0 END) AS NUMERIC), 3) AS total_weighted_r,
-                   STDDEV_SAMP(CASE WHEN o.triggered THEN o.r_multiple END) AS std_r,
+                   SUM(CASE WHEN o.triggered AND COALESCE(o.r_planned, o.r_multiple) > 0
+                            THEN 1 ELSE 0 END) AS wins,
+                   ROUND(CAST(AVG(CASE WHEN o.triggered
+                                       THEN COALESCE(o.r_planned, o.r_multiple) END)
+                             AS NUMERIC), 3) AS avg_r,
+                   ROUND(CAST(SUM(CASE WHEN o.triggered
+                                       THEN COALESCE(o.r_planned, o.r_multiple) * COALESCE(p.size_r, 1)
+                                       ELSE 0 END) AS NUMERIC), 3) AS total_weighted_r,
+                   STDDEV_SAMP(CASE WHEN o.triggered
+                                     THEN COALESCE(o.r_planned, o.r_multiple) END) AS std_r,
                    ROUND(CAST(AVG(CASE WHEN o.triggered THEN o.baseline_r END) AS NUMERIC), 3) AS baseline_avg_r
             FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
             WHERE 1=1{lane_clause(lane)}
@@ -1374,29 +1392,39 @@ def management_quality(con: duckdb.DuckDBPyConnection) -> dict:
     silently compares a mean over one set of trades against a mean over
     another, and the gap between two such means is not an edge estimate.
     """
+    # "actual" realized R is COALESCE(r_planned, r_multiple): rows graded after
+    # v23 carry the honest planned-risk denominator, legacy rows fall back to the
+    # (possibly inflated) r_multiple until re-graded. The hold-to-close
+    # counterfactual is COALESCE(eod_r_planned, eod_r) for the same reason, so a
+    # row always compares one denominator against itself -- never planned actual
+    # against floored benchmark.
     row = con.execute(
         """SELECT
              SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END),
-             AVG(CASE WHEN o.triggered THEN o.r_multiple END),
-             COUNT(CASE WHEN o.triggered AND o.r_multiple IS NOT NULL
+             AVG(CASE WHEN o.triggered THEN COALESCE(o.r_planned, o.r_multiple) END),
+             COUNT(CASE WHEN o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL
                         THEN 1 END),
              AVG(CASE WHEN o.triggered THEN o.baseline_r END),
              COUNT(CASE WHEN o.triggered AND o.baseline_r IS NOT NULL
                         THEN 1 END),
-             AVG(CASE WHEN o.triggered AND o.r_multiple IS NOT NULL
+             AVG(CASE WHEN o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL
                        AND o.baseline_r IS NOT NULL
-                      THEN o.r_multiple - o.baseline_r END),
-             COUNT(CASE WHEN o.triggered AND o.r_multiple IS NOT NULL
+                      THEN COALESCE(o.r_planned, o.r_multiple) - o.baseline_r END),
+             COUNT(CASE WHEN o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL
                          AND o.baseline_r IS NOT NULL THEN 1 END),
-             AVG(CASE WHEN o.triggered AND o.eod_r IS NOT NULL
-                      THEN o.r_multiple - o.eod_r END),
-             COUNT(CASE WHEN o.triggered AND o.r_multiple IS NOT NULL
-                         AND o.eod_r IS NOT NULL THEN 1 END),
+             AVG(CASE WHEN o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL
+                       AND COALESCE(o.eod_r_planned, o.eod_r) IS NOT NULL
+                      THEN COALESCE(o.r_planned, o.r_multiple)
+                           - COALESCE(o.eod_r_planned, o.eod_r) END),
+             COUNT(CASE WHEN o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL
+                         AND COALESCE(o.eod_r_planned, o.eod_r) IS NOT NULL THEN 1 END),
              SUM(CASE WHEN o.exit_reason = 'stop' THEN 1 ELSE 0 END),
              SUM(CASE WHEN o.exit_reason = 'stop' AND o.target_hit_after_stop
                       THEN 1 ELSE 0 END),
-             AVG(CASE WHEN o.exit_reason = 'stop' THEN o.eod_r END),
-             COUNT(CASE WHEN o.exit_reason = 'stop' AND o.eod_r IS NOT NULL
+             AVG(CASE WHEN o.exit_reason = 'stop'
+                      THEN COALESCE(o.eod_r_planned, o.eod_r) END),
+             COUNT(CASE WHEN o.exit_reason = 'stop'
+                         AND COALESCE(o.eod_r_planned, o.eod_r) IS NOT NULL
                         THEN 1 END),
              AVG(CASE WHEN o.triggered = FALSE AND o.baseline_r IS NOT NULL
                       THEN o.baseline_r END),
@@ -1431,12 +1459,12 @@ def sizing_counterfactual(con: duckdb.DuckDBPyConnection) -> dict:
     """Did size allocation add value? Compares actual size-weighted total R to the
     same trades at a uniform (average) size. Positive edge = sizing skill is real."""
     row = con.execute(
-        """SELECT SUM(o.r_multiple * COALESCE(p.size_r, 1)),
-                  SUM(o.r_multiple),
+        """SELECT SUM(COALESCE(o.r_planned, o.r_multiple) * COALESCE(p.size_r, 1)),
+                  SUM(COALESCE(o.r_planned, o.r_multiple)),
                   AVG(COALESCE(p.size_r, 1)),
                   COUNT(*)
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND o.r_multiple IS NOT NULL"""
+           WHERE o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL"""
     ).fetchone()
     actual, sum_r, avg_size, n = row
     if not n:
@@ -1945,14 +1973,15 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
     con.execute(
         """INSERT INTO runner_candidate_outcomes
            (session_date, ticker, eval_date, triggered, entry_fill, exit_price,
-            exit_reason, r_multiple, mfe_r, mae_r, eod_r, selected,
+            exit_reason, r_multiple, r_planned, eod_r_planned, mfe_r, mae_r, eod_r, selected,
             selection_rank, pick_id, sim_version, atr14, stop_dist_atr,
             trend_side_200d, entry_after_et)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             o["session_date"], o["ticker"].upper(), o.get("eval_date"),
             o.get("triggered"), o.get("entry_fill"), o.get("exit_price"),
-            o.get("exit_reason"), o.get("r_multiple"), o.get("mfe_r"),
+            o.get("exit_reason"), o.get("r_multiple"),
+            o.get("r_planned"), o.get("eod_r_planned"), o.get("mfe_r"),
             o.get("mae_r"), o.get("eod_r"), bool(selected), rank, pick_id,
             o.get("sim_version"), o.get("atr14"), o.get("stop_dist_atr"),
             o.get("trend_side_200d"), o.get("entry_after_et"),

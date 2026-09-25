@@ -70,6 +70,17 @@ def _mean_std(values: list[float]) -> tuple[float | None, float | None]:
     return mean, math.sqrt(var)
 
 
+def _planned_r(r: dict) -> float | None:
+    """Realized R in planned-risk units: `r_planned` when present, else the
+    legacy `r_multiple` (which used the floored effective risk). Rows graded
+    after v23 carry `r_planned`; older rows fall back until re-graded."""
+    v = r.get("r_planned")
+    if v is not None:
+        return float(v)
+    v = r.get("r_multiple")
+    return float(v) if v is not None else None
+
+
 def candidate_rows(con: Any, sessions: int = 60,
                    scan_version: int | None = None,
                    sim_version: int | None = None) -> list[dict]:
@@ -94,7 +105,7 @@ def candidate_rows(con: Any, sessions: int = 60,
             continue
         if sim_version is not None and r.get("sim_version") != sim_version:
             continue
-        if not r.get("triggered") or r.get("r_multiple") is None:
+        if not r.get("triggered") or _planned_r(r) is None:
             continue
         out.append(r)
     return _attach_regime(con, out)
@@ -157,7 +168,7 @@ def candidate_comparisons(rows: list[dict], n_dimensions: int = 1) -> list[Compa
     for dim in MINING_DIMENSIONS:
         buckets: dict[str, list[float]] = {}
         for r in rows:
-            buckets.setdefault(bucket_of(dim, r), []).append(float(r["r_multiple"]))
+            buckets.setdefault(bucket_of(dim, r), []).append(float(_planned_r(r)))
         for level, values in sorted(buckets.items()):
             mean, std = _mean_std(values)
             out.append(Comparison(
@@ -170,7 +181,7 @@ def candidate_comparisons(rows: list[dict], n_dimensions: int = 1) -> list[Compa
 
 def setup_edge(rows: list[dict], min_n: int = 8) -> dict:
     """Mean R across ALL candidates vs. zero. Does the setup have edge at all?"""
-    values = [float(r["r_multiple"]) for r in rows]
+    values = [float(_planned_r(r)) for r in rows]
     mean, std = _mean_std(values)
     t, df, p = one_sample_t(mean, std, len(values), 0.0)
     return {
@@ -198,7 +209,7 @@ def selection_edge(rows: list[dict], min_n: int = 8) -> dict:
         d = r.get("session_date")
         side = "selected" if r.get("selected") else "unselected"
         by_session.setdefault(d, {"selected": [], "unselected": []})[side].append(
-            float(r["r_multiple"]))
+            float(_planned_r(r)))
 
     contested = {d: v for d, v in by_session.items()
                  if v["selected"] and v["unselected"]}
@@ -340,13 +351,13 @@ def runner_random_ablation(rows: list[dict], draws: int = RUNNER_ABLATION_DRAWS,
     rng = random.Random(seed)
     by_session: dict[Any, dict[str, list[float]]] = {}
     for r in rows:
-        if not r.get("triggered") or r.get("r_multiple") is None:
+        if not r.get("triggered") or _planned_r(r) is None:
             continue
         s = r.get("session_date")
         by_session.setdefault(s, {"pool": [], "selected": []})
-        by_session[s]["pool"].append(float(r["r_multiple"]))
+        by_session[s]["pool"].append(float(_planned_r(r)))
         if r.get("selected"):
-            by_session[s]["selected"].append(float(r["r_multiple"]))
+            by_session[s]["selected"].append(float(_planned_r(r)))
 
     actual_total = 0.0
     contested = 0

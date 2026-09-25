@@ -308,7 +308,8 @@ def _runner_payload(con, d) -> dict:
             # agent/runner_research.selection_edge() and feeds the weekly
             # miner, which is the only thing allowed to write a playbook rule.
             "movers": [
-                {"ticker": r["ticker"], "r_multiple": r["r_multiple"],
+                {"ticker": r["ticker"], "change_pct": r["change_pct"],
+                 "r_multiple": r["r_multiple"],
                  "exit_reason": r["exit_reason"], "selected": r["selected"],
                  "rank": r["rank"]}
                 for r in runner_view.top_movers(s, 10)

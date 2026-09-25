@@ -90,16 +90,17 @@ def test_api_status_includes_runner_movers(monkeypatch, tmp_path):
 
     session = date(2026, 9, 18)
     con = ledger.connect()
-    for i, (ticker, r) in enumerate([("WINNER", 5.0), ("PICKED_LOSER", -1.0)]):
+    for i, (ticker, r, chg) in enumerate([("WINNER", 5.0, 18.0),
+                                           ("PICKED_LOSER", -1.0, -6.0)]):
         con.execute(
             """INSERT INTO runner_candidates
                (session_date, ticker, first_pass_et, detection_price,
-                stop_price, target_price, stop_dist, scan_version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+                stop_price, target_price, stop_dist, change_pct, scan_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)""",
             [session, ticker, datetime(2026, 9, 18, 10, 30),
-             10.0 + i, 9.5 + i, 11.0 + i, 0.5])
+             10.0 + i, 9.5 + i, 11.0 + i, 0.5, chg])
     ledger.mark_runner_selected(con, session, "PICKED_LOSER", 1, None)
-    for ticker, r in [("WINNER", 5.0), ("PICKED_LOSER", -1.0)]:
+    for ticker, r, _ in [("WINNER", 5.0, 18.0), ("PICKED_LOSER", -1.0, -6.0)]:
         ledger.save_runner_candidate_outcome(con, {
             "session_date": session, "ticker": ticker, "eval_date": session,
             "triggered": True, "r_multiple": r, "exit_reason": "eod",

@@ -50,7 +50,7 @@ def con(monkeypatch):
 
 
 def _candidate(ticker, *, price=20.0, minutes=630, stop_dist=0.5,
-              session=SESSION) -> dict:
+              change_pct=4.0, session=SESSION) -> dict:
     return {
         "session_date": session, "ticker": ticker,
         "first_pass_et": datetime(session.year, session.month, session.day,
@@ -59,7 +59,7 @@ def _candidate(ticker, *, price=20.0, minutes=630, stop_dist=0.5,
         "scan_pass_et": datetime(session.year, session.month, session.day, 11, 30),
         "detection_price": price, "vwap": price * 0.99,
         "vwap_pct_above": 1.0, "ema9": price - stop_dist, "ema9_slope": 0.03,
-        "rvol": 2.0, "trend_consistency": 70.0, "change_pct": 4.0,
+        "rvol": 2.0, "trend_consistency": 70.0, "change_pct": change_pct,
         "float_shares": 40.0, "earnings_days_away": 30,
         "prev_close": price * 0.96, "prev_volume": 2_000_000,
         "price_tier": "5-20" if price < 20 else "20-50",
@@ -70,17 +70,23 @@ def _candidate(ticker, *, price=20.0, minutes=630, stop_dist=0.5,
 
 
 def _seed_graded_session(con, session=SESSION):
-    """A session with 4 candidates, 2 selected, all graded with distinct R --
-    the shape needed to exercise both the main table and top_movers()."""
-    tickers_r = [("WINNER", 5.0), ("RUNNERUP", 2.0), ("PICKED_LOSER", -1.0),
-                ("ALSO_PICKED", 0.5)]
-    for i, (t, _) in enumerate(tickers_r):
-        ledger.save_runner_candidate(con, _candidate(t, price=10.0 + i, session=session))
-    # Select the two that did WORST, so the mismatch top_movers surfaces is
-    # unambiguous rather than accidentally matching.
+    """A session with 4 candidates, 2 selected, all graded with distinct R AND
+    distinct change_pct -- the shape needed to exercise both the main table and
+    top_movers(), which now ranks by price movement, not realized R.
+
+    The change_pct order is deliberately DIFFERENT from the R order (RUNNERUP
+    is the biggest price mover even though WINNER realized the most R), so a
+    ranking-by-R regression cannot silently pass the movers assertions."""
+    tickers = [("WINNER", 5.0, 2.0), ("RUNNERUP", 2.0, 18.0),
+               ("PICKED_LOSER", -1.0, -6.0), ("ALSO_PICKED", 0.5, 1.5)]
+    for i, (t, _, chg) in enumerate(tickers):
+        ledger.save_runner_candidate(con, _candidate(
+            t, price=10.0 + i, change_pct=chg, session=session))
+    # Select the two that did WORST by price movement, so the mismatch
+    # top_movers surfaces is unambiguous rather than accidentally matching.
     ledger.mark_runner_selected(con, session, "PICKED_LOSER", 1, None)
     ledger.mark_runner_selected(con, session, "ALSO_PICKED", 2, None)
-    for t, r in tickers_r:
+    for t, r, _ in tickers:
         ledger.save_runner_candidate_outcome(con, {
             "session_date": session, "ticker": t, "eval_date": session,
             "triggered": True, "r_multiple": r, "exit_reason": "eod",
@@ -94,20 +100,25 @@ def _seed_graded_session(con, session=SESSION):
 
 # --------------------------------------------------------- top_movers()
 
-def test_top_movers_ranks_by_realized_r_descending(con):
+def test_top_movers_ranks_by_price_movement_descending(con):
+    """Movers are ranked by change_pct, not realized R: RUNNERUP out-moves
+    WINNER even though WINNER realized the bigger R."""
     _seed_graded_session(con)
     s = runner_view.session_summary(con, SESSION)
     movers = runner_view.top_movers(s, n=10)
     assert [m["ticker"] for m in movers] == \
-        ["WINNER", "RUNNERUP", "ALSO_PICKED", "PICKED_LOSER"]
+        ["RUNNERUP", "WINNER", "ALSO_PICKED", "PICKED_LOSER"]
 
 
-def test_top_movers_excludes_ungraded_rows(con):
-    ledger.save_runner_candidate(con, _candidate("UNGRADED"))
+def test_top_movers_includes_ungraded_rows(con):
+    """A mover is a price move, not a realized R: a name the scan saw move but
+    that never triggered still belongs in the top-movers list."""
+    ledger.save_runner_candidate(con, _candidate("UNGRADED", change_pct=99.0))
     _seed_graded_session(con)
     s = runner_view.session_summary(con, SESSION)
     movers = runner_view.top_movers(s, n=10)
-    assert "UNGRADED" not in [m["ticker"] for m in movers]
+    assert "UNGRADED" in [m["ticker"] for m in movers]
+    assert movers[0]["ticker"] == "UNGRADED"  # biggest move, never triggered
 
 
 def test_top_movers_respects_n(con):

@@ -58,7 +58,15 @@ Simulation rules (documented, conservative):
   execution_anomaly so the evening grader doesn't narrate a thesis test that
   never actually happened at the intended level.
   Metrics:
-    r_multiple = signed P&L / initial risk per share
+    r_planned = signed P&L against the PLANNED ENTRY, over PLANNED risk per share
+                (|entry - stop|, never floored). This is the honest realized R the
+                weekly miner reports, and it is bounded by the plan's geometry: a
+                target exit scores the plan's reward:risk no matter how far the
+                actual fill drifted. Fill drift is still auditable in
+                fill_vs_plan_r / execution_anomaly below, never capitalized.
+    r_multiple = signed P&L / effective risk per share (fill-to-stop, floored at
+                 25% of planned risk) -- diagnostic only; INFLATED (up to ~4x) on
+                 favorable gap-through fills, so never the headline number.
     mfe_r / mae_r = max favorable / adverse excursion in R while in the trade
     missed_move_r = for UNTRIGGERED picks, what the move from the entry level to the
                     best price would have been worth in R (measures entries that were too cute)
@@ -73,7 +81,10 @@ Simulation rules (documented, conservative):
                  to the close with NO stop, NO target, NO time_stop and NO flatten. This
                  counterfactual stays UNCONDITIONED by design — actual_r - eod_r must keep
                  measuring "did active management add value", not get contaminated by the
-                 new exit rules above.
+                 new exit rules above. In effective (floored) risk units; see
+                 eod_r_planned for the planned-risk twin.
+    eod_r_planned = the same hold-to-close counterfactual in PLANNED-risk units, so the
+                 management edge (r_planned - eod_r_planned) never mixes denominators.
     target_hit_after_stop = for stopped-out trades: did price go on to touch the target
                  later the same session? A high rate = stops are placed inside the noise.
   Friction (slippage_bps, default 5):
@@ -770,6 +781,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
 
     sign = 1.0 if long else -1.0
     r_mult = sign * (exit_price - fill_price) / risk
+    r_planned = sign * (exit_price - entry) / planned_risk  # planned geometry, never floored
     mfe = sign * (best_px - fill_price) / risk
     mae = sign * (worst_px - fill_price) / risk  # negative or zero
 
@@ -786,6 +798,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     if slip > 0:
         eod_exit = eod_exit * (1 - slip) if long else eod_exit * (1 + slip)
     out["eod_r"] = round(sign * (eod_exit - fill_price) / risk, 3)
+    out["eod_r_planned"] = round(sign * (eod_exit - entry) / planned_risk, 3)
 
     # target_hit_after_stop: only meaningful for stopped trades. Scans from the
     # exit bar onward (the same-bar case counts, consistent with the conservative
@@ -803,6 +816,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "exit_reason": exit_reason,
         "exit_time": exit_time,
         "r_multiple": round(float(r_mult), 3),
+        "r_planned": round(float(r_planned), 3),
         "mfe_r": round(float(mfe), 3),
         "mae_r": round(float(mae), 3),
     })

@@ -102,6 +102,54 @@ def test_best_edge_picks_highest_avg_r_among_qualified():
     assert "99.0" not in out
 
 
+# ------------------------------------------- stats_by reads r_planned, not r_multiple
+#
+# r_multiple floors its risk denominator at 25% of planned risk (agent/grading.py),
+# which can inflate it up to ~4x on a favorable gap-through fill. That inflated
+# number must never drive "Current best edge" -- the dashboard's single headline
+# claim, built from ledger.stats_by via dashboard.best_edge.
+
+def _insert_graded_pick(con, d, ticker, setup_type, r_multiple, r_planned):
+    con.execute(
+        "INSERT INTO picks (plan_date, ticker, direction, setup_type, thesis, "
+        "conviction, size_r, entry_price, stop_price, target_price) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [d, ticker, "long", setup_type, "t", 3, 1.0, 10.0, 9.5, 11.0],
+    )
+    pick_id = con.execute(
+        "SELECT pick_id FROM picks WHERE plan_date=? AND ticker=? ORDER BY pick_id DESC LIMIT 1",
+        [d, ticker],
+    ).fetchone()[0]
+    con.execute(
+        "INSERT INTO outcomes (pick_id, eval_date, triggered, r_multiple, r_planned) "
+        "VALUES (?,?,?,?,?)",
+        [pick_id, d, True, r_multiple, r_planned],
+    )
+
+
+def test_stats_by_avg_r_uses_r_planned_when_present(con):
+    # Three picks, all r_planned == 1.0 (the honest, plan-bounded result), but
+    # r_multiple inflated to 5.0/6.0/7.0 (a favorable-fill risk-floor artifact).
+    # avg_r must land on 1.0, not ~6.0 -- otherwise the inflated number is still
+    # the one feeding "Current best edge".
+    for i, (rmul, rplan) in enumerate([(5.0, 1.0), (6.0, 1.0), (7.0, 1.0)]):
+        _insert_graded_pick(con, date(2026, 9, 20 + i), f"T{i}", "gap_go", rmul, rplan)
+    rows = ledger.stats_by(con, "setup_type")
+    row = next(r for r in rows if r["dim"] == "gap_go")
+    assert row["avg_r"] == pytest.approx(1.0, abs=1e-6)
+    assert row["total_weighted_r"] == pytest.approx(3.0, abs=1e-6)
+
+
+def test_stats_by_falls_back_to_r_multiple_for_legacy_rows(con):
+    # A pre-v23 row has r_planned = NULL; stats_by must not silently drop it
+    # or treat it as zero -- it falls back to the old (possibly inflated, but
+    # only-available) r_multiple until the row is re-graded.
+    _insert_graded_pick(con, date(2026, 9, 20), "LEGACY", "gap_fade", 2.0, None)
+    rows = ledger.stats_by(con, "setup_type")
+    row = next(r for r in rows if r["dim"] == "gap_fade")
+    assert row["avg_r"] == pytest.approx(2.0, abs=1e-6)
+
+
 # --------------------------------------------------- conclusions_payload guard
 
 def test_conclusions_payload_has_all_keys_on_fresh_ledger(con):

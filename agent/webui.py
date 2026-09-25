@@ -762,14 +762,14 @@ function renderRunner(){
   if(movers.length){
     const overlap = movers.filter(m=>m.selected).length;
     const mvRows = movers.map(m=>{
-      const rc = m.r_multiple==null ? '#8b949e' : (m.r_multiple>0 ? '#3fb950' : '#f85149');
+      const rc = m.change_pct==null ? '#8b949e' : (m.change_pct>=0 ? '#3fb950' : '#f85149');
       const tag = m.selected ? `<span style="color:#3fb950;font-weight:700">#${m.rank} picked</span>` : `<span style="color:#8b949e">not picked</span>`;
       const link = tickerLink(m.ticker, {date: state.today, lane:'runner', id: m.ticker.toUpperCase() + ':' + state.today});
-      return `<tr><td><b>${link}</b></td><td class="num" style="color:${rc}">${m.r_multiple==null?'—':Number(m.r_multiple).toFixed(2)}</td><td>${esc(m.exit_reason||'')}</td><td>${tag}</td></tr>`;
+      return `<tr><td><b>${link}</b></td><td class="num" style="color:${rc}">${m.change_pct==null?'—':Number(m.change_pct).toFixed(1)+'%'}</td><td>${esc(m.exit_reason||'')}</td><td>${tag}</td></tr>`;
     }).join('');
-    moversHtml = `<h3>Top ${movers.length} movers today (by realized R)</h3>
+    moversHtml = `<h3>Top ${movers.length} movers today (by % move)</h3>
       <p class="muted-note">${overlap} of ${movers.length} were selected. Same-day eyeball check, not a training signal — one day's winners are noise to retune a selector on. The FDR-corrected version, across many sessions, feeds the weekly miner instead.</p>
-      <div class="table-wrap"><table><thead><tr><th>Ticker</th><th class="num">R</th><th>Exit</th><th></th></tr></thead><tbody>${mvRows}</tbody></table></div>`;
+      <div class="table-wrap"><table><thead><tr><th>Ticker</th><th class="num">% move</th><th>Exit</th><th></th></tr></thead><tbody>${mvRows}</tbody></table></div>`;
   }
   let picksHtml = '';
   if((rn.picks||[]).length){
