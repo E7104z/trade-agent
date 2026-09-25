@@ -1,6 +1,7 @@
 # Secrets — never commit
 credentials.json
 .env
+.env.vercel.local
 
 # Data & generated artifacts
 data/ledger.duckdb

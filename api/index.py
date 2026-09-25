@@ -17,12 +17,14 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import time
 import traceback
 from datetime import date, datetime
 from decimal import Decimal
 from functools import wraps
+from typing import Any
 
 from flask import Flask, Response, redirect, request, session, url_for
 
@@ -32,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent import ledger  # noqa: E402
 from agent import dashboard as dashboard_lib  # noqa: E402
 from agent.config import load_config  # noqa: E402
+from agent.chartui import CHART_MARKER, chart_embed  # noqa: E402
 from agent.mascot import MASCOT_MARKER, mascot_embed  # noqa: E402
 from agent.memory import read_playbook  # noqa: E402
 from agent.webui import PAGE as _PAGE  # noqa: E402
@@ -190,6 +193,10 @@ def logout():
 # Arby the desk mascot: a self-contained widget injected at the marker. It only
 # reads /api/status and never touches the run/loop logic above.
 _PAGE = _PAGE.replace(MASCOT_MARKER, mascot_embed())
+# The strategy-aware chart drawer (specs/CHART_DRAWER_SPEC_v1.md): a second
+# self-contained widget injected at its own marker, same pattern as Arby. It
+# only reads /api/chart and never touches the run/loop logic above.
+_PAGE = _PAGE.replace(CHART_MARKER, chart_embed())
 
 
 @app.route("/")
@@ -850,6 +857,69 @@ def intraday_check():
     except Exception as e:
         log("intraday", f"WARN heartbeat not recorded: {e}")
     return json_response(result)
+
+
+_CHART_CACHE: dict[tuple, tuple[float, dict]] = {}
+_CHART_TTL_LIVE = 20     # seconds -- Phase 5 live polling cadence
+_CHART_TTL_FINAL = 6 * 3600
+_TICKER_RE = re.compile(r"^[A-Z.]{1,10}$")
+
+
+@app.route("/api/chart")
+@login_required
+def api_chart():
+    """Chart drawer payload (specs/CHART_DRAWER_SPEC_v1.md Phase 1.2).
+
+    Any exception during payload construction is caught by
+    chart_payload.build() itself and surfaced through `warnings` with a 200 --
+    the drawer must never blank on a transient data problem. Only bad INPUT
+    (this endpoint's job, not build()'s) is a 400.
+    """
+    from agent import chart_payload
+    from agent.util import is_market_day, market_close_et, now_et
+
+    ticker = (request.args.get("ticker") or "").strip().upper()
+    if not _TICKER_RE.match(ticker):
+        return json_response({"error": "ticker must match ^[A-Z.]{1,10}$"}, 400)
+    try:
+        d = parse_date(request.args["date"]) if request.args.get("date") else today_et()
+    except Exception:
+        return json_response({"error": "invalid date"}, 400)
+    lane = request.args.get("lane") or None
+    if lane not in (None, "morning", "shadow", "runner", "live"):
+        return json_response({"error": f"unknown lane {lane!r}"}, 400)
+    raw_id = request.args.get("id")
+    ctx_id: Any = None
+    if raw_id is not None:
+        try:
+            ctx_id = int(raw_id)
+        except ValueError:
+            ctx_id = raw_id  # runner id is "TICKER:DATE"; live id is a broker order id string
+    try:
+        tf = int(request.args.get("tf", 5))
+    except ValueError:
+        tf = 5
+    if tf not in (1, 5, 15):
+        return json_response({"error": "tf must be 1, 5, or 15"}, 400)
+    asof = request.args.get("asof") == "1"
+
+    now_dt = now_et()
+    final = d < now_dt.date() or (is_market_day(d) and now_dt.time() >= market_close_et(d)) or not is_market_day(d)
+    kind = "final" if final else "live"
+    cache_key = (ticker, d.isoformat(), lane, str(ctx_id), tf, asof, kind)
+    ttl = _CHART_TTL_FINAL if final else _CHART_TTL_LIVE
+    now = time.monotonic()
+    cached = _CHART_CACHE.get(cache_key)
+    if cached and now - cached[0] < ttl and cached[1].get("bars"):
+        return json_response(cached[1], compact=True)
+
+    con = ledger.connect()
+    try:
+        payload = chart_payload.build(con, load_config(), ticker, d, lane, ctx_id, tf=tf, asof=asof)
+    finally:
+        con.close()
+    _CHART_CACHE[cache_key] = (now, payload)
+    return json_response(payload, compact=True)
 
 
 @app.route("/api/runner/candidates")

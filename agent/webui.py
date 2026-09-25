@@ -35,6 +35,8 @@ html,body{height:100%}
 body{margin:0;font-family:var(--sans);background:var(--bg);color:var(--text);font-size:14px;line-height:1.5;
   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
 a{color:var(--accent-strong);text-decoration:none}a:hover{text-decoration:underline}
+a.tk{color:var(--text);font-weight:700;border-bottom:1px dotted var(--border-strong)}
+a.tk:hover{color:var(--accent-strong);border-bottom-color:var(--accent)}
 h1,h2,h3,h4{margin:0;font-weight:600;letter-spacing:-.01em}
 code,pre,.num{font-family:var(--mono)}
 .app{display:flex;min-height:100vh}
@@ -215,6 +217,7 @@ window.TA = (function(){
   };
 })();
 </script>
+<!--CHART-->
 </head>
 <body>
 <div class="app">
@@ -327,6 +330,22 @@ const px = v => (v==null || v==='' || isNaN(v)) ? '—' : Number(v).toFixed(Math
 const empty = m => `<div class="empty">${m}</div>`;
 const kpi = (label, value, sub, cls) => `<div class="stat ${cls||''}"><div class="stat-label">${label}</div><div class="stat-value">${value}</div><div class="stat-sub">${sub||''}</div></div>`;
 
+// Every ticker in every structured table routes through here (CHART_DRAWER_SPEC_v1
+// §4) -- tests/test_webui_ticker_links.py fails CI if a table ever prints a raw
+// ticker/symbol instead. ctx = {date, lane, id}; lane/id are optional (History's
+// generic renderer omits them and lets the drawer pick via `contexts`).
+function tickerLink(ticker, ctx){
+  ctx = ctx || {};
+  const t = String(ticker == null ? '' : ticker).toUpperCase().replace(/[^A-Z.]/g, '');
+  if(!t) return esc(ticker);
+  const d = ctx.date || (state && state.today) || '';
+  const qs = [];
+  if(ctx.lane) qs.push('lane=' + encodeURIComponent(ctx.lane));
+  if(ctx.id != null) qs.push('id=' + encodeURIComponent(ctx.id));
+  const href = '#/chart/' + t + '/' + encodeURIComponent(d) + (qs.length ? '?' + qs.join('&') : '');
+  return `<a class="tk" href="${href}">${esc(ticker)}</a>`;
+}
+
 let state = null;
 
 const PAGES = {
@@ -339,9 +358,37 @@ const PAGES = {
   runs:{t:'Runs', s:'Trigger a loop and review run history'},
 };
 
-function currentPage(){ return (location.hash||'#/overview').replace('#/','') || 'overview'; }
+// #/chart/<TICKER>/<DATE>?lane=..&id=.. opens the drawer OVER whichever real
+// page is underneath -- it is never itself a page in PAGES, and currentPage()
+// reports the last real page so the router (and the drawer's own close
+// button) can agree on what to fall back to.
+let lastRealPage = 'overview';
+function isChartRoute(h){ return h.indexOf('chart/') === 0; }
+function currentPage(){
+  const h = (location.hash||'#/overview').replace('#/','') || 'overview';
+  return isChartRoute(h) ? lastRealPage : h;
+}
+function parseChartRoute(h){
+  const rest = h.slice('chart/'.length);
+  const qIdx = rest.indexOf('?');
+  const path = qIdx >= 0 ? rest.slice(0, qIdx) : rest;
+  const qs = new URLSearchParams(qIdx >= 0 ? rest.slice(qIdx + 1) : '');
+  const parts = path.split('/');
+  const ticker = decodeURIComponent(parts[0] || '');
+  if(!ticker) return null;
+  return {ticker, date: decodeURIComponent(parts[1] || '') || (state && state.today) || '',
+         lane: qs.get('lane') || null, id: qs.get('id')};
+}
 function renderRoute(){
-  const p = PAGES[currentPage()] ? currentPage() : 'overview';
+  const h = (location.hash||'#/overview').replace('#/','') || 'overview';
+  if(isChartRoute(h)){
+    const parsed = parseChartRoute(h);
+    if(parsed && window.TA.openChart) window.TA.openChart(Object.assign({viaNav: true}, parsed));
+    return;  // leave whatever real page is underneath exactly as it is
+  }
+  if(window.TA.closeChart) window.TA.closeChart();
+  const p = PAGES[h] ? h : 'overview';
+  lastRealPage = p;
   document.querySelectorAll('.page').forEach(s => s.classList.toggle('active', s.dataset.page===p));
   document.querySelectorAll('.nav-item[data-page]').forEach(a => a.classList.toggle('active', a.dataset.page===p));
   $('page-title').textContent = PAGES[p].t;
@@ -349,6 +396,7 @@ function renderRoute(){
   if(p === 'history' && !historyDatesLoaded) loadHistoryDates();
   if(p === 'today') loadPaper();
 }
+window.TA.lastPage = () => lastRealPage;
 let historyDatesLoaded = false;
 window.addEventListener('hashchange', renderRoute);
 
@@ -519,7 +567,10 @@ function renderOverview(){
   const plan = state.plan;
   let planMini;
   if(plan && plan.no_trade) planMini = `<div class="kpi-line"><span class="pill warn">NO TRADE</span><span>${esc(plan.no_trade_reason||'')}</span></div>`;
-  else if(plan && (plan.picks||[]).length) planMini = `<div class="kpi-line"><span class="pill ok">${plan.picks.length} PICKS</span><span>${plan.picks.map(p=>esc(p.ticker)).join(', ')}</span></div>`;
+  else if(plan && (plan.picks||[]).length) planMini = `<div class="kpi-line"><span class="pill ok">${plan.picks.length} PICKS</span><span>${plan.picks.map(p=>{
+    const today = (state.picks_today||[]).find(x => String(x.ticker).toUpperCase() === String(p.ticker).toUpperCase());
+    return tickerLink(p.ticker, today ? {date: state.today, lane:'morning', id: today.pick_id} : {date: state.today});
+  }).join(', ')}</span></div>`;
   else if(plan) planMini = `<div class="kpi-line"><span class="pill info">PLAN READY</span><span>${esc(plan.market_stance||'')}</span></div>`;
   else planMini = `<div class="kpi-line"><span class="pill neutral">NO PLAN</span><span>The morning call hasn't run for today.</span></div>`;
 
@@ -564,7 +615,8 @@ function planHtml(){
   if(!source.length) return `<p>${esc(plan.market_stance||'')}</p><div class="empty">Plan has no picks yet.</div>`;
   const rows = source.map(p=>{
     const entryType = p.entry_type || (p.entry_plan && p.entry_plan.type) || 'open';
-    return `<tr><td>${esc(p.ticker)}</td><td>${esc(p.direction)}</td><td>${esc(p.setup_type||'')}</td>
+    const link = tickerLink(p.ticker, p.pick_id != null ? {date: state.today, lane:'morning', id: p.pick_id} : {date: state.today});
+    return `<tr><td>${link}</td><td>${esc(p.direction)}</td><td>${esc(p.setup_type||'')}</td>
       <td>${esc(entryType)} @ ${px(p.entry_price)}</td><td>${px(p.stop_price)}</td>
       <td>${px(p.target_price)}</td><td>${esc(p.size_r ?? '—')}R</td><td>${esc(p.conviction ?? '—')}</td>
       <td class="wrap">${esc(p.thesis_final||p.thesis||'')}</td></tr>`;
@@ -580,7 +632,7 @@ function shadowHtml(){
     const outcome = r.eod_outcome
       ? `${esc(r.eod_outcome)}${r.forgone_r!=null ? ' (' + fmtR(r.forgone_r) + 'R)' : ''}`
       : 'ungraded';
-    return `<tr><td>${esc(r.ticker)}</td><td>${esc(r.direction||'')}</td><td>${esc(r.setup_type||'')}</td>
+    return `<tr><td>${tickerLink(r.ticker, {date: state.today, lane:'shadow', id: r.rejection_id})}</td><td>${esc(r.direction||'')}</td><td>${esc(r.setup_type||'')}</td>
       <td>${esc(r.entry_type||'')} @ ${px(r.entry_price)}</td><td>${px(r.stop_price)}</td>
       <td>${px(r.target_price)}</td><td>${esc(r.conviction ?? '—')}</td>
       <td class="wrap">${esc(r.reason||'')}</td><td class="wrap">${esc(r.thesis||'')}</td><td>${outcome}</td></tr>`;
@@ -619,6 +671,22 @@ const etTime = iso => {
 const STATUS_PILL = s => ({filled:'ok', partially_filled:'info', new:'info', accepted:'info', held:'info',
   pending_new:'info', canceled:'neutral', expired:'neutral', rejected:'bad', replaced:'neutral'}[String(s||'').toLowerCase()] || 'neutral');
 
+// Positions/orders come straight from the broker (by symbol only); resolve
+// today's ledger live_order_id by symbol so the ticker can still link into
+// lane:'live' (CHART_DRAWER_SPEC_v1 §4.2). Prefers an OPEN order for that
+// symbol (exit_reason IS NULL), else the most recent.
+function liveOrderIdFor(symbol){
+  const rows = (paperState && paperState.ledger_today) || [];
+  const matches = rows.filter(o => String(o.ticker||'').toUpperCase() === String(symbol||'').toUpperCase());
+  if(!matches.length) return null;
+  const open = matches.find(o => o.exit_reason == null);
+  return (open || matches[matches.length - 1]).live_order_id;
+}
+function liveTickerLink(symbol){
+  const id = liveOrderIdFor(symbol);
+  return tickerLink(symbol, id != null ? {date: state.today, lane:'live', id} : {date: state.today});
+}
+
 function paperHtml(){
   const p = paperState;
   if(!p) return empty('Loading the paper account…');
@@ -633,13 +701,13 @@ function paperHtml(){
         : `<span class="pill warn">MONITOR IDLE</span><span>last intraday tick ${age < 120 ? Math.round(age) + ' min' : (age/60).toFixed(1) + ' h'} ago — expected every 5 min during the session</span>`);
   const pos = p.positions || [];
   const posHtml = pos.length ? `<div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Avg entry</th><th class="num">Last</th><th class="num">Unrealized</th></tr></thead><tbody>${
-      pos.map(x => `<tr><td><b>${esc(x.symbol)}</b></td><td>${esc(x.side)}</td><td class="num">${esc(x.qty)}</td>
+      pos.map(x => `<tr><td><b>${liveTickerLink(x.symbol)}</b></td><td>${esc(x.side)}</td><td class="num">${esc(x.qty)}</td>
         <td class="num">${px(x.avg_entry_price)}</td><td class="num">${px(x.current_price)}</td>
         <td class="num ${rCls(x.unrealized_pl)}">${x.unrealized_pl==null?'—':fmtMoney(x.unrealized_pl).replace('$-','-$')} ${x.unrealized_plpc==null?'':'('+(x.unrealized_plpc*100).toFixed(2)+'%)'}</td></tr>`).join('')
     }</tbody></table></div>` : empty('No open positions.');
   const ords = p.orders || [];
   const ordHtml = ords.length ? `<div class="table-wrap" style="max-height:420px"><table><thead><tr><th>Submitted</th><th>Symbol</th><th>Side</th><th class="num">Qty</th><th>Type</th><th>Status</th><th class="num">Fill</th><th>Exit legs</th></tr></thead><tbody>${
-      ords.map(o => `<tr><td>${etTime(o.submitted_at)}</td><td><b>${esc(o.symbol)}</b></td><td>${esc(o.side)}</td><td class="num">${esc(o.qty)}</td>
+      ords.map(o => `<tr><td>${etTime(o.submitted_at)}</td><td><b>${liveTickerLink(o.symbol)}</b></td><td>${esc(o.side)}</td><td class="num">${esc(o.qty)}</td>
         <td>${esc(o.type)}${o.order_class && o.order_class!=='simple' ? ' · '+esc(o.order_class) : ''}${o.limit_price!=null?' @ '+px(o.limit_price):''}</td>
         <td><span class="pill ${STATUS_PILL(o.status)}">${esc(o.status)}</span></td>
         <td class="num">${px(o.filled_avg_price)}</td>
@@ -696,7 +764,8 @@ function renderRunner(){
     const mvRows = movers.map(m=>{
       const rc = m.r_multiple==null ? '#8b949e' : (m.r_multiple>0 ? '#3fb950' : '#f85149');
       const tag = m.selected ? `<span style="color:#3fb950;font-weight:700">#${m.rank} picked</span>` : `<span style="color:#8b949e">not picked</span>`;
-      return `<tr><td><b>${esc(m.ticker)}</b></td><td class="num" style="color:${rc}">${m.r_multiple==null?'—':Number(m.r_multiple).toFixed(2)}</td><td>${esc(m.exit_reason||'')}</td><td>${tag}</td></tr>`;
+      const link = tickerLink(m.ticker, {date: state.today, lane:'runner', id: m.ticker.toUpperCase() + ':' + state.today});
+      return `<tr><td><b>${link}</b></td><td class="num" style="color:${rc}">${m.r_multiple==null?'—':Number(m.r_multiple).toFixed(2)}</td><td>${esc(m.exit_reason||'')}</td><td>${tag}</td></tr>`;
     }).join('');
     moversHtml = `<h3>Top ${movers.length} movers today (by realized R)</h3>
       <p class="muted-note">${overlap} of ${movers.length} were selected. Same-day eyeball check, not a training signal — one day's winners are noise to retune a selector on. The FDR-corrected version, across many sessions, feeds the weekly miner instead.</p>
@@ -704,7 +773,7 @@ function renderRunner(){
   }
   let picksHtml = '';
   if((rn.picks||[]).length){
-    const pRows = rn.picks.map(p=>`<tr><td><b>${esc(p.ticker)}</b></td><td>${esc(p.direction)}</td><td>${esc(p.conviction||'')}</td>
+    const pRows = rn.picks.map(p=>`<tr><td><b>${tickerLink(p.ticker, {date: state.today, lane:'runner', id: p.ticker.toUpperCase() + ':' + state.today})}</b></td><td>${esc(p.direction)}</td><td>${esc(p.conviction||'')}</td>
       <td class="num">${esc(p.size_r ?? '—')}R</td><td class="num">${px(p.entry_price)}</td><td class="num">${px(p.stop_price)}</td>
       <td class="num">${px(p.target_price)}</td><td class="wrap">${esc(p.thesis||'')}</td></tr>`).join('');
     picksHtml = `<h3>Selected picks (${rn.picks.length})</h3>
@@ -752,7 +821,8 @@ function renderRunnerTable(){
   const n = (v, dg) => (v==null ? '—' : Number(v).toFixed(dg==null?2:dg));
   const body = rows.map(r=>{
     const sel = r.selected ? `<span class="pos" style="font-weight:700">#${esc(r.rank)}</span>` : '';
-    return `<tr><td>${sel}</td><td><b>${esc(r.ticker)}</b></td><td>${esc(r.detection_et||'')}</td>
+    const link = tickerLink(r.ticker, {date: state.today, lane:'runner', id: r.ticker.toUpperCase() + ':' + state.today});
+    return `<tr><td>${sel}</td><td><b>${link}</b></td><td>${esc(r.detection_et||'')}</td>
       <td class="num">${n(r.price)}</td><td class="num">${n(r.stop)}</td><td class="num">${n(r.target)}</td>
       <td class="num">${n(r.rvol)}</td><td class="num">${n(r.vwap_pct)}</td><td class="num">${n(r.tc,1)}</td>
       <td class="num">${n(r.change_pct)}</td><td class="num ${rCls(r.r_multiple)}">${n(r.r_multiple)}</td>
@@ -895,6 +965,18 @@ async function loadHistoryDates(){
   }
 }
 
+// Mirrors api/index.py::_QUERYABLE_TABLES' date column, for the tables the
+// History dropdown actually lists (CHART_DRAWER_SPEC_v1 §4.2) -- so a ticker
+// cell can link with the right date even though this generic renderer has no
+// per-table knowledge otherwise. No lane/id: the drawer resolves via `contexts`.
+const TABLE_DATE_COL = {
+  picks:'plan_date', outcomes:'eval_date', rejections:'plan_date', daily_plans:'plan_date',
+  regime_history:'date', runs:'run_date', runner_sessions:'session_date',
+  runner_candidates:'session_date', runner_candidate_outcomes:'session_date',
+  live_orders:'session_date', lessons:'created_date', calibration:'session_date',
+  rule_confirmations:'session_date', open_question_progress:'session_date',
+};
+
 async function loadHistory(){
   const date = $('historyDate').value;
   const table = $('historyTable').value;
@@ -917,8 +999,9 @@ async function loadHistory(){
       return;
     }
     const headers = d.columns || [];
+    const dateCol = TABLE_DATE_COL[table];
     const headerHtml = headers.map(column => `<th>${historyText(column)}</th>`).join('');
-    const rowsHtml = d.rows.map(row => '<tr>' + headers.map(column => `<td>${historyText(row[column])}</td>`).join('') + '</tr>').join('');
+    const rowsHtml = d.rows.map(row => '<tr>' + headers.map(column => `<td>${historyCell(column, row, dateCol)}</td>`).join('') + '</tr>').join('');
     view.innerHTML = `<table><thead><tr>${headerHtml}</tr></thead><tbody>${rowsHtml}</tbody></table>`;
   } catch(e) {
     result.textContent = 'Could not load history: ' + e.message;
@@ -928,6 +1011,15 @@ async function loadHistory(){
 function historyText(value){
   if(value === null || value === undefined) return '—';
   return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+}
+
+function historyCell(column, row, dateCol){
+  const value = row[column];
+  if((column === 'ticker' || column === 'symbol') && value){
+    const rowDate = dateCol ? row[dateCol] : null;
+    return tickerLink(value, rowDate ? {date: String(rowDate).slice(0, 10)} : {});
+  }
+  return historyText(value);
 }
 
 loadData();
