@@ -123,8 +123,22 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
 
     # --- 1. morning plan ------------------------------------------------
     m_session = _expected_session(now, MORNING_DUE)
-    stages.append(_day_stage("morning", "Morning plan", runs.get("morning", []),
-                             m_session, "Morning plan"))
+    morning_stage = _day_stage("morning", "Morning plan", runs.get("morning", []),
+                               m_session, "Morning plan")
+    # A run killed by the 300s function timeout writes NOTHING to `runs` --
+    # that's the "never reached the ledger" branch above -- but morning.py's
+    # _mark() heartbeat (agent/ledger.py beat/"morning_run") survives the kill
+    # because it's written the instant each stage finishes, not batched for
+    # later. When that's the likelier story (no ok/failed row at all, but a
+    # heartbeat exists for today), name the exact stage it died in/after
+    # instead of leaving the generic "a missed cron, or a killed function" guess.
+    if morning_stage["status"] == "bad" and morning_stage.get("last_status") is None:
+        from .ledger import last_beat
+        hb = last_beat(con, "morning_run")
+        if hb and hb.get("last_at") and _as_date(hb["last_at"]) == m_session:
+            morning_stage["detail"] = (
+                f"{morning_stage['detail']} -- last heartbeat: {hb['detail']}")
+    stages.append(morning_stage)
 
     # --- 2. runner lane -------------------------------------------------
     rcfg = (cfg.get("runner", {}) or {}) if cfg else {}

@@ -954,11 +954,23 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
     t_start = _time.monotonic()
     t_last = [t_start]
     stages: dict = {"timings_s": {}}
+    if lock:
+        ledger.beat(con, "morning_run", f"{d.isoformat()} started (data bundle fetch)")
 
     def _mark(name: str) -> None:
         now = _time.monotonic()
-        stages["timings_s"][name] = round(now - t_last[0], 1)
+        elapsed = round(now - t_last[0], 1)
+        stages["timings_s"][name] = elapsed
         t_last[0] = now
+        # stages["timings_s"] itself is only ever persisted to `runs` AFTER the
+        # plan is saved (record_run_stages, well below) -- so a 300s-timeout
+        # kill during the analyst/risk LLM calls (the two stages actually
+        # close to that budget) has historically left zero trace of where it
+        # died (2026-08-28, 2026-09-24, 2026-09-25 all show an empty `runs`
+        # row for the date). A heartbeat survives a kill because it is written
+        # the instant each stage finishes, not batched for later -- same
+        # best-effort, never-fails-the-job pattern as the intraday monitor's.
+        ledger.beat(con, "morning_run", f"{d.isoformat()} reached '{name}' at +{round(now - t_start, 1)}s")
 
     try:
         # 1. data
