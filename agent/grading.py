@@ -120,7 +120,12 @@ _CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 # booked as a "target" exit at a loss); runner candidates enter no earlier
 # than the scan tick / selection decision that could actually act on them
 # (see runner_scan.honest_entry_time).
-CURRENT_SIM_VERSION = 4
+# v5 = minute bars end at the last REGULAR bar (15:59 / 12:59): Alpaca's
+# inclusive `end` had admitted the 16:00 after-hours print, whose close was
+# the "eod" exit of every hold-to-close trade (on an early close, every bar
+# 13:00-16:00); and r_planned is scored from the worse of the planned entry
+# and the fill, so an adverse market or gap-through fill is never hidden.
+CURRENT_SIM_VERSION = 5
 
 
 def _risk_per_share(entry: float, stop: float) -> float:

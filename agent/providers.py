@@ -350,16 +350,7 @@ class Alpaca:
             return self._get(path, {**params, "end": self._clamp_end(end).isoformat()})
 
     def minute_bars(self, symbol: str, d: date) -> list[dict]:
-        start = datetime.combine(d, dtime(9, 30), tzinfo=ET)
-        # Regular session only. Alpaca stamps a bar at its START time and treats
-        # the `end` bound as INCLUSIVE, so an `end` of the session close (16:00
-        # ET, 13:00 on an early close) admits the first AFTER-HOURS bar (the
-        # 16:00-16:01 print) into a series every consumer reads as regular
-        # hours. That bar's close then becomes the "eod" exit, flattering (or
-        # deflating) every hold-to-close outcome. Back `end` off one minute to
-        # the LAST regular-hours bar's timestamp (15:59 / 12:59) -- the same
-        # 390-bar session the offline synthetic generator already produces.
-        end = datetime.combine(d, market_close_et(d), tzinfo=ET) - timedelta(minutes=1)
+        start, end = regular_session_window(d)
         if self._clamp_end(end) <= start:
             return []
         params = {
@@ -522,16 +513,31 @@ def yf_quote_change(symbols: dict[str, str]) -> list[dict]:
     return out
 
 
+def regular_session_window(d: date) -> tuple[datetime, datetime]:
+    """(first, last) regular-session 1-minute bar timestamps for `d`, ET.
+
+    Alpaca stamps a bar at its START time and treats `end` as INCLUSIVE, so an
+    `end` at the session close (16:00 ET, 13:00 on an early close) admits the
+    first AFTER-HOURS bar into a series every consumer reads as regular hours,
+    and its close becomes the "eod" exit of every hold-to-close outcome. The
+    last regular bar is stamped 15:59 (12:59): the 390-bar session the offline
+    synthetic generator produces. Every minute-bar fetch uses this one window.
+    """
+    return (datetime.combine(d, dtime(9, 30), tzinfo=ET),
+            datetime.combine(d, market_close_et(d), tzinfo=ET) - timedelta(minutes=1))
+
+
 def yf_minute_bars(symbol: str, d: date) -> list[dict]:
     yf = _yf()
     hist = yf.Ticker(symbol).history(
         start=d.isoformat(), end=(d + timedelta(days=1)).isoformat(),
         interval="1m", prepost=False,
     )
+    close_t = market_close_et(d)
     bars = []
     for ts, row in hist.iterrows():
         ts_et = ts.tz_convert(ET) if ts.tzinfo else ts.tz_localize(ET)
-        if ts_et.time() < dtime(9, 30) or ts_et.time() >= dtime(16, 0):
+        if ts_et.time() < dtime(9, 30) or ts_et.time() >= close_t:
             continue
         bars.append({"t": ts_et.to_pydatetime(), "o": float(row["Open"]), "h": float(row["High"]),
                      "l": float(row["Low"]), "c": float(row["Close"]), "v": int(row["Volume"])})
@@ -771,8 +777,12 @@ class MarketData:
         if self.alpaca:
             try:
                 if minute:
-                    start = datetime.combine(d, dtime(9, 30), tzinfo=ET)
-                    end = self.alpaca._clamp_end(datetime.combine(d, dtime(16, 0), tzinfo=ET))
+                    # The SAME window as Alpaca.minute_bars. This path used to
+                    # keep its own 16:00 bound after the per-symbol one was
+                    # fixed, so every graded session -- evening and regrade
+                    # both prefetch -- still carried the 16:00 after-hours bar.
+                    start, end = regular_session_window(d)
+                    end = self.alpaca._clamp_end(end)
                     got = self.alpaca.multi_bars(syms, "1Min", start, end,
                                                  workers=self.alpaca.concurrency)
                     with self._cache_lock:

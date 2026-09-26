@@ -175,7 +175,7 @@ def test_limit_entry_cannot_fill_after_its_time_stop():
     out = grading.simulate_pick(pick, bars, None, session_date=SESSION)
     assert out["triggered"] is False
     assert out["untriggered_reason"] == "time_stop_expired_pretrigger"
-    assert out["sim_version"] == grading.CURRENT_SIM_VERSION == 4
+    assert out["sim_version"] == grading.CURRENT_SIM_VERSION >= 4  # rule since v4
 
 
 def test_limit_entry_inside_its_window_still_fills():

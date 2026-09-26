@@ -724,61 +724,59 @@ def plan_for_date(con: duckdb.DuckDBPyConnection, d: date) -> dict | None:
 
 # ------------------------------------------------------------------- outcomes
 
+# Simulator-produced outcome columns, in write order. Everything else on an
+# outcome row is written by someone else and must survive a re-grade: the
+# evening's LLM process grade (grade, grade_notes -- apply_grades) and the live
+# broker's realized R (live_r -- set_live_r).
+_OUTCOME_SIM_COLS = (
+    "eval_date", "triggered", "entry_fill", "exit_price", "exit_reason",
+    "r_multiple", "r_planned", "eod_r_planned", "mfe_r", "mae_r",
+    "day_open", "day_high", "day_low", "day_close", "day_volume",
+    "missed_move_r", "baseline_r", "eod_r", "target_hit_after_stop",
+    "execution_anomaly", "fill_vs_plan_r",
+    "adv20", "vwap_at_fill", "fill_vs_vwap_pct", "vwap_side_at_fill",
+    "first_vwap_reclaim_et", "first_vwap_reject_et", "vwap_crosses",
+    "pct_time_above_vwap", "rvol_at_1000", "rvol_at_1200", "rvol_close",
+    "ema9_5m_loss_et",
+    "atr14", "stop_dist_atr", "target_dist_atr", "gap_atr",
+    "or15_high", "or15_low", "or_break_dir", "or_break_et", "fill_vs_or",
+    "mae_before_mfe", "time_to_mfe_min",
+    "gap_fill_frac_1000", "gap_fill_frac_1200", "gap_fill_frac_close",
+    "trend_side_200d", "ext_atr_at_entry", "short_pct_float", "float_shares", "mkt_cap",
+    "r_multiple_2x", "r_multiple_3x", "slippage_bps_used", "friction_model",
+    "participation_pct", "session_length", "flatten_inert",
+    "untriggered_reason", "untriggered_note", "trigger_gap_r",
+)
+
+
 def save_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> None:
-    con.execute("DELETE FROM outcomes WHERE pick_id = ?", [o["pick_id"]])
+    """Write a simulated outcome. An existing row is UPDATED in place.
+
+    This was DELETE-then-INSERT of the simulator's columns, so `run.py regrade`
+    silently erased every re-graded pick's LLM grade, grade_notes and live_r,
+    none of which a re-grade recomputes. grade and grade_notes are written only
+    when `o` carries them; any other column not produced here is left as is.
+    """
     sim_version = o.get("sim_version")
     if sim_version is None:
         from .grading import CURRENT_SIM_VERSION
         sim_version = CURRENT_SIM_VERSION
-    con.execute(
-        """INSERT INTO outcomes
-           (pick_id, eval_date, triggered, entry_fill, exit_price, exit_reason,
-            r_multiple, r_planned, eod_r_planned, mfe_r, mae_r, day_open, day_high, day_low, day_close,
-            day_volume, missed_move_r, baseline_r, eod_r, target_hit_after_stop,
-            execution_anomaly, fill_vs_plan_r,
-            adv20, vwap_at_fill, fill_vs_vwap_pct, vwap_side_at_fill,
-            first_vwap_reclaim_et, first_vwap_reject_et, vwap_crosses,
-            pct_time_above_vwap, rvol_at_1000, rvol_at_1200, rvol_close,
-            ema9_5m_loss_et,
-            atr14, stop_dist_atr, target_dist_atr, gap_atr,
-            or15_high, or15_low, or_break_dir, or_break_et, fill_vs_or,
-            mae_before_mfe, time_to_mfe_min,
-            gap_fill_frac_1000, gap_fill_frac_1200, gap_fill_frac_close,
-            trend_side_200d, ext_atr_at_entry, short_pct_float, float_shares, mkt_cap,
-            r_multiple_2x, r_multiple_3x, slippage_bps_used, friction_model, participation_pct,
-            session_length, flatten_inert,
-            untriggered_reason, untriggered_note, trigger_gap_r,
-            grade, grade_notes, graded_at, sim_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                   ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                   ?,?,?,?,?,?,?)""",
-        [
-            o["pick_id"], o["eval_date"], o.get("triggered"), o.get("entry_fill"),
-            o.get("exit_price"), o.get("exit_reason"), o.get("r_multiple"),
-            o.get("r_planned"), o.get("eod_r_planned"),
-            o.get("mfe_r"), o.get("mae_r"), o.get("day_open"), o.get("day_high"),
-            o.get("day_low"), o.get("day_close"), o.get("day_volume"),
-            o.get("missed_move_r"), o.get("baseline_r"), o.get("eod_r"),
-            o.get("target_hit_after_stop"), o.get("execution_anomaly"), o.get("fill_vs_plan_r"),
-            o.get("adv20"), o.get("vwap_at_fill"), o.get("fill_vs_vwap_pct"), o.get("vwap_side_at_fill"),
-            o.get("first_vwap_reclaim_et"), o.get("first_vwap_reject_et"), o.get("vwap_crosses"),
-            o.get("pct_time_above_vwap"), o.get("rvol_at_1000"), o.get("rvol_at_1200"), o.get("rvol_close"),
-            o.get("ema9_5m_loss_et"),
-            o.get("atr14"), o.get("stop_dist_atr"), o.get("target_dist_atr"), o.get("gap_atr"),
-            o.get("or15_high"), o.get("or15_low"), o.get("or_break_dir"), o.get("or_break_et"),
-            o.get("fill_vs_or"), o.get("mae_before_mfe"), o.get("time_to_mfe_min"),
-            o.get("gap_fill_frac_1000"), o.get("gap_fill_frac_1200"), o.get("gap_fill_frac_close"),
-            o.get("trend_side_200d"), o.get("ext_atr_at_entry"), o.get("short_pct_float"),
-            o.get("float_shares"), o.get("mkt_cap"),
-            o.get("r_multiple_2x"), o.get("r_multiple_3x"), o.get("slippage_bps_used"),
-            o.get("friction_model"), o.get("participation_pct"),
-            o.get("session_length"), o.get("flatten_inert"),
-            o.get("untriggered_reason"), o.get("untriggered_note"),
-            o.get("trigger_gap_r"),
-            o.get("grade"), o.get("grade_notes"),
-            o.get("graded_at", datetime.now()), sim_version,
-        ],
-    )
+    cols = list(_OUTCOME_SIM_COLS) + ["graded_at", "sim_version"]
+    vals = [o.get(c) for c in _OUTCOME_SIM_COLS] + [o.get("graded_at", datetime.now()),
+                                                    sim_version]
+    for c in ("grade", "grade_notes"):
+        if c in o:
+            cols.append(c)
+            vals.append(o[c])
+    exists = con.execute("SELECT 1 FROM outcomes WHERE pick_id = ?",
+                         [o["pick_id"]]).fetchone()
+    if exists:
+        con.execute(f"UPDATE outcomes SET {', '.join(c + ' = ?' for c in cols)} "
+                    f"WHERE pick_id = ?", vals + [o["pick_id"]])
+        return
+    con.execute(f"INSERT INTO outcomes (pick_id, {', '.join(cols)}) "
+                f"VALUES ({', '.join('?' for _ in range(len(cols) + 1))})",
+                [o["pick_id"]] + vals)
 
 
 def apply_grades(con: duckdb.DuckDBPyConnection, reviews: list[dict], picks: list[dict]) -> int:

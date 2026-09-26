@@ -143,15 +143,16 @@ def con(tmp_path, monkeypatch):
 
 
 def test_population_family_keeps_long_and_short_apart_and_pins_sim_version(con):
-    from agent.grading import CURRENT_SIM_VERSION
+    # population rows carry the population simulator's own version line
+    from agent.population import POPULATION_SIM_VERSION
     d = date(2026, 9, 1)
     for sym, gap in (("AAA", 6.0), ("BBB", -9.0)):
         con.execute("""INSERT INTO population_universe (plan_date, symbol, gap_pct, atr_pct,
                        in_scan_universe, was_picked) VALUES (?,?,?,?,TRUE,FALSE)""", [d, sym, gap, 4.0])
-    rows = [("AAA", "momentum", "long", 1.0, CURRENT_SIM_VERSION),
-            ("AAA", "fade", "short", -1.0, CURRENT_SIM_VERSION),
-            ("BBB", "momentum", "short", 2.0, CURRENT_SIM_VERSION),
-            ("BBB", "fade", "long", 0.5, CURRENT_SIM_VERSION - 1)]      # old sim: excluded
+    rows = [("AAA", "momentum", "long", 1.0, POPULATION_SIM_VERSION),
+            ("AAA", "fade", "short", -1.0, POPULATION_SIM_VERSION),
+            ("BBB", "momentum", "short", 2.0, POPULATION_SIM_VERSION),
+            ("BBB", "fade", "long", 0.5, POPULATION_SIM_VERSION - 1)]      # old sim: excluded
     for sym, arm, direction, r, sv in rows:
         con.execute("""INSERT INTO population_outcomes (plan_date, symbol, arm, direction,
                        r_multiple, sim_version) VALUES (?,?,?,?,?,?)""", [d, sym, arm, direction, r, sv])
@@ -168,12 +169,13 @@ def test_population_family_keeps_long_and_short_apart_and_pins_sim_version(con):
 
 
 def test_every_family_joins_the_same_batch(con):
-    from agent.grading import CURRENT_SIM_VERSION
+    # population rows carry the population simulator's own version line
+    from agent.population import POPULATION_SIM_VERSION
     d = date(2026, 9, 1)
     con.execute("""INSERT INTO population_universe (plan_date, symbol, gap_pct, atr_pct)
                    VALUES (?, 'AAA', 6.0, 4.0)""", [d])
     con.execute("""INSERT INTO population_outcomes (plan_date, symbol, arm, direction, r_multiple,
-                   sim_version) VALUES (?, 'AAA', 'momentum', 'long', 1.0, ?)""", [d, CURRENT_SIM_VERSION])
+                   sim_version) VALUES (?, 'AAA', 'momentum', 'long', 1.0, ?)""", [d, POPULATION_SIM_VERSION])
     pid = con.execute("""INSERT INTO picks (plan_date, ticker, direction, setup_type, size_r,
                          entry_type, entry_price, stop_price, target_price, conviction)
                          VALUES (?, 'T', 'long', 'gap_go', 0.5, 'open', 10, 9, 12, 3)

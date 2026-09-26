@@ -1,10 +1,11 @@
 """
-The evening runner summary's "mean R" must quote planned-risk units (r_planned),
-not the floored r_multiple. The floored value runs hot — a fill closer than the
-planned stop inflates R — so the evening log's eyeball number stopped matching
-the ledger, which the weekly miner reads via
-COALESCE(o.r_planned, o.r_multiple) and which the exit-replay parity check
-compares against r_planned.
+The evening runner summary's "mean R" must quote r_planned -- the number the
+weekly miner (COALESCE(o.r_planned, o.r_multiple)), the runner stats and the
+exit-replay parity check all read -- not r_multiple, a different measure
+(fill-to-stop risk, floored at 25% of plan). On 2026-09-26 the regrade log
+printed the r_multiple means (-0.05..-0.47) while `run.py runner-exits` printed
+the r_planned mean (+0.32, inflated by r_planned's since-fixed detection-price
+basis): two unrelated "mean R"s for the same trades.
 
 Pinned here by stubbing simulate_pick to a triggered outcome where the two
 disagree, then asserting the summary's mean_r tracks r_planned.
@@ -40,8 +41,7 @@ class _MD:
 
 
 def test_runner_mean_r_uses_planned_risk_units(con, monkeypatch):
-    # Floored r_multiple +0.32 vs honest planned-risk R -0.45: the exact
-    # 2026-09-21..23 production signature the bug report describes.
+    # The two measures disagree in sign, so the summary can only match one.
     monkeypatch.setattr(evening, "simulate_pick", lambda *a, **k: {
         "triggered": True, "r_planned": -0.45, "r_multiple": 0.32,
     })

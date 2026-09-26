@@ -158,15 +158,22 @@ def winrate_comparisons(rows_by_lane: dict[str, list[dict]]) -> list[Comparison]
 
 
 def population_rows(con: Any) -> list[dict]:
-    """Population-monkey outcomes joined to the snapshot, current sim_version only."""
-    from .grading import CURRENT_SIM_VERSION
+    """Population-monkey outcomes joined to the snapshot, current sim_version only.
+
+    The population simulator keeps its OWN version line
+    (population.POPULATION_SIM_VERSION), stamped on every population_outcomes
+    row. This filtered on grading.CURRENT_SIM_VERSION instead -- 4 against rows
+    stamped 1 -- so from S7's first run the population family (the short side)
+    entered the weekly batch with zero rows.
+    """
+    from .population import POPULATION_SIM_VERSION
     rows = con.execute(
         """SELECT o.plan_date, o.symbol, o.arm, o.direction, o.r_multiple,
                   u.gap_pct, u.atr_pct, u.in_scan_universe, u.was_picked
            FROM population_outcomes o
            LEFT JOIN population_universe u ON u.plan_date = o.plan_date AND u.symbol = o.symbol
            WHERE o.r_multiple IS NOT NULL AND o.sim_version = ?""",
-        [CURRENT_SIM_VERSION]).fetchall()
+        [POPULATION_SIM_VERSION]).fetchall()
     regimes: dict = {}
     try:
         regimes = dict(con.execute("SELECT plan_date, regime_tag FROM daily_plans").fetchall())

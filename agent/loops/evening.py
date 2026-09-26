@@ -361,11 +361,13 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
         summary["scored"] += 1
         if sim.get("triggered"):
             summary["triggered"] += 1
-            # Mean R is quoted in planned-risk units (r_planned), the same
-            # denominator the weekly miner and the exit-replay parity check
-            # read. Accumulating the floored r_multiple here ran hot -- a fill
-            # closer than the planned stop inflates R -- so the evening's
-            # eyeball "mean R" no longer matched the ledger it described.
+            # Mean R is quoted as r_planned -- the number the weekly miner, the
+            # runner stats and the exit-replay parity check all read. This line
+            # used to report r_multiple, a different measure (fill-to-stop
+            # risk, floored at 25% of plan), so on 2026-09-26 the regrade log
+            # and `run.py runner-exits` printed two unrelated "mean R"s for the
+            # same trades (-0.05..-0.47 vs +0.32; the +0.32 was r_planned's own
+            # since-fixed detection-price basis, not this line's fault).
             if sim.get("r_planned") is not None:
                 summary["sum_r"] += sim["r_planned"]
             _replay_exits(replays, summary, ticker, c, bars, cutoff, sim, d,
