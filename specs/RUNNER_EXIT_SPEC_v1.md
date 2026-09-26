@@ -1,6 +1,6 @@
 # RUNNER EXIT SPEC v1 — measure every exit before changing one
 
-**Status:** Phases 1–2 implemented and deployed 2026-09-26 (997 tests pass). Phase 0 steps 1–2 blocked for Claude (production reads are refused); steps 3–4 are Jason's to run. Phases 3–5 are proposed, not built.
+**Status:** Phases 1–2 implemented and deployed 2026-09-26 (`83ede5a`, fix `de736bf`; 1004 tests pass). Phase 0 steps 1–2 blocked for Claude (production reads are refused); steps 3–4 are Jason's to run. Phases 3–5 are proposed, not built.
 **Goals served:** 1 (primary), 3, 5, 4
 **Scope:** new `agent/runner_exits.py`, `agent/migrations_v24.py`; `agent/ledger.py`, `agent/loops/evening.py`, `agent/integrity.py`, `api/index.py`, `run.py`; `tests/test_runner_exits.py`.
 **Depends on:** nothing new. Phase 3 reuses S2 (FORWARD_VALIDATION_SPEC_v1) as it stands.
@@ -102,19 +102,19 @@ Paper first. Add a per-policy kill switch in config. Live exits must be graded a
 
 ## Phase 5 — the exit may depend on the day (proposed; pre-register before looking)
 
-The local replay's strongest pattern is not any single policy but the day. Per-session plan means (local ledger, sim v4, not production):
+The local replay's strongest pattern is not any single policy but the day. Per-session mean R by the fill (local ledger, sim v4, policy family v2, not production):
 
 | session | n | plan | no_target | breakeven_1r | ema9_trail | vwap_trail |
 |---|---|---|---|---|---|---|
-| 09-11 | 65 | −0.26 | −0.19 | −0.24 | −0.16 | −0.10 |
-| 09-15 | 20 | +0.27 | +0.33 | +0.02 | 0.00 | +0.15 |
-| 09-17 | 300 | −0.20 | −0.40 | −0.16 | −0.14 | −0.35 |
-| 09-18 | 248 | +0.26 | +0.44 | +0.17 | −0.09 | +0.36 |
-| 09-21 | 313 | +0.13 | +0.21 | +0.20 | +0.13 | +0.19 |
-| 09-22 | 324 | +0.14 | +0.27 | +0.14 | +0.01 | +0.24 |
-| 09-23 | 266 | −0.45 | −0.48 | −0.33 | −0.23 | −0.40 |
+| 09-11 | 65 | −0.54 | −0.47 | −0.58 | −0.44 | −0.38 |
+| 09-15 | 20 | +0.03 | +0.09 | −0.03 | −0.24 | −0.09 |
+| 09-17 | 300 | −0.37 | −0.56 | −0.31 | −0.31 | −0.51 |
+| 09-18 | 248 | +0.06 | +0.24 | −0.01 | −0.29 | +0.16 |
+| 09-21 | 313 | −0.08 | 0.00 | −0.06 | −0.08 | −0.02 |
+| 09-22 | 324 | −0.03 | +0.10 | −0.01 | −0.16 | +0.07 |
+| 09-23 | 266 | −0.63 | −0.66 | −0.55 | −0.41 | −0.58 |
 
-On up-tape days, holding longer wins. On fade days, tight exits lose less. Averaged over both kinds of day, every policy nets out near zero. If this holds in production, the lever is a **day-type signal known at entry time**, not a better universal exit.
+On up-tape days, holding longer wins. On fade days, tight exits lose less. Averaged over both kinds of day, no policy moves the mean by more than a few hundredths of an R. If this holds in production, the lever is a **day-type signal known at entry time**, not a better universal exit.
 
 That is a 2-D cell (exit policy × day type), and it must be pre-registered, with its day-type definition fixed in code, **before** any production data is examined for it. It then enters the batch under the 2-D cap like S7's pairs. Candidate day-type signals, all knowable by the detection tick:
 - SPY above or below its session VWAP at 10:30;
@@ -125,29 +125,33 @@ Choose one before looking. Choosing after looking is the artifact this spec exis
 
 ---
 
-## Local evidence (not production; 7 sessions, 1,536 triggered candidates, sim v4, 0 parity failures)
+## Local evidence (not production; 7 sessions, 1,536 triggered candidates, sim v4, family v2, 0 parity failures)
 
-Replayed on a copy of `data/ledger.duckdb` with real Alpaca bars:
+Replayed on a copy of `data/ledger.duckdb` with real Alpaca bars, R booked from the fill (see Correction below):
 
 | policy | mean R | win% | ΔR/session vs plan (uncorrected) |
 |---|---|---|---|
-| plan | −0.025 | 38 | — |
-| no_target | +0.006 | 33 | +0.041 |
-| breakeven_1r | −0.000 | 43 | −0.013 |
-| ema9_trail | −0.061 | 36 | −0.054 |
-| vwap_trail | +0.008 | 31 | +0.029 |
-| scale_1r_ema9 | −0.058 | 41 | −0.057 |
-| time_1100 | −0.078 | 43 | −0.083 |
-| time_1200 | −0.032 | 42 | +0.007 |
-| time_1300 | −0.023 | 41 | +0.031 |
-| time_1400 | −0.010 | 41 | +0.028 |
-| time_1500 | −0.012 | 40 | +0.025 |
+| plan | −0.215 | 37 | — |
+| no_target | −0.184 | 30 | +0.041 |
+| breakeven_1r | −0.196 | 32 | +0.002 |
+| ema9_trail | −0.250 | 28 | −0.054 |
+| vwap_trail | −0.182 | 27 | +0.029 |
+| scale_1r_ema9 | −0.249 | 32 | −0.066 |
+| time_1100 | −0.252 | 35 | −0.083 |
+| time_1200 | −0.209 | 37 | +0.007 |
+| time_1300 | −0.212 | 36 | +0.031 |
+| time_1400 | −0.204 | 37 | +0.028 |
+| time_1500 | −0.202 | 37 | +0.025 |
 
-- **Give-back:** 154 of 845 plan stop-outs (18%) were up at least 1R first. Under the old sim-v3 walked-back entry it looked like 32%; part of the apparent give-back was look-ahead.
+- **Give-back:** 103 of 845 plan stop-outs (12%) were up at least 1R first.
 - **Peaks** (no_target, by ET hour): 10:00 297 · 11:00 295 · 12:00 237 · 13:00 174 · 14:00 154 · 15:00 369. The move usually peaks in the first 90 minutes after detection or into the close; midday is the trough.
-- **Honest-entry baseline:** under sim v4, the plan exit's mean R is about zero (−0.025). The +0.19 the v3 rows showed was mostly the look-ahead entry. No exit rule on this list turns this setup's average into a clear edge; Phase 5 is where the leverage looks to be.
+- **Honest baseline:** by the fill, the plan exit loses about 0.2R per trade on this corpus, and no exit rule on this list turns that into an edge. Phase 5 is where the leverage looks to be.
 
----
+### Correction (2026-09-26)
+
+The first version of this section reported a plan mean of −0.025R, and production's first `runner-exits` run printed +0.318R (49% wins) over 9/21–9/23. Both were inflated by `r_planned` itself: it scored every trade from the PLANNED entry. Runner candidates are bought at market at the decision tick, up to an hour after detection, and sized off detection-to-stop, so scoring from detection credited the whole detection-to-fill run. On 9/21–9/23 production entries came at the ~11:18 selection tick, and the log's by-the-fill session means were −0.05, −0.10 and −0.47R.
+
+Fixed in `de736bf`: `r_planned` now scores from the worse of the planned entry and the fill (friction included). Every ΔR in this spec was unaffected, because the entry price cancels out of a paired difference.
 
 ## Constraints
 
