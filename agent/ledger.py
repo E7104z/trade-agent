@@ -394,6 +394,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v22.STATEMENTS
 from . import migrations_v23  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v23.STATEMENTS
 
+# --- v24 runner exit-policy replays (RUNNER_EXIT_SPEC_v1) -------------------
+from . import migrations_v24  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v24.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -1995,6 +1999,46 @@ def runner_outcomes_for_date(con: duckdb.DuckDBPyConnection, d: date) -> list[di
         "SELECT * FROM runner_candidate_outcomes WHERE session_date = ? ORDER BY ticker", [d]
     ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
+
+
+_REPLAY_COLS = ("session_date", "ticker", "policy", "policy_version", "sim_version",
+                "r_planned", "exit_reason", "exit_et", "mfe_r", "mfe_et")
+
+
+def save_runner_exit_replays(con: duckdb.DuckDBPyConnection, d: date,
+                             rows: list[dict], chunk: int = 400) -> None:
+    """Replace a session's exit replays wholesale (agent/runner_exits.py).
+
+    The evening re-prices every candidate of a session in one pass, so the
+    session is the unit of replacement: one DELETE, then chunked multi-row
+    INSERTs. Row-at-a-time would be ~3000 Neon round trips on a runner-heavy
+    evening that has already brushed its time budget.
+    """
+    con.execute("DELETE FROM runner_exit_replays WHERE session_date = ?", [d])
+    cols = ", ".join(_REPLAY_COLS)
+    one = "(" + ",".join("?" for _ in _REPLAY_COLS) + ")"
+    for i in range(0, len(rows), chunk):
+        part = rows[i:i + chunk]
+        params: list = []
+        for r in part:
+            params.extend([d, r["ticker"].upper()] + [r.get(c) for c in _REPLAY_COLS[2:]])
+        con.execute(f"INSERT INTO runner_exit_replays ({cols}) VALUES "
+                    + ",".join(one for _ in part), params)
+
+
+def runner_exit_replays_since(con: duckdb.DuckDBPyConnection,
+                              from_date: date) -> list[dict]:
+    """Replay rows joined to their candidate's scan_version, for the search."""
+    rows = con.execute(
+        f"""SELECT {", ".join("x." + c for c in _REPLAY_COLS)}, c.scan_version
+            FROM runner_exit_replays x
+            JOIN runner_candidates c
+              ON c.session_date = x.session_date AND c.ticker = x.ticker
+            WHERE x.session_date >= ?
+            ORDER BY x.session_date, x.ticker, x.policy""",
+        [from_date],
+    ).fetchall()
+    return [dict(zip(_REPLAY_COLS + ("scan_version",), r)) for r in rows]
 
 
 def mark_runner_selected(con: duckdb.DuckDBPyConnection, session_date: date,

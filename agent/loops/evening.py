@@ -190,6 +190,41 @@ def _runner_grader_block(con, d: date) -> str:
               "decision time - not on which row happened to win.")
 
 
+def _replay_exits(replays: list[dict], summary: dict, ticker: str, c: dict,
+                  bars: list[dict], cutoff, sim: dict, d: date,
+                  slippage: float, min_bar_volume: float, flatten_at) -> None:
+    """Append one triggered candidate's exit-policy replays (RUNNER_EXIT_SPEC_v1).
+
+    The `plan` arm must reproduce the grader's r_planned for this exact trade.
+    If it does not, the replay engine has drifted from simulate_pick, and every
+    ΔR it would report for this candidate measures that drift, not an exit --
+    so none of its rows are kept, and the mismatch is logged and counted.
+    """
+    from .. import runner_exits
+    try:
+        rows = runner_exits.replay(
+            bars, runner_exits.fill_index(bars, cutoff),
+            float(c.get("detection_price")), float(c.get("stop_price")),
+            slippage_bps=slippage, min_bar_volume=min_bar_volume,
+            flatten_at=flatten_at, session_date=d)
+    except Exception as e:
+        log("evening", f"  runner {ticker}: exit replay failed ({e})")
+        return
+    ref = next((r for r in rows if r["policy"] == runner_exits.REFERENCE), None)
+    graded = sim.get("r_planned")
+    if ref is None or graded is None or abs(ref["r_planned"] - graded) > 1e-3:
+        summary["exit_replay_parity_fail"] += 1
+        log("evening", f"  WARN runner {ticker}: exit replay plan arm "
+                       f"{ref and ref['r_planned']} != graded r_planned {graded} - "
+                       f"replays for this candidate not stored")
+        return
+    for r in rows:
+        r.update(ticker=ticker, policy_version=runner_exits.POLICY_VERSION,
+                 sim_version=sim.get("sim_version"))
+    replays.extend(rows)
+    summary["exit_replays"] += 1
+
+
 def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
     """Price EVERY runner candidate, traded or not (RUNNER_PORT_SPEC 1.5).
 
@@ -212,9 +247,11 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
     sliced array - none of them are read or stored here.
     """
     candidates = ledger.runner_candidates_for_date(con, d)
-    summary = {"scored": 0, "triggered": 0, "sum_r": 0.0, "no_bars": 0, "skipped": 0}
+    summary = {"scored": 0, "triggered": 0, "sum_r": 0.0, "no_bars": 0, "skipped": 0,
+               "exit_replays": 0, "exit_replay_parity_fail": 0}
     if not candidates:
         return summary
+    replays: list[dict] = []
     selection_at = (ledger.runner_session(con, d) or {}).get("selection_at")
 
     slippage = float(cfg.get("slippage_bps", 0) or 0)
@@ -307,6 +344,11 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
             "exit_price": sim.get("exit_price"),
             "exit_reason": sim.get("exit_reason"),
             "r_multiple": sim.get("r_multiple"),
+            # v23 added these columns, but this call never passed them, so every
+            # runner row kept r_planned NULL and the runner stats fell back to
+            # the floored (inflated) r_multiple.
+            "r_planned": sim.get("r_planned"),
+            "eod_r_planned": sim.get("eod_r_planned"),
             "mfe_r": sim.get("mfe_r"),
             "mae_r": sim.get("mae_r"),
             "eod_r": sim.get("eod_r"),
@@ -321,13 +363,25 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
             summary["triggered"] += 1
             if sim.get("r_multiple") is not None:
                 summary["sum_r"] += sim["r_multiple"]
+            _replay_exits(replays, summary, ticker, c, bars, cutoff, sim, d,
+                          slippage, min_bar_volume, flatten_at)
+
+    # Exit-policy replays (RUNNER_EXIT_SPEC_v1). Measurement only: nothing here
+    # changes a live exit, and a failure here must never fail the grading pass.
+    try:
+        ledger.save_runner_exit_replays(con, d, replays)
+    except Exception as e:
+        log("evening", f"  WARN runner exit replays not saved ({e})")
 
     summary["sum_r"] = round(summary["sum_r"], 2)
     summary["mean_r"] = (round(summary["sum_r"] / summary["triggered"], 3)
                          if summary["triggered"] else None)
     log("evening", f"Runner candidates priced: {summary['scored']} scored, "
                    f"{summary['triggered']} triggered, mean R "
-                   f"{summary['mean_r'] if summary['mean_r'] is not None else 'n/a'}")
+                   f"{summary['mean_r'] if summary['mean_r'] is not None else 'n/a'}; "
+                   f"exit replays {summary['exit_replays']}"
+                   + (f" ({summary['exit_replay_parity_fail']} parity failures)"
+                      if summary["exit_replay_parity_fail"] else ""))
     return summary
 
 

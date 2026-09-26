@@ -223,6 +223,14 @@ def build_search(con: Any, ledger_mod: Any, q: float = 0.10, min_n: int = 8):
         comps.append(runner_research.setup_edge(runner_rows, min_n=min_n)["comparison"])
         comps.append(runner_research.selection_edge(runner_rows, min_n=min_n)["comparison"])
 
+    # RUNNER_EXIT_SPEC_v1: every pre-registered exit policy vs the plan exit,
+    # paired, per session. Same batch -- each policy is a look whether or not
+    # it has rows yet.
+    from . import runner_exits
+    comps.extend(_safe("integrity", "runner exit policies",
+                       lambda: runner_exits.exit_policy_comparisons(
+                           runner_exits.current_replay_rows(con)), []))
+
     # STRUCTURAL_MINING_SPEC_v1: pre-registered 2-D pairs, exact win-frequency
     # tests, and the population family (the short side). All in THIS batch --
     # none is corrected apart from the rest, and every one is a counted look.
@@ -318,6 +326,9 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
     # miner are the corrected ones, not a second uncorrected pass.
     runner_comps = [c for c in (getattr(search, "comparisons", None) or [])
                     if str(getattr(c, "dimension", "")).startswith("runner_")]
+    from . import runner_exits
+    exit_comps = [c for c in runner_comps if c.dimension == runner_exits.DIMENSION]
+    runner_comps = [c for c in runner_comps if c.dimension != runner_exits.DIMENSION]
 
     counterfactual = _safe("integrity", "counterfactual summary",
                            lambda: research.counterfactual_summary(con), {})
@@ -332,6 +343,8 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
                                                 runner_comps, runner_versions), ""),
         _safe("integrity", "runner random markdown",
               lambda: runner_research.runner_random_ablation_md(runner_random), ""),
+        _safe("integrity", "runner exit markdown",
+              lambda: runner_exits.exit_md(exit_comps, runner_exits.current_replay_rows(con)), ""),
     ]
     if paired_mod is not None:
         parts.append(paired_mod.paired_md(paired_cmp))

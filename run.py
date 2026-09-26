@@ -17,6 +17,9 @@ Trade Agent CLI.
                                            relabel scan_version 1 runner rows
                                            that pass every v2 gate (dry run
                                            unless --apply)
+  python run.py runner-exits [--from YYYY-MM-DD]
+                                           runner exit-policy replay report
+                                           (read-only; fill it with regrade-runner)
   python run.py research [--full]         research-integrity report: selection
                                            ablation + population baseline
                                            (zero API cost, read-only)
@@ -862,6 +865,12 @@ def main() -> None:
     p_rstatus.add_argument("--date", type=str, default=None,
                            help="YYYY-MM-DD (default: today ET)")
 
+    p_rexits = sub.add_parser(
+        "runner-exits",
+        help="runner exit-policy replay report (read-only, zero API cost)")
+    p_rexits.add_argument("--from", dest="from_date", type=str, default=None,
+                          help="YYYY-MM-DD (default: last 120 days)")
+
     p_research = sub.add_parser("research", help="research integrity report (selection ablation + population baseline, zero API cost)")
     p_research.add_argument("--full", action="store_true", help="also render the full weekly research block (FDR looks, quarantine, paired arms)")
 
@@ -909,6 +918,19 @@ def main() -> None:
         weekly.run(cfg, run_date)
     elif args.cmd == "runner":
         cmd_runner(cfg, args)
+    elif args.cmd == "runner-exits":
+        from datetime import timedelta
+        from agent import runner_exits
+        con = ledger.connect()
+        try:
+            since = (parse_date(args.from_date) if args.from_date
+                     else today_et() - timedelta(days=120))
+            rows = [r for r in ledger.runner_exit_replays_since(con, since)
+                    if r.get("policy_version") == runner_exits.POLICY_VERSION
+                    and r.get("r_planned") is not None]
+            print(runner_exits.report_text(rows))
+        finally:
+            con.close()
     elif args.cmd == "runner-status":
         from agent import runner_view
         con = ledger.connect()

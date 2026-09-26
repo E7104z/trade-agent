@@ -562,6 +562,8 @@ _QUERYABLE_TABLES = {
     "runner_candidates": "session_date",
     "runner_candidate_outcomes": "session_date",
     "runner_sessions": "session_date",
+    # RUNNER_EXIT_SPEC_v1: each triggered candidate under every exit policy.
+    "runner_exit_replays": "session_date",
     "live_orders": "session_date",
     # The integrity layer's own state (INTEGRITY_REPAIR_SPEC_v1 Phase 1).
     # Without these, whether a false survivor was recorded, or whether any
