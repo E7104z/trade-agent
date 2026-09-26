@@ -44,7 +44,7 @@ Data access means an authenticated `/api/table/...` session, or a local `DATABAS
 
 ## Phase 1 — replay every triggered candidate under a fixed exit family (implemented)
 
-`agent/runner_exits.py`. `replay()` walks one triggered long candidate through each `ExitPolicy` on the same minute bars, fill, slippage and thin-bar rule the grader used. The rules below are pre-registered: fixed in code before any data was seen, versioned as `POLICY_VERSION = 1`, and never tuned on the rows they are scored on.
+`agent/runner_exits.py`. `replay()` walks one triggered long candidate through each `ExitPolicy` on the same minute bars, fill, slippage and thin-bar rule the grader used. The rules below are pre-registered: fixed in code before any data was seen, versioned as `POLICY_VERSION` (currently 2: R booked from the fill basis), and never tuned on the rows they are scored on.
 
 | policy | question | rule |
 |---|---|---|
