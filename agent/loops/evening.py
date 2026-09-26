@@ -377,6 +377,15 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
     return summary
 
 
+def _rr_band_note(ticker: str, rr: float, eod_outcome: str,
+                  forgone: float | None) -> str:
+    """Q14 progress note for one rejection in the 1.8-2.0 R:R band. Starts with
+    the ticker, which is what `run.py regrade-shadow` keys on to avoid
+    recording the same observation twice."""
+    return (f"{ticker} planned R:R={rr:.2f} (1.8-2.0 band) {eod_outcome} "
+            f"forgone={forgone if forgone is None else round(forgone, 2)}R")
+
+
 def _q1_gap_fade_mechanics(con, md: MarketData, d: date, picks: list[dict],
                            outcomes: list[dict], shadow: dict,
                            slippage_bps: float = 0.0) -> int:
@@ -618,8 +627,7 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
     for ticker, rr, eod_outcome, forgone in shadow.get("rr_band_notes", []):
         ledger.add_question_progress(
             con, Q_RR_TEST_SHADOW, d, 1,
-            f"{ticker} planned R:R={rr:.2f} (1.8-2.0 band) {eod_outcome} "
-            f"forgone={forgone if forgone is None else round(forgone, 2)}R")
+            _rr_band_note(ticker, rr, eod_outcome, forgone))
         counts["q_increments"] += 1
 
     counts["q_increments"] += _q1_gap_fade_mechanics(con, md, d, picks, outcomes, shadow,

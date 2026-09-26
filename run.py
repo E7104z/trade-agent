@@ -219,6 +219,423 @@ def cmd_regrade_runner(cfg, args) -> None:
     con.close()
 
 
+def cmd_regrade_shadow(cfg, args) -> None:
+    """Re-price every shadow-ledger rejection on/after --from with the evening
+    loop's own simulator and friction. Dry run unless --apply.
+
+    Written for 2026-09-25: a test run whose environment carried the
+    production DATABASE_URL (tests/test_morning_pipeline_repair.py, before
+    tests/conftest.py stripped it) inserted two fixture rejections and marked
+    EVERY rejection would_have_won +1.0R. That evening's grader then skipped
+    the day's real rejections, because they already looked graded.
+    --delete-ids removes named fixture rows first; each is printed before it
+    goes.
+
+    The evening also turns shadow grading into open-question progress: Q14
+    (R:R band, recorded from the 2026-09-17 session on) and Q1 (gap-fade
+    mechanics). Re-pricing does not touch that table. A session whose
+    evening ran while its rejections already looked graded never got its
+    shadow notes -- 2026-09-25 -- and --progress-for names those sessions;
+    a note is added only where that ticker has none for that question and
+    session. Opt-in per session, because a blanket backfill also writes
+    observations for sessions from before a question was being recorded.
+    """
+    from agent.grading import CURRENT_SIM_VERSION
+    from agent.loops.evening import (Q_GAP_FADE_MECHANICS, Q_RR_TEST_SHADOW,
+                                     _grade_rejections, _q1_gap_fade_mechanics,
+                                     _rr_band_note)
+    from agent.providers import MarketData
+
+    from_date = parse_date(args.from_date)
+    delete_ids = [int(x) for x in (args.delete_ids or "").split(",") if x.strip()]
+    progress_for = {parse_date(x) for x in (args.progress_for or "").split(",") if x.strip()}
+    con = ledger.connect()
+
+    for rid in delete_ids:
+        row = con.execute(
+            "SELECT rejection_id, plan_date, ticker, reason, entry_price, stop_price, "
+            "target_price, eod_outcome, forgone_r FROM rejections WHERE rejection_id = ?",
+            [rid]).fetchone()
+        log("regrade", f"delete rejection {rid}: {row if row else 'NOT FOUND'}")
+
+    keep = (f" AND rejection_id NOT IN ({','.join('?' * len(delete_ids))})"
+            if delete_ids else "")
+    rows = con.execute(
+        f"""SELECT plan_date, COUNT(*),
+                   SUM(CASE WHEN eod_outcome = 'would_have_won' AND forgone_r = 1.0
+                            THEN 1 ELSE 0 END)
+            FROM rejections WHERE plan_date >= ?{keep}
+            GROUP BY plan_date ORDER BY plan_date""",
+        [from_date, *delete_ids]).fetchall()
+    total = sum(int(r[1]) for r in rows)
+    for d, n, stamped in rows:
+        log("regrade", f"{d}: {n} rejection(s), {int(stamped or 0)} carrying the "
+                       f"would_have_won +1.0R stamp")
+    if not args.apply:
+        log("regrade", f"Dry run: would delete {len(delete_ids)} row(s) and re-price "
+                       f"{total} rejection(s) across {len(rows)} session(s). "
+                       f"Re-run with --apply to write.")
+        con.close()
+        return
+    if total > 500 and not args.force:
+        log("regrade", f"Refusing: this would re-price {total} rejection rows "
+                       f"across {len(rows)} session(s) (>500). Re-run with --force.")
+        con.close()
+        sys.exit(1)
+
+    for rid in delete_ids:
+        con.execute("DELETE FROM rejections WHERE rejection_id = ?", [rid])
+
+    def _has_note(qid: int, d, ticker: str) -> bool:
+        # Q14 notes read "TICKER planned R:R=...", Q1 notes "TICKER: planned-entry ..."
+        return con.execute(
+            "SELECT 1 FROM open_question_progress "
+            "WHERE question_id = ? AND session_date = ? AND (note LIKE ? OR note LIKE ?)",
+            [qid, d, f"{ticker} %", f"{ticker}:%"]).fetchone() is not None
+
+    md = MarketData(cfg)
+    slippage = float(cfg.get("slippage_bps", 5))
+    flatten_at = cfg.get("flatten_at")
+    min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
+    q_added = 0
+    for d, n, _stamped in rows:
+        # Reset and re-price one session at a time, so a failure partway
+        # leaves every finished session graded and the rerun picks up the rest.
+        con.execute("UPDATE rejections SET eod_outcome = NULL, forgone_r = NULL, "
+                    "graded_at = NULL, sim_version = NULL WHERE plan_date = ?", [d])
+        tickers = [r[0] for r in con.execute(
+            "SELECT DISTINCT ticker FROM rejections WHERE plan_date = ?", [d]).fetchall()]
+        md.prefetch_session(tickers, d, daily=False)
+        shadow = _grade_rejections(con, md, d, slippage_bps=slippage,
+                                   flatten_at=flatten_at, min_bar_volume=min_bar_volume)
+        log("regrade", f"{d}: re-priced {shadow['scored']}/{n} rejection(s), "
+                       f"net forgone {shadow['net_forgone_r']:+.2f}R")
+        if d not in progress_for:
+            continue
+        for ticker, rr, eod_outcome, forgone in shadow["rr_band_notes"]:
+            if not _has_note(Q_RR_TEST_SHADOW, d, ticker):
+                ledger.add_question_progress(con, Q_RR_TEST_SHADOW, d, 1,
+                                             _rr_band_note(ticker, rr, eod_outcome, forgone))
+                q_added += 1
+        missing_fades = [g for g in shadow["gap_fade_notes"]
+                         if not _has_note(Q_GAP_FADE_MECHANICS, d, g[0]["ticker"])]
+        q_added += _q1_gap_fade_mechanics(con, md, d, [], [],
+                                          {"gap_fade_notes": missing_fades},
+                                          slippage_bps=slippage)
+    log("regrade", f"Deleted {len(delete_ids)} row(s); re-priced {total} rejection(s) "
+                   f"from {from_date} onward under sim_version={CURRENT_SIM_VERSION}; "
+                   f"added {q_added} missing open-question note(s)")
+    con.close()
+
+
+def cmd_find_test_rows(cfg, args) -> None:
+    """Read-only sweep for rows a test run wrote into this ledger.
+
+    Five test files used to isolate themselves only by pointing
+    ledger.DB_PATH at a tmp file, which connect() ignores when DATABASE_URL
+    is set (tests/conftest.py now strips it). On 2026-09-25 at least two of
+    them ran against production. This lists every fingerprint those files can
+    leave, so the damage is known before anything is deleted. Writes nothing.
+    """
+    from datetime import datetime, time as dtime
+
+    since = parse_date(args.since)
+    since_ts = datetime.combine(since, dtime(0, 0))
+    con = ledger.connect()
+
+    def show(title: str, sql: str, params: list) -> None:
+        rows = con.execute(sql, params).fetchall()
+        print(f"\n== {title}: {len(rows)}")
+        for r in rows:
+            print("  ", tuple(str(v) if v is not None else None for v in r))
+
+    show("fixture rejections (AAAA / PHVS 'no live quote' / MARA 11.5-10.9-12.6)",
+         """SELECT rejection_id, plan_date, ticker, reason, entry_price, stop_price,
+                   target_price, eod_outcome, forgone_r, graded_at
+            FROM rejections
+            WHERE ticker = 'AAAA'
+               OR (ticker = 'PHVS' AND reason = 'no live quote')
+               OR (ticker = 'MARA' AND entry_price = 11.5 AND stop_price = 10.9)
+            ORDER BY rejection_id""", [])
+
+    # save_rejections DELETEs a date's rows before inserting, so a fixture
+    # written onto a real session wipes that session's real rejections.
+    # daily_plans.persisted_rejection_count is what the morning actually wrote.
+    plans = con.execute(
+        "SELECT plan_date, persisted_rejection_count FROM daily_plans "
+        "ORDER BY plan_date").fetchall()
+    counts = dict(con.execute(
+        "SELECT plan_date, COUNT(*) FROM rejections GROUP BY plan_date").fetchall())
+    short = [(d, want, int(counts.get(d, 0))) for d, want in plans
+             if want is not None and int(counts.get(d, 0)) != int(want)]
+    print(f"\n== sessions whose stored rejections != the morning's persisted count: {len(short)}")
+    for d, want, have in short:
+        print(f"   {d}: morning persisted {want}, ledger now holds {have}")
+
+    weekend = sorted({d for (d,) in con.execute(
+        "SELECT plan_date FROM daily_plans UNION SELECT plan_date FROM rejections").fetchall()
+        if d is not None and d.weekday() >= 5})
+    print(f"\n== weekend sessions in daily_plans/rejections: {len(weekend)}")
+    for d in weekend:
+        print("  ", d)
+
+    show("picks with fixture tickers (TEST, AAAA, TA-TD)",
+         """SELECT pick_id, plan_date, ticker, entry_price, stop_price, target_price
+            FROM picks WHERE ticker IN ('TEST', 'AAAA', 'TA', 'TB', 'TC', 'TD')
+            ORDER BY pick_id""", [])
+
+    show("fixture lessons ('test lesson' / 'placeholder')",
+         """SELECT lesson_id, created_date, lesson, status, confirmations, contradictions
+            FROM lessons WHERE lesson IN ('test lesson', 'placeholder')
+            ORDER BY lesson_id""", [])
+
+    show("live orders for 2026-09-04 or with fixture ids (stop-1 / oco-1)",
+         """SELECT live_order_id, pick_id, session_date, ticker, status, exit_reason,
+                   live_r, oco_order_id
+            FROM live_orders
+            WHERE session_date = ? OR live_order_id = 'stop-1' OR oco_order_id = 'oco-1'""",
+         [parse_date("2026-09-04")])
+
+    show(f"runs started on/after {since} for an earlier session",
+         """SELECT run_id, loop, run_date, started_at, status
+            FROM runs WHERE started_at >= ? AND run_date < ?
+            ORDER BY run_id""", [since_ts, since])
+
+    show(f"outcomes graded on/after {since} for picks from before it",
+         """SELECT p.plan_date, p.ticker, o.pick_id, o.exit_reason, o.r_multiple,
+                   o.graded_at, o.sim_version
+            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+            WHERE o.graded_at >= ? AND p.plan_date < ?
+            ORDER BY o.graded_at""", [since_ts, since])
+    con.close()
+
+
+_FIXTURE_REJECTIONS_SQL = """
+    SELECT rejection_id, plan_date, ticker, reason FROM rejections
+    WHERE ticker = 'AAAA'
+       OR (ticker = 'PHVS' AND reason = 'no live quote' AND entry_price = 12.4)
+       OR (ticker = 'MARA' AND entry_price = 11.5 AND stop_price = 10.9)
+    ORDER BY rejection_id"""
+
+
+def cmd_repair_test_rows(cfg, args) -> None:
+    """Remove what test runs wrote into this ledger, and put back the shadow
+    rows they deleted. Dry run unless --apply. `find-test-rows` shows the
+    damage; this repairs the part a fixture signature identifies exactly.
+
+    Removes:
+      - lessons 'test lesson' / 'placeholder', with their dated
+        confirmations and contradictions
+      - the AAPL 'stop-1' live order on 2026-09-04, and the live_r the
+        monitor wrote onto that session's real pick
+      - runs logged on/after --since for an earlier session
+      - daily plans CREATED on/after --since for an earlier date (the empty
+        January plans, the Saturday 2026-08-29 plan), with anything under them
+      - fixture rejections (AAAA / PHVS 'no live quote' / MARA 11.5-10.9-12.6)
+    Restores, for each --rebuild date: the session's rejections, rebuilt from
+    its stored plan and analyst candidates by the morning's own
+    _build_rejections. save_rejections deletes a date's rows before
+    inserting, so a fixture written onto a real session wiped that session.
+    Refused when the session still holds real rejections, or when the
+    morning's persisted count disagrees with the rebuild.
+
+    Re-price the shadow ledger afterwards with `regrade-shadow`.
+    """
+    import json
+    from datetime import datetime, time as dtime
+
+    from agent.loops.morning import _build_rejections
+
+    since = parse_date(args.since)
+    since_ts = datetime.combine(since, dtime(0, 0))
+    rebuild = [parse_date(x) for x in (args.rebuild or "").split(",") if x.strip()]
+    con = ledger.connect()
+    steps: list = []   # (description, callable) run in order on --apply
+
+    def listing(title: str, sql: str, params: list) -> list:
+        rows = con.execute(sql, params).fetchall()
+        print(f"\n== {title}: {len(rows)}")
+        for r in rows:
+            print("  ", tuple(str(v) if v is not None else None for v in r))
+        return rows
+
+    def sql_step(desc: str, sql: str, params: list) -> None:
+        steps.append((desc, lambda: con.execute(sql, params)))
+
+    def in_list(ids: list) -> str:
+        return ",".join("?" * len(ids))
+
+    lessons = [r[0] for r in listing(
+        "fixture lessons",
+        "SELECT lesson_id, created_date, lesson, confirmations FROM lessons "
+        "WHERE lesson IN ('test lesson', 'placeholder') ORDER BY lesson_id", [])]
+    if lessons:
+        for tbl in ("lesson_confirmations", "lesson_contradictions"):
+            sql_step(f"delete {tbl} rows for fixture lessons",
+                     f"DELETE FROM {tbl} WHERE lesson_id IN ({in_list(lessons)})", lessons)
+        sql_step(f"delete {len(lessons)} fixture lesson(s)",
+                 f"DELETE FROM lessons WHERE lesson_id IN ({in_list(lessons)})", lessons)
+
+    for order_id, pick_id, _d, _t in listing(
+            "fixture live orders (AAPL stop-1, 2026-09-04)",
+            "SELECT live_order_id, pick_id, session_date, ticker FROM live_orders "
+            "WHERE live_order_id = 'stop-1' AND ticker = 'AAPL' AND session_date = ?",
+            [parse_date("2026-09-04")]):
+        sql_step(f"delete live order {order_id}",
+                 "DELETE FROM live_orders WHERE live_order_id = ?", [order_id])
+        others = con.execute("SELECT COUNT(*) FROM live_orders WHERE pick_id = ? "
+                             "AND live_order_id <> ?", [pick_id, order_id]).fetchone()[0]
+        live_r = con.execute("SELECT live_r FROM outcomes WHERE pick_id = ?",
+                             [pick_id]).fetchone()
+        print(f"   pick {pick_id}: outcomes.live_r now {live_r[0] if live_r else None}; "
+              f"other live orders on it: {others}")
+        if not others:
+            sql_step(f"clear the live_r the fixture wrote onto pick {pick_id}",
+                     "UPDATE outcomes SET live_r = NULL WHERE pick_id = ?", [pick_id])
+
+    runs = [r[0] for r in listing(
+        f"runs logged on/after {since} for an earlier session",
+        "SELECT run_id, loop, run_date, started_at, status FROM runs "
+        "WHERE started_at >= ? AND run_date < ? ORDER BY run_id", [since_ts, since])]
+    if runs:
+        sql_step(f"delete {len(runs)} run row(s)",
+                 f"DELETE FROM runs WHERE run_id IN ({in_list(runs)})", runs)
+
+    for (d, _created) in listing(
+            f"daily plans created on/after {since} for an earlier date",
+            "SELECT plan_date, created_at FROM daily_plans "
+            "WHERE created_at >= ? AND plan_date < ? ORDER BY plan_date", [since_ts, since]):
+        n_picks, n_rej = (con.execute("SELECT COUNT(*) FROM picks WHERE plan_date = ?",
+                                      [d]).fetchone()[0],
+                          con.execute("SELECT COUNT(*) FROM rejections WHERE plan_date = ?",
+                                      [d]).fetchone()[0])
+        print(f"   {d}: {n_picks} pick(s), {n_rej} rejection(s) under it")
+        sql_step(f"delete outcomes under {d}",
+                 "DELETE FROM outcomes WHERE pick_id IN "
+                 "(SELECT pick_id FROM picks WHERE plan_date = ?)", [d])
+        for tbl in ("picks", "rejections", "daily_plans"):
+            sql_step(f"delete {tbl} for {d}", f"DELETE FROM {tbl} WHERE plan_date = ?", [d])
+
+    fixture_rej = listing("fixture rejections", _FIXTURE_REJECTIONS_SQL, [])
+    fixture_ids = [r[0] for r in fixture_rej]
+    if fixture_ids:
+        sql_step(f"delete {len(fixture_ids)} fixture rejection(s)",
+                 f"DELETE FROM rejections WHERE rejection_id IN ({in_list(fixture_ids)})",
+                 fixture_ids)
+
+    for d in rebuild:
+        print(f"\n== rebuild rejections for {d}")
+        real = con.execute(
+            "SELECT COUNT(*) FROM rejections WHERE plan_date = ?"
+            + (f" AND rejection_id NOT IN ({in_list(fixture_ids)})" if fixture_ids else ""),
+            [d, *fixture_ids]).fetchone()[0]
+        if real:
+            print(f"   REFUSED: the ledger still holds {real} real rejection(s) for it")
+            continue
+        row = con.execute("SELECT plan_json, analyst_json, persisted_rejection_count "
+                          "FROM daily_plans WHERE plan_date = ?", [d]).fetchone()
+        if not row:
+            print("   REFUSED: no stored plan for this session")
+            continue
+        rows = _build_rejections(json.loads(row[1] or "{}"), json.loads(row[0] or "{}"))
+        if row[2] is not None and len(rows) != int(row[2]):
+            print(f"   REFUSED: rebuild gives {len(rows)} row(s), the morning persisted {row[2]}")
+            continue
+        for r in rows:
+            print(f"   {r['ticker']} {r.get('direction')} {r.get('entry_type')} "
+                  f"{r.get('entry_price')}/{r.get('stop_price')}/{r.get('target_price')} "
+                  f"| {str(r.get('reason'))[:80]}")
+        steps.append((f"rebuild {len(rows)} rejection(s) for {d}",
+                      lambda d=d, rows=rows: ledger.save_rejections(con, d, rows)))
+
+    if not args.apply:
+        print(f"\nDry run: {len(steps)} step(s) would run. Re-run with --apply to write.")
+        for desc, _fn in steps:
+            print(f"   - {desc}")
+        con.close()
+        return
+    for desc, fn in steps:
+        fn()
+        log("repair", desc)
+    log("repair", f"Done: {len(steps)} step(s). Now re-price the shadow ledger with regrade-shadow.")
+    con.close()
+
+
+def cmd_undo_progress_backfill(cfg, args) -> None:
+    """Take back the open-question notes the first `regrade-shadow` over-added
+    on 2026-09-25. Dry run unless --apply.
+
+    That version backfilled every session, and misread both questions:
+      - Q14 (R:R band, shadow arm) was only recorded from the 2026-09-17
+        session on (3b0df74 reached production 2026-09-17 02:44 UTC), so a
+        Q14 note for an earlier session is an observation the system never
+        recorded -- and it counts toward the R:R threshold test.
+      - Q1 notes read "TICKER: ..." and its has-a-note check looked for
+        "TICKER ...", so every gap-fade rejection's note was written twice.
+    Q14 notes for sessions before --q14-from are deleted. Q1 notes are cut
+    back to one per gap_fade row (rejections + picks) for that session and
+    ticker, which is what the evening writes; the first ones read are kept.
+    """
+    from agent.loops.evening import Q_GAP_FADE_MECHANICS, Q_RR_TEST_SHADOW
+
+    q14_from = parse_date(args.q14_from)
+    con = ledger.connect()
+    steps: list = []
+
+    early = con.execute(
+        "SELECT session_date, note FROM open_question_progress "
+        "WHERE question_id = ? AND session_date < ? ORDER BY session_date",
+        [Q_RR_TEST_SHADOW, q14_from]).fetchall()
+    print(f"\n== Q14 notes for sessions before {q14_from}: {len(early)}")
+    for d, note in early:
+        print(f"   {d}  {note}")
+    if early:
+        steps.append((f"delete {len(early)} Q14 note(s) before {q14_from}",
+                      lambda: con.execute(
+                          "DELETE FROM open_question_progress "
+                          "WHERE question_id = ? AND session_date < ?",
+                          [Q_RR_TEST_SHADOW, q14_from])))
+
+    groups: dict = {}
+    for d, note, inc in con.execute(
+            "SELECT session_date, note, increment FROM open_question_progress "
+            "WHERE question_id = ?", [Q_GAP_FADE_MECHANICS]).fetchall():
+        groups.setdefault((d, str(note).split(":", 1)[0]), []).append((note, inc))
+    print("\n== Q1 notes beyond one per gap_fade row:")
+    extra = 0
+    for (d, ticker), rows in sorted(groups.items()):
+        expected = sum(con.execute(
+            f"SELECT COUNT(*) FROM {tbl} WHERE plan_date = ? AND ticker = ? "
+            "AND setup_type = 'gap_fade'", [d, ticker]).fetchone()[0]
+            for tbl in ("rejections", "picks"))
+        if expected == 0 or len(rows) <= expected:
+            continue
+        extra += len(rows) - expected
+        print(f"   {d} {ticker}: {len(rows)} note(s) for {expected} gap_fade row(s)")
+        for note, _inc in rows:
+            print(f"      {note}")
+
+        def collapse(d=d, ticker=ticker, keep=rows[:expected]) -> None:
+            con.execute("DELETE FROM open_question_progress "
+                        "WHERE question_id = ? AND session_date = ? AND note LIKE ?",
+                        [Q_GAP_FADE_MECHANICS, d, f"{ticker}:%"])
+            for note, inc in keep:
+                ledger.add_question_progress(con, Q_GAP_FADE_MECHANICS, d, inc or 1, note)
+
+        steps.append((f"cut {d} {ticker} Q1 notes to {expected}", collapse))
+    print(f"   {extra} extra note(s) in total")
+
+    if not args.apply:
+        print(f"\nDry run: {len(steps)} step(s) would run. Re-run with --apply to write.")
+        con.close()
+        return
+    for desc, fn in steps:
+        fn()
+        log("repair", desc)
+    log("repair", f"Done: {len(steps)} step(s).")
+    con.close()
+
+
 def cmd_regate_runner(cfg, args) -> None:
     """Relabel scan_version 1 runner candidates whose STORED inputs pass every
     scan_version 2 gate (agent/runner_regate.py). Dry run unless --apply.
@@ -378,6 +795,45 @@ def main() -> None:
     p_rregrade.add_argument("--force", action="store_true",
                             help="required if this would re-price more than 500 rows")
 
+    p_sregrade = sub.add_parser(
+        "regrade-shadow",
+        help="re-price shadow-ledger rejections with the evening simulator (dry run unless --apply)")
+    p_sregrade.add_argument("--from", dest="from_date", required=True,
+                            help="YYYY-MM-DD -- re-price sessions on/after this date")
+    p_sregrade.add_argument("--delete-ids", dest="delete_ids", default=None,
+                            help="comma-separated rejection_ids to delete first (e.g. test fixture rows)")
+    p_sregrade.add_argument("--progress-for", dest="progress_for", default=None,
+                            help="comma-separated sessions whose missing Q14/Q1 shadow notes to add "
+                                 "(default: none)")
+    p_sregrade.add_argument("--apply", action="store_true",
+                            help="write the changes (default is a dry run)")
+    p_sregrade.add_argument("--force", action="store_true",
+                            help="required if this would re-price more than 500 rows")
+
+    p_ftr = sub.add_parser(
+        "find-test-rows",
+        help="read-only: list rows a test run may have written into this ledger")
+    p_ftr.add_argument("--since", default="2026-09-24",
+                       help="YYYY-MM-DD -- flag runs/grades written on/after this date for earlier sessions")
+
+    p_rtr = sub.add_parser(
+        "repair-test-rows",
+        help="remove rows test runs wrote, rebuild rejections they deleted (dry run unless --apply)")
+    p_rtr.add_argument("--since", default="2026-09-24",
+                       help="YYYY-MM-DD -- plans/runs written on/after this date for earlier sessions are fixtures")
+    p_rtr.add_argument("--rebuild", default=None,
+                       help="comma-separated YYYY-MM-DD sessions whose rejections to rebuild from the stored plan")
+    p_rtr.add_argument("--apply", action="store_true",
+                       help="write the changes (default is a dry run)")
+
+    p_upb = sub.add_parser(
+        "undo-progress-backfill",
+        help="remove the Q14/Q1 notes the first regrade-shadow over-added (dry run unless --apply)")
+    p_upb.add_argument("--q14-from", dest="q14_from", default="2026-09-17",
+                       help="YYYY-MM-DD -- first session whose evening recorded Q14 notes")
+    p_upb.add_argument("--apply", action="store_true",
+                       help="write the changes (default is a dry run)")
+
     p_regate = sub.add_parser(
         "regate-runner",
         help="relabel scan_version 1 runner rows that pass every v2 gate (dry run unless --apply)")
@@ -430,6 +886,14 @@ def main() -> None:
         cmd_regrade(cfg, args)
     elif args.cmd == "regrade-runner":
         cmd_regrade_runner(cfg, args)
+    elif args.cmd == "regrade-shadow":
+        cmd_regrade_shadow(cfg, args)
+    elif args.cmd == "find-test-rows":
+        cmd_find_test_rows(cfg, args)
+    elif args.cmd == "repair-test-rows":
+        cmd_repair_test_rows(cfg, args)
+    elif args.cmd == "undo-progress-backfill":
+        cmd_undo_progress_backfill(cfg, args)
     elif args.cmd == "regate-runner":
         cmd_regate_runner(cfg, args)
     elif args.cmd == "research":
