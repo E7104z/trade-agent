@@ -24,7 +24,7 @@ import requests
 from . import indicators as ind
 from .config import ECON_OVERRIDES_PATH, MOCKS_DIR, Config
 from .indicators import rvol_simple, vwap_distance, vwap_series
-from .util import ET, is_market_day, log, now_et, prev_market_day
+from .util import ET, is_market_day, log, market_close_et, now_et, prev_market_day
 
 ALPACA_DATA = "https://data.alpaca.markets"
 
@@ -351,7 +351,15 @@ class Alpaca:
 
     def minute_bars(self, symbol: str, d: date) -> list[dict]:
         start = datetime.combine(d, dtime(9, 30), tzinfo=ET)
-        end = datetime.combine(d, dtime(16, 0), tzinfo=ET)
+        # Regular session only. Alpaca stamps a bar at its START time and treats
+        # the `end` bound as INCLUSIVE, so an `end` of the session close (16:00
+        # ET, 13:00 on an early close) admits the first AFTER-HOURS bar (the
+        # 16:00-16:01 print) into a series every consumer reads as regular
+        # hours. That bar's close then becomes the "eod" exit, flattering (or
+        # deflating) every hold-to-close outcome. Back `end` off one minute to
+        # the LAST regular-hours bar's timestamp (15:59 / 12:59) -- the same
+        # 390-bar session the offline synthetic generator already produces.
+        end = datetime.combine(d, market_close_et(d), tzinfo=ET) - timedelta(minutes=1)
         if self._clamp_end(end) <= start:
             return []
         params = {

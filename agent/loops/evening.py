@@ -361,8 +361,13 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
         summary["scored"] += 1
         if sim.get("triggered"):
             summary["triggered"] += 1
-            if sim.get("r_multiple") is not None:
-                summary["sum_r"] += sim["r_multiple"]
+            # Mean R is quoted in planned-risk units (r_planned), the same
+            # denominator the weekly miner and the exit-replay parity check
+            # read. Accumulating the floored r_multiple here ran hot -- a fill
+            # closer than the planned stop inflates R -- so the evening's
+            # eyeball "mean R" no longer matched the ledger it described.
+            if sim.get("r_planned") is not None:
+                summary["sum_r"] += sim["r_planned"]
             _replay_exits(replays, summary, ticker, c, bars, cutoff, sim, d,
                           slippage, min_bar_volume, flatten_at)
 
