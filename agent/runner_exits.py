@@ -56,7 +56,9 @@ __all__ = [
 
 # Bump when the family or any member's semantics change. Rows from different
 # versions describe different experiments and are never pooled.
-POLICY_VERSION = 1
+# v2: R booked from the worse of planned entry and fill (grader's r_planned
+# fix); breakeven/scale levels measured from that basis, not the plan's entry.
+POLICY_VERSION = 2
 
 REFERENCE = "plan"
 DIMENSION = "runner_exit_policy"
@@ -183,9 +185,14 @@ def _walk(p: ExitPolicy, bars: list[dict], fill_idx: int, fill: float,
     order is the grader's conservative one: a pending trail exit (at the open),
     then the stop, flatten, time stop, target, and only then anything that
     arms for a LATER bar (breakeven, trail)."""
+    # R is booked from `ref`, the worse of the planned entry and the fill -- the
+    # grader's r_planned basis. The target is the PLAN's level (what the live
+    # bracket carries); open-profit levels (breakeven, scale) are measured on
+    # the position as booked, from `ref`.
+    ref = max(entry, fill)
     target = entry + p.target_r * risk if p.target_r is not None else None
-    be_level = entry + p.breakeven_at_r * risk if p.breakeven_at_r is not None else None
-    scale_level = entry + p.scale_at_r * risk if p.scale_at_r is not None else None
+    be_level = ref + p.breakeven_at_r * risk if p.breakeven_at_r is not None else None
+    scale_level = ref + p.scale_at_r * risk if p.scale_at_r is not None else None
 
     active_stop = stop
     be_pending = be_done = False
@@ -194,14 +201,14 @@ def _walk(p: ExitPolicy, bars: list[dict], fill_idx: int, fill: float,
     best_px, best_idx = fill, fill_idx
 
     def r_at(px: float) -> float:
-        return ((px * (1 - slip)) - entry) / risk
+        return ((px * (1 - slip)) - ref) / risk
 
     def done(px: float, reason: str, idx: int) -> dict:
         return {"policy": p.name,
                 "r_planned": round(banked + open_frac * r_at(px), 3),
                 "exit_reason": reason,
                 "exit_et": _naive_et(bars[idx].get("t")),
-                "mfe_r": round((best_px - entry) / risk, 3),
+                "mfe_r": round((best_px - ref) / risk, 3),
                 "mfe_et": _naive_et(bars[best_idx].get("t"))}
 
     for i in range(fill_idx, len(bars)):

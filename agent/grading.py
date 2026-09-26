@@ -58,12 +58,13 @@ Simulation rules (documented, conservative):
   execution_anomaly so the evening grader doesn't narrate a thesis test that
   never actually happened at the intended level.
   Metrics:
-    r_planned = signed P&L against the PLANNED ENTRY, over PLANNED risk per share
-                (|entry - stop|, never floored). This is the honest realized R the
-                weekly miner reports, and it is bounded by the plan's geometry: a
-                target exit scores the plan's reward:risk no matter how far the
-                actual fill drifted. Fill drift is still auditable in
-                fill_vs_plan_r / execution_anomaly below, never capitalized.
+    r_planned = signed P&L from the WORSE of the planned entry and the actual fill
+                (friction included), over PLANNED risk per share (|entry - stop|,
+                never floored). This is the honest realized R the weekly miner
+                reports. A favorable fill is never credited (a target exit scores
+                at most the plan's reward:risk), and an adverse fill -- a market
+                or gap-through entry above a long's plan -- is never hidden.
+                Fill drift is auditable in fill_vs_plan_r / execution_anomaly.
     r_multiple = signed P&L / effective risk per share (fill-to-stop, floored at
                  25% of planned risk) -- diagnostic only; INFLATED (up to ~4x) on
                  favorable gap-through fills, so never the headline number.
@@ -781,7 +782,17 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
 
     sign = 1.0 if long else -1.0
     r_mult = sign * (exit_price - fill_price) / risk
-    r_planned = sign * (exit_price - entry) / planned_risk  # planned geometry, never floored
+    # r_planned is scored from the WORSE of the planned entry and the actual
+    # fill (friction included). A favorable fill is never credited -- the plan
+    # bounds the upside -- and an adverse one is never hidden. Scoring from the
+    # planned entry alone credited every point a market or gap-through fill
+    # paid ABOVE the plan: a runner entered at the 11:18 decision tick, an hour
+    # after its detection price, booked the detection-to-fill run it never
+    # held (production 2026-09-21..23: session means of -0.05..-0.47R by the
+    # fill printed as +0.32R). Position size is set off the planned risk, so
+    # this is the dollars in planned-R units.
+    ref = max(entry, fill_price) if long else min(entry, fill_price)
+    r_planned = sign * (exit_price - ref) / planned_risk  # planned risk, never floored
     mfe = sign * (best_px - fill_price) / risk
     mae = sign * (worst_px - fill_price) / risk  # negative or zero
 
@@ -798,7 +809,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     if slip > 0:
         eod_exit = eod_exit * (1 - slip) if long else eod_exit * (1 + slip)
     out["eod_r"] = round(sign * (eod_exit - fill_price) / risk, 3)
-    out["eod_r_planned"] = round(sign * (eod_exit - entry) / planned_risk, 3)
+    out["eod_r_planned"] = round(sign * (eod_exit - ref) / planned_risk, 3)
 
     # target_hit_after_stop: only meaningful for stopped trades. Scans from the
     # exit bar onward (the same-bar case counts, consistent with the conservative

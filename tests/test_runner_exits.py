@@ -85,6 +85,19 @@ def test_plan_arm_reproduces_the_grader(path, slip):
     assert plan["exit_reason"] == sim["exit_reason"]
 
 
+def test_a_late_fill_above_detection_books_from_the_fill():
+    # Detected at 10.00; the honest fill is an hour later at 10.30 (+0.6R of
+    # drift nobody held). Every arm books from 10.30, like the grader.
+    path = _rise() + [10.3] * 30 + [round(10.3 + 0.03 * i, 4) for i in range(1, 30)] + [11.1] * 240
+    bars = _bars(path)
+    sim = _sim(bars, fill_idx=90)
+    r = _replay(bars, fill_idx=90)
+    assert r["plan"]["exit_reason"] == sim["exit_reason"] == "target"
+    assert r["plan"]["r_planned"] == pytest.approx(sim["r_planned"], abs=1e-9)
+    assert r["plan"]["r_planned"] == pytest.approx((TARGET - 10.3) / 0.5)
+    assert r["no_target"]["r_planned"] == pytest.approx((11.1 - 10.3) / 0.5)
+
+
 def test_plan_arm_honors_flatten_like_the_grader():
     bars = _bars(_PATHS["eod"])
     sim = _sim(bars, flatten_at="15:30")
@@ -276,3 +289,78 @@ def test_weekly_search_counts_every_exit_policy_as_a_look(con, monkeypatch):
     search = integrity.build_search(con, ledger)
     exits = [c for c in search.comparisons if c.dimension == runner_exits.DIMENSION]
     assert len(exits) == len(runner_exits.POLICIES) - 1
+
+
+# ================================================================ regrade safety
+
+def test_outcome_save_updates_in_place_and_keeps_selection(con):
+    ledger.mark_runner_selected(con, SESSION, "RUNR", 2, 77)
+    ledger.save_runner_candidate_outcome(con, {"session_date": SESSION, "ticker": "runr",
+                                               "triggered": True, "r_planned": -1.0})
+    ledger.save_runner_candidate_outcome(con, {"session_date": SESSION, "ticker": "RUNR",
+                                               "triggered": True, "r_planned": 0.5})
+    row = ledger.runner_outcomes_for_date(con, SESSION)
+    assert len(row) == 1
+    assert (row[0]["selected"], row[0]["selection_rank"], row[0]["pick_id"],
+            row[0]["r_planned"]) == (True, 2, 77, 0.5)
+
+
+def test_restore_runner_selection_fills_only_missing_stamps(con):
+    ids = [con.execute(
+        """INSERT INTO picks (plan_date, ticker, direction, setup_type, entry_type,
+                              entry_price, stop_price, target_price)
+           VALUES (?, ?, 'long', 'dto_runner', 'open', 10, 9.5, 11) RETURNING pick_id""",
+        [SESSION, t]).fetchone()[0] for t in ("AAA", "BBB", "CCC")]
+    ledger.mark_runner_selected(con, SESSION, "AAA", 1, ids[0])
+    # BBB's row was lost mid-save and re-inserted without stamps; CCC's never existed.
+    ledger.save_runner_candidate_outcome(con, {"session_date": SESSION, "ticker": "BBB"})
+    assert ledger.restore_runner_selection(con, SESSION) == ["BBB", "CCC"]
+    got = {r["ticker"]: (r["selected"], r["selection_rank"], r["pick_id"])
+           for r in ledger.runner_outcomes_for_date(con, SESSION)}
+    assert got == {"AAA": (True, 1, ids[0]), "BBB": (True, 2, ids[1]),
+                   "CCC": (True, 3, ids[2])}
+    assert ledger.restore_runner_selection(con, SESSION) == []
+
+
+def test_regrade_runner_retries_a_session_when_the_connection_drops(con, monkeypatch, tmp_path):
+    import types
+    import run as cli
+    from agent import providers
+    from agent.loops import evening
+
+    _candidate(con, SESSION, "RUNR")
+    calls = []
+
+    class OperationalError(Exception):
+        pass
+
+    def flaky(con_, md, d, cfg):
+        calls.append(d)
+        if len(calls) == 1:
+            raise OperationalError("server closed the connection unexpectedly")
+        return {"scored": 1, "mean_r": 0.0}
+
+    class _MD:
+        def __init__(self, cfg):
+            pass
+
+        def prefetch_session(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(evening, "_grade_runner_candidates", flaky)
+    monkeypatch.setattr(providers, "MarketData", _MD)
+    cli.cmd_regrade_runner(Config(raw={}), types.SimpleNamespace(
+        from_date=SESSION.isoformat(), force=True))
+    assert calls == [SESSION, SESSION]
+
+    calls.clear()
+
+    def broken(con_, md, d, cfg):
+        calls.append(d)
+        raise ValueError("a real bug is not retried")
+
+    monkeypatch.setattr(evening, "_grade_runner_candidates", broken)
+    with pytest.raises(ValueError):
+        cli.cmd_regrade_runner(Config(raw={}), types.SimpleNamespace(
+            from_date=SESSION.isoformat(), force=True))
+    assert calls == [SESSION]

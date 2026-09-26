@@ -210,16 +210,36 @@ def cmd_regrade_runner(cfg, args) -> None:
                        f"across {len(rows)} session(s) (>500). Re-run with --force.")
         con.close()
         sys.exit(1)
+    con.close()
     md = MarketData(cfg)
     for d, n in rows:
-        tickers = ledger.runner_candidate_tickers(con, d)
-        md.prefetch_session(tickers, d, daily=False)
-        summary = _grade_runner_candidates(con, md, d, cfg)
+        # A fresh connection per session, and one retry if it drops: Neon
+        # closed one mid-session on 2026-09-26 (568 candidates). Re-grading a
+        # session is idempotent -- outcome rows are updated in place and
+        # replays are replaced per session -- so the retry is safe.
+        for attempt in (1, 2):
+            con = ledger.connect()
+            try:
+                tickers = ledger.runner_candidate_tickers(con, d)
+                md.prefetch_session(tickers, d, daily=False)
+                summary = _grade_runner_candidates(con, md, d, cfg)
+                restored = ledger.restore_runner_selection(con, d)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 2 or type(e).__name__ not in ("OperationalError",
+                                                              "InterfaceError"):
+                    raise
+                log("regrade", f"{d}: connection lost ({type(e).__name__}); retrying session")
+            finally:
+                try:
+                    con.close()
+                except Exception:  # noqa: BLE001
+                    pass
         log("regrade", f"{d}: re-priced {summary['scored']}/{n} candidate(s), "
-                       f"mean R {summary.get('mean_r')}")
+                       f"mean R {summary.get('mean_r')}"
+                       + (f"; restored selection on {', '.join(restored)}" if restored else ""))
     log("regrade", f"Re-priced {total} runner candidate row(s) from {from_date} onward "
                    f"under sim_version={CURRENT_SIM_VERSION}")
-    con.close()
 
 
 def cmd_regrade_shadow(cfg, args) -> None:

@@ -1970,10 +1970,31 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
     selected = o.get("selected", prior[0] if prior else False)
     rank = o.get("selection_rank", prior[1] if prior else None)
     pick_id = o.get("pick_id", prior[2] if prior else None)
-    con.execute(
-        "DELETE FROM runner_candidate_outcomes WHERE session_date = ? AND ticker = ?",
-        [o["session_date"], o["ticker"].upper()],
-    )
+    values = [
+        o.get("eval_date"), o.get("triggered"), o.get("entry_fill"), o.get("exit_price"),
+        o.get("exit_reason"), o.get("r_multiple"),
+        o.get("r_planned"), o.get("eod_r_planned"), o.get("mfe_r"),
+        o.get("mae_r"), o.get("eod_r"), bool(selected), rank, pick_id,
+        o.get("sim_version"), o.get("atr14"), o.get("stop_dist_atr"),
+        o.get("trend_side_200d"), o.get("entry_after_et"),
+    ]
+    key = [o["session_date"], o["ticker"].upper()]
+    # One statement either way. This was DELETE-then-INSERT, each committed on
+    # its own: a connection lost between the two (Neon dropped one mid-regrade
+    # on 2026-09-26; a 300s kill can land there too) deleted the row and, with
+    # it, the selection stamps nothing else records.
+    if prior:
+        con.execute(
+            """UPDATE runner_candidate_outcomes SET
+                 eval_date = ?, triggered = ?, entry_fill = ?, exit_price = ?,
+                 exit_reason = ?, r_multiple = ?, r_planned = ?, eod_r_planned = ?,
+                 mfe_r = ?, mae_r = ?, eod_r = ?, selected = ?, selection_rank = ?,
+                 pick_id = ?, sim_version = ?, atr14 = ?, stop_dist_atr = ?,
+                 trend_side_200d = ?, entry_after_et = ?
+               WHERE session_date = ? AND ticker = ?""",
+            values + key,
+        )
+        return
     con.execute(
         """INSERT INTO runner_candidate_outcomes
            (session_date, ticker, eval_date, triggered, entry_fill, exit_price,
@@ -1981,16 +2002,32 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
             selection_rank, pick_id, sim_version, atr14, stop_dist_atr,
             trend_side_200d, entry_after_et)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        [
-            o["session_date"], o["ticker"].upper(), o.get("eval_date"),
-            o.get("triggered"), o.get("entry_fill"), o.get("exit_price"),
-            o.get("exit_reason"), o.get("r_multiple"),
-            o.get("r_planned"), o.get("eod_r_planned"), o.get("mfe_r"),
-            o.get("mae_r"), o.get("eod_r"), bool(selected), rank, pick_id,
-            o.get("sim_version"), o.get("atr14"), o.get("stop_dist_atr"),
-            o.get("trend_side_200d"), o.get("entry_after_et"),
-        ],
+        key + values,
     )
+
+
+def restore_runner_selection(con: duckdb.DuckDBPyConnection, d: date) -> list[str]:
+    """Re-stamp selection onto outcome rows that lost it, from the day's
+    `dto_runner` picks. Only fills a MISSING stamp, never overwrites one.
+
+    Selection writes one pick per selected name, in rank order, so a pick's
+    position among the session's runner picks is its rank. Needed after a
+    DELETE-then-INSERT save (before 2026-09-26) died between its statements.
+    """
+    picks = con.execute(
+        """SELECT ticker, pick_id FROM picks
+           WHERE plan_date = ? AND setup_type = 'dto_runner' ORDER BY pick_id""",
+        [d]).fetchall()
+    restored = []
+    for rank, (ticker, pick_id) in enumerate(picks, start=1):
+        row = con.execute(
+            """SELECT selected, pick_id FROM runner_candidate_outcomes
+               WHERE session_date = ? AND ticker = ?""", [d, ticker.upper()]).fetchone()
+        if row is not None and row[0] and row[1] is not None:
+            continue
+        mark_runner_selected(con, d, ticker, rank, pick_id)
+        restored.append(ticker.upper())
+    return restored
 
 
 def runner_outcomes_for_date(con: duckdb.DuckDBPyConnection, d: date) -> list[dict]:

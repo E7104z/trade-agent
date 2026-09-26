@@ -164,6 +164,36 @@ def test_target_exit_scores_plan_geometry_regardless_of_fill_drift():
             "fill {} moved r_planned to {}".format(open_px, out["r_planned"])
 
 
+@pytest.mark.parametrize("direction,entry,stop,target,open_px,exit_px,want", [
+    # long market entry filled 1.0 above its plan: a target exit is worth
+    # (104 - 101) / 2 = 1.5R of the dollars sized on the plan, not 2.0R.
+    ("long", 100.0, 98.0, 104.0, 101.0, 104.0, 1.5),
+    ("short", 100.0, 102.0, 96.0, 99.0, 96.0, 1.5),
+])
+def test_adverse_fill_is_never_hidden_by_planned_r(direction, entry, stop, target,
+                                                   open_px, exit_px, want):
+    # Production 2026-09-21..23: runner fills an hour after detection printed
+    # +0.32R by the detection price while the trades lost money by the fill.
+    pick = _pick(direction=direction, entry_type="open", entry=entry, stop=stop,
+                 target=target)
+    hi, lo = (max(open_px, exit_px) + 0.5, open_px - 0.1) if direction == "long" \
+        else (open_px + 0.1, min(open_px, exit_px) - 0.5)
+    out = simulate_pick(pick, [_bar(open_px, open_px + 0.1, open_px - 0.1, open_px),
+                               _bar(open_px, hi, lo, exit_px)], None)
+    assert out["exit_reason"] == "target"
+    assert out["r_planned"] == pytest.approx(want, abs=1e-3)
+    # eod_r_planned shares the basis, so management edge never mixes them.
+    assert out["eod_r_planned"] == pytest.approx(want, abs=1e-3)
+
+
+def test_planned_r_pays_entry_friction():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    out = simulate_pick(pick, [_bar(100.0, 100.1, 99.9, 100.0),
+                               _bar(100.0, 104.5, 99.9, 104.2)], None, slippage_bps=10)
+    # fill 100.1 (friction), exit 104 * 0.999 = 103.896 -> (103.896 - 100.1) / 2
+    assert out["r_planned"] == pytest.approx(1.898, abs=1e-3)
+
+
 def test_short_target_exit_scores_about_planned_r():
     pick = _pick(direction="short", entry_type="open", entry=100.0,
                  stop=102.0, target=96.0)
