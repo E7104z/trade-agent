@@ -302,3 +302,122 @@ def test_full_mode_shows_outcome_and_bars_past_cutoff(con, cfg):
 def test_outcomes_untriggered_reason_surfaced(con):
     cols = [c[0] for c in con.execute("DESCRIBE outcomes").fetchall()]
     assert "untriggered_reason" in cols
+
+
+# -------------------------------------------------------------------- summary
+
+def _summary_out(**over):
+    out = {"lane": "morning", "asof": False,
+           "levels": [{"kind": "entry", "price": 100.0}, {"kind": "stop", "price": 98.0},
+                      {"kind": "target", "price": 106.0},
+                      {"kind": "structural", "price": 110.0}],
+           "markers": [], "context": {"direction": "long", "outcome": None}}
+    out.update(over)
+    return out
+
+
+def test_trade_summary_risk_and_reward_are_server_computed():
+    s = chart_payload.trade_summary(_summary_out())
+    assert (s["entry"], s["stop"], s["target"]) == (100.0, 98.0, 106.0)
+    assert s["risk_per_share"] == 2.0
+    assert s["risk_pct"] == 2.0
+    assert s["reward_r"] == 3.0
+    assert s["direction"] == "long"
+    assert s["status"] == "Not graded yet"
+
+
+def test_trade_summary_missing_stop_leaves_risk_blank_not_zero():
+    out = _summary_out(levels=[{"kind": "entry", "price": 100.0}, {"kind": "target", "price": 106.0}])
+    s = chart_payload.trade_summary(out)
+    assert s["risk_per_share"] is None and s["risk_pct"] is None and s["reward_r"] is None
+
+
+def test_trade_summary_graded_result_fill_and_exit():
+    out = _summary_out(
+        markers=[{"kind": "fill", "timestamp": 1, "price": 100.05, "source": "replay"},
+                 {"kind": "exit", "timestamp": 2, "price": 106.0, "reason": "target", "source": "replay"}],
+        context={"direction": "long", "outcome": {"triggered": True, "exit_reason": "target",
+                                                  "r_multiple": 2.95}})
+    s = chart_payload.trade_summary(out)
+    assert s["result"] == {"label": "Result", "r": 2.95}
+    assert s["status"] == "Target hit"
+    assert s["fill"] == {"price": 100.05, "timestamp": 1}
+    assert s["exit"] == {"price": 106.0, "timestamp": 2, "reason": "Target hit"}
+
+
+def test_trade_summary_untriggered_says_so():
+    out = _summary_out(context={"direction": "long", "outcome": {
+        "triggered": False, "r_multiple": None, "untriggered_reason": "entry_never_touched"}})
+    s = chart_payload.trade_summary(out)
+    assert s["status"] == "Not triggered (entry never touched)"
+
+
+def test_trade_summary_shadow_reports_forgone_r():
+    out = _summary_out(lane="shadow", context={"direction": "long", "counterfactual": True,
+                                               "outcome": {"eod_outcome": "would_have_won", "forgone_r": 1.35}})
+    s = chart_payload.trade_summary(out)
+    assert s["result"] == {"label": "Forgone", "r": 1.35}
+    assert s["status"] == "Would have won"
+
+
+def test_trade_summary_asof_hides_outcome():
+    s = chart_payload.trade_summary(_summary_out(asof=True))
+    assert s["result"] is None
+    assert s["status"] == "Outcome hidden (as-of)"
+
+
+def test_trade_summary_live_prefers_broker_legs_and_reports_unrealized():
+    out = _summary_out(
+        lane="live",
+        levels=[{"kind": "entry", "price": 100.0}, {"kind": "stop", "price": 98.0},
+                {"kind": "target", "price": 106.0},
+                {"kind": "stop", "price": 99.0, "source": "broker"}],
+        context={"live": {"open": True, "side": "buy", "unrealized_r": 0.4}, "outcome": None})
+    s = chart_payload.trade_summary(out)
+    assert s["stop"] == 99.0  # the resting broker leg, not the plan's 98
+    assert s["direction"] == "long"
+    assert s["result"] == {"label": "Unrealized", "r": 0.4}
+    assert s["status"] == "Position open"
+
+
+def test_runner_summary_labels_entry_as_detection():
+    s = chart_payload.trade_summary(_summary_out(lane="runner"))
+    assert s["entry_label"] == "Detection"
+
+
+def test_build_attaches_summary_and_series_bar_minutes(con, cfg):
+    d = date(2026, 1, 5)
+    pick_id = _insert_pick(con, d, MOCK_TICKER)
+    out = chart_payload.build(con, cfg, MOCK_TICKER, d, "morning", pick_id, tf=5)
+    assert out["summary"]["entry"] == 100.0
+    assert out["summary"]["reward_r"] == 3.0
+    assert out["series"]["vwap"]["bar_minutes"] == 1
+    assert out["series"]["ema9"]["bar_minutes"] == 5
+
+
+def test_replay_guard_ungraded_row_is_not_a_disagreement():
+    g = chart_payload._replay_guard("replay_vs_ledger", None, 2.1, None, graded=False)
+    assert g["ok"] is True
+    assert "not graded" in g["detail"]
+
+
+def test_replay_guard_graded_row_with_missing_value_still_flags():
+    g = chart_payload._replay_guard("replay_vs_ledger", None, 2.1, CURRENT_SIM_VERSION, graded=True)
+    assert g["ok"] is False
+
+
+def test_same_day_ungraded_pick_has_no_false_guard_alarm(con, cfg):
+    d = date(2026, 1, 5)
+    pick_id = _insert_pick(con, d, MOCK_TICKER)  # no outcomes row: evening loop hasn't run
+    out = chart_payload.build(con, cfg, MOCK_TICKER, d, "morning", pick_id, tf=5)
+    assert all(g["ok"] for g in out["guards"])
+    assert out["summary"]["status"] == "Not graded yet"
+
+
+def test_ungraded_shadow_row_reports_not_graded_instead_of_blank_result(con, cfg):
+    d = date(2026, 1, 5)
+    rej_id = _insert_rejection(con, d, MOCK_TICKER)
+    out = chart_payload.build(con, cfg, MOCK_TICKER, d, "shadow", rej_id, tf=5)
+    assert out["summary"]["result"] is None
+    assert out["summary"]["status"] == "Not graded yet"
+    assert all(g["ok"] for g in out["guards"])

@@ -283,7 +283,7 @@ def markers_from_replay(sim: dict, direction: str) -> list[dict]:
         if ems is not None and sim.get("exit_price") is not None:
             out.append({"kind": "exit", "timestamp": ems, "price": sim["exit_price"],
                        "label": f"Exit ({sim.get('exit_reason') or ''}) {sim['exit_price']:.2f}",
-                       "source": "replay"})
+                       "reason": sim.get("exit_reason"), "source": "replay"})
     return out
 
 
@@ -377,7 +377,12 @@ def _replay_runner(md: MarketData, con, cfg: Config, candidate: dict, d: date,
 # ---------------------------------------------------------------------- guard
 
 def _replay_guard(name: str, stored: float | None, replayed: float | None,
-                  stored_sim_version: int | None) -> dict:
+                  stored_sim_version: int | None, graded: bool = True) -> dict:
+    # An ungraded row (evening loop hasn't run for it yet) has no ledger value
+    # to disagree with -- that's "nothing to compare", not a mismatch, and
+    # flagging it put a red banner on every same-day chart.
+    if not graded:
+        return {"name": name, "ok": True, "detail": "not graded yet -- replay only"}
     if stored_sim_version is not None and stored_sim_version != CURRENT_SIM_VERSION:
         return {"name": name, "ok": False,
                "detail": f"graded under sim v{stored_sim_version}, replayed under v{CURRENT_SIM_VERSION}"}
@@ -474,6 +479,7 @@ def build(con, cfg: Config, ticker: str, d: date, lane: str | None, ctx_id: Any,
     }
     if not lane:
         out["bars"] = to_kline(aggregate(bars, tf))
+        out["summary"] = trade_summary(out)
         return out
 
     try:
@@ -493,7 +499,95 @@ def build(con, cfg: Config, ticker: str, d: date, lane: str | None, ctx_id: Any,
         warnings.append(f"chart build error: {e}")
         if not out["bars"]:
             out["bars"] = to_kline(aggregate(bars, tf))
+    out["summary"] = trade_summary(out)
     return out
+
+
+# --------------------------------------------------------------------- summary
+
+_EXIT_LABELS = {"target": "Target hit", "stop": "Stopped out", "eod": "Flat at close",
+                "time_stop": "Time stop", "no_trigger": "Not triggered", "no_data": "No data"}
+_SHADOW_LABELS = {"would_have_won": "Would have won", "would_have_lost": "Would have lost",
+                  "scratch": "Scratch", "unmeasurable": "Unmeasurable"}
+
+
+def _humanize(raw, table: dict) -> str | None:
+    if raw is None or raw == "":
+        return None
+    return table.get(str(raw), str(raw).replace("_", " ").capitalize())
+
+
+def _first_level(levels: list[dict], kind: str) -> float | None:
+    """Price of the first `kind` level; a broker leg (live lane) outranks the
+    plan's number because it is what is actually resting at the broker."""
+    hits = [lv for lv in levels if lv.get("kind") == kind and lv.get("price") is not None]
+    broker = [lv for lv in hits if lv.get("source") == "broker"]
+    pick = (broker or hits or [None])[0]
+    return float(pick["price"]) if pick else None
+
+
+def _first_marker(markers: list[dict], kind: str) -> dict | None:
+    m = next((m for m in markers if m.get("kind") == kind and m.get("price") is not None
+              and m.get("timestamp") is not None), None)
+    if m is None:
+        return None
+    out = {"price": float(m["price"]), "timestamp": m["timestamp"]}
+    if kind == "exit":
+        out["reason"] = _humanize(m.get("reason"), _EXIT_LABELS)
+    return out
+
+
+def trade_summary(out: dict) -> dict:
+    """The drawer's headline numbers (entry/stop/target, risk, reward R, fill,
+    exit, result), derived here from what the lane builder already put in
+    `out` so the browser only formats them and never computes one (R-0).
+    Runs after as-of filtering, so a hidden outcome stays hidden."""
+    levels = out.get("levels") or []
+    markers = out.get("markers") or []
+    ctx = out.get("context") or {}
+    live = ctx.get("live") or None
+    outcome = ctx.get("outcome")
+
+    direction = ctx.get("direction")
+    if direction is None and live:
+        direction = {"buy": "long", "sell": "short"}.get(str(live.get("side") or "").lower())
+
+    entry, stop, target = (_first_level(levels, k) for k in ("entry", "stop", "target"))
+    risk = abs(entry - stop) if entry is not None and stop is not None else None
+    risk_pct = round(risk / entry * 100, 2) if risk is not None and entry else None
+    reward_r = (round(abs(target - entry) / risk, 2)
+                if risk and target is not None and entry is not None else None)
+
+    result, status = None, None
+    if live and live.get("open"):
+        result = {"label": "Unrealized", "r": live.get("unrealized_r")}
+        status = "Position open"
+    elif outcome:
+        if "forgone_r" in outcome:
+            if outcome.get("eod_outcome") is not None:  # None = evening loop hasn't graded it
+                result = {"label": "Forgone", "r": outcome.get("forgone_r")}
+                status = _humanize(outcome.get("eod_outcome"), _SHADOW_LABELS)
+        else:
+            result = {"label": "Result", "r": outcome.get("r_multiple")}
+            if outcome.get("triggered") is False:
+                why = _humanize(outcome.get("untriggered_reason"), {})
+                status = "Not triggered" + (f" ({why.lower()})" if why else "")
+            else:
+                status = _humanize(outcome.get("exit_reason"), _EXIT_LABELS)
+    elif out.get("asof"):
+        status = "Outcome hidden (as-of)"
+    if status is None and out.get("lane"):
+        status = "Not graded yet"
+
+    return {
+        "direction": direction,
+        "entry_label": "Detection" if out.get("lane") == "runner" else "Entry",
+        "entry": entry, "stop": stop, "target": target,
+        "risk_per_share": round(risk, 4) if risk is not None else None,
+        "risk_pct": risk_pct, "reward_r": reward_r,
+        "fill": _first_marker(markers, "fill"), "exit": _first_marker(markers, "exit"),
+        "result": result, "status": status,
+    }
 
 
 def _build_morning(con, cfg, md, out, t, d, pick_id, bars, daily, tf, asof, warnings, guards):
@@ -511,9 +605,10 @@ def _build_morning(con, cfg, md, out, t, d, pick_id, bars, daily, tf, asof, warn
     vwap_series = series_morning_vwap(bars, pm_bars)
     ema9 = series_morning_ema9(aggregate(bars, 5))
     out["series"] = {
-        "vwap": {"basis": "indicators.vwap_series RTH", "points": vwap_series["vwap"]},
-        "pm_vwap": {"basis": "indicators.vwap_series premarket 04:00-09:30 ET", "points": vwap_series["pm_vwap"]},
-        "ema9": {"basis": "indicators.ema_series 5m (SMA seed)", "points": ema9},
+        "vwap": {"basis": "indicators.vwap_series RTH", "bar_minutes": 1, "points": vwap_series["vwap"]},
+        "pm_vwap": {"basis": "indicators.vwap_series premarket 04:00-09:30 ET", "bar_minutes": 1,
+                    "points": vwap_series["pm_vwap"]},
+        "ema9": {"basis": "indicators.ema_series 5m (SMA seed)", "bar_minutes": 5, "points": ema9},
     }
     levels, level_warnings = levels_morning(pick, outcome_row, cfg)
     out["levels"] = levels
@@ -538,7 +633,8 @@ def _build_morning(con, cfg, md, out, t, d, pick_id, bars, daily, tf, asof, warn
 
     stored_r = (outcome_row or {}).get("r_multiple")
     stored_sim = (outcome_row or {}).get("sim_version")
-    guards.append(_replay_guard("replay_vs_ledger", stored_r, sim.get("r_multiple"), stored_sim))
+    guards.append(_replay_guard("replay_vs_ledger", stored_r, sim.get("r_multiple"), stored_sim,
+                                graded=outcome_row is not None))
     if not guards[-1]["ok"]:
         for m in markers:
             if m.get("source") == "replay":
@@ -577,9 +673,10 @@ def _build_shadow(con, cfg, md, out, t, d, rejection_id, bars, tf, asof, warning
     vwap_series = series_morning_vwap(bars, pm_bars)
     ema9 = series_morning_ema9(aggregate(bars, 5))
     out["series"] = {
-        "vwap": {"basis": "indicators.vwap_series RTH", "points": vwap_series["vwap"]},
-        "pm_vwap": {"basis": "indicators.vwap_series premarket 04:00-09:30 ET", "points": vwap_series["pm_vwap"]},
-        "ema9": {"basis": "indicators.ema_series 5m (SMA seed)", "points": ema9},
+        "vwap": {"basis": "indicators.vwap_series RTH", "bar_minutes": 1, "points": vwap_series["vwap"]},
+        "pm_vwap": {"basis": "indicators.vwap_series premarket 04:00-09:30 ET", "bar_minutes": 1,
+                    "points": vwap_series["pm_vwap"]},
+        "ema9": {"basis": "indicators.ema_series 5m (SMA seed)", "bar_minutes": 5, "points": ema9},
     }
     pick_shaped = {"direction": rejection.get("direction"), "entry_price": rejection.get("entry_price"),
                   "stop_price": rejection.get("stop_price"), "target_price": rejection.get("target_price"),
@@ -595,7 +692,8 @@ def _build_shadow(con, cfg, md, out, t, d, rejection_id, bars, tf, asof, warning
 
     eod_outcome, forgone_replay = classify_shadow(sim)
     stored_forgone = rejection.get("forgone_r")
-    guards.append(_replay_guard("replay_vs_ledger", stored_forgone, forgone_replay, None))
+    guards.append(_replay_guard("replay_vs_ledger", stored_forgone, forgone_replay, None,
+                                graded=rejection.get("eod_outcome") is not None))
     if not guards[-1]["ok"]:
         for m in out["markers"]:
             if m.get("source") == "replay":
@@ -628,8 +726,10 @@ def _build_runner(con, cfg, md, out, t, d, bars, tf, asof, warnings, guards):
     scan_bars = _runner_scan_bars(md, t, d, close_dt)
     rseries = series_runner(scan_bars)
     out["series"] = {
-        "vwap": {"basis": "runner_indicators.vwap (native 5Min, DTO parity)", "points": rseries["vwap"]},
-        "ema9": {"basis": "runner_indicators.ema period=9 (native 5Min, DTO parity)", "points": rseries["ema9"]},
+        "vwap": {"basis": "runner_indicators.vwap (native 5Min, DTO parity)", "bar_minutes": 5,
+                 "points": rseries["vwap"]},
+        "ema9": {"basis": "runner_indicators.ema period=9 (native 5Min, DTO parity)", "bar_minutes": 5,
+                 "points": rseries["ema9"]},
     }
     out["levels"] = levels_runner(candidate)
 
@@ -657,7 +757,8 @@ def _build_runner(con, cfg, md, out, t, d, bars, tf, asof, warnings, guards):
 
     stored_r = (stored or {}).get("r_multiple")
     stored_sim = (stored or {}).get("sim_version")
-    guards.append(_replay_guard("replay_vs_ledger", stored_r, sim.get("r_multiple"), stored_sim))
+    guards.append(_replay_guard("replay_vs_ledger", stored_r, sim.get("r_multiple"), stored_sim,
+                                graded=stored is not None))
     if not guards[-1]["ok"]:
         for m in out["markers"]:
             if m.get("source") == "replay":
@@ -692,9 +793,10 @@ def _build_live(con, cfg, md, out, t, d, order_id, bars, tf, warnings, guards):
     vwap_series = series_morning_vwap(bars, pm_bars)
     ema9 = series_morning_ema9(aggregate(bars, 5))
     out["series"] = {
-        "vwap": {"basis": "indicators.vwap_series RTH", "points": vwap_series["vwap"]},
-        "pm_vwap": {"basis": "indicators.vwap_series premarket 04:00-09:30 ET", "points": vwap_series["pm_vwap"]},
-        "ema9": {"basis": "indicators.ema_series 5m (SMA seed)", "points": ema9},
+        "vwap": {"basis": "indicators.vwap_series RTH", "bar_minutes": 1, "points": vwap_series["vwap"]},
+        "pm_vwap": {"basis": "indicators.vwap_series premarket 04:00-09:30 ET", "bar_minutes": 1,
+                    "points": vwap_series["pm_vwap"]},
+        "ema9": {"basis": "indicators.ema_series 5m (SMA seed)", "bar_minutes": 5, "points": ema9},
     }
 
     pick_row = None
@@ -734,7 +836,7 @@ def _build_live(con, cfg, md, out, t, d, order_id, bars, tf, warnings, guards):
         markers.append({"kind": "exit", "timestamp": _ms(order_row["exit_fill_at"]),
                         "price": order_row.get("exit_fill_price"),
                         "label": f"Exit ({order_row.get('exit_reason') or ''}) {order_row.get('exit_fill_price')}",
-                        "source": "broker"})
+                        "reason": order_row.get("exit_reason"), "source": "broker"})
     out["markers"] = markers
     out["windows"] = [{"kind": "premarket", "start": _ms(datetime.combine(d, dtime(4, 0), tzinfo=ET)),
                        "end": _ms(datetime.combine(d, dtime(9, 30), tzinfo=ET))}]
