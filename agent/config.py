@@ -49,6 +49,14 @@ _DEFAULTS: dict[str, Any] = {
         "max_picks": 1,
         "size_r": 0.25,
     },
+    # The desk trades every session: when review and validation leave the plan
+    # empty, the best valid rejected candidate goes on at minimum size, labeled
+    # `daily_floor` so it is measured apart from full approvals.
+    "daily_floor": {
+        "enabled": False,
+        "size_r": 0.25,
+        "min_rr": 1.0,
+    },
     "max_entry_ref_distance_pct": 15.0,  # entry further than this from last price = ungrounded, dropped
     "atr_gate": "warn",         # "warn" | "enforce" -- noise-stop gate rollout switch, default warn-only
     "earnings_gate": "warn",    # "warn" | "enforce" -- binary-event gate rollout switch, default warn-only

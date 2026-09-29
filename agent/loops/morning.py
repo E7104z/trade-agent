@@ -530,8 +530,13 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
         conv = p.get("conviction")
         p["conviction"] = int(min(max(int(conv), 1), 5)) if isinstance(conv, (int, float)) else 3
 
+        # The daily floor pick is exempt from the conviction bar below, never
+        # from the size clamps. It is minimum-sized by construction, and a
+        # breaker that could veto it would never reset: a streak or a trailing
+        # drawdown only moves when the desk trades.
+        floor = p.get("exploration_lane") == "daily_floor"
         if losing_streak:
-            if p["conviction"] < 4:
+            if p["conviction"] < 4 and not floor:
                 warnings.append(f"{t}: dropped — losing streak >= 3 demands conviction >= 4 "
                                 f"(had {p['conviction']})")
                 continue
@@ -539,7 +544,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                 warnings.append(f"{t}: size clamped {p['size_r']} -> 0.5R (losing-streak rule)")
                 p["size_r"] = 0.5
         if dd_mode:
-            if p["conviction"] < 4:
+            if p["conviction"] < 4 and not floor:
                 warnings.append(f"{t}: dropped — capital preservation mode demands conviction >= 4 "
                                 f"(had {p['conviction']})")
                 continue
@@ -865,6 +870,149 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config,
     return True
 
 
+# How far each kill-check reaches toward "not a valid order" rather than "not
+# a good trade". The daily floor walks rejected candidates softest kill first;
+# _validate_plan, not this table, is what decides validity.
+_FLOOR_KILL_RANK = {
+    "rr": 0, "conviction": 0,
+    "regime_fit": 1, "crowding": 1, "correlation": 1, "stop_quality": 1,
+    "chase": 1, "staleness": 1,
+    "event_risk": 2,
+    "grounding": 3, "entry_type": 3,
+}
+
+
+def _normalize_floor_picks(plan: dict, cfg: Config) -> None:
+    """The risk manager's own floor pick (`floor_pick: true`) goes on at the
+    floor size and carries the `daily_floor` label, so the ledger measures it
+    apart from a full approval. A flagged pick also clears a contradictory
+    `no_trade`, which would otherwise make _validate_plan discard it."""
+    floor = cfg.get("daily_floor", {}) or {}
+    size = float(floor.get("size_r", cfg.get("min_size_r", 0.25)))
+    flagged = [p for p in plan.get("picks") or [] if p.get("floor_pick")]
+    for p in flagged:
+        p["size_r"] = size
+        p["exploration_lane"] = "daily_floor"
+        entry = (p.get("entry_plan") or {}).get("price", p.get("entry_price"))
+        stop, target = p.get("stop_price"), p.get("target_price")
+        if all(isinstance(x, (int, float)) for x in (entry, stop, target)) and entry != stop:
+            p["exploration_rr"] = round(abs(target - entry) / abs(entry - stop), 4)
+        # Attribution follows the admission path, as in _add_exploration_pick.
+        p.pop("probe_for", None)
+    if flagged:
+        plan["no_trade"] = False
+        plan.pop("no_trade_reason", None)
+
+
+def _floor_candidates(candidates: dict, plan: dict, cfg: Config) -> list[dict]:
+    """Fallback picks for a plan that review and validation left empty, best
+    first.
+
+    Every analyst candidate not already in the plan, with complete levels and
+    planned R:R >= `daily_floor.min_rr`, ranked by the risk manager's
+    primary_kill_check (softest first, _FLOOR_KILL_RANK), then conviction,
+    then R:R. Each comes back at the floor size, conviction capped at 3 (the
+    risk manager did not approve it), labeled `daily_floor`. Nothing here
+    decides validity: _run_daily_floor puts each through _validate_plan in
+    this order and keeps the first that survives.
+    """
+    floor = cfg.get("daily_floor", {}) or {}
+    if not floor.get("enabled"):
+        return []
+    min_rr = float(floor.get("min_rr", 1.0))
+    size = float(floor.get("size_r", cfg.get("min_size_r", 0.25)))
+    rejected_rows = {str(r.get("ticker", "")).upper(): r for r in plan.get("rejected", []) or []}
+    seen = {str(p.get("ticker", "")).upper() for p in plan.get("picks") or []}
+    ranked: list[tuple[tuple, dict]] = []
+    for i, c in enumerate(candidates.get("candidates", []) or []):
+        ticker = str(c.get("ticker", "")).upper().strip()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        entry_plan = c.get("entry_plan") or {}
+        entry = entry_plan.get("price", c.get("entry_price"))
+        stop, target = c.get("stop_price"), c.get("target_price")
+        if not all(isinstance(x, (int, float)) for x in (entry, stop, target)):
+            continue
+        risk = abs(float(entry) - float(stop))
+        if risk <= 0:
+            continue
+        rr = abs(float(target) - float(entry)) / risk
+        if rr < min_rr:
+            continue
+        kill = str((rejected_rows.get(ticker) or {}).get("primary_kill_check") or "").strip().lower()
+        conv = c.get("conviction")
+        conv = int(conv) if isinstance(conv, (int, float)) else 3
+        pick = {
+            **c,
+            "ticker": ticker,
+            "entry_plan": {"type": entry_plan.get("type", "open"), "price": entry},
+            "entry_price": entry,
+            "size_r": size,
+            "conviction": min(conv, 3),
+            "exploration_lane": "daily_floor",
+            "exploration_rr": round(rr, 4),
+        }
+        pick.pop("probe_for", None)
+        ranked.append(((_FLOOR_KILL_RANK.get(kill, 1), -conv, -rr, i), pick))
+    ranked.sort(key=lambda row: row[0])
+    return [pick for _, pick in ranked]
+
+
+def _apply_daily_floor(plan: dict, floor_picks: list[dict], validate_one) -> list[str]:
+    """Put the first floor pick that survives validation into an empty plan.
+
+    `validate_one` is _validate_plan bound to this session's streak, drawdown
+    and price/ATR/earnings maps, so a floor pick clears every mechanical gate
+    a regular pick clears (an ungrounded price or a mistyped entry is still
+    dropped). The plan stays a no-trade day only when no candidate is a valid
+    order at all. Returns log lines.
+    """
+    if plan.get("picks") or not floor_picks:
+        return []
+    notes: list[str] = []
+    for pick in floor_picks:
+        trial, warnings = validate_one({"no_trade": False, "picks": [pick]})
+        notes += [f"floor {pick['ticker']}: {w}" for w in warnings]
+        if trial.get("picks"):
+            chosen = trial["picks"][0]
+            if plan.get("no_trade_reason"):
+                plan["stand_down_overridden"] = plan["no_trade_reason"]
+            plan["picks"] = [chosen]
+            plan["total_risk_r"] = trial["total_risk_r"]
+            plan["no_trade"] = False
+            plan.pop("no_trade_reason", None)
+            notes.append(f"DAILY FLOOR: {chosen['ticker']} admitted at {chosen['size_r']}R "
+                         f"(planned R:R {chosen.get('exploration_rr')}) — the desk trades every session")
+            return notes
+    notes.append("DAILY FLOOR: no candidate survived validation — no valid order to place today")
+    return notes
+
+
+def _run_daily_floor(plan: dict, candidates: dict, cfg: Config, md: MarketData,
+                     bundle: dict, cand_quotes: dict[str, float],
+                     streak: dict | None, drawdown: dict | None) -> list[str]:
+    """The desk trades every session: if validation left `plan` empty, walk the
+    rejected candidates softest kill first through the same validator.
+
+    Prices come from quotes already fetched this run, so there is no new quote
+    call and an unpriced candidate stays dropped. ATR and earnings are one
+    batched top-up each, the same cost as a normal pick day. Both arms call
+    this, so the paired comparison is not confounded by one arm having a
+    floor and the other not.
+    """
+    floor_picks = [] if plan.get("picks") else _floor_candidates(candidates, plan, cfg)
+    if not floor_picks:
+        return []
+    floor_plan = {"picks": floor_picks}
+    refs = {**_reference_prices(bundle), **cand_quotes}
+    atr_map = _grounded_atr(md, floor_plan, bundle)
+    earnings_map = _grounded_earnings(md, floor_plan, bundle)
+    return _apply_daily_floor(plan, floor_picks, lambda trial: _validate_plan(
+        trial, cfg, streak, drawdown, ref_prices=refs,
+        atr_map=atr_map, earnings_map=earnings_map))
+
+
 def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: str,
                       bundle_md: str, bundle: dict, reg_md: str, mem: dict,
                       regime_tag: str, model: str, llm_call) -> dict:
@@ -891,8 +1039,10 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
         # against its own MarketData.
         armb_quotes: dict[str, float] = {}
         armb_health: dict = {}
+        armb_cands: dict = {}
 
         def _quotes_md_arm_b(cands: dict) -> str:
+            armb_cands.update(cands)
             q = _grounded_candidate_prices(md2, cands, bundle, d)
             armb_quotes.update(q)
             armb_health.update(_candidate_grounding_health(cands, bundle, q))
@@ -901,14 +1051,20 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
         def _validate_arm_b(p: dict) -> tuple[dict, list[str]]:
             # data_health from the shared bundle but ITS OWN MarketData (md2
             # probes the feed independently) and its own candidate population.
-            return _validate_plan(
-                p, cfg, ledger.current_streak(con2, lane="morning"),
-                ledger.trailing_weighted_r(con2, int(cfg.get("drawdown_window", 10)),
-                                           lane="morning"),
+            # The daily floor applies here on the same terms as arm A.
+            streak = ledger.current_streak(con2, lane="morning")
+            drawdown = ledger.trailing_weighted_r(
+                con2, int(cfg.get("drawdown_window", 10)), lane="morning")
+            _normalize_floor_picks(p, cfg)
+            p, warnings = _validate_plan(
+                p, cfg, streak, drawdown,
                 ref_prices=_grounded_ref_prices(md2, p, bundle, d, seed=armb_quotes),
                 atr_map=_grounded_atr(md2, p, bundle),
                 earnings_map=_grounded_earnings(md2, p, bundle),
                 session_health={**_bundle_health(md2, bundle), **armb_health})
+            warnings += _run_daily_floor(p, armb_cands, cfg, md2, bundle, armb_quotes,
+                                         streak, drawdown)
+            return p, warnings
 
         return paired_mod.run_challenger_arm(
             con2, cfg, d,
@@ -1039,6 +1195,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             "MIN_SIZE_R": str(cfg.get("min_size_r", 0.25)),
             "MAX_SIZE_R": str(cfg.get("max_size_r", 1.5)),
             "MAX_TOTAL_RISK_R": str(cfg.get("max_total_open_risk_r", 3.0)),
+            "FLOOR_SIZE_R": str((cfg.get("daily_floor", {}) or {}).get(
+                "size_r", cfg.get("min_size_r", 0.25))),
         })
 
         from . import paired as paired_mod
@@ -1093,25 +1251,29 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         _mark("risk")
         plan["analyst_candidate_count"] = n_cand
         plan["risk_rejection_count"] = len(plan.get("rejected", []) or [])
+        _normalize_floor_picks(plan, cfg)
         _add_exploration_pick(candidates, plan, cfg, mem.get("backlog_ids"))
         plan["validator_proposed_count"] = len(plan.get("picks", []) or [])
 
         # 7. validate + persist (ref prices cover every proposed ticker — live-fetched if needed)
         session_health = {**_bundle_health(md, bundle),
                           **_candidate_grounding_health(candidates, bundle, cand_quotes)}
+        # Lane-scoped: the streak clamp and drawdown breaker are this lane's
+        # discipline and read this lane's record only (see ledger.lane_clause
+        # -- runner picks would otherwise fill the window).
+        streak = ledger.current_streak(con, lane="morning")
+        drawdown = ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10)),
+                                              lane="morning")
         plan, warnings = _validate_plan(
-            # Lane-scoped: the streak clamp and drawdown breaker are this
-            # lane's discipline and read this lane's record only (see
-            # ledger.lane_clause -- runner picks would otherwise fill the window).
-            plan, cfg, ledger.current_streak(con, lane="morning"),
-            ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10)),
-                                       lane="morning"),
+            plan, cfg, streak, drawdown,
             ref_prices=_grounded_ref_prices(md, plan, bundle, d, seed=cand_quotes),
             atr_map=_grounded_atr(md, plan, bundle),
             earnings_map=_grounded_earnings(md, plan, bundle),
             session_health=session_health)
         plan["validator_drop_count"] = max(
             0, plan["validator_proposed_count"] - len(plan.get("picks", []) or []))
+        warnings += _run_daily_floor(plan, candidates, cfg, md, bundle, cand_quotes,
+                                     streak, drawdown)
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = reg.get("tag", "")

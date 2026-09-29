@@ -24,6 +24,11 @@
     "allow_with_picks": true,
     "backlog_probe": true
   },
+  "daily_floor": {
+    "enabled": true,
+    "size_r": 0.25,
+    "min_rr": 1.0
+  },
   "slippage_bps": 5,
   "leveraged_gate": "warn",
   "flatten_at": null,

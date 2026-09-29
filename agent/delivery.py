@@ -52,16 +52,23 @@ def morning_email_html(plan_date: date, plan: dict, regime_md: str) -> str:
         picks_html = f"<p><b>NO TRADE TODAY.</b> {plan.get('no_trade_reason','')}</p>"
     else:
         rows = []
+        floor = False
         for p in plan.get("picks", []):
             entry_type = (p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open"
+            lane = p.get("exploration_lane")
+            floor = floor or lane == "daily_floor"
+            setup = p.get('setup_type', '') + (f" [{lane.replace('_', ' ')}]" if lane else "")
             rows.append(f"""
             <tr>
-              <td>{p['ticker']}</td><td>{p['direction']}</td><td>{p.get('setup_type','')}</td>
+              <td>{p['ticker']}</td><td>{p['direction']}</td><td>{setup}</td>
               <td>{entry_type} @ {p.get('entry_price')}</td><td>{p.get('stop_price')}</td><td>{p.get('target_price')}</td>
               <td>{p.get('size_r')}R</td><td>{p.get('conviction')}</td>
-              <td>{p.get('thesis_final','')}</td>
+              <td>{p.get('thesis_final') or p.get('thesis', '')}</td>
             </tr>""")
-        picks_html = f"""
+        floor_note = ("<p><b>Daily floor pick:</b> nothing cleared every kill-check, so the desk's "
+                      "best valid candidate goes on at minimum size. The desk trades every session.</p>"
+                      if floor else "")
+        picks_html = floor_note + f"""
         <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:monospace;font-size:13px">
           <tr style="background:#eee"><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th><th>Stop</th>
           <th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr>
