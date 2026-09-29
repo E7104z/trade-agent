@@ -23,7 +23,7 @@ from agent import ledger
 from agent.config import Config
 from agent.delivery import morning_email_html
 from agent.loops.morning import (_apply_daily_floor, _floor_candidates,
-                                 _normalize_floor_picks, _run_daily_floor,
+                                 _normalize_floor_picks, _run_test_lanes,
                                  _validate_plan)
 
 FLOOR = {"enabled": True, "size_r": 0.25, "min_rr": 1.0}
@@ -152,17 +152,17 @@ class _NoNetwork:
         return {}
 
 
-def test_run_daily_floor_prices_from_the_bundle_and_candidate_quotes_only():
+def test_the_floor_prices_from_the_bundle_and_candidate_quotes_only():
     cfg = _cfg()
     cands = {"candidates": [_cand("WEB"), _cand("GAP", target=11.2)]}
     plan = _empty_plan(("WEB", "rr"), ("GAP", "rr"))
     bundle = {"premarket_gappers": [{"symbol": "GAP", "last": 10.0}]}
     # WEB ranks first (higher R:R) and is priced by the candidate-quote pass.
-    notes = _run_daily_floor(plan, cands, cfg, _NoNetwork(), bundle, {"WEB": 10.02}, None, None)
+    notes = _run_test_lanes(plan, cands, cfg, _NoNetwork(), bundle, {"WEB": 10.02}, None, None)
     assert [p["ticker"] for p in plan["picks"]] == ["WEB"], notes
     # Without that quote, WEB is unpriced and dropped; GAP is next.
     plan = _empty_plan(("WEB", "rr"), ("GAP", "rr"))
-    _run_daily_floor(plan, cands, cfg, _NoNetwork(), bundle, {}, None, None)
+    _run_test_lanes(plan, cands, cfg, _NoNetwork(), bundle, {}, None, None)
     assert [p["ticker"] for p in plan["picks"]] == ["GAP"]
 
 

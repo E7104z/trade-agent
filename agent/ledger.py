@@ -1322,11 +1322,29 @@ def equity_curve(con: duckdb.DuckDBPyConnection, account_size: float, dollars_pe
     return curve
 
 
-def current_streak(con: duckdb.DuckDBPyConnection, lane: str | None = None) -> dict:
-    """Consecutive win/loss streak over triggered trades, most recent first."""
+# Lanes that trade a setup to TEST it, not because the desk's judgment chose
+# it: every valid candidate the risk manager rejected (coverage), and the
+# one-a-day minimum (daily_floor). Both go on at minimum size.
+TEST_LANES = ("coverage", "daily_floor")
+
+
+def judgment_clause(alias: str = "p") -> str:
+    """SQL predicate (with leading AND) that leaves out TEST_LANES picks: the
+    streak rule and the drawdown breaker are discipline on the desk's own
+    judgment, and ten minimum-size test trades a day would otherwise fill
+    their windows, the same way runner picks would (see lane_clause)."""
+    lanes = ", ".join(f"'{x}'" for x in TEST_LANES)
+    return f" AND COALESCE({alias}.exploration_lane, '') NOT IN ({lanes})"
+
+
+def current_streak(con: duckdb.DuckDBPyConnection, lane: str | None = None,
+                   judgment_only: bool = False) -> dict:
+    """Consecutive win/loss streak over triggered trades, most recent first.
+    `judgment_only` leaves out TEST_LANES picks (see judgment_clause)."""
+    extra = judgment_clause() if judgment_only else ""
     rows = con.execute(
         f"""SELECT o.r_multiple FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND o.r_multiple IS NOT NULL{lane_clause(lane)}
+           WHERE o.triggered AND o.r_multiple IS NOT NULL{lane_clause(lane)}{extra}
            ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT 30"""
     ).fetchall()
     if not rows:
@@ -1363,13 +1381,15 @@ def overall_stats(con: duckdb.DuckDBPyConnection, lane: str | None = None) -> di
 
 
 def trailing_weighted_r(con: duckdb.DuckDBPyConnection, n: int = 10,
-                        lane: str | None = None) -> dict:
+                        lane: str | None = None, judgment_only: bool = False) -> dict:
     """Sum of size-weighted R over the last n triggered trades — the drawdown
-    circuit breaker's input. Catches slow bleeds that never form a losing streak."""
+    circuit breaker's input. Catches slow bleeds that never form a losing streak.
+    `judgment_only` leaves out TEST_LANES picks (see judgment_clause)."""
+    extra = judgment_clause() if judgment_only else ""
     rows = con.execute(
         f"""SELECT o.r_multiple * COALESCE(p.size_r, 1)
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND o.r_multiple IS NOT NULL{lane_clause(lane)}
+           WHERE o.triggered AND o.r_multiple IS NOT NULL{lane_clause(lane)}{extra}
            ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT ?""",
         [n],
     ).fetchall()

@@ -68,6 +68,11 @@ def morning_email_html(plan_date: date, plan: dict, regime_md: str) -> str:
         floor_note = ("<p><b>Daily floor pick:</b> nothing cleared every kill-check, so the desk's "
                       "best valid candidate goes on at minimum size. The desk trades every session.</p>"
                       if floor else "")
+        n_cov = sum(1 for p in plan.get("picks", []) if p.get("exploration_lane") == "coverage")
+        if n_cov:
+            floor_note += (f"<p><b>{n_cov} coverage trade{'s' if n_cov != 1 else ''}:</b> setups the "
+                           "risk manager rejected, traded at minimum size so every strategy the "
+                           "analyst found is tested today.</p>")
         picks_html = floor_note + f"""
         <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:monospace;font-size:13px">
           <tr style="background:#eee"><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th><th>Stop</th>

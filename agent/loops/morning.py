@@ -530,11 +530,11 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
         conv = p.get("conviction")
         p["conviction"] = int(min(max(int(conv), 1), 5)) if isinstance(conv, (int, float)) else 3
 
-        # The daily floor pick is exempt from the conviction bar below, never
-        # from the size clamps. It is minimum-sized by construction, and a
-        # breaker that could veto it would never reset: a streak or a trailing
-        # drawdown only moves when the desk trades.
-        floor = p.get("exploration_lane") == "daily_floor"
+        # Test-lane picks (coverage, daily floor) are exempt from the conviction
+        # bar below, never from the size clamps. They are minimum-sized by
+        # construction, and a breaker that could veto them would never reset:
+        # a streak or a trailing drawdown only moves when the desk trades.
+        floor = p.get("exploration_lane") in _TEST_LANES
         if losing_streak:
             if p["conviction"] < 4 and not floor:
                 warnings.append(f"{t}: dropped — losing streak >= 3 demands conviction >= 4 "
@@ -647,8 +647,14 @@ _KILL_CHECK_ENUM = {"staleness", "chase", "entry_type", "grounding", "crowding",
 def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
     """Shadow ledger input: every analyst candidate that did NOT survive to the final
     plan, carrying its full plan levels so the evening loop can grade the counterfactual."""
-    taken = {p["ticker"].upper() for p in plan.get("picks", [])}
     rejected_rows = {str(r.get("ticker", "")).upper(): r for r in plan.get("rejected", []) or []}
+    # A test-lane pick the risk manager rejected keeps its shadow row: the
+    # shadow ledger goes on pricing every kill, whatever size the desk then
+    # traded it at. (Minute bars are cached per ticker, so grading it twice
+    # costs no second fetch.)
+    taken = {p["ticker"].upper() for p in plan.get("picks", [])
+             if not (p.get("exploration_lane") in _TEST_LANES
+                     and p["ticker"].upper() in rejected_rows)}
     # Stamped per row rather than filtered out: a rejection from a degraded
     # session is still graded (a counterfactual is still a counterfactual), it
     # just must not be counted as a REASON — see ledger.shadow_summary.
@@ -871,8 +877,8 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config,
 
 
 # How far each kill-check reaches toward "not a valid order" rather than "not
-# a good trade". The daily floor walks rejected candidates softest kill first;
-# _validate_plan, not this table, is what decides validity.
+# a good trade". The coverage lane and the daily floor walk rejected candidates
+# softest kill first; _validate_plan, not this table, decides validity.
 _FLOOR_KILL_RANK = {
     "rr": 0, "conviction": 0,
     "regime_fit": 1, "crowding": 1, "correlation": 1, "stop_quality": 1,
@@ -880,6 +886,11 @@ _FLOOR_KILL_RANK = {
     "event_risk": 2,
     "grounding": 3, "entry_type": 3,
 }
+
+# Lanes that put a candidate the risk manager rejected on the tape anyway, at
+# minimum size, to test the setup (ledger.TEST_LANES). Such a pick keeps its
+# shadow row, so the shadow ledger still prices every kill.
+_TEST_LANES = frozenset({"coverage", "daily_floor"})
 
 
 def _normalize_floor_picks(plan: dict, cfg: Config) -> None:
@@ -904,23 +915,16 @@ def _normalize_floor_picks(plan: dict, cfg: Config) -> None:
         plan.pop("no_trade_reason", None)
 
 
-def _floor_candidates(candidates: dict, plan: dict, cfg: Config) -> list[dict]:
-    """Fallback picks for a plan that review and validation left empty, best
-    first.
+def _ranked_rejects(candidates: dict, plan: dict, lane: str, size: float,
+                    min_rr: float, blocked: frozenset = frozenset()) -> list[dict]:
+    """Analyst candidates not already in the plan, as `lane` picks, best first.
 
-    Every analyst candidate not already in the plan, with complete levels and
-    planned R:R >= `daily_floor.min_rr`, ranked by the risk manager's
-    primary_kill_check (softest first, _FLOOR_KILL_RANK), then conviction,
-    then R:R. Each comes back at the floor size, conviction capped at 3 (the
-    risk manager did not approve it), labeled `daily_floor`. Nothing here
-    decides validity: _run_daily_floor puts each through _validate_plan in
-    this order and keeps the first that survives.
+    Kept: complete levels, planned R:R >= min_rr, and a primary_kill_check not
+    in `blocked`. Ranked by that kill-check (softest first, _FLOOR_KILL_RANK),
+    then conviction, then R:R. Each comes back at `size`, conviction capped at
+    3 (the risk manager did not approve it), labeled `lane`. Nothing here
+    decides validity: the caller puts each through _validate_plan.
     """
-    floor = cfg.get("daily_floor", {}) or {}
-    if not floor.get("enabled"):
-        return []
-    min_rr = float(floor.get("min_rr", 1.0))
-    size = float(floor.get("size_r", cfg.get("min_size_r", 0.25)))
     rejected_rows = {str(r.get("ticker", "")).upper(): r for r in plan.get("rejected", []) or []}
     seen = {str(p.get("ticker", "")).upper() for p in plan.get("picks") or []}
     ranked: list[tuple[tuple, dict]] = []
@@ -941,6 +945,8 @@ def _floor_candidates(candidates: dict, plan: dict, cfg: Config) -> list[dict]:
         if rr < min_rr:
             continue
         kill = str((rejected_rows.get(ticker) or {}).get("primary_kill_check") or "").strip().lower()
+        if kill in blocked:
+            continue
         conv = c.get("conviction")
         conv = int(conv) if isinstance(conv, (int, float)) else 3
         pick = {
@@ -950,7 +956,7 @@ def _floor_candidates(candidates: dict, plan: dict, cfg: Config) -> list[dict]:
             "entry_price": entry,
             "size_r": size,
             "conviction": min(conv, 3),
-            "exploration_lane": "daily_floor",
+            "exploration_lane": lane,
             "exploration_rr": round(rr, 4),
         }
         pick.pop("probe_for", None)
@@ -959,14 +965,109 @@ def _floor_candidates(candidates: dict, plan: dict, cfg: Config) -> list[dict]:
     return [pick for _, pick in ranked]
 
 
+def _floor_candidates(candidates: dict, plan: dict, cfg: Config) -> list[dict]:
+    """Fallback picks for a plan that review, validation and coverage left
+    empty, best first (see _ranked_rejects). Every kill-check is eligible:
+    the validator is what keeps a broken order off the tape."""
+    floor = cfg.get("daily_floor", {}) or {}
+    if not floor.get("enabled"):
+        return []
+    return _ranked_rejects(candidates, plan, "daily_floor",
+                           float(floor.get("size_r", cfg.get("min_size_r", 0.25))),
+                           float(floor.get("min_rr", 1.0)))
+
+
+def _trial_validator(cfg: Config, md: MarketData, bundle: dict, candidates: dict,
+                     cand_quotes: dict[str, float], streak: dict | None,
+                     drawdown: dict | None):
+    """_validate_plan bound to this session, for one-pick trials of analyst
+    candidates (coverage lane, daily floor), so each clears every mechanical
+    gate a regular pick clears.
+
+    Prices come from quotes already fetched this run: no new quote call, and
+    an unpriced candidate stays dropped. ATR and earnings are one batched
+    top-up each over the analyst's whole list, built on first use and shared
+    by every trial after it.
+    """
+    maps: dict = {}
+
+    def validate_one(trial: dict) -> tuple[dict, list[str]]:
+        if not maps:
+            everyone = {"picks": [{"ticker": t} for t in _candidate_tickers(candidates)]}
+            maps["refs"] = {**_reference_prices(bundle), **cand_quotes}
+            maps["atr"] = _grounded_atr(md, everyone, bundle)
+            maps["earnings"] = _grounded_earnings(md, everyone, bundle)
+        return _validate_plan(trial, cfg, streak, drawdown, ref_prices=maps["refs"],
+                              atr_map=maps["atr"], earnings_map=maps["earnings"])
+
+    return validate_one
+
+
+def _admit(plan: dict, picks: list[dict]) -> None:
+    """Add validated test-lane picks to the plan; the day is a trading day."""
+    if plan.get("no_trade_reason"):
+        plan["stand_down_overridden"] = plan["no_trade_reason"]
+    plan["picks"] = (plan.get("picks") or []) + picks
+    plan["total_risk_r"] = round(sum(float(p.get("size_r") or 0) for p in plan["picks"]), 2)
+    plan["no_trade"] = False
+    plan.pop("no_trade_reason", None)
+
+
+def _run_coverage(plan: dict, candidates: dict, cfg: Config, validate_one) -> list[str]:
+    """Every setup the analyst found gets traded today.
+
+    For each setup_type the plan does not already hold, the best-ranked
+    candidate the risk manager rejected goes on at `coverage_lane.size_r`,
+    labeled `coverage`, one per setup, up to `max_picks`. The risk manager's
+    kills decide SIZE and LABEL, not whether a setup is tested. A candidate
+    killed for a broken order (`blocking_kills`: an ungrounded price, a
+    mistyped entry, an unlabeled earnings report today) stays off the tape,
+    and every candidate must still pass validate_one. Coverage picks sit
+    outside max_picks and max_total_open_risk_r, which size the desk's own
+    approvals; the lane has its own cap. Returns log lines.
+    """
+    lane = cfg.get("coverage_lane", {}) or {}
+    if not lane.get("enabled"):
+        return []
+    size = float(lane.get("size_r", cfg.get("min_size_r", 0.25)))
+    blocked = frozenset(str(k).lower() for k in
+                        lane.get("blocking_kills", ("grounding", "entry_type", "event_risk")))
+    max_picks = int(lane.get("max_picks", 12))
+    ranked = _ranked_rejects(candidates, plan, "coverage", size,
+                             float(lane.get("min_rr", 1.0)), blocked)
+
+    def setup_of(p: dict) -> str:
+        return str(p.get("setup_type") or "").strip().lower() or f"?{p.get('ticker')}"
+
+    covered = {setup_of(p) for p in plan.get("picks") or []}
+    admitted: list[dict] = []
+    notes: list[str] = []
+    for pick in ranked:
+        if len(admitted) >= max_picks:
+            break
+        if setup_of(pick) in covered:
+            continue
+        trial, warnings = validate_one({"no_trade": False, "picks": [pick]})
+        notes += [f"coverage {pick['ticker']}: {w}" for w in warnings]
+        if trial.get("picks"):
+            admitted.append(trial["picks"][0])
+            covered.add(setup_of(pick))
+    if admitted:
+        _admit(plan, admitted)
+        plan["coverage_pick_count"] = len(admitted)
+        notes.append(f"COVERAGE: {len(admitted)} setup(s) traded at {size}R: " + ", ".join(
+            f"{p['ticker']} {p.get('setup_type')}" for p in admitted))
+    return notes
+
+
 def _apply_daily_floor(plan: dict, floor_picks: list[dict], validate_one) -> list[str]:
     """Put the first floor pick that survives validation into an empty plan.
 
     `validate_one` is _validate_plan bound to this session's streak, drawdown
-    and price/ATR/earnings maps, so a floor pick clears every mechanical gate
-    a regular pick clears (an ungrounded price or a mistyped entry is still
-    dropped). The plan stays a no-trade day only when no candidate is a valid
-    order at all. Returns log lines.
+    and price/ATR/earnings maps (_trial_validator), so a floor pick clears
+    every mechanical gate a regular pick clears (an ungrounded price or a
+    mistyped entry is still dropped). The plan stays a no-trade day only when
+    no candidate is a valid order at all. Returns log lines.
     """
     if plan.get("picks") or not floor_picks:
         return []
@@ -976,12 +1077,7 @@ def _apply_daily_floor(plan: dict, floor_picks: list[dict], validate_one) -> lis
         notes += [f"floor {pick['ticker']}: {w}" for w in warnings]
         if trial.get("picks"):
             chosen = trial["picks"][0]
-            if plan.get("no_trade_reason"):
-                plan["stand_down_overridden"] = plan["no_trade_reason"]
-            plan["picks"] = [chosen]
-            plan["total_risk_r"] = trial["total_risk_r"]
-            plan["no_trade"] = False
-            plan.pop("no_trade_reason", None)
+            _admit(plan, [chosen])
             notes.append(f"DAILY FLOOR: {chosen['ticker']} admitted at {chosen['size_r']}R "
                          f"(planned R:R {chosen.get('exploration_rr')}) — the desk trades every session")
             return notes
@@ -989,28 +1085,47 @@ def _apply_daily_floor(plan: dict, floor_picks: list[dict], validate_one) -> lis
     return notes
 
 
-def _run_daily_floor(plan: dict, candidates: dict, cfg: Config, md: MarketData,
-                     bundle: dict, cand_quotes: dict[str, float],
-                     streak: dict | None, drawdown: dict | None) -> list[str]:
-    """The desk trades every session: if validation left `plan` empty, walk the
-    rejected candidates softest kill first through the same validator.
+def _coverage_prompt_text(cfg: Config) -> dict[str, str]:
+    """Prompt placeholders that describe the coverage lane, empty when it is
+    off, so neither prompt promises trades the config will not place."""
+    lane = cfg.get("coverage_lane", {}) or {}
+    if not lane.get("enabled"):
+        return {"COVERAGE_ANALYST": "", "COVERAGE_SECTION": ""}
+    size = lane.get("size_r", cfg.get("min_size_r", 0.25))
+    blocking = ", ".join(f"`{k}`" for k in lane.get(
+        "blocking_kills", ("grounding", "entry_type", "event_risk")))
+    return {
+        "COVERAGE_ANALYST": (
+            " The desk trades every candidate that is a valid order: the risk manager's"
+            " approvals at full size, the rest at minimum size as coverage. So every"
+            " setup you find gets tested today."),
+        "COVERAGE_SECTION": (
+            "# COVERAGE (every setup found gets tested)\n\n"
+            f"Every candidate you reject still trades today at {size}R as a **coverage** trade,"
+            " the best one per setup, UNLESS its `primary_kill_check` is one of"
+            f" {blocking}. A broken order stays off the tape. So your kills decide SIZE and"
+            " LABEL, not whether a setup gets tested: approve what deserves real size, and"
+            " reject the rest honestly.\n\n"
+            "That makes `primary_kill_check` matter in both directions. Calling a broken order"
+            " `rr` puts it on the tape. Calling a weak but valid trade `grounding` hides its"
+            " setup from the test. Coverage trades are graded and counted like any trade and"
+            " compared against your approvals, which is how the desk learns whether your"
+            " selection adds value.\n\n"),
+    }
 
-    Prices come from quotes already fetched this run, so there is no new quote
-    call and an unpriced candidate stays dropped. ATR and earnings are one
-    batched top-up each, the same cost as a normal pick day. Both arms call
-    this, so the paired comparison is not confounded by one arm having a
-    floor and the other not.
-    """
-    floor_picks = [] if plan.get("picks") else _floor_candidates(candidates, plan, cfg)
-    if not floor_picks:
-        return []
-    floor_plan = {"picks": floor_picks}
-    refs = {**_reference_prices(bundle), **cand_quotes}
-    atr_map = _grounded_atr(md, floor_plan, bundle)
-    earnings_map = _grounded_earnings(md, floor_plan, bundle)
-    return _apply_daily_floor(plan, floor_picks, lambda trial: _validate_plan(
-        trial, cfg, streak, drawdown, ref_prices=refs,
-        atr_map=atr_map, earnings_map=earnings_map))
+
+def _run_test_lanes(plan: dict, candidates: dict, cfg: Config, md: MarketData,
+                    bundle: dict, cand_quotes: dict[str, float],
+                    streak: dict | None, drawdown: dict | None) -> list[str]:
+    """After validation: coverage (every setup found gets traded), then the
+    daily floor (the day is never empty). Both arms call this, so the paired
+    comparison is not confounded by one arm having the lanes and the other
+    not."""
+    validate_one = _trial_validator(cfg, md, bundle, candidates, cand_quotes, streak, drawdown)
+    notes = _run_coverage(plan, candidates, cfg, validate_one)
+    if not plan.get("picks"):
+        notes += _apply_daily_floor(plan, _floor_candidates(candidates, plan, cfg), validate_one)
+    return notes
 
 
 def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: str,
@@ -1051,10 +1166,10 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
         def _validate_arm_b(p: dict) -> tuple[dict, list[str]]:
             # data_health from the shared bundle but ITS OWN MarketData (md2
             # probes the feed independently) and its own candidate population.
-            # The daily floor applies here on the same terms as arm A.
-            streak = ledger.current_streak(con2, lane="morning")
+            # The coverage lane and daily floor apply here on the same terms as arm A.
+            streak = ledger.current_streak(con2, lane="morning", judgment_only=True)
             drawdown = ledger.trailing_weighted_r(
-                con2, int(cfg.get("drawdown_window", 10)), lane="morning")
+                con2, int(cfg.get("drawdown_window", 10)), lane="morning", judgment_only=True)
             _normalize_floor_picks(p, cfg)
             p, warnings = _validate_plan(
                 p, cfg, streak, drawdown,
@@ -1062,8 +1177,8 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
                 atr_map=_grounded_atr(md2, p, bundle),
                 earnings_map=_grounded_earnings(md2, p, bundle),
                 session_health={**_bundle_health(md2, bundle), **armb_health})
-            warnings += _run_daily_floor(p, armb_cands, cfg, md2, bundle, armb_quotes,
-                                         streak, drawdown)
+            warnings += _run_test_lanes(p, armb_cands, cfg, md2, bundle, armb_quotes,
+                                        streak, drawdown)
             return p, warnings
 
         return paired_mod.run_challenger_arm(
@@ -1151,7 +1266,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         mem = build_morning_memory(con, cfg)
 
         # 4. build prompts
-        analyst_system = load_prompt("morning_analyst", {})
+        analyst_system = load_prompt("morning_analyst", _coverage_prompt_text(cfg))
         user_block = (
             f"# TODAY: {d.isoformat()} ({d.strftime('%A')})\n\n"
             f"## MARKET DATA\n\n{bundle_md}\n\n"
@@ -1197,6 +1312,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             "MAX_TOTAL_RISK_R": str(cfg.get("max_total_open_risk_r", 3.0)),
             "FLOOR_SIZE_R": str((cfg.get("daily_floor", {}) or {}).get(
                 "size_r", cfg.get("min_size_r", 0.25))),
+            **_coverage_prompt_text(cfg),
         })
 
         from . import paired as paired_mod
@@ -1261,9 +1377,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # Lane-scoped: the streak clamp and drawdown breaker are this lane's
         # discipline and read this lane's record only (see ledger.lane_clause
         # -- runner picks would otherwise fill the window).
-        streak = ledger.current_streak(con, lane="morning")
+        # judgment_only: minimum-size test trades (coverage, daily floor) are
+        # not the desk's judgment and would otherwise fill both windows.
+        streak = ledger.current_streak(con, lane="morning", judgment_only=True)
         drawdown = ledger.trailing_weighted_r(con, int(cfg.get("drawdown_window", 10)),
-                                              lane="morning")
+                                              lane="morning", judgment_only=True)
         plan, warnings = _validate_plan(
             plan, cfg, streak, drawdown,
             ref_prices=_grounded_ref_prices(md, plan, bundle, d, seed=cand_quotes),
@@ -1272,8 +1390,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             session_health=session_health)
         plan["validator_drop_count"] = max(
             0, plan["validator_proposed_count"] - len(plan.get("picks", []) or []))
-        warnings += _run_daily_floor(plan, candidates, cfg, md, bundle, cand_quotes,
-                                     streak, drawdown)
+        warnings += _run_test_lanes(plan, candidates, cfg, md, bundle, cand_quotes,
+                                    streak, drawdown)
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = reg.get("tag", "")

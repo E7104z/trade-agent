@@ -57,6 +57,16 @@ _DEFAULTS: dict[str, Any] = {
         "size_r": 0.25,
         "min_rr": 1.0,
     },
+    # Every setup the analyst finds gets traded: each candidate the risk manager
+    # rejected on judgment goes on at minimum size, one per setup, labeled
+    # `coverage`. Only a broken order (blocking_kills) stays off the tape.
+    "coverage_lane": {
+        "enabled": False,
+        "size_r": 0.25,
+        "min_rr": 1.0,
+        "max_picks": 12,
+        "blocking_kills": ["grounding", "entry_type", "event_risk"],
+    },
     "max_entry_ref_distance_pct": 15.0,  # entry further than this from last price = ungrounded, dropped
     "atr_gate": "warn",         # "warn" | "enforce" -- noise-stop gate rollout switch, default warn-only
     "earnings_gate": "warn",    # "warn" | "enforce" -- binary-event gate rollout switch, default warn-only
