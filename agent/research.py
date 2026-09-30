@@ -583,6 +583,17 @@ def validate_predicate(pred: Any, comparisons: Iterable[Any]) -> tuple[dict | No
     return canon, "", ""
 
 
+def realized_r(row: dict) -> float | None:
+    """The realized R every mined statistic uses: planned-risk R (`r_planned`)
+    where the row carries it, else the legacy `r_multiple`. Same measure as
+    ledger's COALESCE(r_planned, r_multiple) and runner_research._planned_r,
+    so discovery, pairs, and forward validation share one denominator."""
+    v = row.get("r_planned")
+    if v is None:
+        v = row.get("r_multiple")
+    return float(v) if v is not None else None
+
+
 def matches(pred: dict, row: dict) -> bool:
     from . import buckets
     return all(buckets.label(pred["lane"], c["dimension"], row) == c["level"]
@@ -630,7 +641,7 @@ def runner_rows(con: Any, on: date | None = None) -> list[dict]:
     rows = [r for r in ledger.runner_candidate_outcomes_since(con, on)
             if r.get("session_date") == on and r.get("scan_version") == scan_v
             and r.get("sim_version") == sim_v and r.get("triggered")
-            and r.get("r_multiple") is not None
+            and realized_r(r) is not None
             and r.get("exit_reason") != "invalid_fill"]
     return runner_research._attach_regime(con, rows)
 
@@ -659,7 +670,7 @@ def discovery_stats(pred: dict, comparisons: Iterable[Any], rows: list[dict]) ->
         if getattr(c, "dimension", None) == pair_dim and getattr(c, "level", None) == pair_level:
             return {"n": int(c.n or 0), "effect": c.mean_r, "q": c.q_value,
                     "note": "pre-registered 2-D pair, screened in this run's batch"}
-    vals = [float(r["r_multiple"]) for r in rows if matches(pred, r)]
+    vals = [realized_r(r) for r in rows if matches(pred, r) and realized_r(r) is not None]
     mean = (sum(vals) / len(vals)) if vals else None
     return {"n": len(vals), "effect": mean, "q": None,
             "note": "2-D cell outside this run's FDR batch — unscreened at discovery"}
@@ -755,7 +766,7 @@ def observe_session(con: Any, d: date) -> dict:
                 key, source = f"outcome:{row.get('pick_id')}", "taken"
             else:
                 key, source = f"runner:{row.get('session_date')}:{row.get('ticker')}", "runner_field"
-            if record_rule_observation(con, rid, d, row["r_multiple"], key, source):
+            if record_rule_observation(con, rid, d, realized_r(row), key, source):
                 out["recorded"] += 1
         # EVIDENCE_BACKLOG_SPEC_v1 Phase 5: the desk's counterfactual streams
         # -- rejected candidates (shadow ledger) and the gap population's
@@ -768,7 +779,7 @@ def observe_session(con: Any, d: date) -> dict:
                 counterfactual = _counterfactual_rows(con, d)
             for key, source, row in counterfactual:
                 if matches(pred, row) and record_rule_observation(
-                        con, rid, d, row["r_multiple"], key, source):
+                        con, rid, d, realized_r(row), key, source):
                     out["counterfactual"] += 1
     return out
 
@@ -940,6 +951,27 @@ _CLAIMS_EDGE = re.compile(
 
 _TIER_ORDER = {"none": 0, "unvalidated": 0, "provisional": 1, "low": 2,
                "moderate": 3, "established": 4}
+
+
+def tier_for_n(n: int | None) -> str:
+    """The confidence tier a REALIZED (triggered) n supports -- the table in
+    the playbook's own Reading section. Picks that never triggered are not n."""
+    n = int(n or 0)
+    if n <= 0:
+        return "none"
+    if n < 8:
+        return "provisional"
+    if n < 20:
+        return "low"
+    if n < 40:
+        return "moderate"
+    return "established"
+
+
+def tier_rank(tier: str | None) -> int:
+    """Order of a stated tier; an unknown word ("high") ranks above every real
+    tier, so it can never pass as a legitimate claim."""
+    return _TIER_ORDER.get(str(tier or "").strip().lower(), 99)
 
 
 def check_playbook_provenance(

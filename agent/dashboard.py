@@ -149,17 +149,31 @@ def playbook_html(markdown: str) -> str:
 
 # ------------------------------------------------------------------ best edge
 
-def best_edge(setup_stats: list[dict]) -> str:
-    """Deterministic "current best edge": the setup with the best realized avg R
-    over at least 3 triggered trades. The LLM never derives this number.
+# The playbook's own reporting floor: an average R is shown only at n >= 8.
+EDGE_FLOOR = 8
 
-    Only a POSITIVE average is an edge. When the best setup still loses money
-    the honest statement is "no positive edge yet" plus the least-bad
-    candidate -- the same rule weekly._check_best_edge enforces on the
-    playbook. Printing "best edge: -0.41R" in green read as a finding."""
+
+def best_edge(setup_stats: list[dict], validated: list[dict] | None = None) -> str:
+    """Deterministic "current best edge" for the dashboard and email.
+
+    Edge is a VALIDATED rule (forward-tested after an FDR-screened
+    discovery), the same definition the playbook's Current Best Edge uses; a
+    validated rule is named with its tag. Without one, the best setup is
+    shown only at n >= 8 triggered trades and labelled descriptive, never as
+    "the setup the desk is most profitable in" -- this used to crown a setup
+    on three trades, while the playbook beside it said NO VALIDATED EDGE YET.
+
+    Only a POSITIVE average is even a candidate. When the best setup still
+    loses money the honest statement is "no positive edge yet" plus the
+    least-bad setup.
+    """
+    if validated:
+        v = validated[0]
+        return (f"[rule: {v['rule_id']}] {str(v.get('statement', ''))[:120]} "
+                f"(validated, forward n={v.get('forward_n')})")
     candidates = [
         s for s in setup_stats
-        if (s.get("triggered") or 0) >= 3 and s.get("avg_r") is not None
+        if (s.get("triggered") or 0) >= EDGE_FLOOR and s.get("avg_r") is not None
     ]
     if not candidates:
         return ""
@@ -167,7 +181,41 @@ def best_edge(setup_stats: list[dict]) -> str:
     line = f"{top['dim']} \u00b7 avg {top['avg_r']}R over {top['triggered']} triggered"
     if top["avg_r"] <= 0:
         return f"No positive edge yet \u2014 least negative: {line}"
-    return line
+    return (f"No validated edge yet \u2014 best setup at n >= {EDGE_FLOOR} (descriptive, "
+            f"not edge until a rule for it is VALIDATED): {line}")
+
+
+def validated_rules(con: Any) -> list[dict]:
+    """VALIDATED rules from the research registry; [] if it cannot be read."""
+    try:
+        from .research import rule_states
+        return [r for r in rule_states(con) if r.get("state") == "VALIDATED"]
+    except Exception:
+        return []
+
+
+def _selection_edge_rows(con: Any) -> list[dict]:
+    """The weekly selection-edge history with rows from an older ablation
+    method withdrawn (numbers blanked), exactly as the playbook renders them."""
+    from .ablation import METHOD_VERSION
+    out = []
+    for r in ledger.selection_edge_history(con, 26):
+        if (r.get("method_version") or 1) < METHOD_VERSION:
+            r = {**r, "edge_r": None, "p_value": None, "pct_random_beaten": None,
+                 "verdict": f"withdrawn: ablation method {r.get('method_version') or 1} "
+                            "(desk arm triggered-only, lanes pooled) - not comparable"}
+        out.append(r)
+    return out
+
+
+def _question_rows(con: Any) -> list[dict]:
+    """Open questions as the playbook states them: progress against the
+    question's own threshold, and a Result only when answerable."""
+    from .question_eval import evaluate
+    return [{"question_id": e["id"], "title": e["title"],
+             "progress": f"{e['progress']}/{e['target']}", "answerable": e["answerable"],
+             "status": e["result"] if e["answerable"] else (e.get("reason") or "below threshold")}
+            for e in evaluate(con)]
 
 
 # ----------------------------------------------------------------- conclusions
@@ -187,11 +235,12 @@ def conclusions_payload(con: Any) -> dict:
 
     setup_stats = _guard(lambda: ledger.stats_by(con, "setup_type"), [])
     return {
-        "best_edge": best_edge(setup_stats),
+        "best_edge": best_edge(setup_stats, _guard(lambda: validated_rules(con), [])),
         "lessons": _guard(lambda: ledger.active_lessons(con, 25), []),
-        "open_questions": _guard(lambda: ledger.question_progress_totals(con), []),
-        "shadow": _guard(lambda: ledger.shadow_summary(con, 20), {}),
+        "open_questions": _guard(lambda: _question_rows(con), []),
+        "shadow": _guard(lambda: ledger.shadow_summary(
+            con, 20, since=ledger.morning_window_start(con, 20)), {}),
         "calibration": _guard(lambda: ledger.calibration_aggregate(con), []),
         "management": _guard(lambda: ledger.management_quality(con), {}),
-        "selection_edge": _guard(lambda: ledger.selection_edge_history(con, 26), []),
+        "selection_edge": _guard(lambda: _selection_edge_rows(con), []),
     }

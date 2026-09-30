@@ -17,7 +17,7 @@ import re
 import subprocess
 from datetime import date
 
-from .. import ledger, open_questions
+from .. import ledger, open_questions, question_eval
 from ..config import BASE_DIR, Config
 from ..failures import classify_failure, format_failure
 from ..delivery import render_dashboard, send_email, weekly_email_html
@@ -119,6 +119,7 @@ def _selection_edge_row(abl: dict, week_ending, sim_version=None) -> dict:
         "sessions": abl.get("sessions"),
         "verdict": verdict,
         "sim_version": sim_version,
+        "method_version": abl.get("method_version"),
     }
 
 
@@ -134,11 +135,12 @@ def _selection_edge_md(history: list[dict]) -> str:
     when it has something to say cannot show a flat trend, and "no edge yet,
     still" is the finding most likely to be quietly dropped.
     """
+    from ..ablation import METHOD_VERSION
     from ..migrations_v13 import MIN_VERDICT_N
 
     header = (
         "## SELECTION EDGE (tracked weekly — reproduce this table verbatim)\n\n"
-        "| Week | n (triggered) | Selection edge (R vs. baseline) | "
+        "| Week | n (taken) | Selection edge (R vs. baseline) | "
         "% of random portfolios beaten | verdict |\n"
         "|-----:|--:|--:|--:|:--|")
     if not history:
@@ -149,6 +151,17 @@ def _selection_edge_md(history: list[dict]) -> str:
     lines = [header]
     for r in history:
         n = r.get("n_triggered") or 0
+        # A row computed by an older ablation method is WITHDRAWN, numbers and
+        # verdict both: method 1 compared triggered-only desk picks (runner
+        # picks included) against a pool padded with 0R non-triggers, which
+        # ranks any losing book near the bottom whatever its selection skill.
+        # Printed beside method-2 rows it would read as a trend.
+        if (r.get("method_version") or 1) < METHOD_VERSION:
+            lines.append(
+                f"| {r['week_ending']} | {n} | — | — | withdrawn: ablation method "
+                f"{r.get('method_version') or 1} (desk arm triggered-only, lanes pooled) — "
+                "not comparable |")
+            continue
         # Below the floor the numeric cells are suppressed too, not just the
         # verdict -- an edge figure printed beside "insufficient data" is the
         # number a reader remembers, exactly the failure the Calibration
@@ -210,8 +223,14 @@ def _counterfactuals_md(mem: dict) -> str:
         sizing_read += f" over n={sizing_n} — below the n>=20 bar this metric is read at"
     elif sizing_n:
         sizing_read += f" over n={sizing_n}"
+        if sc.get("size_r_p") is not None:
+            sizing_read += (f"; corr(size, R) = {sc.get('size_r_corr'):+.2f}, "
+                            f"p={sc.get('size_r_p'):.3f} (the test of that sign)")
     return (
         "## DETERMINISTIC COUNTERFACTUALS (computed by the system, not the LLM)\n\n"
+        "MORNING LANE ONLY. Runner picks share the ledger but are a different "
+        "strategy (EMA9 stop, fixed 2R target, fixed 0.25R size); they are measured "
+        "in the runner block and never pooled here.\n\n"
         f"Every average below carries ITS OWN n. Readings are suppressed below "
         f"n={MIN_INTERPRETABLE_N}: a suppressed metric may be quoted as a number, "
         "but you may not call it positive or negative, may not contrast two "
@@ -481,17 +500,42 @@ def _calibration_md(cal: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _shadow_md(sh: dict) -> str:
-    """The shadow ledger, with the concentration arithmetic already done.
+def shadow_verdict(sh: dict) -> str:
+    """The computed reading of the shadow ledger, one sentence.
 
-    `net forgone R` is a SUM over a fat-tailed quantity, so a handful of rows
-    can author it outright. Reported alone it reads as the average price of the
-    filter, which is what it is not: the filter can be right on the median
-    candidate and still show a large positive net because three rejections ran.
-    So the top rows, the net WITHOUT them, and the median row are computed and
-    printed together — and when the tail and the remainder carry opposite
-    signs, that is stated as the headline finding rather than left for the
-    miner to notice.
+    Based on the one-sample test of mean forgone R per scored rejection -- the
+    question "do the filters, on average, cost or save R?" -- and nothing else.
+    The median, the ex-top-3 net and the win/loss counts are descriptive; none
+    of them may turn a non-significant mean into "the filters are working".
+    """
+    n = sh.get("scored_rows", 0) or 0
+    p = sh.get("p_forgone")
+    mean = sh.get("mean_forgone_r")
+    if n < MIN_INTERPRETABLE_N or mean is None:
+        return (f"NOT INTERPRETABLE: {n} scored rejections (floor {MIN_INTERPRETABLE_N}); "
+                "no statement about what the filters cost or save")
+    if p is None:
+        return "untestable (zero variance in forgone R)"
+    if p < 0.05:
+        return (f"the filters {'COST' if mean > 0 else 'SAVED'} R on average: mean forgone "
+                f"{mean:+.3f}R per scored rejection, t={sh.get('t_forgone')}, p={p:.3f}")
+    return (f"the filters' net effect is NOT distinguishable from zero: mean forgone "
+            f"{mean:+.3f}R per scored rejection, t={sh.get('t_forgone')}, p={p:.3f}. "
+            "Neither 'the filters are working' nor 'the filters are too tight' is supported")
+
+
+def _shadow_md(sh: dict) -> str:
+    """The shadow ledger for the miner, with its verdict computed.
+
+    `net forgone R` is a SUM over a fat-tailed quantity, so the top rows, the
+    net without them and the median are computed beside it. They are
+    DESCRIPTIVE. This block used to call a positive net with a negative
+    ex-tail net a "TAIL ARTIFACT" and conclude that the filters "SAVED money
+    on everything outside the tail" -- which invites exactly the wrong
+    reading in a book whose returns ARE the right tail: a filter that shaves
+    a little off the body while giving up the largest winners has a real
+    cost, not an artifact. The verdict is `shadow_verdict`, a significance
+    test on the mean, and it is the only reading the playbook may state.
     """
     # `reason` is verbatim prose, so this list is one line per rejection, not a
     # grouping. It is kept for detail and capped, because thirty paragraphs of
@@ -512,7 +556,8 @@ def _shadow_md(sh: dict) -> str:
         for c in sh.get("by_category", [])
     ) or "  (no scored rejections yet)"
     top_md = "\n".join(
-        f"  - {t['ticker']} ({t['eod_outcome']}, {t['reason']}): {t['forgone_r']:+.2f}R"
+        f"  - {t['ticker']} ({t['eod_outcome']}, {t.get('category') or '?'}, "
+        f"{t['reason'][:120]}): {t['forgone_r']:+.2f}R"
         for t in sh.get("top_rows", [])
     ) or "  (none)"
 
@@ -520,52 +565,60 @@ def _shadow_md(sh: dict) -> str:
     top3 = sh.get("top3_forgone_r", 0) or 0
     ex3 = sh.get("net_forgone_r_ex_top3", 0) or 0
     scored = sh.get("scored_rows", 0) or 0
+    total = sh.get("total", 0) or 0
     rest_n = max(0, scored - len(sh.get("top_rows", [])))
+    unjudged = (sh.get("scratch", 0) or 0) + (sh.get("unmeasurable", 0) or 0)
 
-    if scored and (net > 0) and (ex3 < 0):
+    if scored and top3 > 0 and abs(top3) >= abs(net):
         concentration = (
-            f"READ THIS BEFORE QUOTING THE NET: the headline {net:+.2f}R is a "
-            f"TAIL ARTIFACT. The top 3 rejections contribute {top3:+.2f}R; the "
-            f"other {rest_n} scored rejections net {ex3:+.2f}R — the filters SAVED "
-            "money on everything outside the tail. A net this shape is evidence "
-            "about three rows, not about the filter's typical cost, and it is not "
-            "grounds for loosening anything."
-        )
-    elif scored and abs(top3) > abs(net):
-        concentration = (
-            f"CONCENTRATION WARNING: the top 3 rejections contribute {top3:+.2f}R "
-            f"against a headline net of {net:+.2f}R, so the remaining {rest_n} "
-            f"scored rejections net {ex3:+.2f}R. The sum is dominated by its tail; "
-            "quote the median and the ex-tail net alongside it or not at all."
+            f"RIGHT-TAIL CONCENTRATION: the 3 largest forgone rows sum to {top3:+.2f}R "
+            f"against a headline net of {net:+.2f}R; the other {rest_n} scored "
+            f"rejections net {ex3:+.2f}R. Both halves are the filters' cost. In a "
+            "trading book the right tail is where the P&L lives -- a filter that "
+            "saves a little on the body and gives up the largest winners has a real "
+            "cost, not an artifact. The ex-tail figure is a sensitivity read; it is "
+            "never evidence that the filters work."
         )
     else:
         concentration = (
             f"Top-3 contribution {top3:+.2f}R; the other {rest_n} scored "
-            f"rejections net {ex3:+.2f}R."
+            f"rejections net {ex3:+.2f}R (descriptive)."
         )
 
     median = sh.get("median_forgone_r")
     median_s = f"{median:+.3f}R" if median is not None else "n/a"
+    since = sh.get("since")
     return (
-        f"- trailing sessions with shadow data: {sh.get('sessions', 0)}\n"
-        f"- total rejected: {sh.get('total', 0)} "
-        f"(would_have_won {sh.get('would_have_won', 0)}, "
+        f"- window: sessions from {since or 'n/a'} (the same window as the "
+        "participation funnel below); sessions with graded rejections: "
+        f"{sh.get('sessions', 0)}\n"
+        f"- total rejected and graded: {total} (would_have_won {sh.get('would_have_won', 0)}, "
         f"would_have_lost {sh.get('would_have_lost', 0)}, "
-        f"scratch {sh.get('scratch', 0)}, unmeasurable {sh.get('unmeasurable', 0)})\n"
+        f"scratch {sh.get('scratch', 0)} [untriggered or |R| < 0.2], "
+        f"unmeasurable {sh.get('unmeasurable', 0)}); {unjudged} of {total} decide "
+        "nothing either way\n"
+        f"- of those, {sh.get('degraded_rows', 0)} are from degraded sessions: graded and "
+        "counted in the totals, excluded from the category table; "
+        f"{sh.get('ungraded_rows', 0)} further rejections in the window are not graded yet\n"
         f"- NET FORGONE R (positive = filters cost us): {net:+.2f} "
         f"across {scored} scored rows\n"
         f"- MEDIAN forgone R per scored rejection: {median_s} "
-        "(the typical rejection, which the sum does not describe)\n"
+        "(the typical rejection; a median of zero means the typical rejection neither "
+        "cost nor saved anything)\n"
         f"- NET EXCLUDING the 3 largest: {ex3:+.2f}R\n"
         f"- {concentration}\n"
+        f"- COMPUTED VERDICT (the only reading you may state): {shadow_verdict(sh)}\n"
         f"- the 3 largest forgone-R rejections (cite THESE rows, not rows carried "
         f"over from an earlier week):\n{top_md}\n"
-        f"- captured R by taken trades over same window: {sh.get('captured_r_window', 0):+.2f}\n"
-        "- forgone R BY REJECTION CATEGORY (the closed enum — this is the "
-        f"aggregate that answers Open Question #5):\n{cats_md}\n"
-        "  (`uncategorized` = rows written before the category column existed; "
-        "they are not evidence that no category applied, only that none was "
-        "recorded. `other` is a real category meaning the kill-check was not R:R.)\n"
+        f"- captured R by the desk's own taken trades, same sessions, same measure "
+        f"(morning lane, unweighted r_multiple): {sh.get('captured_r_window', 0):+.2f} over "
+        f"{sh.get('captured_n', 0)} triggered trades\n"
+        "- forgone R BY REJECTION CATEGORY (the kill-check enum; `multiple` = the risk "
+        "manager said more than one check was binding, so the cost belongs to no single "
+        f"filter):\n{cats_md}\n"
+        "  (`uncategorized` = rows written before any category existed; `other` = no kill "
+        "check was recorded. Neither says WHICH filter cost the R, so neither can answer "
+        "Open Question #5.)\n"
         f"- verbatim kill notes, largest first (detail, not a grouping):\n{reasons_md}"
     )
 
@@ -586,7 +639,8 @@ def _participation_md(pt: dict) -> str:
     pct = lambda v: "n/a" if v is None else f"{v:.1%}"  # noqa: E731
     per = pt.get("candidates_per_triggered_trade")
     lines = [
-        f"- sessions evaluated (degraded sessions excluded): {pt['sessions_evaluated']}",
+        f"- morning lane, sessions from {pt.get('since') or 'n/a'}; sessions evaluated "
+        f"(degraded sessions excluded): {pt['sessions_evaluated']}",
         f"- sessions with at least one triggered trade: {pt['sessions_traded']} "
         f"({pct(pt.get('session_trade_rate'))} of sessions)",
         f"- candidates evaluated: {pt['candidates_evaluated']} "
@@ -627,6 +681,15 @@ def _v3_sections(mem: dict) -> str:
         + ("  << STALE: AUTO-DEMOTE to UNVALIDATED" if r["sessions_since"] >= STALE_SESSIONS else "")
         for r in stale
     ) or "(no rule confirmations recorded yet — rules keep their current last_confirmed values)"
+    # Every dated line of the CURRENT playbook, not only the setups that have
+    # confirmation rows: regime and sizing rules carry dates too, and a decay
+    # check over five rules is not a decay check.
+    dated = mem.get("dated_rule_lines") or []
+    dated_md = "\n".join(
+        f"- [{d['section']}] {d['label']}: last_confirmed {d['last_confirmed']}, "
+        f"{d['sessions_since']} market sessions"
+        + ("  << STALE: the system will mark it auto-demoted" if d["stale"] else "")
+        for d in dated) or "(no dated rule lines in the current playbook)"
 
     qp = mem.get("question_progress", [])
     qp_md = "\n".join(
@@ -635,14 +698,221 @@ def _v3_sections(mem: dict) -> str:
         for q in qp
     ) or "(no open-question events yet — report Progress unchanged, do not silently drop any question)"
 
+    evals = mem.get("question_eval")
+    questions_md = (question_eval.answers_md(evals) if evals is not None
+                    else open_questions.registry_md(qp))
     return (
-        f"## CALIBRATION ROWS (aggregate by stated conviction)\n\n{cal_md}\n\n"
-        f"## SHADOW LEDGER (trailing 20 sessions)\n\n{shadow_md}\n\n"
-        f"## PARTICIPATION FUNNEL (trailing 20 non-degraded sessions)\n\n{participation_md}\n\n"
+        f"## CALIBRATION ROWS (aggregate by stated conviction, MORNING lane)\n\n{cal_md}\n\n"
+        f"## SHADOW LEDGER (the trailing 20 non-degraded sessions)\n\n{shadow_md}\n\n"
+        f"## PARTICIPATION FUNNEL (the same sessions, MORNING lane)\n\n{participation_md}\n\n"
         f"## RULE CONFIRMATIONS / STALENESS (decay threshold: {STALE_SESSIONS} sessions)\n\n{stale_md}\n\n"
-        f"{open_questions.registry_md(qp)}\n\n"
-        f"## OPEN QUESTION PROGRESS EVENTS THIS LEDGER (raw event notes)\n\n{qp_md}"
+        f"### Every dated rule line in the current playbook (market sessions since last_confirmed)\n\n{dated_md}\n\n"
+        f"{questions_md}\n\n"
+        f"## OPEN QUESTION PROGRESS EVENTS THIS LEDGER (raw event notes, MORNING lane)\n\n{qp_md}"
     )
+
+
+# --------------------------------------------------------------------------
+# System-rendered playbook sections (2026-09-29 audit)
+#
+# Every number in these sections is computed; the miner used to reproduce them
+# and, in reproducing them, added readings the numbers did not support ("the
+# filters are working", "selecting appears to make outcomes worse", a
+# conviction contrast at t ~ 0.9). They are now rendered here and placed by
+# playbook_enforcement.enforce(computed=...). Plain lines and tables, not rule
+# bullets: they are measurements, never instructions.
+# --------------------------------------------------------------------------
+
+def _fmt_r(v) -> str:
+    return "—" if v is None else f"{v:+.2f}R"
+
+
+def _calibration_section(cal: list[dict], evals: list[dict]) -> list[str]:
+    by_c = {int(c["conviction"]): c for c in cal if c.get("conviction") is not None}
+    lines = ["",
+             "> System-rendered from the calibration rows: MORNING lane only (runner-lane",
+             "> rows excluded), all sessions -- not the funnel's trailing window. WR/avgR",
+             "> are shown only at n >= 8; the verdict is Open Question 3's computed test,",
+             "> not a reading of this table.",
+             "",
+             "| Conviction | n | realized WR | realized avgR | verdict |",
+             "|-----------:|--:|:-----------:|:-------------:|:--------|"]
+    for conv in (5, 4, 3, 2, 1):
+        c = by_c.get(conv)
+        if not c or c.get("suppressed") or not c.get("n"):
+            lines.append(f"| {conv} | {c['n'] if c else 0} | — | — | insufficient data |")
+        else:
+            wr = "—" if c.get("win_rate") is None else f"{c['win_rate']:.1%}"
+            lines.append(f"| {conv} | {c['n']} | {wr} | {_fmt_r(c.get('avg_r'))} | "
+                         "n >= 8, descriptive |")
+    q3 = next((e for e in evals if e["id"] == 3), None)
+    verdict = ("not computed" if q3 is None else
+               (q3["result"] if q3["answerable"] else f"not yet computable — {q3.get('reason')}"))
+    lines += ["", f"Calibration verdict (computed, Q3): {verdict}.", ""]
+    return lines
+
+
+def _selection_edge_section(history: list[dict]) -> list[str]:
+    from ..ablation import METHOD_VERSION
+    body = _selection_edge_md(history).splitlines()[1:]   # drop the prompt heading
+    return (["",
+             f"> System-rendered from the selection ablation (method {METHOD_VERSION}): the",
+             "> desk's measurable taken picks (a pick that never filled counts 0R) against",
+             "> random draws of the same number from the same session's candidates. Morning",
+             "> lane only. Rows from an older method are withdrawn, not compared."]
+            + body + [""])
+
+
+def _runner_section(research_block: dict, states: list[dict]) -> list[str]:
+    from ..runner_research import MIN_CONTESTED_SESSIONS
+    from ..runner_selection import NO_RUNNER_RULES
+    validated = [s for s in states if s.get("state") == "VALIDATED"
+                 and (s.get("lane") == "runner" or "runner" in " ".join(s.get("dimensions") or []))]
+    lines = [""]
+    if validated:
+        lines.append("Validated runner rules (forward-tested after quarantine):")
+        lines.append("")
+        for s in validated:
+            lines.append(f"- [rule: {s['rule_id']}] {s['statement'][:200]} "
+                         f"(forward n={s['forward_n']})")
+    else:
+        lines.append(f"**{NO_RUNNER_RULES}**")
+    lines += ["",
+              "> System-rendered from the research layer. Measurements, not rules: nothing",
+              "> below tells the selector to prefer or avoid any candidate.",
+              ""]
+    setup = research_block.get("runner_setup_edge") or {}
+    if setup.get("n"):
+        p = setup.get("p_value")
+        reading = ("UNDERPOWERED" if setup.get("underpowered") else
+                   "not distinguishable from zero" if p is None or p >= 0.05 else
+                   ("negative expectancy as detected and simulated" if (setup.get("mean_r") or 0) < 0
+                    else "positive expectancy as detected and simulated"))
+        p_s = "n/a" if p is None else ("<0.001" if p < 0.001 else f"{p:.3f}")
+        lines.append(f"Setup edge (every triggered candidate, current scan/sim version, vs 0): "
+                     f"n={setup['n']}, mean R {_fmt_r(setup.get('mean_r'))}, p={p_s} -> {reading}.  ")
+    else:
+        lines.append("Setup edge: no triggered candidates under the current scan/sim version.  ")
+    sel = research_block.get("runner_selection_edge") or {}
+    lines.append(f"Selection edge (selected vs unselected, contested sessions only): "
+                 f"{sel.get('n_selected', 0)} selected / {sel.get('n_unselected', 0)} unselected "
+                 f"across {sel.get('sessions_contested', 0)} session(s) -> "
+                 f"{sel.get('verdict', 'not computed')}.  ")
+    rnd = research_block.get("runner_random") or {}
+    if rnd.get("sessions"):
+        rverdict = (f"NO VERDICT (under {MIN_CONTESTED_SESSIONS} contested sessions)"
+                    if rnd["sessions"] < MIN_CONTESTED_SESSIONS else
+                    "beating random" if rnd["percentile"] >= 95 else
+                    "WORSE than random" if rnd["percentile"] <= 5 else
+                    "indistinguishable from random")
+        lines.append(f"Selector vs random draws from its own pool: {rverdict} "
+                     f"({rnd['sessions']} contested session(s)).  ")
+    comps = research_block.get("runner_comps") or []
+    survivors = [c for c in comps if c.significant]
+    degenerate = sorted({f"{c.dimension}={c.level}" for c in comps if c.test == "degenerate"})
+    lines.append("Dimension cells whose mean differs from 0 after FDR (in a losing lane a big "
+                 "cell can pass by being the lane; it is not a separating attribute): "
+                 + ("; ".join(f"{c.dimension}={c.level} n={c.n} mean {_fmt_r(c.mean_r)} "
+                              f"q={c.q_value:.3f}" for c in survivors[:8]) or "none") + ".  ")
+    if degenerate:
+        lines.append("Not tested (one cell holds >= 90% of its dimension, so it restates the "
+                     "lane mean): " + ", ".join(degenerate) + ".")
+    lines.append("")
+    return lines
+
+
+def _shadow_section(sh: dict, pt: dict) -> list[str]:
+    if not sh.get("total"):
+        return ["", "No graded rejections in the window yet.", ""]
+    top = "; ".join(f"{t['ticker']} {t['forgone_r']:+.2f}R ({t.get('category') or '?'})"
+                    for t in sh.get("top_rows") or []) or "none"
+    cats = "; ".join(f"{c['category']} n={c['n']}, net {c['net_forgone_r']:+.2f}R"
+                     for c in sh.get("by_category") or []) or "none"
+    median = sh.get("median_forgone_r")
+    return [
+        "",
+        f"> System-rendered from the shadow ledger: sessions from {sh.get('since')}, the same",
+        "> window as the Participation Funnel. Rejections are priced by the same simulator",
+        "> as taken trades, with perfect fills; shadow data never loosens a filter on its own.",
+        "",
+        f"- Rejected and graded: {sh['total']} (would have won {sh['would_have_won']}, would "
+        f"have lost {sh['would_have_lost']}, scratch {sh['scratch']} [untriggered or |R| < 0.2], "
+        f"unmeasurable {sh['unmeasurable']}); {sh['scratch'] + sh['unmeasurable']} of "
+        f"{sh['total']} decide nothing either way. {sh.get('degraded_rows', 0)} from degraded "
+        f"sessions (graded, not in the category split); {sh.get('ungraded_rows', 0)} not yet graded.",
+        f"- Net forgone R: {sh['net_forgone_r']:+.2f} over {sh['scored_rows']} scored rows "
+        "(positive = the filters cost R). Median per rejection: "
+        f"{'n/a' if median is None else f'{median:+.3f}R'}.",
+        f"- The 3 largest forgone rows sum to {sh['top3_forgone_r']:+.2f}R ({top}); the rest net "
+        f"{sh['net_forgone_r_ex_top3']:+.2f}R. The tail is part of the filters' cost, not an artifact.",
+        f"- **Verdict (computed):** {shadow_verdict(sh)}.",
+        f"- The desk's own taken trades over the same sessions, same measure: "
+        f"{sh.get('captured_r_window', 0):+.2f}R over {sh.get('captured_n', 0)} triggered trades.",
+        f"- By kill check (`multiple` = more than one check was binding; `other`/`uncategorized` "
+        f"= none recorded): {cats}.",
+        "",
+    ]
+
+
+def _participation_section(pt: dict, sh: dict) -> list[str]:
+    if not pt or not pt.get("sessions_evaluated"):
+        return ["", "No non-degraded sessions in the window yet.", ""]
+    pct = lambda v: "n/a" if v is None else f"{v:.1%}"  # noqa: E731
+    per = pt.get("candidates_per_triggered_trade")
+    lines = [
+        "",
+        f"> System-rendered. Morning lane, the trailing {pt['sessions_evaluated']} non-degraded "
+        f"sessions (from {pt.get('since')}) — the Shadow Ledger Summary's window.",
+        "",
+        f"- Sessions: {pt['sessions_evaluated']} evaluated, {pt['sessions_traded']} with at "
+        f"least one triggered trade ({pct(pt.get('session_trade_rate'))}).",
+        f"- Candidates evaluated: {pt['candidates_evaluated']} = {pt['picks_taken']} taken + "
+        f"{pt['rejections']} rejected; take rate {pct(pt.get('take_rate'))}; trigger rate "
+        f"(triggered / taken) {pct(pt.get('trigger_rate'))} ({pt['picks_triggered']} triggered); "
+        f"{per if per is not None else 'n/a'} candidates per triggered trade.",
+    ]
+    if sh.get("since") == pt.get("since") and sh.get("total") is not None:
+        expect = sh["total"] - sh.get("degraded_rows", 0) + sh.get("ungraded_rows", 0)
+        lines.append(
+            f"- Reconciliation: {pt['rejections']} rejected here = {sh['total']} graded in the "
+            f"Shadow Ledger Summary - {sh.get('degraded_rows', 0)} from degraded sessions + "
+            f"{sh.get('ungraded_rows', 0)} not yet graded"
+            + ("." if expect == pt["rejections"] else f" (= {expect}: MISMATCH, investigate)."))
+    lines.append("")
+    return lines
+
+
+def _system_sections(mem: dict, research_block: dict, evals: list[dict],
+                     se_history: list[dict]) -> dict[str, list[str]]:
+    """Body lines for every system-rendered section, keyed as
+    playbook_enforcement.SYSTEM_SECTIONS expects."""
+    sh = mem.get("shadow") or {}
+    pt = mem.get("participation") or {}
+    return {
+        "calibration": _calibration_section(mem.get("calibration") or [], evals),
+        "selection edge": _selection_edge_section(se_history),
+        "runner lane": _runner_section(research_block, list(research_block.get("states") or [])),
+        "shadow ledger": _shadow_section(sh, pt),
+        "participation funnel": _participation_section(pt, sh),
+        "open questions": question_eval.playbook_md(evals),
+    }
+
+
+def _checked_findings(findings: list[dict], evals: list[dict]) -> tuple[list[dict], int]:
+    """The miner's key findings for the email and log, minus any that quote a
+    small-n WR/avgR or state a finding for a question that is not answerable."""
+    unanswerable = {e["id"] for e in evals if not e["answerable"]}
+    kept, dropped = [], 0
+    for f in findings or []:
+        text = str(f.get("finding", ""))
+        bad_q = any(int(m) in unanswerable for m in re.findall(r"\bQ(\d{1,2})\b", text))
+        bad_n = any("[missing:" not in m for m in _check_wr_suppression(
+            text + (f" n={f.get('n')}" if f.get("n") is not None else "")))
+        if bad_q or bad_n:
+            dropped += 1
+        else:
+            kept.append(f)
+    return kept, dropped
 
 
 # A markdown row from the Calibration table: | 4 | 1 | 0% | -0.05 | ... |
@@ -966,8 +1236,23 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             ledger.save_selection_edge(con, se_row)
         except Exception as e:
             log("weekly", f"WARN could not record selection edge: {e}")
-        selection_edge_md = _selection_edge_md(
-            ledger.selection_edge_history(con))
+        se_history = ledger.selection_edge_history(con)
+        selection_edge_md = _selection_edge_md(se_history)
+
+        # Computed here, once, and used for both the miner's input and the
+        # sections the system renders into the playbook.
+        try:
+            evals = question_eval.evaluate(con)
+        except Exception as e:  # noqa: BLE001 -- measurement never breaks the loop
+            log("weekly", f"WARN open-question evaluation failed: {e}")
+            evals = []
+        mem["question_eval"] = evals
+        from .. import playbook_enforcement
+        try:
+            mem["dated_rule_lines"] = playbook_enforcement.dated_rule_lines(mem["playbook"], d)
+        except Exception as e:  # noqa: BLE001
+            log("weekly", f"WARN dated-rule scan failed: {e}")
+            mem["dated_rule_lines"] = []
 
         log("weekly", f"Mining ledger: {overall['picks_graded']} graded picks, "
                       f"{len(mem['lessons'])} lessons on file, playbook v{mem['playbook_version']}")
@@ -1117,15 +1402,28 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             # re-checked, and only a document with zero blocking violations is
             # written. The Runner Lane -- read by the intraday selector the
             # same day -- falls back to an explicit no-rules statement.
-            from .. import playbook_enforcement
             stale_rules = [r for r in mem.get("rule_staleness", []) or []
                            if (r.get("sessions_since") or 0) >= STALE_SESSIONS]
+            computed = None
+            try:
+                computed = _system_sections(mem, research_block, evals, se_history)
+            except Exception as e:  # noqa: BLE001 -- fall back to checking the miner's text
+                log("weekly", f"WARN system-rendered sections failed ({e}); the miner's "
+                              "versions are checked instead")
             enf = playbook_enforcement.enforce(
-                new_pb, research_block["states"], research_block, stale_rules)
+                new_pb, research_block["states"], research_block, stale_rules,
+                as_of=d, computed=computed,
+                regimes=[r.get("tag") for r in mem.get("regimes") or []],
+                changelog=mined.get("changelog", "") or "")
             for v in enf.violations:
                 label = playbook_enforcement.LOG_LABEL.get(v.checker, v.checker)
                 log("weekly", f"WARN {label}: [{v.severity}/{v.action}] {v.message[:200]}")
             violation_rows = [v.to_row() for v in enf.violations]
+            # The changelog that reaches the document and the email is the
+            # checked one: the miner's raw text restated findings the body
+            # withheld and described sections the system had replaced.
+            mined = {**mined, "changelog": enf.changelog if enf.changelog is not None
+                     else mined.get("changelog", "")}
             if enf.markdown is not None:
                 version = write_playbook(enf.markdown, mined.get("changelog", ""), con)
                 log("weekly", f"Playbook rewritten -> v{version} (old version archived; "
@@ -1153,7 +1451,12 @@ def run(cfg: Config, run_date: date | None = None) -> None:
                 log("weekly", "WARN current_best_edge names a negative R - "
                               "a negative mean R is not an edge; the playbook "
                               "check above will have flagged the same content")
-        for f in mined.get("key_findings", []) or []:
+        findings, n_dropped = _checked_findings(mined.get("key_findings", []) or [], evals)
+        mined = {**mined, "key_findings": findings}
+        if n_dropped:
+            log("weekly", f"  {n_dropped} key finding(s) dropped: small-n WR/avgR or a "
+                          "finding for an open question that is not answerable")
+        for f in findings:
             log("weekly", f"  Finding: {f.get('finding','')} (n={f.get('n','?')}, {f.get('strength','')})")
         for ex in mined.get("experiments", []) or []:
             log("weekly", f"  Experiment: {ex}")

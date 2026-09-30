@@ -502,7 +502,7 @@ function equityChart(curve){
     <div class="eq-meta"><span>${esc(first.date)}</span><span class="eq-last" style="color:${c}">${fmtMoney(last.equity)}</span><span>${esc(last.date)}</span></div>
   </div>`;
 }
-const NO_EDGE = /^No positive edge/;
+const NO_EDGE = /^No (positive|validated) edge/;
 const HEALTH_LABEL = {ok:'HEALTHY', warn:'NEEDS ATTENTION', bad:'STAGE FAILING', unknown:'UNKNOWN'};
 const HEALTH_PILL = {ok:'ok', warn:'warn', bad:'bad'};
 
@@ -842,7 +842,7 @@ function renderResearch(){
   if(!state){ b.innerHTML = empty('Loading…'); return; }
   const cc = state.conclusions || {};
 
-  let bestEdgeHtml = '<div class="empty">Not enough triggered trades yet to declare a current best edge (needs ≥3 per setup).</div>';
+  let bestEdgeHtml = '<div class="empty">No validated edge yet, and no setup has the 8 triggered trades a descriptive average needs.</div>';
   if(cc.best_edge) bestEdgeHtml = `<p>${esc(cc.best_edge)}</p>`;
 
   let lessonsHtml = '<div class="empty">No active lessons yet.</div>';
@@ -854,9 +854,9 @@ function renderResearch(){
 
   let questionsHtml = '<div class="empty">No open-question progress recorded yet.</div>';
   if((cc.open_questions||[]).length){
-    questionsHtml = `<div class="table-wrap"><table><thead><tr><th>Question</th><th>Progress</th><th>Events</th><th>Last</th><th>Recent notes</th></tr></thead><tbody>` +
-      cc.open_questions.map(q=>`<tr><td>Q${q.question_id}</td><td>${q.total}</td><td>${q.events}</td>
-        <td>${esc(q.last_event||'')}</td><td>${esc((q.recent_notes||[]).join(' · '))}</td></tr>`).join('') + '</tbody></table></div>';
+    questionsHtml = `<div class="table-wrap"><table><thead><tr><th>Question</th><th>Progress</th><th>Answerable</th><th>Result / what is missing</th></tr></thead><tbody>` +
+      cc.open_questions.map(q=>`<tr><td title="${esc(q.title||'')}">Q${q.question_id}</td><td>${esc(q.progress||'')}</td>
+        <td>${q.answerable ? 'yes' : 'no'}</td><td>${esc(q.status||'')}</td></tr>`).join('') + '</tbody></table></div>';
   }
 
   let calHtml = '<div class="empty">No calibration data yet.</div>';
@@ -892,12 +892,12 @@ function renderResearch(){
   }
 
   b.innerHTML = `
-    <div class="card best-edge ${NO_EDGE.test(cc.best_edge || '') ? 'none' : ''}"><div class="card-head"><h2>Current best edge</h2><span class="card-sub">the setup the desk is most profitable in right now</span></div>${bestEdgeHtml}</div>
+    <div class="card best-edge ${NO_EDGE.test(cc.best_edge || '') ? 'none' : ''}"><div class="card-head"><h2>Current best edge</h2><span class="card-sub">a VALIDATED rule; otherwise the best setup at n &ge; 8, descriptive only</span></div>${bestEdgeHtml}</div>
     <div class="card"><div class="card-head"><h2>Active lessons</h2></div>${lessonsHtml}</div>
     <div class="card"><div class="card-head"><h2>Open questions</h2></div>${questionsHtml}</div>
     <div class="card"><div class="card-head"><h2>Calibration</h2><span class="card-sub">does stated conviction track realized R?</span></div>${calHtml}</div>
     <div class="card"><div class="card-head"><h2>Management quality</h2><span class="card-sub">stop/target machinery vs hold-to-close</span></div>${mgHtml}</div>
-    <div class="card"><div class="card-head"><h2>Runner selection edge</h2><span class="card-sub">weekly, FDR-corrected</span></div>${seHtml}</div>
+    <div class="card"><div class="card-head"><h2>Selection edge</h2><span class="card-sub">morning desk vs random draws from its own candidates, weekly</span></div>${seHtml}</div>
   `;
 }
 function renderRuns(){

@@ -23,7 +23,8 @@ from agent.ablation import ablation_md, candidate_pool, random_pick_ablation
 def con():
     c = duckdb.connect(":memory:")
     c.execute("""CREATE TABLE picks (
-        pick_id INTEGER, plan_date DATE, ticker VARCHAR, size_r DOUBLE)""")
+        pick_id INTEGER, plan_date DATE, ticker VARCHAR, size_r DOUBLE,
+        setup_type VARCHAR)""")
     c.execute("""CREATE TABLE outcomes (
         pick_id INTEGER, triggered BOOLEAN, r_multiple DOUBLE,
         exit_reason VARCHAR, sim_version INTEGER)""")
@@ -41,12 +42,12 @@ _PID = [0]
 _RID = [0]
 
 
-def _take(con, d, ticker, r, sim=2, exit_reason="eod"):
+def _take(con, d, ticker, r, sim=2, exit_reason="eod", setup="gap_go", triggered=True):
     _PID[0] += 1
-    con.execute("INSERT INTO picks (pick_id, plan_date, ticker, size_r) VALUES (?,?,?,1.0)",
-                [_PID[0], d, ticker])
+    con.execute("INSERT INTO picks (pick_id, plan_date, ticker, size_r, setup_type) "
+                "VALUES (?,?,?,1.0,?)", [_PID[0], d, ticker, setup])
     con.execute("""INSERT INTO outcomes (pick_id, triggered, r_multiple, exit_reason, sim_version)
-                   VALUES (?, TRUE, ?, ?, ?)""", [_PID[0], r, exit_reason, sim])
+                   VALUES (?, ?, ?, ?, ?)""", [_PID[0], triggered, r, exit_reason, sim])
 
 
 def _reject(con, d, ticker, forgone, outcome="would_have_won", sim=2):
@@ -111,6 +112,43 @@ def test_pool_session_window_keeps_the_most_recent(con):
         _take(con, d, f"T{i}", 1.0)
         _reject(con, d, f"R{i}", 0.5)
     assert sorted(candidate_pool(con, sessions=2)) == ["2026-08-26", "2026-08-27"]
+
+
+def test_an_untriggered_taken_pick_is_a_measured_zero_like_an_untriggered_rejection(con):
+    """Method 1 kept only the desk's TRIGGERED picks while the random arm drew
+    from rejections worth 0R when they never filled: a losing book ranked
+    against zero-diluted portfolios lands in the bottom tail by construction."""
+    d = date(2026, 8, 27)
+    _take(con, d, "FILLED", -1.0)
+    _take(con, d, "NOFILL", None, exit_reason="no_trigger", triggered=False)
+    _take(con, d, "NODATA", None, exit_reason="no_data", triggered=False)
+    taken = candidate_pool(con)[str(d)]["taken"]
+    assert sorted((c["ticker"], c["r_multiple"]) for c in taken) == [
+        ("FILLED", -1.0), ("NOFILL", 0.0)]
+
+
+def test_runner_picks_are_not_the_risk_managers_selection(con):
+    d = date(2026, 8, 27)
+    _take(con, d, "MORN", 1.0)
+    _take(con, d, "RUNR", -1.0, setup="dto_runner")
+    _reject(con, d, "REJ", 0.5)
+    assert [c["ticker"] for c in candidate_pool(con)[str(d)]["taken"]] == ["MORN"]
+
+
+def test_a_desk_no_better_than_its_pool_is_not_ranked_in_the_bottom_tail(con):
+    """The v9 shape: every candidate, taken or rejected, loses about 1R when it
+    fills and about half of each group never fills. Selection is exactly
+    random, so the desk must sit mid-distribution -- method 1 put it near 0%."""
+    for i in range(20):
+        d = date(2026, 8, 1 + i)
+        _take(con, d, f"T{i}", -1.0)
+        _take(con, d, f"U{i}", None, exit_reason="no_trigger", triggered=False)
+        _reject(con, d, f"R{i}", -1.0, outcome="would_have_lost")
+        _reject(con, d, f"S{i}", 0.0, outcome="scratch")
+    res = random_pick_ablation(con, draws=2000)
+    assert res["method_version"] == 2
+    assert res["picks"] == 40 and res["triggered"] == 20
+    assert 20.0 <= res["percentile"] <= 80.0
 
 
 # ---------------------------------------------------------------- directional

@@ -483,9 +483,9 @@ def render_dashboard(con: duckdb.DuckDBPyConnection, cfg: Config, plan_date: dat
     calibration = ledger.calibration_aggregate(con)
     management = ledger.management_quality(con)
 
-    # Deterministic "current best edge": the setup with the best realized avg R
-    # over at least 3 triggered trades. The LLM never derives this number.
-    best_edge = dashboard.best_edge(setup_stats)
+    # Deterministic "current best edge": a VALIDATED rule, else the best setup
+    # at n >= 8, labelled descriptive. The LLM never derives this number.
+    best_edge = dashboard.best_edge(setup_stats, dashboard.validated_rules(con))
 
     setup_rows = "".join(
         f"<tr><td>{s['dim']}</td><td>{s['n']}</td><td>{s['triggered']}</td>"

@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 __all__ = [
     "MORNING_PICK_DIMS", "MORNING_OUTCOME_DIMS", "MORNING_DIMS", "RUNNER_DIMS",
-    "LANES", "sql", "label", "runner_label", "dimensions",
+    "LANES", "sql", "label", "runner_label", "dimensions", "RUNNER_STOP_ATR_COARSE",
 ]
 
 
@@ -183,8 +183,12 @@ def runner_label(dimension: str, row: dict) -> str:
         return _b(row.get("detection_minutes"), [600, 630, 660, 720],
                   ["pre-10:00", "10:00-10:30", "10:30-11:00", "11:00-12:00", "12:00+"])
     if dimension == "runner_rvol_bucket":
-        return _b(row.get("rvol"), [2.0, 3.0, 5.0],
-                  ["1.5-2", "2-3", "3-5", "5+"])
+        # The lowest label used to be "1.5-2", written when the scan gated on
+        # RVOL >= 1.5. The gate has been off (min_rvol 0) since the RVOL scale
+        # was corrected, so every candidate under 2.0x -- about nine in ten,
+        # median ~0.5x -- was filed as "1.5-2": one label over the whole lane.
+        return _b(row.get("rvol"), [0.5, 1.0, 1.5, 2.0, 3.0, 5.0],
+                  ["<0.5", "0.5-1", "1-1.5", "1.5-2", "2-3", "3-5", "5+"])
     if dimension == "runner_price_tier":
         return row.get("price_tier") or "?"
     if dimension == "runner_vwap_bucket":
@@ -204,16 +208,24 @@ def runner_label(dimension: str, row: dict) -> str:
         return _b(row.get("float_shares"), [20, 50, 100],
                   ["<20M", "20-50M", "50-100M", "100M+"])
     if dimension == "runner_stop_atr_bucket":
-        # Same edges as the morning lane's stop_atr_bucket (Q9) so the runner
-        # pool and the morning picks are bucketed identically and can be read
-        # side by side.
-        return _b(row.get("stop_dist_atr"), [0.5, 1.0, 2.0],
-                  ["<0.5", "0.5-1", "1-2", ">2"])
+        # The runner stop is the 5-minute 9 EMA measured against a DAILY
+        # ATR14, so it sits under 0.5 ATR by construction (median stop ~0.8%
+        # of price): with the morning lane's edges ~99% of candidates shared
+        # one cell and the dimension compared nothing. The morning band
+        # "<0.5" is split into three; the wider labels are unchanged, and
+        # RUNNER_STOP_ATR_COARSE maps the split back for cross-lane reads.
+        return _b(row.get("stop_dist_atr"), [0.15, 0.3, 0.5, 1.0, 2.0],
+                  ["<0.15", "0.15-0.3", "0.3-0.5", "0.5-1", "1-2", ">2"])
     if dimension == "runner_trend_side_200d":
         return row.get("trend_side_200d") or "?"
     if dimension == "runner_regime":
         return row.get("regime_tag") or "?"
     return "?"
+
+
+# Runner stop-ATR labels that subdivide the morning lane's "<0.5" cell, mapped
+# back to it so a morning finding can still be read in the runner field.
+RUNNER_STOP_ATR_COARSE = {"<0.15": "<0.5", "0.15-0.3": "<0.5", "0.3-0.5": "<0.5"}
 
 
 # ------------------------------------------------------------------- unified

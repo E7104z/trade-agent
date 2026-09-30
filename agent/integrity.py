@@ -369,6 +369,8 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         "paired": paired_cmp,
         "runner_setup_edge": runner_setup,
         "runner_selection_edge": runner_selection_edge,
+        "runner_random": runner_random,
+        "runner_comps": runner_comps,
     }
 
 

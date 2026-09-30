@@ -78,28 +78,38 @@ def test_playbook_bullets_strips_bold_and_leading_bullet():
 # ------------------------------------------------------------- best_edge
 
 def test_best_edge_empty_when_nothing_triggers_enough():
+    """The playbook's own floor: no average R below n = 8. The card used to
+    crown a setup on three trades."""
     assert dashboard.best_edge([]) == ""
-    assert dashboard.best_edge([{"dim": "x", "triggered": 2, "avg_r": 1.0}]) == ""
+    assert dashboard.best_edge([{"dim": "x", "triggered": 7, "avg_r": 1.0}]) == ""
 
 
 def test_best_edge_ignores_none_avg_r():
     stats = [
-        {"dim": "alpha", "triggered": 5, "avg_r": None},
-        {"dim": "bravo", "triggered": 3, "avg_r": 0.5},
+        {"dim": "alpha", "triggered": 12, "avg_r": None},
+        {"dim": "bravo", "triggered": 9, "avg_r": 0.5},
     ]
     out = dashboard.best_edge(stats)
-    assert out == "bravo · avg 0.5R over 3 triggered"
+    assert out.startswith("No validated edge yet")
+    assert "bravo · avg 0.5R over 9 triggered" in out
 
 
 def test_best_edge_picks_highest_avg_r_among_qualified():
     stats = [
-        {"dim": "low", "triggered": 3, "avg_r": 0.2},
-        {"dim": "high", "triggered": 4, "avg_r": 2.5},
-        {"dim": "short", "triggered": 2, "avg_r": 99.0},  # not qualified (<3)
+        {"dim": "low", "triggered": 8, "avg_r": 0.2},
+        {"dim": "high", "triggered": 10, "avg_r": 2.5},
+        {"dim": "short", "triggered": 3, "avg_r": 99.0},  # not qualified (< 8)
     ]
     out = dashboard.best_edge(stats)
-    assert "high" in out
+    assert "high" in out and "descriptive" in out
     assert "99.0" not in out
+
+
+def test_best_edge_names_a_validated_rule_first():
+    out = dashboard.best_edge([{"dim": "gap_go", "triggered": 30, "avg_r": 0.9}],
+                              [{"rule_id": "Rfeedfacecafe", "statement": "gap_fade shorts",
+                                "forward_n": 9}])
+    assert out.startswith("[rule: Rfeedfacecafe]")
 
 
 # ------------------------------------------- stats_by reads r_planned, not r_multiple

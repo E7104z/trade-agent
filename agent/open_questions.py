@@ -47,9 +47,10 @@ __all__ = [
 
 
 def _q(qid: int, slug: str, title: str, threshold: int, unit: str,
-       pre_registered: bool = True, note: str = "") -> dict[str, Any]:
+       pre_registered: bool = True, note: str = "", analysis: str = "") -> dict[str, Any]:
     return {"id": qid, "slug": slug, "title": title, "threshold": threshold,
-            "unit": unit, "pre_registered": pre_registered, "note": note}
+            "unit": unit, "pre_registered": pre_registered, "note": note,
+            "analysis": analysis}
 
 
 # ids 1-12 match the constants in agent/loops/evening.py, which are what the
@@ -58,22 +59,33 @@ def _q(qid: int, slug: str, title: str, threshold: int, unit: str,
 OPEN_QUESTIONS: list[dict[str, Any]] = [
     _q(1, "gap_fade_entry_mechanics",
        "gap_fade entry mechanics - does failed-bounce entry beat open-print entry?",
-       8, "gap_fade observations with both prices"),
+       8, "gap_fade observations with both prices",
+       analysis="paired: planned-entry R minus open-print R, over observations where "
+                "BOTH entries filled (taken and shadow rows, labelled)"),
     _q(2, "sympathy_standalone",
        "sympathy standalone - salvageable, or edge-free?",
-       8, "standalone sympathy observations"),
+       8, "standalone sympathy observations",
+       analysis="one-sample: mean realized R of standalone sympathy trades vs 0"),
     _q(3, "conviction_calibration",
        "conviction calibration - does stated conviction predict realized R?",
-       20, "graded picks"),
+       20, "graded picks",
+       analysis="two-arm: conviction 4-5 vs conviction 1-3 (morning lane), each arm "
+                "n >= 8; calibrated only if 4-5 beats 1-3 by >= 0.3R AND the "
+                "difference survives the question batch's FDR"),
     _q(4, "gap_size_chase_threshold",
        "gap-size chase threshold - is 15% the right cutoff?",
-       20, "gap trades"),
+       20, "gap trades",
+       analysis="two-arm: gap > 15% vs gap <= 15%, each arm n >= 8"),
     _q(5, "shadow_filter_cost",
        "shadow-ledger filter cost - which rejection reasons forgo the most R?",
-       20, "sessions of shadow data"),
+       20, "sessions of shadow data",
+       analysis="per kill-check category (uncategorized rows excluded): mean forgone R "
+                "vs 0, categories with n >= 8, FDR across categories"),
     _q(6, "stop_placement_cost",
        "stop placement cost - do targets print later on stopped trades?",
-       10, "stopped trades"),
+       10, "stopped trades",
+       analysis="descriptive: share of stopped morning trades whose target printed "
+                "later the same day, with a 90% Wilson interval"),
     # ---- indicator layer. These were given ids in code but never a written
     # threshold, so they carry the project's declared default forward-n
     # (research.DEFAULT_FORWARD_N) rather than a number invented here. They
@@ -82,15 +94,25 @@ OPEN_QUESTIONS: list[dict[str, Any]] = [
     _q(7, "rvol_separation",
        "RVOL separation - does participation separate winners from chop?",
        8, "triggered picks with RVOL@10:00", pre_registered=False,
-       note="defaulted to the standard forward-n; never pre-registered in prose"),
+       note="defaulted to the standard forward-n; never pre-registered in prose",
+       analysis="two-arm: RVOL@10:00 < 1x vs >= 1x, triggered morning trades, each arm n >= 8"),
     _q(8, "vwap_reversal_edge",
        "VWAP-reclaim longs vs plain dip-buy longs - same edge?",
        8, "triggered longs citing VWAP", pre_registered=False,
-       note="defaulted to the standard forward-n; never pre-registered in prose"),
+       note="defaulted to the standard forward-n; never pre-registered in prose",
+       analysis="two-arm: triggered longs whose thesis cites VWAP vs other triggered "
+                "longs, each arm n >= 8"),
+    # The unit used to be "stopped trades with stop_dist_atr". Every stopped
+    # trade loses about 1R whatever its stop distance, so a comparison of
+    # stopped trades cannot separate stop placements at all; the question is
+    # about what each stop distance does to the TRADE. Each arm needs n >= 8.
     _q(9, "stop_atr_sweet_spot",
        "stop distance sweet spot - do 1-2 ATR stops out-R sub-0.5 ATR stops?",
-       8, "stopped trades with stop_dist_atr", pre_registered=False,
-       note="defaulted to the standard forward-n; never pre-registered in prose"),
+       8, "triggered trades per stop bucket (1-2 ATR and <0.5 ATR)", pre_registered=False,
+       note="defaulted to the standard forward-n; never pre-registered in prose; unit "
+            "corrected 2026-09-29 from stopped trades, which all lose ~1R",
+       analysis="two-arm: triggered morning trades with stop 1-2 ATR vs < 0.5 ATR, "
+                "each arm n >= 8 (runner-lane stops are never counted)"),
     _q(10, "blue_sky_vs_overhead",
        "blue-sky gaps vs gaps into overhead supply",
        8, "triggered gap/breakout picks", pre_registered=False,
@@ -98,11 +120,15 @@ OPEN_QUESTIONS: list[dict[str, Any]] = [
     _q(11, "trend_alignment_200d",
        "trend alignment - longs above vs below the 200d MA (shorts mirrored)",
        8, "triggered picks with trend_side_200d", pre_registered=False,
-       note="defaulted to the standard forward-n; never pre-registered in prose"),
+       note="defaulted to the standard forward-n; never pre-registered in prose",
+       analysis="two-arm: trend-aligned (long above / short below the 200d) vs "
+                "counter-trend, triggered morning trades, each arm n >= 8"),
     _q(12, "shortedness",
        "shortedness - does short%float >= 15 separate squeeze winners from chop?",
        8, "triggered squeeze/momentum picks", pre_registered=False,
-       note="defaulted to the standard forward-n; never pre-registered in prose"),
+       note="defaulted to the standard forward-n; never pre-registered in prose",
+       analysis="two-arm: short%float >= 15 vs < 15 among triggered squeeze/momentum "
+                "trades, each arm n >= 8"),
     # ---- ids 13 and 14, not 7. The miner minted this experiment as "#7" in
     # playbook v4, colliding with the indicator layer's RVOL question, which
     # had held id 7 in code since before v4 was written.
@@ -114,14 +140,30 @@ OPEN_QUESTIONS: list[dict[str, Any]] = [
     # evening loop was writing no observations for it at all -- those numbers
     # were the miner's estimates from reading the shadow ledger, which is
     # exactly the hand-counting that pre-registration exists to replace.
+    # ARM A counts an untriggered taken pick as 0R, exactly as ARM B counts an
+    # untriggered rejection as 0R (the shadow ledger's `scratch`). Counting
+    # only ARM A's triggered trades compared "trades that filled" against
+    # "candidates, filled or not" -- the asymmetry that also biased the
+    # selection ablation.
     _q(13, "rr_threshold_test_taken",
        "R:R threshold test, ARM A - taken trades at planned R:R >= 2.0",
-       20, "triggered trades at R:R >= 2.0",
-       note="paired with Q14; was numbered #7 in playbook v4-v5"),
+       20, "measurable taken trades at R:R >= 2.0 (untriggered = 0R)",
+       note="paired with Q14; was numbered #7 in playbook v4-v5",
+       analysis="two-arm with Q14: ARM A mean R vs ARM B mean forgone R, same R "
+                "measure; answerable only when BOTH arms reach 20"),
     _q(14, "rr_threshold_test_shadow",
        "R:R threshold test, ARM B - rejected candidates at 1.8 <= R:R < 2.0",
        20, "scored rejections in the 1.8-2.0 band",
-       note="paired with Q13; the shadow arm of the same experiment"),
+       note="paired with Q13; the shadow arm of the same experiment",
+       analysis="the other arm of Q13; see Q13"),
+    # Declared 2026-09-29, before any result was computed. Every line of the
+    # Sizing Policy is an untested prior and none of Q1-Q14 tested sizing, so
+    # the one sizing question the ledger can already answer is registered.
+    _q(15, "sizing_predicts_r",
+       "sizing - does the size the desk chose predict realized R?",
+       20, "triggered morning trades whose size was a decision",
+       analysis="correlation of size_r with realized R over judgment picks (runner, "
+                "coverage and daily-floor picks excluded: their size is fixed by rule)"),
 ]
 
 _BY_ID = {q["id"]: q for q in OPEN_QUESTIONS}

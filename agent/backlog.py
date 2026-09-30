@@ -89,21 +89,26 @@ def _rule_items(con: Any, since: date) -> list[dict]:
 
 
 def _question_items(con: Any, since: date) -> list[dict]:
-    from .open_questions import OPEN_QUESTIONS
-    totals = dict(con.execute(
-        "SELECT question_id, SUM(increment) FROM open_question_progress GROUP BY question_id"
-    ).fetchall())
+    """Questions that are not yet ANSWERABLE, with the progress their threshold
+    is compared against (agent/question_eval.py). A raw event total said a
+    question was done when the arm it was missing was still empty -- Q9 at
+    20/8 with no 1-2 ATR trades at all."""
+    from .question_eval import evaluate
     recent = dict(con.execute(
         """SELECT question_id, SUM(increment) FROM open_question_progress
            WHERE session_date >= ? GROUP BY question_id""", [since]).fetchall())
     out = []
-    for q in OPEN_QUESTIONS:
-        n, target = int(totals.get(q["id"]) or 0), int(q["threshold"])
-        if n >= target:
+    for e in evaluate(con):
+        if e["answerable"]:
             continue
-        out.append({"item_type": "question", "item_id": f"Q{q['id']}", "lane": None,
-                    "n": n, "target": target, "rate_10s": int(recent.get(q["id"]) or 0),
-                    "what_counts": q["title"]})
+        target = int(e["target"] or e["threshold"])
+        # A total at or past its threshold whose arms are short (Q3: 25 graded
+        # picks, 3 at conviction 4-5) is still open; it sorts as nearly done.
+        n = min(int(e["progress"] or 0), max(0, target - 1))
+        out.append({"item_type": "question", "item_id": f"Q{e['id']}", "lane": None,
+                    "n": n,
+                    "target": target, "rate_10s": int(recent.get(e["id"]) or 0),
+                    "what_counts": e["title"] + (f" ({e['reason']})" if e.get("reason") else "")})
     # Largest remaining fraction first: the most starved question leads.
     out.sort(key=lambda i: -((i["target"] - i["n"]) / max(1, i["target"])))
     return out

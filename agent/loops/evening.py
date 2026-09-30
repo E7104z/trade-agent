@@ -450,18 +450,29 @@ def _rr_band_note(ticker: str, rr: float, eod_outcome: str,
 def _q1_gap_fade_mechanics(con, md: MarketData, d: date, picks: list[dict],
                            outcomes: list[dict], shadow: dict,
                            slippage_bps: float = 0.0) -> int:
-    """Q1: on every gap_fade candidate, compare planned entry vs open-print entry."""
+    """Q1: on every gap_fade candidate, compare planned entry vs open-print entry.
+
+    Every note names its source -- `[taken]` for a desk pick, `[shadow]` for a
+    rejected candidate priced by the simulator -- because a shadow row whose
+    planned entry "triggered" in simulation was being reported as "the one
+    triggered comparison", i.e. as a trade the desk took (WING, playbook v9,
+    which the same document listed as a rejection). And the counter only
+    moves when BOTH entries produced an R: the question compares two realized
+    entries, and an untriggered planned entry has nothing to compare, which is
+    how Q1 read 15/8 "THRESHOLD MET" while its own finding said the number of
+    comparable observations was one.
+    """
     n = 0
-    candidates: list[tuple[dict, list]] = []
+    candidates: list[tuple[dict, list, str]] = []
     for p in picks:
         if p.get("setup_type") == "gap_fade":
             try:
-                candidates.append((p, md.minute_bars(p["ticker"], d)))
+                candidates.append((p, md.minute_bars(p["ticker"], d), "taken"))
             except Exception:
                 continue
     for r, _sim, bars in shadow.get("gap_fade_notes", []):
-        candidates.append((r, bars))
-    for c, bars in candidates:
+        candidates.append((r, bars, "shadow"))
+    for c, bars, source in candidates:
         if not bars:
             continue
         planned = simulate_pick({"pick_id": 0, "direction": c["direction"],
@@ -474,11 +485,15 @@ def _q1_gap_fade_mechanics(con, md: MarketData, d: date, picks: list[dict],
                                   "stop_price": c["stop_price"],
                                   "target_price": c["target_price"]}, bars, None,
                                  slippage_bps=slippage_bps, session_date=d)
-        note = (f"{c['ticker']}: planned-entry R="
-                f"{planned.get('r_multiple') if planned.get('triggered') else 'untriggered'}, "
-                f"open-print R={open_sim.get('r_multiple')}")
-        ledger.add_question_progress(con, Q_GAP_FADE_MECHANICS, d, 1, note)
-        n += 1
+        planned_r = planned.get("r_multiple") if planned.get("triggered") else None
+        open_r = open_sim.get("r_multiple") if open_sim.get("triggered") else None
+        comparable = planned_r is not None and open_r is not None
+        note = (f"{c['ticker']}: [{source}] planned-entry R="
+                f"{planned_r if planned_r is not None else 'untriggered'}, "
+                f"open-print R={open_r if open_r is not None else 'untriggered'}")
+        ledger.add_question_progress(con, Q_GAP_FADE_MECHANICS, d,
+                                     1 if comparable else 0, note)
+        n += 1 if comparable else 0
     return n
 
 
@@ -544,10 +559,20 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
     by_id = {o["pick_id"]: o for o in outcomes}
     con.execute("DELETE FROM open_question_progress WHERE session_date = ?", [d])
 
-    # calibration rows (taken picks only; conviction as stated in the morning, never adjusted)
+    # MORNING lane only. Runner picks share the `picks` table, and every
+    # calibration row and open question below is about the morning desk: its
+    # stated conviction (Q3), its stops (Q6/Q9), its R:R bar (Q13 -- which
+    # every runner pick, target fixed at 2R, used to satisfy).
+    picks = [p for p in picks if p.get("setup_type") != ledger.RUNNER_SETUP]
+
+    # calibration rows (taken picks only; conviction as stated in the morning,
+    # never adjusted). Realized R is the planned-risk R every other morning
+    # statistic reads, falling back to r_multiple on legacy rows.
     for p in picks:
         o = by_id.get(p["pick_id"], {})
-        realized = o.get("r_multiple") if o.get("triggered") else None
+        realized = None
+        if o.get("triggered") and o.get("exit_reason") != "invalid_fill":
+            realized = o.get("r_planned") if o.get("r_planned") is not None else o.get("r_multiple")
         ledger.add_calibration_row(con, d, p["ticker"], p.get("conviction"), realized)
         counts["calibration"] += 1
         if realized is not None:  # Q3 increments with every realized calibration row

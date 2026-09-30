@@ -45,6 +45,19 @@ Handled explicitly rather than papered over:
   * UNMEASURABLE ROWS ARE DROPPED, not zero-filled. A candidate with no
     intraday data is an absence of evidence; scoring it as 0.0R would pull every
     arm toward the mean and manufacture agreement.
+
+  * BOTH ARMS COUNT A NON-TRIGGER AS 0R (method 2). Method 1 built the desk's
+    arm from its TRIGGERED picks only, while the random arm drew from a pool in
+    which every untriggered rejection was a measured 0.0R. A book of losing
+    trades is then ranked against portfolios diluted with zeros, and lands in
+    the bottom percentile whatever the selection skill -- playbook v9's "beat
+    0.3% of random portfolios". An untriggered taken pick is exactly as
+    measurable as an untriggered rejection: the plan never filled, it earned 0R.
+
+  * MORNING LANE ONLY. Runner picks share the `picks` table but not this
+    pool: the risk manager never chose them, and their unselected alternatives
+    are runner candidates, not these rejections. Method 1 counted them in the
+    desk's arm.
 """
 from __future__ import annotations
 
@@ -52,7 +65,12 @@ import random
 from typing import Any
 
 __all__ = ["candidate_pool", "random_pick_ablation", "ablation_md",
-           "MIN_VERDICT_PICKS", "MIN_VERDICT_SESSIONS"]
+           "MIN_VERDICT_PICKS", "MIN_VERDICT_SESSIONS", "METHOD_VERSION"]
+
+# Bumped whenever the pool or arms change meaning. Recorded on every weekly
+# Selection Edge row, so a row computed under an older method is never read
+# as a point on the same trend.
+METHOD_VERSION = 2
 
 DEFAULT_DRAWS = 5000
 DEFAULT_SEED = 20260827
@@ -81,24 +99,33 @@ def candidate_pool(
     portfolio is exactly zero. That is different from a row we could not measure
     at all, which is excluded.
     """
+    from .ledger import RUNNER_SETUP
     pool: dict[str, dict[str, list[dict]]] = {}
 
-    taken_where = ["o.triggered", "o.r_multiple IS NOT NULL",
-                   "COALESCE(o.exit_reason,'') <> 'invalid_fill'"]
+    # Measurable taken picks: triggered with an R, or provably never filled
+    # (`no_trigger`, 0R). no_data / invalid_plan / invalid_fill are dropped,
+    # the same three states classify_shadow calls `unmeasurable`.
+    taken_where = [
+        "((o.triggered AND o.r_multiple IS NOT NULL) OR "
+        "(COALESCE(o.triggered, FALSE) = FALSE AND o.exit_reason = 'no_trigger'))",
+        "COALESCE(o.exit_reason,'') NOT IN ('invalid_fill', 'no_data', 'invalid_plan')",
+        f"COALESCE(p.setup_type, '') <> '{RUNNER_SETUP}'",
+    ]
     taken_params: list[Any] = []
     if sim_version is not None:
         taken_where.append("COALESCE(o.sim_version, 1) = ?")
         taken_params.append(int(sim_version))
     rows = con.execute(
-        f"""SELECT p.plan_date, p.ticker, o.r_multiple
+        f"""SELECT p.plan_date, p.ticker, o.r_multiple, o.triggered
             FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
             WHERE {' AND '.join(taken_where)}
             ORDER BY p.plan_date, p.pick_id""",
         taken_params,
     ).fetchall()
-    for d, ticker, r in rows:
+    for d, ticker, r, trig in rows:
         pool.setdefault(str(d), {"taken": [], "rejected": []})["taken"].append(
-            {"ticker": ticker, "r_multiple": float(r), "triggered": True}
+            {"ticker": ticker, "r_multiple": float(r) if trig else 0.0,
+             "triggered": bool(trig)}
         )
 
     # Rejections: `eod_outcome` is the shadow classification written by the
@@ -164,6 +191,7 @@ def random_pick_ablation(
     actual_total = 0.0
     skipped_no_alternative = 0
     n_taken_total = 0
+    n_triggered_total = 0
 
     for _, day in sorted(pool.items()):
         taken, rejected = day["taken"], day["rejected"]
@@ -176,6 +204,7 @@ def random_pick_ablation(
             continue
         actual_total += sum(c["r_multiple"] for c in taken)
         n_taken_total += k
+        n_triggered_total += sum(1 for c in taken if c["triggered"])
         usable.append((combined, k))
 
     if not usable:
@@ -186,6 +215,7 @@ def random_pick_ablation(
             "percentile": None, "p_value": None,
             "skipped_no_alternative": skipped_no_alternative,
             "note": "no session offered a genuine alternative to what was taken",
+            "method_version": METHOD_VERSION,
         }
 
     totals: list[float] = []
@@ -222,6 +252,8 @@ def random_pick_ablation(
         "skipped_no_alternative": skipped_no_alternative,
         "seed": seed,
         "sim_version": sim_version,
+        "triggered": n_triggered_total,
+        "method_version": METHOD_VERSION,
     }
 
 
@@ -261,8 +293,10 @@ def ablation_md(res: dict[str, Any]) -> str:
 
     return "\n".join([
         "## SELECTION ABLATION — RISK MANAGER vs RANDOM (computed, zero API cost)\n",
-        f"Over {res['sessions']} sessions and {res['picks']} taken picks, the actual "
-        f"plan returned {res['actual_total_r']:+.2f}R unweighted.",
+        f"Over {res['sessions']} sessions and {res['picks']} measurable taken picks "
+        f"({res.get('triggered', res['picks'])} triggered; a pick that never filled counts "
+        f"0R, as an untriggered rejection does), the actual plan returned "
+        f"{res['actual_total_r']:+.2f}R unweighted. Morning lane only.",
         f"{res['draws']} Monte Carlo portfolios drawing the SAME NUMBER of picks at "
         f"random from the SAME candidate pool (taken + shadow-ledger rejections) "
         f"returned {res['random_mean_total_r']:+.2f}R on average "

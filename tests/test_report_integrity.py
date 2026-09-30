@@ -176,19 +176,85 @@ def test_shadow_summary_computes_the_concentration_of_its_own_sum(con):
     assert [t["ticker"] for t in sh["top_rows"]] == ["BIG1", "BIG2", "BIG3"]
 
 
-def test_shadow_md_leads_with_the_tail_artifact_when_the_signs_disagree(con):
+def test_shadow_md_treats_the_right_tail_as_cost_not_artifact(con):
+    """The block used to call this shape a TAIL ARTIFACT and say the filters
+    'SAVED money on everything outside the tail'. In a book whose returns are
+    the right tail, giving up the three largest winners is the filters' cost;
+    the verdict is the test on the mean, not the ex-tail sum."""
     _reject(con, 1, "BIG1", 6.16)
     _reject(con, 2, "BIG2", 5.95)
     _reject(con, 3, "BIG3", 3.29)
     for i in range(110):
         _reject(con, 10 + i, f"S{i}", -0.122, outcome="would_have_lost")
     md = _shadow_md(ledger.shadow_summary(con))
-    assert "TAIL ARTIFACT" in md
+    assert "TAIL ARTIFACT" not in md
+    assert "SAVED money" not in md
+    assert "RIGHT-TAIL CONCENTRATION" in md
+    assert "never evidence that the filters work" in md
     assert "MEDIAN forgone R" in md
     assert "NET EXCLUDING the 3 largest" in md
-    assert "not grounds for loosening anything" in md
+    # +1.98R over 113 rows, sd ~0.8: not distinguishable from zero
+    assert "NOT distinguishable from zero" in md
     # and it names this run's rows, so last week's sentence cannot be reused
     assert "BIG1" in md
+
+
+def test_shadow_verdict_needs_a_significant_mean_to_say_saved(con):
+    from agent.loops.weekly import shadow_verdict
+    for i in range(40):
+        _reject(con, i + 1, f"L{i}", -1.0 - 0.01 * i, outcome="would_have_lost")
+    v = shadow_verdict(ledger.shadow_summary(con))
+    assert v.startswith("the filters SAVED R on average")
+    assert "NOT INTERPRETABLE" in shadow_verdict({"scored_rows": 3, "mean_forgone_r": 1.0})
+
+
+def test_shadow_and_funnel_reconcile_on_one_window(con):
+    """v9 printed 150 rejections in the funnel and 142 in the shadow ledger,
+    both 'trailing 20 sessions', and a category table summing to 141."""
+    for i, deg in enumerate([False, False, True]):
+        con.execute("INSERT INTO daily_plans (plan_date, session_degraded) VALUES (?, ?)",
+                    [D + timedelta(days=i), deg])
+    rid = 0
+    for i in range(3):
+        for _ in range(4):
+            rid += 1
+            _reject(con, rid, f"X{rid}", 0.5, d=D + timedelta(days=i))
+    # one ungraded rejection on a clean day
+    con.execute("INSERT INTO rejections (rejection_id, plan_date, ticker, reason) "
+                "VALUES (99, ?, 'UNGR', 'r')", [D])
+    since = ledger.morning_window_start(con, 20)
+    sh = ledger.shadow_summary(con, since=since)
+    pt = ledger.participation_funnel(con, 20)
+    assert sh["since"] == pt["since"] == str(D)
+    assert sh["total"] == 12 and sh["degraded_rows"] == 4 and sh["ungraded_rows"] == 1
+    assert sum(c["n"] for c in sh["by_category"]) == sh["total"] - sh["degraded_rows"]
+    assert pt["rejections"] == sh["total"] - sh["degraded_rows"] + sh["ungraded_rows"]
+
+
+def test_funnel_and_captured_r_are_morning_lane_only(con):
+    con.execute("INSERT INTO daily_plans (plan_date) VALUES (?)", [D])
+    _pick(con, 1, "MORN")
+    con.execute("INSERT INTO outcomes (pick_id, triggered, r_multiple) VALUES (1, TRUE, 1.0)")
+    con.execute("INSERT INTO picks (pick_id, plan_date, ticker, direction, size_r, setup_type) "
+                "VALUES (2, ?, 'RUNR', 'long', 0.25, 'dto_runner')", [D])
+    con.execute("INSERT INTO outcomes (pick_id, triggered, r_multiple) VALUES (2, TRUE, -1.0)")
+    _reject(con, 1, "REJ", 0.0, outcome="scratch")
+    pt = ledger.participation_funnel(con)
+    assert pt["picks_taken"] == 1 and pt["picks_triggered"] == 1
+    sh = ledger.shadow_summary(con)
+    assert sh["captured_r_window"] == pytest.approx(1.0) and sh["captured_n"] == 1
+
+
+def test_a_multi_check_rejection_is_charged_to_no_single_filter(con):
+    ledger.save_rejections(con, D, [
+        {"ticker": "UAL", "reason": "R:R 1.80 and same airline thesis as AAL",
+         "primary_kill_check": "rr", "kill_checks": ["rr", "correlation"],
+         "rejection_category": "rr_below_control"},
+        {"ticker": "ZS", "reason": "regime", "primary_kill_check": "regime_fit",
+         "kill_checks": ["regime_fit"], "rejection_category": "other"}])
+    con.execute("UPDATE rejections SET eod_outcome = 'would_have_won', forgone_r = 2.5")
+    cats = {c["category"] for c in ledger.shadow_summary(con)["by_category"]}
+    assert cats == {"multiple", "regime_fit"}
 
 
 def test_forgone_r_is_grouped_by_category_not_by_verbatim_prose(con):

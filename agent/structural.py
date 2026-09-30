@@ -23,7 +23,7 @@ the correct price, and nothing here is exempt from it.
                stated in advance, not chosen after seeing the cells
   WIN RATE     exact Fisher test per 1-D cell: win frequency in the cell vs
                the rest of its lane. "Win" is the ledger's existing
-               definition (triggered, fill-valid, r_multiple > 0)
+               definition (triggered, fill-valid, realized R > 0)
   POPULATION   mechanical-rule evidence over the whole gap population, arm x
                direction always separate -- long and short never share a cell
   CONSISTENCY  descriptive only (adds no looks): for each surviving finding,
@@ -54,12 +54,22 @@ PAIR_SPEC: tuple[tuple[str, str, str], ...] = (
 PAIR_SEP = "|"
 MIN_STRATA = 2
 
-# Dimensions that exist in both lanes with the SAME bucket definition
-# (agent/buckets.py), so a morning finding can be read in the runner field and
-# vice versa as one more stratum.
+# Dimensions that exist in both lanes (agent/buckets.py), so a morning finding
+# can be read in the runner field and vice versa as one more stratum. The
+# runner stop-ATR dimension subdivides the morning "<0.5" cell; the read goes
+# through buckets.RUNNER_STOP_ATR_COARSE (see `consistency`).
 CROSS_LANE = {"stop_atr_bucket": "runner_stop_atr_bucket",
               "trend_side_200d": "runner_trend_side_200d"}
 CROSS_LANE.update({v: k for k, v in list(CROSS_LANE.items())})
+
+
+def _r(row: dict) -> float:
+    """Realized R, on the same measure as the 1-D search (research.realized_r):
+    planned-risk R where the row carries it. Pairs and win frequencies read the
+    legacy r_multiple while the 1-D cells beside them read r_planned, so one
+    batch compared two different denominators."""
+    from .research import realized_r
+    return float(realized_r(row))
 
 
 def pair_dimension(dims: list[str]) -> str:
@@ -120,7 +130,7 @@ def pair_comparisons(rows_by_lane: dict[str, list[dict]], min_n: int = 8
             levels = tuple(buckets.label(lane, d, r) for d in dims)
             if "?" in levels:
                 continue
-            cells.setdefault(levels, []).append(float(r["r_multiple"]))
+            cells.setdefault(levels, []).append(_r(r))
         for levels, values in sorted(cells.items()):
             m, s = _mean_std(values)
             comps.append(Comparison(dimension=pair_dimension(dims), level=PAIR_SEP.join(levels),
@@ -136,7 +146,7 @@ def winrate_comparisons(rows_by_lane: dict[str, list[dict]]) -> list[Comparison]
     for lane, rows in rows_by_lane.items():
         if not rows:
             continue
-        wins_total = sum(1 for r in rows if float(r["r_multiple"]) > 0)
+        wins_total = sum(1 for r in rows if _r(r) > 0)
         n_total = len(rows)
         for dim in buckets.dimensions(lane):
             cells: dict[str, list[int]] = {}
@@ -145,7 +155,7 @@ def winrate_comparisons(rows_by_lane: dict[str, list[dict]]) -> list[Comparison]
                 if lev == "?":
                     continue
                 c = cells.setdefault(lev, [0, 0])
-                c[0] += 1 if float(r["r_multiple"]) > 0 else 0
+                c[0] += 1 if _r(r) > 0 else 0
                 c[1] += 1
             for lev, (w, n) in sorted(cells.items()):
                 a, b = w, n - w
@@ -270,7 +280,7 @@ def consistency(search: Any, rows_by_lane: dict[str, list[dict]], min_n: int = 8
                 if all(buckets.label(lane, d, r) == lv for d, lv in zip(dims, levels))]
         strata: dict[str, list[float]] = {}
         for r in cell:
-            v = float(r["r_multiple"])
+            v = _r(r)
             if r.get("regime_tag"):
                 strata.setdefault(f"regime={r['regime_tag']}", []).append(v)
             if lane == "morning" and r.get("direction"):
@@ -281,8 +291,19 @@ def consistency(search: Any, rows_by_lane: dict[str, list[dict]], min_n: int = 8
         if len(dims) == 1 and dims[0] in CROSS_LANE:
             other_dim = CROSS_LANE[dims[0]]
             other_lane = "runner" if lane == "morning" else "morning"
-            other = [float(r["r_multiple"]) for r in rows_by_lane.get(other_lane) or []
-                     if buckets.label(other_lane, other_dim, r) == levels[0]]
+            # The runner lane splits the morning "<0.5" stop cell into finer
+            # labels; read a morning cell in the runner field through the
+            # coarse map. A runner-only label has no morning counterpart.
+            coarse = buckets.RUNNER_STOP_ATR_COARSE
+            if other_lane == "runner":
+                def _hit(r, dim=other_dim):
+                    lab = buckets.label("runner", dim, r)
+                    return coarse.get(lab, lab) == levels[0]
+            else:
+                def _hit(r, dim=other_dim):
+                    return buckets.label("morning", dim, r) == levels[0]
+            other = ([] if (lane == "runner" and levels[0] in coarse) else
+                     [_r(r) for r in rows_by_lane.get(other_lane) or [] if _hit(r)])
             if other:
                 strata[f"lane={other_lane}"] = other
         powered = {k: v for k, v in strata.items() if len(v) >= min_n}

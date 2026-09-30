@@ -326,9 +326,11 @@ def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         "by_or_alignment": _outs("or_alignment"),
         "lessons": lessons,
         "regimes": ledger.recent_regimes(con, 30),
-        # v3: the self-deception closers
+        # v3: the self-deception closers. The shadow ledger and the
+        # participation funnel share ONE window -- the trailing 20 non-degraded
+        # morning sessions -- so their counts reconcile.
         "calibration": ledger.calibration_aggregate(con),
-        "shadow": ledger.shadow_summary(con, 20),
+        "shadow": ledger.shadow_summary(con, 20, since=ledger.morning_window_start(con, 20)),
         "rule_staleness": ledger.rule_staleness(con),
         "question_progress": ledger.question_progress_totals(con),
         # How much of what the desk evaluates does it act on? Neither the

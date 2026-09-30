@@ -689,6 +689,16 @@ def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
         else:
             rejection_category = ("rr_below_control" if planned_rr is not None and planned_rr < 2.0
                                   else "other")
+        # Every independently binding check, primary first (enum-filtered,
+        # de-duplicated). More than one means the forgone R cannot be charged
+        # to a single filter -- see ledger._KILL_CATEGORY_SQL.
+        raw_checks = rejected_row.get("kill_checks")
+        kill_checks: list[str] = [kill_check] if kill_check else []
+        if isinstance(raw_checks, list):
+            for k in raw_checks:
+                k = str(k or "").strip().lower()
+                if k in _KILL_CHECK_ENUM and k not in kill_checks:
+                    kill_checks.append(k)
         out.append({
             "ticker": t,
             "direction": c.get("direction"),
@@ -703,6 +713,7 @@ def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
             "source_stage": "risk_rejected" if reason else "validator_or_unselected",
             "rejection_category": rejection_category,
             "primary_kill_check": kill_check,
+            "kill_checks": kill_checks,
             "planned_rr": planned_rr,
             "session_degraded": degraded,
         })

@@ -398,6 +398,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v23.STATEMENTS
 from . import migrations_v24  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v24.STATEMENTS
 
+# --- v25 playbook audit: every binding kill check; ablation method version --
+from . import migrations_v25  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v25.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -1397,10 +1401,14 @@ def trailing_weighted_r(con: duckdb.DuckDBPyConnection, n: int = 10,
     return {"n": len(vals), "sum_weighted_r": round(sum(vals), 3)}
 
 
-def management_quality(con: duckdb.DuckDBPyConnection) -> dict:
+def management_quality(con: duckdb.DuckDBPyConnection, lane: str | None = "morning") -> dict:
     """Deterministic counterfactual aggregates: is the stop/target machinery adding
     value over just holding, are stops inside the noise, and does the desk beat
     the naive same-name open->close baseline (the null model)?
+
+    MORNING lane by default. Runner picks live in the same tables, and pooled
+    they turned "the desk's avgR" and Q6's stopped-then-target rate into a
+    blend of two strategies with different stops, entries and sizes.
 
     Every average here carries its OWN n, because they are computed over
     different row sets: a trade can be triggered but ungraded, graded but
@@ -1421,7 +1429,7 @@ def management_quality(con: duckdb.DuckDBPyConnection) -> dict:
     # row always compares one denominator against itself -- never planned actual
     # against floored benchmark.
     row = con.execute(
-        """SELECT
+        f"""SELECT
              SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END),
              AVG(CASE WHEN o.triggered THEN COALESCE(o.r_planned, o.r_multiple) END),
              COUNT(CASE WHEN o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL
@@ -1452,7 +1460,8 @@ def management_quality(con: duckdb.DuckDBPyConnection) -> dict:
                       THEN o.baseline_r END),
              SUM(CASE WHEN o.triggered = FALSE AND o.baseline_r IS NOT NULL
                       THEN 1 ELSE 0 END)
-           FROM outcomes o"""
+           FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+           WHERE 1=1{lane_clause(lane)}"""
     ).fetchone()
     (n_trig, avg_r, n_avg_r, avg_base, n_base, edge_vs_base, n_edge,
      mgmt_edge, n_mgmt, n_stop, n_stop_then_target, avg_eod_stopped,
@@ -1477,26 +1486,53 @@ def management_quality(con: duckdb.DuckDBPyConnection) -> dict:
     }
 
 
-def sizing_counterfactual(con: duckdb.DuckDBPyConnection) -> dict:
+def sizing_counterfactual(con: duckdb.DuckDBPyConnection, lane: str | None = "morning") -> dict:
     """Did size allocation add value? Compares actual size-weighted total R to the
-    same trades at a uniform (average) size. Positive edge = sizing skill is real."""
-    row = con.execute(
-        """SELECT SUM(COALESCE(o.r_planned, o.r_multiple) * COALESCE(p.size_r, 1)),
-                  SUM(COALESCE(o.r_planned, o.r_multiple)),
-                  AVG(COALESCE(p.size_r, 1)),
-                  COUNT(*)
+    same trades at a uniform (average) size. Positive edge = sizing skill is real.
+
+    Morning lane, and only picks whose size was a DECISION: runner picks are
+    all 0.25R by config, and coverage/daily-floor picks go on at minimum size
+    by rule. Pooled, the "sizing edge" measured the lane mix, not sizing.
+
+    `size_r_corr` / `size_r_p` test the same question directly: does size
+    predict realized R? sizing_edge_r is n x cov(size, R), so its sign is the
+    correlation's sign; the p-value is what says whether it is distinguishable
+    from zero.
+    """
+    from .stats import student_t_sf
+    rows = con.execute(
+        f"""SELECT COALESCE(o.r_planned, o.r_multiple), COALESCE(p.size_r, 1)
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL"""
-    ).fetchone()
-    actual, sum_r, avg_size, n = row
+           WHERE o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL
+             AND COALESCE(o.exit_reason, '') <> 'invalid_fill'{lane_clause(lane)}{judgment_clause()}"""
+    ).fetchall()
+    n = len(rows)
     if not n:
-        return {"n": 0, "actual_weighted_r": 0.0, "flat_size_weighted_r": 0.0, "sizing_edge_r": 0.0}
-    flat = float(sum_r) * float(avg_size)
+        return {"n": 0, "actual_weighted_r": 0.0, "flat_size_weighted_r": 0.0,
+                "sizing_edge_r": 0.0, "size_r_corr": None, "size_r_p": None}
+    rs = [float(r) for r, _ in rows]
+    sizes = [float(z) for _, z in rows]
+    actual = sum(r * z for r, z in zip(rs, sizes))
+    avg_size = sum(sizes) / n
+    flat = sum(rs) * avg_size
+    corr = p_val = None
+    if n >= 3:
+        mr = sum(rs) / n
+        vr = sum((r - mr) ** 2 for r in rs)
+        vz = sum((z - avg_size) ** 2 for z in sizes)
+        if vr > 0 and vz > 0:
+            corr = sum((r - mr) * (z - avg_size) for r, z in zip(rs, sizes)) / (vr * vz) ** 0.5
+            if abs(corr) < 1:
+                t = corr * ((n - 2) / (1 - corr ** 2)) ** 0.5
+                p_val = round(student_t_sf(t, n - 2), 4)
+            corr = round(corr, 3)
     return {
         "n": n,
-        "actual_weighted_r": round(float(actual), 3),
+        "actual_weighted_r": round(actual, 3),
         "flat_size_weighted_r": round(flat, 3),
-        "sizing_edge_r": round(float(actual) - flat, 3),
+        "sizing_edge_r": round(actual - flat, 3),
+        "size_r_corr": corr,
+        "size_r_p": p_val,
     }
 
 
@@ -1599,8 +1635,8 @@ def save_rejections(con: duckdb.DuckDBPyConnection, plan_date: date, rejections:
                (plan_date, ticker, direction, setup_type, reason, entry_type,
                 entry_price, stop_price, target_price, conviction, thesis,
                 source_stage, rejection_category, planned_rr, session_degraded,
-                primary_kill_check)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                primary_kill_check, kill_checks, kill_checks_n)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 plan_date, r["ticker"].upper(), r.get("direction"), r.get("setup_type"),
                 r.get("reason", ""), r.get("entry_type", "open"), r.get("entry_price"),
@@ -1608,6 +1644,8 @@ def save_rejections(con: duckdb.DuckDBPyConnection, plan_date: date, rejections:
                 r.get("thesis"), r.get("source_stage"), r.get("rejection_category"),
                 r.get("planned_rr"), bool(r.get("session_degraded")),
                 r.get("primary_kill_check"),
+                ",".join(r.get("kill_checks") or []) or None,
+                len(r.get("kill_checks") or []) or None,
             ],
         )
     return len(rejections)
@@ -1643,19 +1681,75 @@ def save_rejection_outcome(con: duckdb.DuckDBPyConnection, rejection_id: int,
     )
 
 
-def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20) -> dict:
-    """Shadow-ledger aggregates over the trailing N graded sessions."""
-    dates = [r[0] for r in con.execute(
-        "SELECT DISTINCT plan_date FROM rejections WHERE eod_outcome IS NOT NULL "
-        "ORDER BY plan_date DESC LIMIT ?", [trailing_sessions]).fetchall()]
-    if not dates:
-        return {"sessions": 0, "total": 0, "would_have_won": 0, "would_have_lost": 0,
+# A rejection is "degraded" when its own row says so OR its session is flagged
+# degraded in daily_plans. Both the shadow summary and the participation
+# funnel use THIS predicate, so their counts reconcile by construction: before,
+# one read the row flag and the other the session flag, over two different
+# "trailing 20 sessions" windows, and the playbook printed 150 rejections in
+# one section and 142 in the next.
+_DEGRADED_REJECTION = (
+    "(COALESCE(session_degraded, FALSE) OR plan_date IN "
+    "(SELECT plan_date FROM daily_plans WHERE COALESCE(session_degraded, FALSE)))")
+
+
+def morning_window_start(con: duckdb.DuckDBPyConnection,
+                         trailing_sessions: int = 20) -> date | None:
+    """First plan date of the trailing `trailing_sessions` NON-degraded morning
+    sessions: the one window the weekly shadow ledger and participation funnel
+    share. None on an empty ledger."""
+    try:
+        dates = [r[0] for r in con.execute(
+            "SELECT plan_date FROM daily_plans "
+            "WHERE COALESCE(session_degraded, FALSE) = FALSE "
+            "ORDER BY plan_date DESC LIMIT ?", [trailing_sessions]).fetchall()]
+    except Exception:
+        return None
+    return min(dates) if dates else None
+
+
+# The closed enum a rejection's cost is attributed to. The risk manager's
+# `primary_kill_check` (eleven values) is finer than `rejection_category`
+# (R:R or not), so it is used where present; "other" now only means "no kill
+# check was recorded". A rejection the risk manager said failed MORE than one
+# check cannot be charged to either filter alone and is grouped as `multiple`.
+_KILL_CATEGORY_SQL = (
+    "CASE WHEN COALESCE(kill_checks_n, 0) > 1 THEN 'multiple' "
+    "WHEN primary_kill_check = 'rr' THEN 'rr_below_control' "
+    "WHEN primary_kill_check IS NOT NULL THEN primary_kill_check "
+    "ELSE COALESCE(rejection_category, 'uncategorized') END")
+
+
+def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20,
+                   since: date | None = None) -> dict:
+    """Shadow-ledger aggregates over a window of sessions.
+
+    `since` (a plan date) pins the window -- the weekly loop passes the start
+    of the trailing non-degraded morning sessions so this and the
+    participation funnel describe the same days. Without it the window is the
+    trailing N sessions that have graded rejections (the original behaviour).
+    """
+    from .stats import one_sample_t
+    if since is not None:
+        lo = since
+        n_sessions = con.execute(
+            "SELECT COUNT(DISTINCT plan_date) FROM rejections "
+            "WHERE eod_outcome IS NOT NULL AND plan_date >= ?", [lo]).fetchone()[0] or 0
+    else:
+        dates = [r[0] for r in con.execute(
+            "SELECT DISTINCT plan_date FROM rejections WHERE eod_outcome IS NOT NULL "
+            "ORDER BY plan_date DESC LIMIT ?", [trailing_sessions]).fetchall()]
+        lo = min(dates) if dates else None
+        n_sessions = len(dates)
+    if lo is None or not n_sessions:
+        return {"sessions": 0, "since": str(lo) if lo else None, "total": 0,
+                "would_have_won": 0, "would_have_lost": 0,
                 "scratch": 0, "unmeasurable": 0, "net_forgone_r": 0.0,
                 "scored_rows": 0, "top3_forgone_r": 0.0,
                 "net_forgone_r_ex_top3": 0.0, "median_forgone_r": None,
+                "mean_forgone_r": None, "std_forgone_r": None, "t_forgone": None,
+                "p_forgone": None, "degraded_rows": 0, "ungraded_rows": 0,
                 "top_rows": [], "by_reason": [], "by_category": [],
-                "captured_r_window": 0.0}
-    lo = min(dates)
+                "captured_r_window": 0.0, "captured_n": 0}
     row = con.execute(
         """SELECT COUNT(*),
                   SUM(CASE WHEN eod_outcome='would_have_won' THEN 1 ELSE 0 END),
@@ -1664,72 +1758,87 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20) 
                   SUM(CASE WHEN eod_outcome='unmeasurable' THEN 1 ELSE 0 END),
                   SUM(COALESCE(forgone_r, 0))
            FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?""", [lo]).fetchone()
+    degraded_rows = con.execute(
+        f"""SELECT COUNT(*) FROM rejections
+            WHERE eod_outcome IS NOT NULL AND plan_date >= ? AND {_DEGRADED_REJECTION}""",
+        [lo]).fetchone()[0] or 0
+    ungraded_rows = con.execute(
+        f"""SELECT COUNT(*) FROM rejections
+            WHERE eod_outcome IS NULL AND plan_date >= ? AND NOT {_DEGRADED_REJECTION}""",
+        [lo]).fetchone()[0] or 0
     # Rejection-reason FREQUENCY is the one aggregate a degraded session
     # actively corrupts: on a day the pipeline could not price its candidates,
     # every "could not be verified" row is a fact about the plumbing, not about
     # the desk's judgment, and pooling them inflates whichever reason the
     # outage happened to produce. The rows stay stored and stay graded (the
     # counterfactual is still real, and the totals above still count them) --
-    # they are just not counted as reasons. COALESCE covers rows written
-    # before the column existed; those sessions are not retroactively
-    # relabeled, they are simply read as not-degraded, which is what they were
-    # recorded as.
+    # they are just not counted as reasons, and `degraded_rows` says how many
+    # that is so the category table reconciles to the total.
     by_reason = con.execute(
-        """SELECT reason, COUNT(*), ROUND(CAST(SUM(COALESCE(forgone_r,0)) AS NUMERIC), 2)
+        f"""SELECT reason, COUNT(*), ROUND(CAST(SUM(COALESCE(forgone_r,0)) AS NUMERIC), 2)
            FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?
-             AND COALESCE(session_degraded, FALSE) = FALSE
+             AND NOT {_DEGRADED_REJECTION}
            GROUP BY reason ORDER BY SUM(COALESCE(forgone_r,0)) DESC""", [lo]).fetchall()
     # `reason` is the risk manager's verbatim prose, so grouping on it produces
     # one group per rejection -- a list wearing a GROUP BY. Open Question #5
-    # ("which rejection reasons forgo the most R?") cannot be answered from it
-    # at all, and the answer that reached the playbook instead came from the
-    # miner reading free text and counting by eye. `rejection_category` is the
-    # closed enum the morning loop already writes; group on that. Rows written
-    # before the column existed are bucketed as `uncategorized` under their own
-    # name rather than folded into `other`, which is a real category meaning
-    # "we looked and it was not R:R".
+    # ("which rejection reasons forgo the most R?") cannot be answered from it.
+    # Group on the closed kill-check enum instead (_KILL_CATEGORY_SQL). Rows
+    # written before any category existed are bucketed as `uncategorized` under
+    # their own name rather than folded into `other`.
     by_category = con.execute(
-        """SELECT COALESCE(rejection_category, 'uncategorized'), COUNT(*),
-                  ROUND(CAST(SUM(COALESCE(forgone_r,0)) AS NUMERIC), 2)
+        f"""SELECT {_KILL_CATEGORY_SQL}, COUNT(*),
+                  ROUND(CAST(SUM(COALESCE(forgone_r,0)) AS NUMERIC), 2),
+                  SUM(CASE WHEN forgone_r IS NOT NULL THEN 1 ELSE 0 END)
            FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?
-             AND COALESCE(session_degraded, FALSE) = FALSE
+             AND NOT {_DEGRADED_REJECTION}
            GROUP BY 1 ORDER BY SUM(COALESCE(forgone_r,0)) DESC""", [lo]).fetchall()
-    captured = con.execute(
-        """SELECT COALESCE(SUM(o.r_multiple * COALESCE(p.size_r,1)), 0)
+    # What the desk's own taken trades did over the same sessions, on the SAME
+    # measure as forgone R: morning lane, unweighted r_multiple (the shadow
+    # simulator's measure; rejections carry no size). It used to be size-
+    # weighted, pooled with runner picks, and windowed on eval_date.
+    captured, captured_n = con.execute(
+        f"""SELECT COALESCE(SUM(o.r_multiple), 0), COUNT(*)
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND o.eval_date >= ?""", [lo]).fetchone()[0]
+           WHERE o.triggered AND o.r_multiple IS NOT NULL
+             AND COALESCE(o.exit_reason, '') <> 'invalid_fill'
+             AND p.plan_date >= ?{lane_clause("morning")}""", [lo]).fetchone()
 
-    # CONCENTRATION. `net_forgone_r` is a SUM, and a sum over a fat-tailed
-    # quantity is the one summary statistic a handful of rows can author on
-    # their own. Reported alone it reads as "the filter costs this much per
-    # rejection," which is exactly what it does not mean: a filter can be
-    # correct on the median candidate and still show a large positive net
-    # because three rejections ran. So the arithmetic that settles it is
-    # computed here rather than left to the miner's eye -- the top rows, what
-    # the net is WITHOUT them, and the median row. When the tail and the
-    # remainder disagree in SIGN, the sum is a statement about the tail and
-    # nothing else.
+    # CONCENTRATION. `net_forgone_r` is a SUM over a fat-tailed quantity, so a
+    # handful of rows can author it. The top rows, the net without them and
+    # the median are computed here so nobody has to eyeball them -- but the
+    # ex-tail figure is a SENSITIVITY read, not a verdict: in a trading book
+    # the right tail is where the P&L lives, and a filter that saves a little
+    # on the body while giving up the largest winners has a real cost. The
+    # verdict is the one-sample test on the mean forgone R per scored
+    # rejection (`t_forgone` / `p_forgone`).
     scored = [float(r[0]) for r in con.execute(
         """SELECT forgone_r FROM rejections
            WHERE eod_outcome IS NOT NULL AND plan_date >= ? AND forgone_r IS NOT NULL
            ORDER BY forgone_r DESC""", [lo]).fetchall()]
     top_rows = [
         {"ticker": r[0], "reason": r[1], "eod_outcome": r[2],
-         "forgone_r": round(float(r[3]), 2)}
+         "forgone_r": round(float(r[3]), 2), "category": r[4]}
         for r in con.execute(
-            """SELECT ticker, reason, eod_outcome, forgone_r FROM rejections
+            f"""SELECT ticker, reason, eod_outcome, forgone_r, {_KILL_CATEGORY_SQL}
+               FROM rejections
                WHERE eod_outcome IS NOT NULL AND plan_date >= ? AND forgone_r IS NOT NULL
                ORDER BY forgone_r DESC LIMIT 3""", [lo]).fetchall()
     ]
     net = round(row[5] or 0.0, 2)
     top3 = round(sum(scored[:3]), 2)
-    median = None
+    median = mean = std = t = p = None
     if scored:
         mid = sorted(scored)
         k = len(mid) // 2
         median = round(mid[k] if len(mid) % 2 else (mid[k - 1] + mid[k]) / 2.0, 3)
+        mean = sum(scored) / len(scored)
+        if len(scored) >= 2:
+            std = (sum((v - mean) ** 2 for v in scored) / (len(scored) - 1)) ** 0.5
+        t, _df, p = one_sample_t(mean, std, len(scored))
+        mean = round(mean, 4)
+        std = round(std, 4) if std is not None else None
     return {
-        "sessions": len(dates), "total": row[0] or 0,
+        "sessions": int(n_sessions), "since": str(lo), "total": row[0] or 0,
         "would_have_won": row[1] or 0, "would_have_lost": row[2] or 0,
         "scratch": row[3] or 0, "unmeasurable": row[4] or 0,
         "net_forgone_r": net,
@@ -1737,10 +1846,19 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20) 
         "top3_forgone_r": top3,
         "net_forgone_r_ex_top3": round(net - top3, 2),
         "median_forgone_r": median,
+        "mean_forgone_r": mean,
+        "std_forgone_r": std,
+        "t_forgone": t,
+        "p_forgone": round(p, 4) if p is not None else None,
+        "degraded_rows": int(degraded_rows),
+        "ungraded_rows": int(ungraded_rows),
         "top_rows": top_rows,
         "by_reason": [{"reason": r[0], "n": r[1], "net_forgone_r": float(r[2]) if r[2] is not None else 0.0} for r in by_reason],
-        "by_category": [{"category": r[0], "n": r[1], "net_forgone_r": float(r[2]) if r[2] is not None else 0.0} for r in by_category],
+        "by_category": [{"category": r[0], "n": r[1],
+                         "net_forgone_r": float(r[2]) if r[2] is not None else 0.0,
+                         "scored": int(r[3] or 0)} for r in by_category],
         "captured_r_window": round(float(captured or 0.0), 2),
+        "captured_n": int(captured_n or 0),
     }
 
 
@@ -1756,9 +1874,14 @@ def participation_funnel(con: duckdb.DuckDBPyConnection,
     in every other aggregate here, because a desk that trades almost never has
     a small, quiet, entirely unremarkable ledger.
 
-    Degraded sessions are excluded, for the same reason they are excluded from
-    every other selectivity judgment: on those days the pipeline could not
-    evaluate the market, so the resulting no-trade was plumbing, not patience.
+    MORNING lane only: rejections are the morning risk manager's, so the
+    picks beside them must be too (runner picks, up to ten a session, were
+    counted as "taken" here). Degraded sessions are excluded -- their picks,
+    their rejections and the session itself -- for the same reason they are
+    excluded from every other selectivity judgment: on those days the pipeline
+    could not evaluate the market, so the resulting no-trade was plumbing,
+    not patience. The window starts where `morning_window_start` says, which
+    is the window the weekly shadow summary is given too.
     """
     try:
         dates = [r[0] for r in con.execute(
@@ -1772,19 +1895,24 @@ def participation_funnel(con: duckdb.DuckDBPyConnection,
     empty = {"sessions_evaluated": 0, "sessions_traded": 0, "candidates_evaluated": 0,
              "picks_taken": 0, "picks_triggered": 0, "rejections": 0,
              "take_rate": None, "trigger_rate": None, "session_trade_rate": None,
-             "candidates_per_triggered_trade": None}
+             "candidates_per_triggered_trade": None, "since": None}
     if not dates:
         return empty
     lo = min(dates)
+    not_degraded_day = ("p.plan_date NOT IN (SELECT plan_date FROM daily_plans "
+                        "WHERE COALESCE(session_degraded, FALSE))")
 
     n_rej = con.execute(
-        "SELECT COUNT(*) FROM rejections WHERE plan_date >= ?", [lo]).fetchone()[0] or 0
+        f"SELECT COUNT(*) FROM rejections WHERE plan_date >= ? AND NOT {_DEGRADED_REJECTION}",
+        [lo]).fetchone()[0] or 0
     n_picks = con.execute(
-        "SELECT COUNT(*) FROM picks WHERE plan_date >= ?", [lo]).fetchone()[0] or 0
+        f"SELECT COUNT(*) FROM picks p WHERE p.plan_date >= ? AND {not_degraded_day}"
+        f"{lane_clause('morning')}", [lo]).fetchone()[0] or 0
     n_trig, n_days_traded = con.execute(
-        """SELECT COUNT(*), COUNT(DISTINCT p.plan_date)
+        f"""SELECT COUNT(*), COUNT(DISTINCT p.plan_date)
            FROM picks p JOIN outcomes o ON o.pick_id = p.pick_id
-           WHERE p.plan_date >= ? AND o.triggered""", [lo]).fetchone()
+           WHERE p.plan_date >= ? AND {not_degraded_day} AND o.triggered{lane_clause('morning')}""",
+        [lo]).fetchone()
     n_trig, n_days_traded = int(n_trig or 0), int(n_days_traded or 0)
 
     evaluated = n_picks + n_rej
@@ -1800,6 +1928,7 @@ def participation_funnel(con: duckdb.DuckDBPyConnection,
         "trigger_rate": pct(n_trig, n_picks),
         "session_trade_rate": pct(n_days_traded, len(dates)),
         "candidates_per_triggered_trade": round(evaluated / n_trig, 1) if n_trig else None,
+        "since": str(lo),
     }
 
 
@@ -1828,13 +1957,28 @@ def add_calibration_row(con: duckdb.DuckDBPyConnection, session_date: date, tick
 CALIBRATION_MIN_N = 8
 
 
+# A calibration row belongs to the RUNNER lane when its (session, ticker) was
+# a runner pick and not also a morning pick. The evening loop wrote a row for
+# every pick of the day, runner picks included, so the "conviction" table was
+# largely the intraday selector's conviction, not the morning desk's. Rows are
+# excluded at read time -- nothing stored is rewritten -- and the evening loop
+# no longer writes them.
+_RUNNER_ONLY_ROW = (
+    "EXISTS (SELECT 1 FROM picks rp WHERE rp.plan_date = {d} AND rp.ticker = {t} "
+    f"AND rp.setup_type = '{RUNNER_SETUP}') "
+    "AND NOT EXISTS (SELECT 1 FROM picks mp WHERE mp.plan_date = {d} AND mp.ticker = {t} "
+    f"AND COALESCE(mp.setup_type, '') <> '{RUNNER_SETUP}')")
+
+
 def calibration_aggregate(con: duckdb.DuckDBPyConnection,
                           min_n: int = CALIBRATION_MIN_N) -> list[dict]:
+    """Realized WR/avgR per stated conviction -- MORNING lane only."""
+    runner_only = _RUNNER_ONLY_ROW.format(d="c.session_date", t="c.ticker")
     rows = con.execute(
-        """SELECT stated_conviction, COUNT(*),
+        f"""SELECT stated_conviction, COUNT(*),
                   SUM(CASE WHEN win THEN 1 ELSE 0 END),
                   ROUND(CAST(AVG(realized_r) AS NUMERIC), 3)
-           FROM calibration WHERE realized_r IS NOT NULL
+           FROM calibration c WHERE realized_r IS NOT NULL AND NOT ({runner_only})
            GROUP BY stated_conviction ORDER BY stated_conviction DESC"""
     ).fetchall()
     out = []
@@ -1896,19 +2040,65 @@ def add_question_progress(con: duckdb.DuckDBPyConnection, question_id: int,
     )
 
 
-def question_progress_totals(con: duckdb.DuckDBPyConnection) -> list[dict]:
+# Questions whose progress rows are written per TAKEN PICK (evening
+# _deterministic_events). Their notes start with the ticker. Runner picks sit
+# in the same `picks` table, so until the evening loop was lane-scoped they
+# were counted too -- Q13 ("taken trades at planned R:R >= 2.0") counted every
+# runner pick, whose target is always exactly 2R. Q1 (gap_fade) and Q14
+# (shadow rejections) never see runner picks; Q5 is per session.
+PICK_DRIVEN_QUESTIONS = (2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13)
+
+
+def _runner_only_picks(con: duckdb.DuckDBPyConnection) -> set[tuple[str, str]]:
+    """(plan_date, TICKER) pairs that were runner picks and not morning picks."""
+    runner = {(str(d), str(t).upper()) for d, t in con.execute(
+        f"SELECT plan_date, ticker FROM picks WHERE setup_type = '{RUNNER_SETUP}'").fetchall()}
+    if not runner:
+        return set()
+    morning = {(str(d), str(t).upper()) for d, t in con.execute(
+        f"SELECT plan_date, ticker FROM picks "
+        f"WHERE COALESCE(setup_type, '') <> '{RUNNER_SETUP}'").fetchall()}
+    return runner - morning
+
+
+def _is_runner_progress_row(qid: int, session_date, note: str,
+                            runner_only: set[tuple[str, str]]) -> bool:
+    if qid not in PICK_DRIVEN_QUESTIONS or not runner_only or not (note or "").split():
+        return False
+    ticker = note.split()[0].rstrip(":").upper()
+    return (str(session_date), ticker) in runner_only
+
+
+def question_progress_rows(con: duckdb.DuckDBPyConnection, qid: int,
+                           runner_only: set[tuple[str, str]] | None = None) -> list[dict]:
+    """Every progress row for one question, runner-lane rows excluded."""
+    if runner_only is None:
+        runner_only = _runner_only_picks(con)
     rows = con.execute(
-        """SELECT question_id, SUM(increment), COUNT(*),
-                  MAX(session_date)
-           FROM open_question_progress GROUP BY question_id ORDER BY question_id"""
-    ).fetchall()
+        "SELECT session_date, increment, note FROM open_question_progress "
+        "WHERE question_id = ? ORDER BY session_date", [qid]).fetchall()
+    return [{"session_date": d, "increment": inc or 0, "note": note or ""}
+            for d, inc, note in rows
+            if not _is_runner_progress_row(qid, d, note or "", runner_only)]
+
+
+def question_progress_totals(con: duckdb.DuckDBPyConnection) -> list[dict]:
+    """Per question: the recorded increments, MORNING lane only (see
+    PICK_DRIVEN_QUESTIONS), with the most recent notes."""
+    qids = [r[0] for r in con.execute(
+        "SELECT DISTINCT question_id FROM open_question_progress ORDER BY question_id"
+    ).fetchall()]
+    runner_only = _runner_only_picks(con)
     out = []
-    for r in rows:
-        notes = con.execute(
-            "SELECT note FROM open_question_progress WHERE question_id = ? "
-            "ORDER BY session_date DESC LIMIT 5", [r[0]]).fetchall()
-        out.append({"question_id": r[0], "total": r[1] or 0, "events": r[2],
-                    "last_event": str(r[3]), "recent_notes": [n[0] for n in notes]})
+    for qid in qids:
+        rows = question_progress_rows(con, qid, runner_only)
+        if not rows:
+            continue
+        recent = sorted(rows, key=lambda r: str(r["session_date"]), reverse=True)[:5]
+        out.append({"question_id": qid, "total": sum(r["increment"] for r in rows),
+                    "events": len(rows),
+                    "last_event": str(max(r["session_date"] for r in rows)),
+                    "recent_notes": [r["note"] for r in recent]})
     return out
 
 
@@ -2290,12 +2480,13 @@ def save_selection_edge(con: duckdb.DuckDBPyConnection, row: dict) -> None:
     con.execute(
         """INSERT INTO selection_edge_history
            (week_ending, n_triggered, actual_total_r, random_mean_r, edge_r,
-            pct_random_beaten, p_value, sessions, verdict, sim_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            pct_random_beaten, p_value, sessions, verdict, sim_version, method_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         [row["week_ending"], row.get("n_triggered"), row.get("actual_total_r"),
          row.get("random_mean_r"), row.get("edge_r"),
          row.get("pct_random_beaten"), row.get("p_value"),
-         row.get("sessions"), row.get("verdict"), row.get("sim_version")],
+         row.get("sessions"), row.get("verdict"), row.get("sim_version"),
+         row.get("method_version")],
     )
 
 

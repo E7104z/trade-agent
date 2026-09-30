@@ -43,10 +43,20 @@ def test_detection_bucket(minutes, expected):
 
 
 @pytest.mark.parametrize("rvol, expected", [
+    (0.2, "<0.5"), (0.5, "0.5-1"), (0.99, "0.5-1"), (1.2, "1-1.5"),
     (1.6, "1.5-2"), (2.0, "2-3"), (3.0, "3-5"), (9.9, "5+"), (None, "?"),
 ])
 def test_rvol_bucket(rvol, expected):
     assert rr.bucket_of("runner_rvol_bucket", {"rvol": rvol}) == expected
+
+
+def test_rvol_below_the_old_gate_is_not_labelled_1_5_to_2():
+    """The scan's RVOL gate is off (min_rvol 0), so most candidates run well
+    under 1.5x. Filing them as "1.5-2" put ~98% of the lane in one cell."""
+    labels = {rr.bucket_of("runner_rvol_bucket", {"rvol": v})
+              for v in (0.24, 0.31, 0.52, 0.96, 1.43)}
+    assert "1.5-2" not in labels
+    assert len(labels) >= 3
 
 
 def test_slope_bucket_is_normalized_by_price():
@@ -212,7 +222,11 @@ def test_scan_version_filter_prevents_cross_semantics_comparison():
 # ----------------------------------------------------- new v14 mining dims
 
 def test_stop_atr_and_trend_buckets():
-    assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 0.4}) == "<0.5"
+    # The runner's EMA9 stop sits under 0.5 daily ATR by construction, so the
+    # morning lane's "<0.5" cell is split three ways for this lane.
+    assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 0.1}) == "<0.15"
+    assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 0.2}) == "0.15-0.3"
+    assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 0.4}) == "0.3-0.5"
     assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 0.7}) == "0.5-1"
     assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 1.5}) == "1-2"
     assert rr.bucket_of("runner_stop_atr_bucket", {"stop_dist_atr": 3.0}) == ">2"

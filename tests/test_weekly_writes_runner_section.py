@@ -111,9 +111,11 @@ def test_the_run_leaves_no_write_time_violations(wired, capsys):
     assert "runner-section violation" not in capsys.readouterr().out
 
 
-def test_a_miner_that_omits_the_section_is_reported(wired, monkeypatch, capsys):
-    """And the negative: if a future miner response drops the section, the run
-    must say so rather than silently reverting the selector to no-rules."""
+def test_a_miner_that_omits_the_section_still_delivers_one(wired, monkeypatch, capsys):
+    """And the negative: a miner response that drops the section must not
+    silently revert the selector to the placeholder. The section is now
+    system-rendered (2026-09-29 audit), so the selector gets the computed
+    Runner Lane whatever the miner wrote."""
     cfg, payload = wired
     stripped = dict(payload)
     pb = stripped["playbook_markdown"]
@@ -131,6 +133,10 @@ def test_a_miner_that_omits_the_section_is_reported(wired, monkeypatch, capsys):
     monkeypatch.setattr(weekly, "LLMClient", _StubLLM)
     weekly.run(cfg, run_date=date(2026, 9, 21))
 
-    out = capsys.readouterr().out
-    assert "runner-section violation" in out
-    assert "selector" in out
+    con = ledger.connect()
+    from agent.runner_selection import NO_RUNNER_RULES, _playbook_section
+    section = _playbook_section(con)
+    con.close()
+    assert section != NO_RUNNER_RULES
+    assert section.startswith("## Runner Lane")
+    assert "System-rendered" in section and NO_RUNNER_RULES in section

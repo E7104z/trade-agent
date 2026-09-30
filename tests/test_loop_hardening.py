@@ -441,8 +441,8 @@ def test_a_losing_setup_is_never_called_the_best_edge():
                                {"dim": "gap_go", "triggered": 3, "avg_r": -0.9}])
     assert out.startswith("No positive edge yet")
     assert "dto_runner" in out
-    assert dashboard.best_edge([{"dim": "gap_go", "triggered": 3, "avg_r": 0.4}]) \
-        == "gap_go · avg 0.4R over 3 triggered"
+    # three trades are not an edge, nor even a reportable average
+    assert dashboard.best_edge([{"dim": "gap_go", "triggered": 3, "avg_r": 0.4}]) == ""
 
 
 # ============================================================ health

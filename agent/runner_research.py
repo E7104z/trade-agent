@@ -195,6 +195,14 @@ def setup_edge(rows: list[dict], min_n: int = 8) -> dict:
     }
 
 
+# Contested sessions a selection verdict needs. The candidates of one session
+# share its tape, so nine picks from one morning are closer to one observation
+# than to nine; the random-portfolio control withholds its verdict below the
+# same count, and the two readings of the same selector must not disagree
+# about whether a verdict exists.
+MIN_CONTESTED_SESSIONS = 3
+
+
 def selection_edge(rows: list[dict], min_n: int = 8) -> dict:
     """Mean R of selected vs. unselected, restricted to sessions where a real
     choice was made.
@@ -202,7 +210,9 @@ def selection_edge(rows: list[dict], min_n: int = 8) -> dict:
     Sessions where every candidate was auto-selected (candidates <= max_picks)
     carry no selection signal — there was no choice — so including them would
     dilute the comparison with rows that answer a different question. Only
-    sessions containing BOTH a selected and an unselected candidate count.
+    sessions containing BOTH a selected and an unselected candidate count, and
+    below MIN_CONTESTED_SESSIONS of them the comparison is underpowered however
+    many rows each side holds.
     """
     by_session: dict[Any, dict[str, list[float]]] = {}
     for r in rows:
@@ -221,10 +231,13 @@ def selection_edge(rows: list[dict], min_n: int = 8) -> dict:
     t, df, p = welch_t(m_sel, s_sel, len(sel), m_unsel, s_unsel, len(unsel))
 
     delta = (m_sel - m_unsel) if (m_sel is not None and m_unsel is not None) else None
-    underpowered = len(sel) < min_n or len(unsel) < min_n
+    underpowered = (len(sel) < min_n or len(unsel) < min_n
+                    or len(contested) < MIN_CONTESTED_SESSIONS)
     if underpowered:
         verdict = (f"underpowered - {len(sel)} selected / {len(unsel)} unselected "
-                   f"across {len(contested)} contested session(s), need n>={min_n} a side")
+                   f"across {len(contested)} contested session(s), need n>={min_n} a side "
+                   f"and >= {MIN_CONTESTED_SESSIONS} contested sessions; no direction "
+                   "may be read from the delta")
     elif p is not None and p < 0.05:
         verdict = ("selected outperformed unselected"
                    if (delta or 0) > 0 else
@@ -321,9 +334,11 @@ def runner_md(setup: dict, selection: dict, comparisons: list[Comparison],
     for c in comparisons:
         if c.n < 3:
             continue
+        q_cell = ("not tested (degenerate: restates the lane mean)"
+                  if c.test == "degenerate" else
+                  f"{_fmt(c.q_value, 4)}{' *' if c.significant else ''}")
         lines.append(
-            f"| {c.dimension} | {c.level} | {c.n} | {_fmt(c.mean_r)} | "
-            f"{_fmt(c.q_value, 4)}{' *' if c.significant else ''} |")
+            f"| {c.dimension} | {c.level} | {c.n} | {_fmt(c.mean_r)} | {q_cell} |")
     return "\n".join(lines)
 
 
@@ -416,9 +431,9 @@ def runner_random_ablation_md(res: dict) -> str:
         return ("## RUNNER SELECTION ABLATION (selector vs random)\n\n"
                 "(not computable yet -- " + str(res.get("note", "no graded candidates")) + ")")
     pct = res["percentile"]
-    if res["sessions"] < 3:
-        verdict = ("NO VERDICT -- under 3 contested sessions; the percentile "
-                   "is about these picks, not the runner selector")
+    if res["sessions"] < MIN_CONTESTED_SESSIONS:
+        verdict = (f"NO VERDICT -- under {MIN_CONTESTED_SESSIONS} contested sessions; "
+                   "the percentile is about these picks, not the runner selector")
     elif pct >= 95:
         verdict = "the runner selector is beating random draws from its own candidate pool"
     elif pct <= 5:

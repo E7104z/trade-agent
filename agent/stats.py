@@ -419,6 +419,39 @@ class SearchResult:
         }
 
 
+# A cell holding at least this share of its dimension's rows is the lane mean
+# under another name. Tested against zero it reproduces the lane's own mean R
+# test once per dimension, so a lane that loses money shows up as a row of
+# "significant" cells that are one fact counted several times -- four
+# q<0.001 runner cells, each ~99% of the same 1,003 rows, read as four
+# independent confirmations. Such a cell is kept and shown, but not tested and
+# not counted as a look; the lane's mean is tested once, by its own comparison.
+DEGENERATE_SHARE = 0.90
+
+
+def _mark_degenerate(comps: list[Comparison]) -> None:
+    totals: dict[str, int] = {}
+    levels: dict[str, int] = {}
+    for c in comps:
+        if c.test != "one_sample":
+            continue
+        totals[c.dimension] = totals.get(c.dimension, 0) + int(c.n or 0)
+        levels[c.dimension] = levels.get(c.dimension, 0) + 1
+    for c in comps:
+        total = totals.get(c.dimension, 0)
+        # A dimension with one level (the lane-mean comparison itself) is the
+        # test these cells duplicate; it is never degenerate.
+        if c.test != "one_sample" or levels.get(c.dimension, 0) < 2 or not total:
+            continue
+        share = (c.n or 0) / total
+        if share >= DEGENERATE_SHARE:
+            c.test = "degenerate"
+            c.t_stat = c.df = c.p_value = None
+            c.mde = None
+            c.note = (c.note + f" degenerate: holds {share:.0%} of this dimension's "
+                      f"{total} rows, so it restates the lane mean; not tested").strip()
+
+
 def evaluate_search(
     comparisons: Iterable[Comparison],
     q: float = 0.10,
@@ -430,8 +463,13 @@ def evaluate_search(
     marked significant -- consistent with the playbook's existing n>=8 rule. The
     point of still testing them is that they must count toward the multiplicity
     denominator: a look you took and then dismissed is still a look.
+
+    A cell holding >= DEGENERATE_SHARE of its dimension's rows is not tested
+    (see `_mark_degenerate`): it is the lane mean again, not a look at the
+    dimension.
     """
     comps = list(comparisons)
+    _mark_degenerate(comps)
     for c in comps:
         # Only one-sample comparisons are tested here. Any other test was
         # computed by its producer on the data it needs (two arms, a 2x2

@@ -43,9 +43,10 @@ def con(monkeypatch):
 
 
 def _abl(picks, actual=-18.2, baseline=0.5, pct=12.6, sessions=5):
+    from agent.ablation import METHOD_VERSION
     return {"picks": picks, "actual_total_r": actual,
             "random_mean_total_r": baseline, "percentile": pct,
-            "p_value": 0.87, "sessions": sessions}
+            "p_value": 0.87, "sessions": sessions, "method_version": METHOD_VERSION}
 
 
 # ------------------------------------------------------------- the row
@@ -132,19 +133,23 @@ def test_rerunning_a_week_overwrites_rather_than_double_counting(con):
     assert rows[0]["n_triggered"] == 30
 
 
-def test_historical_backfill_of_the_v7_figures(con):
-    """Spec Phase 2 step 2: the -18.2R / 12.6% figures already in v7's prose
-    can be entered as a historical row and render correctly."""
+def test_rows_from_the_old_ablation_method_are_withdrawn(con):
+    """The v7 -18.2R / 12.6% and v9 -6.77R / 0.3% rows were computed by method
+    1: the desk's arm held only its triggered picks (runner picks included)
+    while the random arm drew from rejections worth 0R when they never filled.
+    Their numbers are not a point on the method-2 trend and are not shown."""
     ledger.save_selection_edge(con, {
         "week_ending": date(2026, 9, 11), "n_triggered": 22,
         "actual_total_r": -18.2, "random_mean_r": 0.0, "edge_r": -18.2,
         "pct_random_beaten": 12.6, "p_value": 0.87, "sessions": 8,
         "verdict": "no detectable selection edge", "sim_version": 3,
     })
+    ledger.save_selection_edge(con, _selection_edge_row(_abl(25), date(2026, 10, 2)))
     md = _selection_edge_md(ledger.selection_edge_history(con))
-    assert "-18.20R" in md
-    assert "12.6%" in md
-    assert "no detectable selection edge" in md
+    assert "-18.20R" not in md and "12.6% |" not in md.split("2026-10-02")[0]
+    assert "withdrawn: ablation method 1" in md
+    assert "-18.70R" in md                      # the method-2 row still shows
+    assert _check_selection_edge_table(md) == []
 
 
 # ------------------------------------------------ write-time enforcement
