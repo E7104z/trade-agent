@@ -44,7 +44,7 @@
     "alpaca_paper": true,
     "breakout_two_step": false,
     "trading_base": "https://paper-api.alpaca.markets",
-    "max_picks_per_day": 16,
+    "max_picks_per_day": 20,
     "intraday_check_secret_env": "CRON_SECRET"
   },
   "min_bar_volume": 0,

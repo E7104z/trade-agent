@@ -122,12 +122,21 @@ def submit_bracket_order(ticker: str, qty: int, side: str, entry_type: str,
     if str(entry_type or "open").lower() == "breakout":
         config = _cfg(cfg)
         if (config.get("live_paper", {}) or {}).get("breakout_two_step"):
+            # Legacy path: a plain stop entry, exits armed by the monitor after
+            # the fill -- unprotected until the next tick. Kept only behind the
+            # flag; the atomic bracket below is the default.
             return submit_stop_entry_order(ticker, qty, side, entry_price, cfg=config)
-        # Alpaca documents bracket entries as market/limit. A stop-entry
-        # bracket is not atomic, so leave breakout live placement for the
-        # later stop-entry plus OCO flow rather than submit a rejected order.
-        _LOG.warning("Skipping breakout live order for %s: stop-entry bracket is not supported atomically", ticker)
-        return None
+        # A breakout is ONE stop-entry bracket: the entry is a stop order and
+        # the take-profit and stop-loss legs are held until it triggers, so the
+        # position is protected from its fill, exactly as the simulator
+        # assumes. Verified on the paper account 2026-10-02 for both sides
+        # (status pending_new, legs limit/stop "held"). Breakouts used to be
+        # skipped here, on a reading that Alpaca allowed only market/limit
+        # bracket entries, so the ledger graded trades the account never held.
+        # A stop already through the market is refused by Alpaca ("stop price
+        # must be greater than current price"); the caller enters those at
+        # market (live_monitor.place_deferred_orders), as the simulator fills a
+        # gapped breakout at the bar's open.
     payload = {
         "symbol": str(ticker).upper(), "qty": str(int(qty)), "side": side.lower(),
         "type": order_type, "time_in_force": "day", "order_class": "bracket",

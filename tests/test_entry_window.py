@@ -242,11 +242,43 @@ def test_open_entries_and_runner_picks_are_not_the_placers_business(tmp_path, mo
     assert out["placed"] == 0 and broker == []
 
 
-def test_a_breakout_is_skipped_and_said_so_while_two_step_is_off(tmp_path, monkeypatch, broker):
+def test_a_breakout_goes_in_as_a_stop_entry_bracket(tmp_path, monkeypatch, broker):
     cfg = _live_cfg(tmp_path, monkeypatch)
     _seed_plan([_pick("WDC", "short", "breakout", 420.0, 445.0, 395.0)])
     out = _run(cfg, datetime(2026, 10, 2, 9, 45, 3, tzinfo=ET), {"WDC": 426.0}, broker)
-    assert broker == [] and "breakout_two_step" in out["skipped"][0]
+    assert out["placed"] == 1 and broker == [("WDC", "sell", "breakout", 420.0)]
+
+
+def test_a_breakout_already_through_its_trigger_enters_at_market(tmp_path, monkeypatch, broker):
+    """Alpaca refuses a stop already crossed; the simulator fills a gapped
+    breakout at the bar's open. So the live order goes in at market."""
+    cfg = _live_cfg(tmp_path, monkeypatch)
+    _seed_plan([_pick("WDC", "short", "breakout", 420.0, 445.0, 395.0)])
+    out = _run(cfg, datetime(2026, 10, 2, 9, 45, 3, tzinfo=ET), {"WDC": 417.5}, broker)
+    assert out["placed"] == 1 and broker == [("WDC", "sell", "open", 420.0)]
+    con = ledger.connect()
+    row = ledger.deferred_placements_for_date(con, D)
+    order = ledger.live_orders_for_date(con, D)[0]
+    con.close()
+    assert "sent at market" in next(iter(row.values()))["detail"]
+    assert order["entry_order_type"] == "open"
+    sim = grading.simulate_pick({"pick_id": 9, "direction": "short", "entry_type": "breakout",
+                                 "entry_price": 420.0, "stop_price": 445.0, "target_price": 395.0,
+                                 "entry_not_before": "09:45"},
+                                _bars([426.0] * 15 + [417.5] * 30), None)
+    assert sim["triggered"] and sim["entry_fill"] == pytest.approx(417.5)   # the bar's open
+
+
+def test_a_breakout_already_past_its_target_is_not_sent(tmp_path, monkeypatch, broker):
+    cfg = _live_cfg(tmp_path, monkeypatch)
+    _seed_plan([_pick("WDC", "short", "breakout", 420.0, 445.0, 395.0)])
+    out = _run(cfg, datetime(2026, 10, 2, 9, 45, 3, tzinfo=ET), {"WDC": 390.0}, broker)
+    assert broker == [] and "past the target" in out["skipped"][0]
+    sim = grading.simulate_pick({"pick_id": 9, "direction": "short", "entry_type": "breakout",
+                                 "entry_price": 420.0, "stop_price": 445.0, "target_price": 395.0,
+                                 "entry_not_before": "09:45"},
+                                _bars([426.0] * 15 + [390.0] * 30), None)
+    assert sim["exit_reason"] == "invalid_fill" and sim["invalid_reason"] == "no_reward_left"
 
 
 def test_a_broker_refusal_is_retried_next_tick(tmp_path, monkeypatch):

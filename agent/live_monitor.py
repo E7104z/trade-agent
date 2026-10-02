@@ -493,14 +493,22 @@ def place_deferred_orders(con, cfg: Config, d: date, now: datetime, md=None) -> 
             ledger.record_deferred_placement(con, d, p["pick_id"], ticker, "skipped", why)
             out["skipped"].append(f"{ticker}: {why}")
             continue
-        if kind == "breakout" and not live_cfg.get("breakout_two_step"):
-            why = ("breakout entries are not placed live (live_paper.breakout_two_step is "
-                   "off); the simulator still grades the pick")
-            ledger.record_deferred_placement(con, d, p["pick_id"], ticker, "skipped", why)
-            out["skipped"].append(f"{ticker}: {why}")
-            continue
+        send_as = kind
+        if kind == "breakout" and px is not None and ((long and px >= entry) or
+                                                      (not long and px <= entry)):
+            # Already through the trigger when the window opened. The simulator
+            # fills a gapped breakout at that bar's open; Alpaca refuses a stop
+            # already crossed. So it enters at market now, same bracket -- or,
+            # past its target, not at all (the simulator: no reward left).
+            if (long and px >= target) or (not long and px <= target):
+                why = (f"price {px:.2f} already past the target {target:.2f} when the window "
+                       f"opened (simulated as invalid_fill, no reward left)")
+                ledger.record_deferred_placement(con, d, p["pick_id"], ticker, "skipped", why)
+                out["skipped"].append(f"{ticker}: {why}")
+                continue
+            send_as = "open"
         side = "buy" if long else "sell"
-        order = live_broker.submit_bracket_order(ticker, qty, side, kind, entry, stop, target,
+        order = live_broker.submit_bracket_order(ticker, qty, side, send_as, entry, stop, target,
                                                  cfg=cfg)
         if not order:
             why = (live_broker.last_error() or "no detail")[:400]
@@ -508,15 +516,16 @@ def place_deferred_orders(con, cfg: Config, d: date, now: datetime, md=None) -> 
             out["refused"].append(f"{ticker}: {why}")
             log("intraday", f"{ticker}: deferred order refused ({why}) -- retried next tick")
             continue
-        if kind == "breakout" and live_cfg.get("breakout_two_step"):
+        if send_as == "breakout" and live_cfg.get("breakout_two_step"):
             order["order_class"] = "stop_then_oco"
-        ledger.save_live_order(con, p["pick_id"], order, d, ticker, side, qty, kind)
+        ledger.save_live_order(con, p["pick_id"], order, d, ticker, side, qty, send_as)
+        how = kind if send_as == kind else f"{kind} already through its trigger, sent at market"
         ledger.record_deferred_placement(con, d, p["pick_id"], ticker, "placed",
-                                         f"placed at {t.strftime('%H:%M:%S')} ET"
+                                         f"{how}; placed at {t.strftime('%H:%M:%S')} ET"
                                          + (f", last {px:.2f}" if px is not None else ""))
         out["placed"] += 1
-        log("intraday", f"{ticker}: deferred {kind} order placed at its entry window "
-                        f"(qty {qty})")
+        log("intraday", f"{ticker}: deferred order placed at its entry window ({how}, "
+                        f"qty {qty})")
     return out
 
 

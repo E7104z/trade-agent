@@ -68,10 +68,26 @@ def test_not_explicitly_paper_refuses_placement(monkeypatch):
         "AAPL", 1, "buy", "open", 100, 98, 104, cfg=_cfg(alpaca_paper=False)) is None
 
 
-def test_breakout_two_step_is_opt_in(monkeypatch):
+def test_a_breakout_is_one_atomic_stop_entry_bracket(monkeypatch):
+    """Alpaca accepts order_class=bracket with a STOP entry (verified on the
+    paper account 2026-10-02, both sides): the exits are held until the entry
+    triggers, so the position is protected from its fill."""
+    calls = []
+    monkeypatch.setattr(live_broker.requests, "request",
+                        lambda *args, **kwargs: (calls.append((args, kwargs)) or
+                                                  _Response({"id": "brk-1", "status": "pending_new"})))
+    result = live_broker.submit_bracket_order(
+        "AAPL", 3, "buy", "breakout", 100, 98, 104, cfg=_cfg())
+    assert result["id"] == "brk-1"
+    assert calls[0][1]["json"] == {
+        "symbol": "AAPL", "qty": "3", "side": "buy", "type": "stop", "time_in_force": "day",
+        "order_class": "bracket", "take_profit": {"limit_price": 104.0},
+        "stop_loss": {"stop_price": 98.0}, "stop_price": 100.0,
+    }
+
+
+def test_breakout_two_step_is_still_opt_in(monkeypatch):
     monkeypatch.setattr(live_broker, "submit_stop_entry_order", lambda *a, **k: {"id": "stop-1"})
-    assert live_broker.submit_bracket_order(
-        "AAPL", 1, "buy", "breakout", 100, 98, 104, cfg=_cfg()) is None
     result = live_broker.submit_bracket_order(
         "AAPL", 1, "buy", "breakout", 100, 98, 104,
         cfg=_cfg(breakout_two_step=True))
