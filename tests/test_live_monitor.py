@@ -119,3 +119,70 @@ def test_armed_oco_target_computes_live_r(monkeypatch, tmp_path):
     assert result["updated"] == 1
     assert row["exit_reason"] == "target"
     assert row["live_r"] == 2.0
+
+# ---------------------------------------------------------------------------
+# The 15:55 flatten is the LAST tick: a close refused while the bracket's legs
+# are still cancelling must be retried inside that tick, not "next tick".
+# 2026-10-01: three positions were carried overnight this way.
+# ---------------------------------------------------------------------------
+
+def _seed_filled_bracket(cfg):
+    con = ledger.connect()
+    pick_id = ledger.save_daily_plan(con, SESSION, {
+        "no_trade": False,
+        "picks": [{"ticker": "AAPL", "direction": "long", "setup_type": "gap_go",
+                   "size_r": 1.0, "entry_plan": {"type": "open"}, "entry_type": "open",
+                   "entry_price": 100.0, "stop_price": 98.0, "target_price": 104.0,
+                   "time_stop": None}],
+    }, {}, "chop")[0]
+    ledger.save_live_order(con, pick_id, {"id": "br-1", "status": "filled",
+                                          "order_class": "bracket"},
+                           SESSION, "AAPL", "buy", 100, "market")
+    con.close()
+
+
+_FILLED_BRACKET = {
+    "status": "filled", "filled_avg_price": "100.2", "filled_at": "2026-09-04T13:31:00Z",
+    "legs": [{"id": "tp", "type": "limit", "status": "new"},
+             {"id": "sl", "type": "stop", "status": "held"}],
+}
+
+
+def test_eod_flatten_retries_a_close_refused_while_legs_cancel(monkeypatch, tmp_path):
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_filled_bracket(cfg)
+    cancelled, attempts, slept = [], [], []
+    monkeypatch.setattr(live_broker, "get_order", lambda oid, **k: dict(_FILLED_BRACKET))
+    monkeypatch.setattr(live_broker, "cancel_order",
+                        lambda oid, **k: cancelled.append(oid) or True)
+
+    def _close(ticker, **k):
+        attempts.append(ticker)
+        if len(attempts) < 3:          # refused: the legs still hold the shares
+            return None
+        return {"id": "close-1", "filled_avg_price": "101.0",
+                "filled_at": "2026-09-04T19:55:03Z"}
+
+    monkeypatch.setattr(live_broker, "close_position", _close)
+    monkeypatch.setattr(live_monitor, "_sleep", lambda s: slept.append(s))
+    result = live_monitor.check(cfg, run_date=SESSION, at=datetime(2026, 9, 4, 15, 55, 1))
+    row = _row()
+    assert sorted(cancelled) == ["sl", "tp"]
+    assert len(attempts) == 3 and slept == [0.5, 1.0]
+    assert result["updated"] == 1
+    assert row["exit_reason"] == "eod" and row["exit_fill_price"] == 101.0
+
+
+def test_a_close_refused_every_time_gives_up_after_bounded_retries(monkeypatch, tmp_path):
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_filled_bracket(cfg)
+    attempts, slept = [], []
+    monkeypatch.setattr(live_broker, "get_order", lambda oid, **k: dict(_FILLED_BRACKET))
+    monkeypatch.setattr(live_broker, "cancel_order", lambda oid, **k: True)
+    monkeypatch.setattr(live_broker, "close_position",
+                        lambda t, **k: attempts.append(t) or None)
+    monkeypatch.setattr(live_monitor, "_sleep", lambda s: slept.append(s))
+    result = live_monitor.check(cfg, run_date=SESSION, at=datetime(2026, 9, 4, 15, 55, 1))
+    assert len(attempts) == len(live_monitor._CLOSE_RETRY_WAITS) + 1
+    assert sum(slept) <= 5.0           # bounded inside the tick's budget
+    assert result["updated"] == 0 and _row()["exit_reason"] is None   # carry_cleanup's job

@@ -1,6 +1,7 @@
 """Intraday synchronization for the optional live paper ledger."""
 from __future__ import annotations
 
+import time as time_mod
 from datetime import date, datetime, time, timedelta
 
 from . import ledger, live_broker
@@ -95,6 +96,34 @@ def _cancel_working_legs(order: dict | None, cfg: Config) -> int:
             live_broker.cancel_order(str(leg["id"]), cfg=cfg)
             n += 1
     return n
+
+
+# Waits between close attempts after a bracket's legs are cancelled, in
+# seconds. Alpaca cancels legs ASYNCHRONOUSLY: until a leg reports canceled it
+# still holds the position's shares, and close_position is refused
+# ("insufficient qty available"). The refused close used to be left for "the
+# next tick" -- but the 15:55 flatten IS the last tick of the session, so it
+# got one attempt, lost the race, and the position was carried overnight
+# (three of them on 2026-10-01, closed by carry_cleanup the next morning).
+_CLOSE_RETRY_WAITS = (0.5, 1.0, 1.5, 2.0)
+_sleep = time_mod.sleep
+
+
+def _close_position_after_legs(ticker: str, order: dict | None, cfg: Config) -> dict:
+    """Cancel the working legs of `order`, then close the position, retrying
+    within this tick while the cancels settle. Returns the close order (empty
+    when every attempt was refused)."""
+    _cancel_working_legs(order, cfg)
+    close_order = live_broker.close_position(ticker, cfg=cfg) or {}
+    for wait in _CLOSE_RETRY_WAITS:
+        if close_order:
+            break
+        _sleep(wait)
+        close_order = live_broker.close_position(ticker, cfg=cfg) or {}
+    if not close_order:
+        log("intraday", f"{ticker}: close refused after {len(_CLOSE_RETRY_WAITS) + 1} "
+                        f"attempts ({live_broker.last_error()})")
+    return close_order
 
 
 def _record_close(con, row: dict, pick: dict, reason: str, close_order: dict,
@@ -227,8 +256,7 @@ def check(cfg: Config, *, run_date: date | None = None, at: datetime | None = No
                 cutoff = _past_cutoff(pick, {**live_cfg, "flatten_at": live_cfg.get("flatten_at") or cfg.get("flatten_at")}, current, close)
                 if cutoff:
                     live_broker.cancel_order(str(oco_id), cfg=cfg)
-                    _cancel_working_legs(oco_order, cfg)
-                    close_order = live_broker.close_position(row["ticker"], cfg=cfg) or {}
+                    close_order = _close_position_after_legs(row["ticker"], oco_order, cfg)
                     if _record_close(con, row, pick, cutoff, close_order, live_entry):
                         updated += 1
                 continue
@@ -252,8 +280,7 @@ def check(cfg: Config, *, run_date: date | None = None, at: datetime | None = No
                         updated += 1
                         continue
                     if live_entry is not None:
-                        _cancel_working_legs(order, cfg)
-                        close_order = live_broker.close_position(row["ticker"], cfg=cfg) or {}
+                        close_order = _close_position_after_legs(row["ticker"], order, cfg)
                         if _record_close(con, row, pick, cutoff, close_order, live_entry):
                             updated += 1
                         continue
@@ -354,8 +381,7 @@ def carry_cleanup(con, cfg: Config, today: date) -> dict:
             ledger.update_live_order(con, row["live_order_id"], entry_fill_price=entry,
                                      entry_fill_at=entry_at)
             row["entry_fill_price"] = entry
-        _cancel_working_legs(exit_src, cfg)
-        close_order = live_broker.close_position(ticker, cfg=cfg) or {}
+        close_order = _close_position_after_legs(ticker, exit_src, cfg)
         if _record_close(con, row, pick, "overnight_carry", close_order, entry):
             out["closed"] += 1
             log("intraday", f"{ticker}: position from {row['session_date']} was still open "
