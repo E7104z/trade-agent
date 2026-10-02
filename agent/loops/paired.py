@@ -188,13 +188,14 @@ def record_arm(
                (plan_date, arm, ticker, direction, setup_type, entry_type,
                 entry_price, stop_price, target_price, size_r, conviction,
                 time_stop, thesis, triggered, entry_fill, exit_price,
-                exit_reason, r_multiple, sim_version, graded_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL)""",
+                exit_reason, r_multiple, sim_version, graded_at, entry_not_before)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?)""",
             [plan_date, arm, str(p.get("ticker", "")).upper(), p.get("direction"),
              p.get("setup_type"), entry_plan.get("type") or p.get("entry_type") or "open",
              p.get("entry_price"), p.get("stop_price"), p.get("target_price"),
              p.get("size_r"), p.get("conviction"), p.get("time_stop"),
-             str(p.get("thesis_final") or p.get("thesis") or "")[:2000]],
+             str(p.get("thesis_final") or p.get("thesis") or "")[:2000],
+             p.get("entry_not_before")],
         )
         n += 1
     return n
@@ -311,7 +312,7 @@ def grade_paired_arms(
     """
     rows = con.execute(
         """SELECT arm, ticker, direction, setup_type, entry_type, entry_price,
-                  stop_price, target_price, time_stop
+                  stop_price, target_price, time_stop, entry_not_before
            FROM paired_arm_picks
            WHERE plan_date = ? AND arm <> 'A' AND graded_at IS NULL
            ORDER BY arm, ticker""",
@@ -321,7 +322,7 @@ def grade_paired_arms(
         return {"graded": 0, "arms": {}}
 
     keys = ["arm", "ticker", "direction", "setup_type", "entry_type",
-            "entry_price", "stop_price", "target_price", "time_stop"]
+            "entry_price", "stop_price", "target_price", "time_stop", "entry_not_before"]
     graded = 0
     per_arm: dict[str, list[float]] = {}
     now = datetime.now()
@@ -333,6 +334,8 @@ def grade_paired_arms(
             "entry_type": row["entry_type"], "entry_price": row["entry_price"],
             "stop_price": row["stop_price"], "target_price": row["target_price"],
             "time_stop": row["time_stop"],
+            # Arm B is graded under the same entry window as production picks.
+            "entry_not_before": row["entry_not_before"],
         }
         try:
             bars = md.minute_bars(row["ticker"], plan_date)

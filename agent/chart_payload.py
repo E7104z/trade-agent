@@ -345,7 +345,8 @@ def _replay_morning(md: MarketData, con, cfg: Config, pick: dict, d: date,
 def _replay_shadow(cfg: Config, rejection: dict, d: date, bars: list[dict]) -> dict:
     shim = {"pick_id": rejection["rejection_id"], "direction": rejection["direction"],
            "entry_type": rejection["entry_type"], "entry_price": rejection["entry_price"],
-           "stop_price": rejection["stop_price"], "target_price": rejection["target_price"]}
+           "stop_price": rejection["stop_price"], "target_price": rejection["target_price"],
+           "entry_not_before": rejection.get("entry_not_before")}
     slippage = float(cfg.get("slippage_bps", 0) or 0)
     flatten_at = cfg.get("flatten_at")
     min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)

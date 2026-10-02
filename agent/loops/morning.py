@@ -17,6 +17,7 @@ from .. import ledger
 from ..config import REPORTS_DIR, Config
 from ..delivery import morning_email_html, render_dashboard, send_email
 from ..failures import classify_failure, format_failure
+from ..grading import MORNING_ENTRY_NOT_BEFORE, entry_not_before_for
 from ..indicators import beta_corr
 from ..llm import LLMClient, load_prompt, merge_usage, prompt_version
 from ..memory import build_morning_memory
@@ -565,6 +566,15 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
             p["size_r"] = round(max(p["size_r"] * scale, min_r), 2)
         warnings.append(f"scaled sizes down by {scale:.2f} to respect total risk cap {max_total}R")
 
+    # The entry window (schema v27): every limit/breakout pick goes live at
+    # morning_entry_not_before, not at the open -- placed then by the intraday
+    # tick and simulated from then. The analyst prompt has always forbidden
+    # entries in the first 15 minutes; until this stamp nothing enforced it.
+    window = str(cfg.get("morning_entry_not_before", MORNING_ENTRY_NOT_BEFORE) or "")
+    for p in valid:
+        p["entry_not_before"] = entry_not_before_for(
+            (p.get("entry_plan") or {}).get("type") or p.get("entry_type"), window)
+
     plan["picks"] = valid
     plan["total_risk_r"] = round(sum(p["size_r"] for p in valid), 2)
     if not valid and not plan.get("no_trade"):
@@ -644,9 +654,12 @@ _KILL_CHECK_ENUM = {"staleness", "chase", "entry_type", "grounding", "crowding",
                     "conviction"}
 
 
-def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
+def _build_rejections(candidates: dict, plan: dict,
+                      window: str | None = MORNING_ENTRY_NOT_BEFORE) -> list[dict]:
     """Shadow ledger input: every analyst candidate that did NOT survive to the final
-    plan, carrying its full plan levels so the evening loop can grade the counterfactual."""
+    plan, carrying its full plan levels so the evening loop can grade the counterfactual.
+    Each carries the same entry window a taken pick of its entry type would have,
+    so the shadow ledger prices a rejection exactly as the desk would have traded it."""
     rejected_rows = {str(r.get("ticker", "")).upper(): r for r in plan.get("rejected", []) or []}
     # A test-lane pick the risk manager rejected keeps its shadow row: the
     # shadow ledger goes on pricing every kill, whatever size the desk then
@@ -716,6 +729,7 @@ def _build_rejections(candidates: dict, plan: dict) -> list[dict]:
             "kill_checks": kill_checks,
             "planned_rr": planned_rr,
             "session_degraded": degraded,
+            "entry_not_before": entry_not_before_for(entry_plan.get("type", "open"), window),
         })
     return out
 
@@ -1205,6 +1219,48 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
         con2.close()
 
 
+def _place_premarket_orders(con, cfg: Config, d: date, plan: dict,
+                            pick_ids: list[int]) -> dict:
+    """Send the morning run's pre-market orders: `open` entries only.
+
+    A limit/breakout pick carries entry_not_before (schema v27) and goes live
+    at its entry window, sent by the intraday tick (live_monitor.
+    place_deferred_orders). Sent from here it was a day order live from 09:30,
+    and a limit already through the price filled on the opening print the plan
+    forbade (NKE and WDC, 2026-10-02).
+    """
+    from .. import live_broker
+    out = {"placed": [], "deferred": [], "not_placed": []}
+    # Explicit slice, not membership-testing the id list: the old
+    # `pick_id not in pick_ids[:max]` form only emulated an index check while
+    # pick_ids happened to be unique and ordered, and would mis-slice
+    # (silently, and in O(n^2)) if an id ever repeated.
+    max_live = int(cfg["live_paper"].get("max_picks_per_day", 4))
+    for p, pick_id in itertools.islice(zip(plan["picks"], pick_ids), max_live):
+        kind = p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open")
+        if p.get("entry_not_before"):
+            log("morning", f"{p['ticker']}: live order deferred to {p['entry_not_before']} ET")
+            out["deferred"].append(p["ticker"])
+            continue
+        entry = float(p["entry_price"])
+        stop = float(p["stop_price"])
+        side = "buy" if p["direction"] == "long" else "sell"
+        qty = live_broker.quantity_for_r(p.get("size_r", 0), cfg.get("dollars_per_r", 500),
+                                         entry, stop)
+        order = live_broker.submit_bracket_order(p["ticker"], qty, side, kind, entry, stop,
+                                                 float(p["target_price"]), cfg=cfg)
+        if not order:
+            log("morning", f"WARN live paper order for {p['ticker']} not placed: "
+                           f"{live_broker.last_error() or 'qty < 1 or breakout skipped'}")
+            out["not_placed"].append(p["ticker"])
+            continue
+        if str(kind).lower() == "breakout" and cfg["live_paper"].get("breakout_two_step"):
+            order["order_class"] = "stop_then_oco"
+        ledger.save_live_order(con, pick_id, order, d, p["ticker"], side, qty, kind)
+        out["placed"].append(p["ticker"])
+    return out
+
+
 def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
     d = run_date or today_et()
     started = now_et().replace(tzinfo=None)
@@ -1427,7 +1483,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
 
         # 8. persist
         _attach_overlay_context(plan, bundle)
-        rejections = _build_rejections(candidates, plan)
+        rejections = _build_rejections(
+            candidates, plan,
+            str(cfg.get("morning_entry_not_before", MORNING_ENTRY_NOT_BEFORE) or ""))
         plan["persisted_rejection_count"] = len(rejections)
         plan["no_trade_category"] = _no_trade_category(plan, rejections)
         pick_ids = ledger.save_daily_plan(con, d, plan, candidates, reg.get("tag", ""))
@@ -1464,33 +1522,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # picks are already locked above; a broker failure cannot change them.
         if cfg.get("live_paper", {}).get("enabled") and plan.get("picks"):
             try:
-                from .. import live_broker
-                # Explicit slice, not membership-testing the id list: the old
-                # `pick_id not in pick_ids[:max]` form only emulated an index
-                # check while pick_ids happened to be unique and ordered, and
-                # would mis-slice (silently, and in O(n^2)) if an id ever
-                # repeated. Behavior-identical in the normal case.
-                max_live = int(cfg["live_paper"].get("max_picks_per_day", 4))
-                for p, pick_id in itertools.islice(zip(plan["picks"], pick_ids), max_live):
-                    entry = float(p["entry_price"])
-                    stop = float(p["stop_price"])
-                    qty = live_broker.quantity_for_r(
-                        p.get("size_r", 0), cfg.get("dollars_per_r", 500), entry, stop)
-                    order = live_broker.submit_bracket_order(
-                        p["ticker"], qty, "buy" if p["direction"] == "long" else "sell",
-                        p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open"),
-                        entry, stop, float(p["target_price"]), cfg=cfg)
-                    if not order:
-                        log("morning", f"WARN live paper order for {p['ticker']} not placed: "
-                                       f"{live_broker.last_error() or 'qty < 1 or breakout skipped'}")
-                    if order:
-                        if ((p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open")).lower()
-                                == "breakout" and cfg["live_paper"].get("breakout_two_step")):
-                            order["order_class"] = "stop_then_oco"
-                        ledger.save_live_order(
-                            con, pick_id, order, d, p["ticker"],
-                            "buy" if p["direction"] == "long" else "sell", qty,
-                            p.get("entry_type") or (p.get("entry_plan") or {}).get("type", "open"))
+                _place_premarket_orders(con, cfg, d, plan, pick_ids)
             except Exception as e:
                 log("morning", f"WARN live paper placement failed; simulation unchanged: {e}")
 

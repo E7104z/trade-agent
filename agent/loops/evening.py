@@ -434,7 +434,9 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
             bars = []
         shim = {"pick_id": r["rejection_id"], "direction": r["direction"],
                 "entry_type": r["entry_type"], "entry_price": r["entry_price"],
-                "stop_price": r["stop_price"], "target_price": r["target_price"]}
+                "stop_price": r["stop_price"], "target_price": r["target_price"],
+                # Same entry window a taken pick of this type carried (v27).
+                "entry_not_before": r.get("entry_not_before")}
         sim = simulate_pick(shim, bars, None, slippage_bps=slippage_bps,
                             flatten_at=flatten_at, min_bar_volume=min_bar_volume,
                             session_date=d)
@@ -501,7 +503,8 @@ def _q1_gap_fade_mechanics(con, md: MarketData, d: date, picks: list[dict],
         planned = simulate_pick({"pick_id": 0, "direction": c["direction"],
                                  "entry_type": c.get("entry_type", "limit"),
                                  "entry_price": c["entry_price"], "stop_price": c["stop_price"],
-                                 "target_price": c["target_price"]}, bars, None,
+                                 "target_price": c["target_price"],
+                                 "entry_not_before": c.get("entry_not_before")}, bars, None,
                                 slippage_bps=slippage_bps, session_date=d)
         open_sim = simulate_pick({"pick_id": 0, "direction": c["direction"],
                                   "entry_type": "open", "entry_price": bars[0]["o"],

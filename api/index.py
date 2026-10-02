@@ -831,6 +831,19 @@ def intraday_check():
         except Exception as e:
             log("intraday", f"WARN carry cleanup failed; monitor unaffected: {e}")
             result["carry"] = {"error": str(e)}
+        # Morning limit/breakout picks go live at their entry window (09:45 by
+        # default), not on the opening print. Guarded like the runner.
+        try:
+            from agent.live_monitor import place_deferred_orders
+            from agent.util import now_et
+            con = ledger.connect()
+            try:
+                result["deferred"] = place_deferred_orders(con, cfg, today_et(), now_et())
+            finally:
+                con.close()
+        except Exception as e:
+            log("intraday", f"WARN deferred order placement failed; monitor unaffected: {e}")
+            result["deferred"] = {"error": str(e)}
     if (cfg.get("runner", {}) or {}).get("enabled"):
         try:
             from agent.loops.runner import tick

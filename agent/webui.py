@@ -617,7 +617,7 @@ function planHtml(){
     const entryType = p.entry_type || (p.entry_plan && p.entry_plan.type) || 'open';
     const link = tickerLink(p.ticker, p.pick_id != null ? {date: state.today, lane:'morning', id: p.pick_id} : {date: state.today});
     return `<tr><td>${link}</td><td>${esc(p.direction)}</td><td>${esc(p.setup_type||'')}</td>
-      <td>${esc(entryType)} @ ${px(p.entry_price)}</td><td>${px(p.stop_price)}</td>
+      <td>${esc(entryType)} @ ${px(p.entry_price)}${p.entry_not_before ? ` <span class="muted-note">(live ${esc(p.entry_not_before)} ET)</span>` : ''}</td><td>${px(p.stop_price)}</td>
       <td>${px(p.target_price)}</td><td>${esc(p.size_r ?? '—')}R</td><td>${esc(p.conviction ?? '—')}</td>
       <td class="wrap">${esc(p.thesis_final||p.thesis||'')}</td></tr>`;
   }).join('');

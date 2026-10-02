@@ -58,10 +58,12 @@ def morning_email_html(plan_date: date, plan: dict, regime_md: str) -> str:
             lane = p.get("exploration_lane")
             floor = floor or lane == "daily_floor"
             setup = p.get('setup_type', '') + (f" [{lane.replace('_', ' ')}]" if lane else "")
+            live_at = (" (live " + str(p["entry_not_before"]) + " ET)"
+                       if p.get("entry_not_before") else "")
             rows.append(f"""
             <tr>
               <td>{p['ticker']}</td><td>{p['direction']}</td><td>{setup}</td>
-              <td>{entry_type} @ {p.get('entry_price')}</td><td>{p.get('stop_price')}</td><td>{p.get('target_price')}</td>
+              <td>{entry_type} @ {p.get('entry_price')}{live_at}</td><td>{p.get('stop_price')}</td><td>{p.get('target_price')}</td>
               <td>{p.get('size_r')}R</td><td>{p.get('conviction')}</td>
               <td>{p.get('thesis_final') or p.get('thesis', '')}</td>
             </tr>""")
@@ -437,7 +439,9 @@ def _plan_html(plan: dict | None) -> str:
         entry_type = (p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open"
         rows.append(
             f"<tr><td>{p['ticker']}</td><td>{p['direction']}</td><td>{p.get('setup_type','')}</td>"
-            f"<td>{entry_type} @ {p.get('entry_price')}</td><td>{p.get('stop_price')}</td><td>{p.get('target_price')}</td>"
+            f"<td>{entry_type} @ {p.get('entry_price')}"
+            f"{' (live ' + str(p['entry_not_before']) + ' ET)' if p.get('entry_not_before') else ''}</td>"
+            f"<td>{p.get('stop_price')}</td><td>{p.get('target_price')}</td>"
             f"<td>{p.get('size_r')}R</td><td>{p.get('conviction')}</td><td>{p.get('thesis_final','')}</td></tr>"
         )
     table = (

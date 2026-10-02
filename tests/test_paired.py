@@ -67,6 +67,8 @@ def con():
     c.execute("CREATE TABLE daily_plans (plan_date DATE)")
     for stmt in migrations_v4.research_schema():
         c.execute(stmt)
+    # v27: paired_arm_picks carries the entry window production picks carry.
+    c.execute("ALTER TABLE paired_arm_picks ADD COLUMN IF NOT EXISTS entry_not_before VARCHAR")
     yield c
     c.close()
 

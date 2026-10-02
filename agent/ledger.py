@@ -406,6 +406,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v25.STATEMENTS
 from . import migrations_v26  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v26.STATEMENTS
 
+# --- v27 the morning lane's entry window (entry_not_before) -----------------
+from . import migrations_v27  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v27.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -621,8 +625,9 @@ def save_daily_plan(
                (plan_date, ticker, direction, setup_type, catalyst, thesis, conviction,
                 size_r, entry_type, entry_price, stop_price, target_price, target2_price,
                 time_stop, invalidation, regime_tag, prompt_version, playbook_version,
-                    in_scan_universe, exploration_lane, exploration_rr, probe_for)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    in_scan_universe, exploration_lane, exploration_rr, probe_for,
+                    entry_not_before)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                RETURNING pick_id""",
             [
                 plan_date,
@@ -647,6 +652,7 @@ def save_daily_plan(
                 p.get("exploration_lane"),
                 p.get("exploration_rr"),
                 p.get("probe_for"),
+                p.get("entry_not_before"),
             ],
         ).fetchone()
         ids.append(row[0])
@@ -692,6 +698,25 @@ def live_orders_for_date(con: duckdb.DuckDBPyConnection, d: date,
     sql += " ORDER BY submitted_at, live_order_id"
     rows = con.execute(sql, [d]).fetchall()
     return [dict(zip(cols, row)) for row in rows]
+
+
+def deferred_placements_for_date(con: duckdb.DuckDBPyConnection, d: date) -> dict[int, dict]:
+    """{pick_id: {status, detail, ...}} for the morning picks the intraday
+    tick placed or refused at their entry window (schema v27)."""
+    cols = [c[0] for c in con.execute("DESCRIBE deferred_placements").fetchall()]
+    rows = con.execute("SELECT * FROM deferred_placements WHERE plan_date = ?", [d]).fetchall()
+    return {r[cols.index("pick_id")]: dict(zip(cols, r)) for r in rows}
+
+
+def record_deferred_placement(con: duckdb.DuckDBPyConnection, d: date, pick_id: int,
+                              ticker: str, status: str, detail: str = "") -> None:
+    """Upsert one pick's deferred-placement outcome (placed | skipped | refused)."""
+    con.execute("DELETE FROM deferred_placements WHERE plan_date = ? AND pick_id = ?",
+                [d, pick_id])
+    con.execute(
+        """INSERT INTO deferred_placements (plan_date, pick_id, ticker, status, detail,
+               attempted_at) VALUES (?,?,?,?,?,?)""",
+        [d, pick_id, str(ticker).upper(), status, (detail or "")[:500], datetime.now()])
 
 
 def update_live_order(con: duckdb.DuckDBPyConnection, live_order_id: str, **fields: Any) -> None:
@@ -1660,8 +1685,8 @@ def save_rejections(con: duckdb.DuckDBPyConnection, plan_date: date, rejections:
                (plan_date, ticker, direction, setup_type, reason, entry_type,
                 entry_price, stop_price, target_price, conviction, thesis,
                 source_stage, rejection_category, planned_rr, session_degraded,
-                primary_kill_check, kill_checks, kill_checks_n)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                primary_kill_check, kill_checks, kill_checks_n, entry_not_before)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 plan_date, r["ticker"].upper(), r.get("direction"), r.get("setup_type"),
                 r.get("reason", ""), r.get("entry_type", "open"), r.get("entry_price"),
@@ -1671,6 +1696,7 @@ def save_rejections(con: duckdb.DuckDBPyConnection, plan_date: date, rejections:
                 r.get("primary_kill_check"),
                 ",".join(r.get("kill_checks") or []) or None,
                 len(r.get("kill_checks") or []) or None,
+                r.get("entry_not_before"),
             ],
         )
     return len(rejections)

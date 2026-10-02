@@ -391,6 +391,135 @@ def carry_cleanup(con, cfg: Config, today: date) -> dict:
     return out
 
 
+def _live_prices(md, tickers: list[str]) -> dict[str, float]:
+    """Latest trade per ticker from one snapshots call; {} when unavailable."""
+    alp = getattr(md, "alpaca", None) if md is not None else None
+    if alp is None or not tickers:
+        return {}
+    try:
+        snaps = alp.snapshots(tickers) or {}
+    except Exception as e:  # noqa: BLE001 -- a price read never blocks placement
+        log("intraday", f"WARN live prices unavailable for deferred placement: {e}")
+        return {}
+    out: dict[str, float] = {}
+    for t, snap in snaps.items():
+        p = ((snap or {}).get("latestTrade") or {}).get("p")
+        if p:
+            out[str(t).upper()] = float(p)
+    return out
+
+
+def place_deferred_orders(con, cfg: Config, d: date, now: datetime, md=None) -> dict:
+    """Send the morning picks whose entry window has opened (schema v27).
+
+    A limit or breakout pick carries entry_not_before (09:45 by default --
+    "no entries in the first 15 minutes after the open"). The morning run no
+    longer sends those orders pre-market, where they were day orders live from
+    09:30 and a limit already through the price filled on the opening print
+    (NKE and WDC on 2026-10-02). This sends them at the first intraday tick at
+    or after the window, with exactly the morning run's sizing and bracket.
+
+    Mirrors the simulator, which starts the same pick's fill search at the
+    window:
+      - a limit whose price is ALREADY through its stop is not sent: it would
+        fill on the wrong side of its own stop, which the simulator grades
+        invalid_fill (a breakout simply rests -- the simulator fills it later);
+      - a pick whose time stop / flatten passed before its window is not sent.
+    Every outcome is recorded in deferred_placements. A broker refusal is
+    retried on the next tick; a skip is final. Idempotent: a pick that has a
+    live order, or a final outcome, is never sent twice.
+    """
+    live_cfg = cfg.get("live_paper", {}) or {}
+    if not live_cfg.get("enabled"):
+        return {"skipped": "live paper disabled"}
+    if not is_market_day(d):
+        return {"skipped": "not a market day"}
+    close = market_close_et(d)
+    t = now.time()                           # `now` is ET wall-clock (now_et())
+    if not (time(9, 30) <= t < close):
+        return {"skipped": "outside market hours"}
+
+    max_live = int(live_cfg.get("max_picks_per_day", 4))
+    morning = [p for p in ledger.picks_for_date(con, d)
+               if p.get("setup_type") != ledger.RUNNER_SETUP]
+    eligible = morning[:max_live]            # the morning run's own slice, pick_id order
+    have_order = {o.get("pick_id") for o in ledger.live_orders_for_date(con, d)}
+    final = {pid for pid, r in ledger.deferred_placements_for_date(con, d).items()
+             if r.get("status") in ("placed", "skipped")}
+    flat_cfg = {**live_cfg, "flatten_at": live_cfg.get("flatten_at") or cfg.get("flatten_at")}
+
+    out = {"placed": 0, "waiting": 0, "skipped": [], "refused": []}
+    due = []
+    for p in eligible:
+        nb = _time_stop(p.get("entry_not_before"))
+        if nb is None or p["pick_id"] in have_order or p["pick_id"] in final:
+            continue
+        if t < nb:
+            out["waiting"] += 1
+            continue
+        cutoff = _past_cutoff(p, flat_cfg, now, close)
+        if cutoff:
+            why = f"its {cutoff} passed before the order could go live"
+            ledger.record_deferred_placement(con, d, p["pick_id"], p["ticker"], "skipped", why)
+            out["skipped"].append(f"{p['ticker']}: {why}")
+            continue
+        due.append(p)
+    if not due:
+        return out
+
+    if md is None:
+        from .providers import MarketData
+        md = MarketData(cfg)
+    last = _live_prices(md, [p["ticker"] for p in due])
+    for p in due:
+        ticker = str(p["ticker"]).upper()
+        long = p.get("direction") == "long"
+        entry, stop, target = (float(p["entry_price"]), float(p["stop_price"]),
+                               float(p["target_price"]))
+        kind = str(p.get("entry_type") or "open").lower()
+        px = last.get(ticker)
+        if kind == "limit" and px is not None and ((long and px <= stop) or (not long and px >= stop)):
+            why = (f"price {px:.2f} already through the stop {stop:.2f} when the window "
+                   f"opened -- the limit would fill on the wrong side of its own stop "
+                   f"(simulated as invalid_fill)")
+            ledger.record_deferred_placement(con, d, p["pick_id"], ticker, "skipped", why)
+            out["skipped"].append(f"{ticker}: {why}")
+            log("intraday", f"{ticker}: deferred order NOT placed -- {why}")
+            continue
+        qty = live_broker.quantity_for_r(p.get("size_r") or 0, cfg.get("dollars_per_r", 500),
+                                         entry, stop)
+        if qty < 1:
+            why = f"qty < 1 at size_r={p.get('size_r')}"
+            ledger.record_deferred_placement(con, d, p["pick_id"], ticker, "skipped", why)
+            out["skipped"].append(f"{ticker}: {why}")
+            continue
+        if kind == "breakout" and not live_cfg.get("breakout_two_step"):
+            why = ("breakout entries are not placed live (live_paper.breakout_two_step is "
+                   "off); the simulator still grades the pick")
+            ledger.record_deferred_placement(con, d, p["pick_id"], ticker, "skipped", why)
+            out["skipped"].append(f"{ticker}: {why}")
+            continue
+        side = "buy" if long else "sell"
+        order = live_broker.submit_bracket_order(ticker, qty, side, kind, entry, stop, target,
+                                                 cfg=cfg)
+        if not order:
+            why = (live_broker.last_error() or "no detail")[:400]
+            ledger.record_deferred_placement(con, d, p["pick_id"], ticker, "refused", why)
+            out["refused"].append(f"{ticker}: {why}")
+            log("intraday", f"{ticker}: deferred order refused ({why}) -- retried next tick")
+            continue
+        if kind == "breakout" and live_cfg.get("breakout_two_step"):
+            order["order_class"] = "stop_then_oco"
+        ledger.save_live_order(con, p["pick_id"], order, d, ticker, side, qty, kind)
+        ledger.record_deferred_placement(con, d, p["pick_id"], ticker, "placed",
+                                         f"placed at {t.strftime('%H:%M:%S')} ET"
+                                         + (f", last {px:.2f}" if px is not None else ""))
+        out["placed"] += 1
+        log("intraday", f"{ticker}: deferred {kind} order placed at its entry window "
+                        f"(qty {qty})")
+    return out
+
+
 def reconcile_evening(con, cfg: Config, d: date) -> dict:
     """Poll today's orders and copy known live R into outcomes only."""
     if not (cfg.get("live_paper", {}) or {}).get("enabled"):
@@ -440,4 +569,22 @@ def reconcile_evening(con, cfg: Config, d: date) -> dict:
     if divergence:
         log("evening", f"Live paper reconciliation: {count} exits, "
                        f"mean |live_r - simulated_r|={sum(divergence) / len(divergence):.3f}R")
-    return {"reconciled": count, "divergence": divergence}
+    # A windowed morning pick with neither a live order nor a recorded
+    # placement outcome never reached the broker: no intraday tick ran at its
+    # entry window. The simulator still graded it, so say so.
+    unplaced = []
+    try:
+        have = {o.get("pick_id") for o in ledger.live_orders_for_date(con, d)}
+        tried = ledger.deferred_placements_for_date(con, d)
+        max_live = int((cfg.get("live_paper", {}) or {}).get("max_picks_per_day", 4))
+        morning = [p for p in picks.values() if p.get("setup_type") != ledger.RUNNER_SETUP]
+        for p in sorted(morning, key=lambda x: x["pick_id"])[:max_live]:
+            if p.get("entry_not_before") and p["pick_id"] not in have and p["pick_id"] not in tried:
+                unplaced.append(p["ticker"])
+        if unplaced:
+            log("evening", f"WARN live paper: {len(unplaced)} pick(s) never reached the broker "
+                           f"(no intraday tick at the entry window): {', '.join(unplaced)} -- "
+                           f"the ledger grades them, the paper account does not hold them")
+    except Exception as e:  # noqa: BLE001 -- a diagnostic never fails the reconcile
+        log("evening", f"WARN could not check deferred placements: {e}")
+    return {"reconciled": count, "divergence": divergence, "never_placed": unplaced}

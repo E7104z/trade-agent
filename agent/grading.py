@@ -152,6 +152,24 @@ SAME_SEMANTICS = {"morning": frozenset({5, 6}), "shadow": frozenset({5, 6}),
                   "runner": frozenset({6}), "live": frozenset({5, 6})}
 
 
+# The morning lane's entry window: "no entries in the first 15 minutes after
+# the open" (prompts/morning_analyst.md), as a time. Stamped on each limit /
+# breakout pick, rejection and paired-arm pick by the morning run (config
+# `morning_entry_not_before`), read by simulate_pick and by the live placer
+# (live_monitor.place_deferred_orders), which submits those orders then.
+MORNING_ENTRY_NOT_BEFORE = "09:45"
+
+
+def entry_not_before_for(entry_type: str | None, window: str | None) -> str | None:
+    """The entry window a pick of `entry_type` carries: `window` for a limit
+    or breakout order, None for an `open` entry (the opening print is the
+    point of an open entry, and it is placed pre-market)."""
+    kind = str(entry_type or "open").lower()
+    if kind not in ("limit", "breakout") or not window:
+        return None
+    return window if _parse_clock(window) is not None else None
+
+
 def same_semantics(stored_version, lane: str | None) -> bool:
     """True when a row graded under `stored_version` was graded by rules
     identical, for `lane`, to the running simulator's."""
@@ -583,6 +601,20 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         if idx is not None:
             entry_cutoff_idx = idx if entry_cutoff_idx is None else min(entry_cutoff_idx, idx)
 
+    # ---- entry window: the pick's entry_not_before ----------------------
+    # A limit/breakout order cannot fill before the time the plan put it live
+    # (schema v27: the morning lane's 09:45, "no entries in the first 15
+    # minutes"). The live placer submits those orders at that time, so the
+    # simulator starts its fill search there too. An `open` entry is the
+    # opening print by definition and is never windowed. A row with no
+    # entry_not_before (every row before 2026-10-02) grades exactly as before.
+    window_idx = 0
+    if entry_type != "open" and pick.get("entry_not_before"):
+        nb = _parse_clock(pick.get("entry_not_before"))
+        if nb is not None:
+            idx = _clock_to_bar_index(nb, bars)
+            window_idx = idx if idx is not None else len(bars)
+
     # ---- find fill -------------------------------------------------------
     fill_price = None
     fill_idx = None
@@ -593,6 +625,8 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         for i, b in enumerate(bars):
             if entry_cutoff_idx is not None and i >= entry_cutoff_idx:
                 break  # order cancelled at the cutoff -- see sim_version 4
+            if i < window_idx:
+                continue  # not live yet -- the order goes in at entry_not_before
             if _is_thin(b, min_bar_volume):
                 continue  # thin-bar filter: don't trust a quiet bar to trigger entry
             if entry_type == "limit":
@@ -615,8 +649,16 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                     break
 
     if fill_price is None:
+        # Measured over the bars the order was LIVE for: a move that happened
+        # before entry_not_before is one the plan forbade itself to take.
+        live_bars = bars[window_idx:]
+        if not live_bars:
+            out["untriggered_reason"] = "other"
+            out["untriggered_note"] = (f"no bars at/after entry_not_before "
+                                       f"{pick.get('entry_not_before')}")
+            return out
         # untriggered: how much did the idea move without us?
-        best = max(b["h"] for b in bars) if long else min(b["l"] for b in bars)
+        best = max(b["h"] for b in live_bars) if long else min(b["l"] for b in live_bars)
         move = (best - entry) if long else (entry - best)
         out["missed_move_r"] = round(move / risk, 2)
         # ...and WHY we never got on. missed_move_r says how far the idea ran
@@ -625,9 +667,10 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         # narrow". Only the second is a rule defect, and only the second
         # would ever justify loosening an entry condition. The cutoff is the
         # same one the fill search above honored.
+        cut = None if entry_cutoff_idx is None else max(0, entry_cutoff_idx - window_idx)
         reason, note, gap_r = classify_untriggered(
-            bars, entry, risk, long, entry_type,
-            cutoff_idx=entry_cutoff_idx, min_bar_volume=min_bar_volume)
+            live_bars, entry, risk, long, entry_type,
+            cutoff_idx=cut, min_bar_volume=min_bar_volume)
         out["untriggered_reason"] = reason
         out["untriggered_note"] = note
         out["trigger_gap_r"] = gap_r
