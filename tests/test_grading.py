@@ -974,16 +974,20 @@ def test_market_close_et_and_is_half_day_calendar():
 def test_half_day_time_stop_after_close_exits_at_the_1300_close():
     # time_stop "by 14:00" on a 13:00-close session cannot fire — the position
     # exits at the actual session close (eod), never against a nonexistent bar.
+    # sim_version 7: the desk's session exit is the live monitor's flatten,
+    # 5 minutes before the 13:00 close -- the OPEN of the 12:55 bar.
     pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0,
                  time_stop="by 14:00")
     bars = [
-        _tbar(12, 58, 100.0, 100.5, 99.5, 100.2),
-        _tbar(12, 59, 100.2, 100.6, 99.8, 100.4),  # last bar of the short session
+        _tbar(12, 53, 100.0, 100.5, 99.5, 100.2),
+        _tbar(12, 54, 100.2, 100.6, 99.8, 100.4),
+        _tbar(12, 55, 100.3, 100.7, 99.9, 100.6),  # flatten bar: out at its open
+        _tbar(12, 59, 100.6, 100.9, 100.1, 100.8),  # last bar of the short session
     ]
     out = simulate_pick(pick, bars, None, session_date=HALF_DAY)
     assert out["session_length"] == "half"
     assert out["exit_reason"] == "eod"
-    assert out["exit_price"] == 100.4
+    assert out["exit_price"] == 100.3
 
 
 def test_half_day_time_stop_before_close_still_fires_normally():
@@ -1002,13 +1006,14 @@ def test_half_day_time_stop_before_close_still_fires_normally():
 def test_half_day_flatten_1555_is_recorded_inert_not_silently_dropped():
     pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0)
     bars = [
-        _tbar(12, 58, 100.0, 100.5, 99.5, 100.2),
-        _tbar(12, 59, 100.2, 100.6, 99.8, 100.4),
+        _tbar(12, 53, 100.0, 100.5, 99.5, 100.2),
+        _tbar(12, 55, 100.3, 100.7, 99.9, 100.6),  # the desk's half-day flatten (v7)
+        _tbar(12, 59, 100.6, 100.9, 100.1, 100.8),
     ]
     out = simulate_pick(pick, bars, None, flatten_at="15:55", session_date=HALF_DAY)
     assert out["flatten_inert"] is True
     assert out["exit_reason"] == "eod"
-    assert out["exit_price"] == 100.4
+    assert out["exit_price"] == 100.3
 
 
 def test_full_day_active_flatten_sets_inert_false_and_session_full():
@@ -1053,3 +1058,39 @@ def test_grade_day_threads_session_date_into_session_length():
     assert outcomes[0]["session_length"] == "half"
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# sim_version 7: the session exit is the live desk's 15:55 flatten
+# ---------------------------------------------------------------------------
+
+def _full_session(prices_by_minute):
+    """1-minute bars 09:30-15:59 with a flat price unless overridden."""
+    from datetime import datetime, timedelta
+    t0 = datetime(FULL_DAY.year, FULL_DAY.month, FULL_DAY.day, 9, 30)
+    out = []
+    for i in range(390):
+        t = t0 + timedelta(minutes=i)
+        p = prices_by_minute.get(t.strftime("%H:%M"), 100.0)
+        out.append({"t": t, "o": p, "h": p + 0.05, "l": p - 0.05, "c": p, "v": 10_000})
+    return out
+
+
+def test_a_held_position_exits_at_the_1555_open_like_the_live_monitor():
+    """The monitor flattens at 15:55; the simulator held to the 15:59 close,
+    so every hold-to-close trade carried four minutes the account never held."""
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0)
+    bars = _full_session({"15:55": 101.0, "15:56": 104.0, "15:59": 104.0})
+    out = simulate_pick(pick, bars, None, session_date=FULL_DAY)
+    assert out["exit_reason"] == "eod"
+    assert out["exit_price"] == 101.0
+    assert out["exit_time"].strftime("%H:%M") == "15:55"
+    assert out["eod_r_planned"] == pytest.approx(0.2)     # same exit for the counterfactual
+
+
+def test_no_entry_fills_at_or_after_the_flatten():
+    pick = _pick(entry_type="limit", entry=99.0, stop=97.0, target=103.0)
+    bars = _full_session({"15:57": 98.5})                   # the only dip, after 15:55
+    out = simulate_pick(pick, bars, None, session_date=FULL_DAY)
+    assert out["triggered"] is False

@@ -274,7 +274,8 @@ def test_evening_stores_replays_and_r_planned(con):
     # Stored as ET wall clock. A tz-aware write lands shifted into the writer's
     # zone (Central locally, UTC on Neon) and the time-of-day read goes wrong.
     assert replays["time_1100"]["exit_et"] == datetime(2026, 9, 16, 11, 0)
-    assert replays["plan"]["exit_et"] == datetime(2026, 9, 16, 15, 59)
+    # sim_version 7 / policy v3: held to the desk's 15:55 flatten, not 15:59.
+    assert replays["plan"]["exit_et"] == datetime(2026, 9, 16, 15, 55)
 
 
 def test_weekly_search_counts_every_exit_policy_as_a_look(con, monkeypatch):

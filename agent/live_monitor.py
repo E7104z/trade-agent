@@ -55,12 +55,12 @@ def _live_r(pick: dict, entry: float | None, exit_price: float | None) -> float 
     return (float(exit_price) - float(entry)) * direction / risk
 
 
-# This desk is intraday-only: the simulator exits every open position at the
-# session close ("eod"). Bracket legs are day orders -- they EXPIRE at the
-# close, and an unmanaged position then simply stays open overnight. The
-# monitor flattens this many minutes before the close so the live account
-# holds what the simulator holds.
-EOD_FLATTEN_MINUTES = 5
+# This desk is intraday-only. Bracket legs are day orders -- they EXPIRE at
+# the close, and an unmanaged position then simply stays open overnight. The
+# monitor flattens this many minutes before the close, and the simulator exits
+# at the same bar (grading.EOD_FLATTEN_MINUTES, sim_version 7), so the live
+# account and the ledger hold the same thing.
+from .grading import EOD_FLATTEN_MINUTES  # noqa: E402
 
 # Alpaca order states that still hold shares / can still fill.
 _WORKING = {"new", "accepted", "held", "pending_new", "partially_filled",

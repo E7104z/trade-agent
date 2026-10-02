@@ -38,7 +38,8 @@ from datetime import date, time as dtime, timedelta
 from typing import Any
 
 from . import runner_indicators as ri
-from .grading import CURRENT_SIM_VERSION, _clock_to_bar_index, _is_thin, _parse_clock
+from .grading import (CURRENT_SIM_VERSION, EOD_FLATTEN_MINUTES, _clock_to_bar_index, _is_thin,
+                      _parse_clock)
 from .stats import Comparison
 from .util import ET, market_close_et
 
@@ -58,7 +59,9 @@ __all__ = [
 # versions describe different experiments and are never pooled.
 # v2: R booked from the worse of planned entry and fill (grader's r_planned
 # fix); breakeven/scale levels measured from that basis, not the plan's entry.
-POLICY_VERSION = 2
+# v3: the session exit is the live desk's 15:55 flatten (the open of the bar
+# EOD_FLATTEN_MINUTES before the close), as the grader's sim_version 7.
+POLICY_VERSION = 3
 
 REFERENCE = "plan"
 DIMENSION = "runner_exit_policy"
@@ -180,7 +183,7 @@ def _five_minute_marks(bars: list[dict]) -> dict[int, dict]:
 def _walk(p: ExitPolicy, bars: list[dict], fill_idx: int, fill: float,
           entry: float, stop: float, risk: float, marks: dict[int, dict],
           slip: float, min_bar_volume: float, flatten_idx: int | None,
-          time_idx: int | None) -> dict:
+          time_idx: int | None, eod_idx: int | None = None) -> dict:
     """One policy, long only, walked bar by bar from the fill. Within a bar the
     order is the grader's conservative one: a pending trail exit (at the open),
     then the stop, flatten, time stop, target, and only then anything that
@@ -213,6 +216,8 @@ def _walk(p: ExitPolicy, bars: list[dict], fill_idx: int, fill: float,
 
     for i in range(fill_idx, len(bars)):
         b = bars[i]
+        if eod_idx is not None and i >= eod_idx and i > fill_idx:
+            return done(b["o"], "eod", i)          # the desk's 15:55 flatten
         if trail_pending:
             return done(b["o"], p.trail, i)
         if be_pending:
@@ -272,6 +277,12 @@ def replay(bars: list[dict], fill_idx: int | None, entry: float, stop: float, *,
             local = _clock_to_bar_index(parsed, trade)
             flatten_idx = None if local is None else fill_idx + local
 
+    # The desk's session exit, as the grader applies it (sim_version 7).
+    from datetime import datetime as _dt
+    eod_t = (_dt.combine(date.min, close_t) - timedelta(minutes=EOD_FLATTEN_MINUTES)).time()
+    local_eod = _clock_to_bar_index(eod_t, trade)
+    eod_idx = None if local_eod is None else fill_idx + local_eod
+
     marks = _five_minute_marks(bars)
     fill_t = trade[0]["t"]
     fill_clock = fill_t.time() if hasattr(fill_t, "time") else fill_t
@@ -284,7 +295,7 @@ def replay(bars: list[dict], fill_idx: int | None, entry: float, stop: float, *,
             local = _clock_to_bar_index(p.time_stop, trade)
             time_idx = None if local is None else fill_idx + local
         out.append(_walk(p, bars, fill_idx, fill, entry, stop, risk, marks,
-                         slip, min_bar_volume, flatten_idx, time_idx))
+                         slip, min_bar_volume, flatten_idx, time_idx, eod_idx))
     return out
 
 

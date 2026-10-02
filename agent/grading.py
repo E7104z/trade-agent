@@ -97,7 +97,7 @@ Simulation rules (documented, conservative):
 from __future__ import annotations
 
 import re
-from datetime import date, time as dtime
+from datetime import date, datetime, time as dtime, timedelta
 from typing import Any
 
 from . import indicators as ind
@@ -135,7 +135,20 @@ _CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 # an order (runner_selection._place_live_orders). Morning and shadow semantics
 # are UNCHANGED from v5 -- their exact-target gate stays -- so a morning row
 # graded under v5 is equivalent to one graded under v6 (SAME_SEMANTICS).
-CURRENT_SIM_VERSION = 6
+# v7 = EVERY lane: the session exit is the live desk's. live_monitor flattens
+# every open position EOD_FLATTEN_MINUTES before the close (15:55; 12:55 on an
+# early close) and cancels any entry still unfilled; the simulator held to the
+# last regular bar's close (15:59), so every hold-to-close trade in the ledger
+# carried four minutes the paper account never held. Now a position still open
+# at that bar exits at its OPEN (when the monitor's market order goes in), no
+# entry may fill at or after it, and the hold-to-close counterfactual (eod_r)
+# ends there too. The open->close null model (baseline_r) is unchanged.
+CURRENT_SIM_VERSION = 7
+
+# Minutes before the session close at which the live monitor flattens every
+# position (and the simulator exits it). The single source: live_monitor
+# imports it from here.
+EOD_FLATTEN_MINUTES = 5
 
 # The least reward, in planned R, a runner fill must leave below the target.
 # It is the execution_anomaly line (fill_vs_plan_r > 0.5) read from the other
@@ -148,8 +161,8 @@ RUNNER_MIN_REWARD_R = 0.5
 # version is compared to the running one (the chart drawer's replay guard),
 # so a v6 bump that changed nothing for the morning lane does not flag every
 # morning chart as "graded under another simulator".
-SAME_SEMANTICS = {"morning": frozenset({5, 6}), "shadow": frozenset({5, 6}),
-                  "runner": frozenset({6}), "live": frozenset({5, 6})}
+SAME_SEMANTICS = {"morning": frozenset({7}), "shadow": frozenset({7}),
+                  "runner": frozenset({7}), "live": frozenset({7})}
 
 
 # The morning lane's entry window: "no entries in the first 15 minutes after
@@ -590,7 +603,12 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     # The earliest of time_stop and flatten_at, clamped against the session
     # close exactly as the exit walk clamps them. A resting limit/breakout
     # order is cancelled at this bar: nothing at or after it may fill.
-    entry_cutoff_idx = None
+    # ---- session exit (sim_version 7): the live desk's 15:55 flatten ------
+    eod_t = (datetime.combine(date.min, close_t)
+             - timedelta(minutes=EOD_FLATTEN_MINUTES)).time()
+    eod_idx = _clock_to_bar_index(eod_t, bars) if bars and bars[0].get("t") is not None else None
+
+    entry_cutoff_idx = eod_idx   # the monitor cancels unfilled entries there too
     for raw in (pick.get("time_stop"), flatten_at):
         if not raw:
             continue
@@ -840,6 +858,11 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
 
     for i in range(fill_idx, len(bars)):
         b = bars[i]
+        if eod_idx is not None and i >= eod_idx and i > fill_idx:
+            # The live monitor's 15:55 flatten: out at this bar's open, before
+            # anything inside the bar (sim_version 7).
+            exit_price, exit_reason, exit_idx = b["o"], "eod", i
+            break
         thin = _is_thin(b, min_bar_volume)
         if long:
             if b["l"] < worst_px:
@@ -913,8 +936,11 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         out["time_to_mfe_min"] = round((best_t - fill_t).total_seconds() / 60, 1)
 
     # ---- management counterfactuals (same risk denominator as r_multiple) ----
-    # eod_r: hold from the actual fill to the close, no stop, no target.
-    eod_exit = bars[-1]["c"]
+    # eod_r: hold from the actual fill to the desk's session exit (the 15:55
+    # flatten; the last bar's close only when the bars end before it), no
+    # stop, no target.
+    eod_exit = (bars[eod_idx]["o"] if eod_idx is not None and eod_idx > fill_idx
+                else bars[-1]["c"])
     if slip > 0:
         eod_exit = eod_exit * (1 - slip) if long else eod_exit * (1 + slip)
     out["eod_r"] = round(sign * (eod_exit - fill_price) / risk, 3)
@@ -925,7 +951,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     # stop-first tie rule above).
     if exit_reason == "stop":
         hit = False
-        for b in bars[exit_idx:]:
+        for b in bars[exit_idx:(eod_idx if eod_idx is not None and eod_idx > exit_idx else len(bars))]:
             if (long and b["h"] >= target) or (not long and b["l"] <= target):
                 hit = True
                 break

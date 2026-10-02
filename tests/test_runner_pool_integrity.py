@@ -402,11 +402,15 @@ def test_r_planned_caps_a_fill_near_a_stale_stop():
     assert grading.realized_r(sim) == sim["r_planned"]
 
 
-def test_sim_version_six_is_runner_only_semantics():
-    assert grading.CURRENT_SIM_VERSION == 6
-    assert grading.same_semantics(5, "morning") and grading.same_semantics(5, "shadow")
-    assert not grading.same_semantics(5, "runner")
-    assert grading.same_semantics(6, "runner") and grading.same_semantics(None, "runner")
+def test_sim_version_semantics_map():
+    """v7 changed the session exit for EVERY lane (the 15:55 flatten), so no
+    older version grades any lane identically to the running simulator."""
+    assert grading.CURRENT_SIM_VERSION == 7
+    for lane in ("morning", "shadow", "runner", "live"):
+        assert grading.same_semantics(7, lane)
+        assert not grading.same_semantics(6, lane)
+        assert not grading.same_semantics(5, lane)
+    assert grading.same_semantics(None, "runner")
 
 
 def test_grade_day_applies_the_runner_entry_time_to_runner_picks_only():
@@ -658,7 +662,7 @@ def test_evening_runner_grading_stores_post_move_and_invalid_reason(con, monkeyp
     assert o["exit_reason"] == "invalid_fill" and o["invalid_reason"] == "stale_bracket"
     assert o["session_close"] == pytest.approx(29.80)
     assert o["post_move_atr"] == pytest.approx((29.80 - 29.49) / 0.6, abs=1e-3)
-    assert o["sim_version"] == 6
+    assert o["sim_version"] == grading.CURRENT_SIM_VERSION
 
 
 # ===================================================================
