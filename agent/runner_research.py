@@ -33,6 +33,7 @@ import random
 from datetime import date, timedelta
 from typing import Any
 
+from .clusters import unit_values
 from .stats import (Comparison, min_detectable_effect_two_sample, one_sample_t,
                     welch_t)
 
@@ -163,35 +164,47 @@ def _attach_regime(con: Any, rows: list[dict]) -> list[dict]:
 
 
 def candidate_comparisons(rows: list[dict], n_dimensions: int = 1) -> list[Comparison]:
-    """One Comparison per (dimension, bucket) — every one of these is a look."""
+    """One Comparison per (dimension, bucket) — every one of these is a look.
+
+    n counts (session, industry) UNITS, not rows (agent/clusters.py): the rows
+    of one session in one industry are one event, and counting them one by
+    one let a cell clear n >= 8 on a single morning's tape. Each unit's value
+    is its rows' mean realized R; the row count rides in the note.
+    """
     out: list[Comparison] = []
     for dim in MINING_DIMENSIONS:
-        buckets: dict[str, list[float]] = {}
+        buckets: dict[str, list[dict]] = {}
         for r in rows:
-            buckets.setdefault(bucket_of(dim, r), []).append(float(_planned_r(r)))
-        for level, values in sorted(buckets.items()):
+            buckets.setdefault(bucket_of(dim, r), []).append(r)
+        for level, cell in sorted(buckets.items()):
+            values = unit_values(cell, _planned_r)
             mean, std = _mean_std(values)
+            note = f"{len(values)} session x industry units from {len(cell)} rows"
+            if level == "?":
+                note = "null/unmeasured bucket; " + note
             out.append(Comparison(
                 dimension=dim, level=level, n=len(values),
-                mean_r=mean, std_r=std, n_dimensions=n_dimensions,
-                note="null/unmeasured bucket" if level == "?" else "",
+                mean_r=mean, std_r=std, n_dimensions=n_dimensions, note=note,
             ))
     return out
 
 
 def setup_edge(rows: list[dict], min_n: int = 8) -> dict:
-    """Mean R across ALL candidates vs. zero. Does the setup have edge at all?"""
-    values = [float(_planned_r(r)) for r in rows]
+    """Mean R across ALL candidates vs. zero. Does the setup have edge at all?
+
+    Tested over (session, industry) units, not rows: see agent/clusters.py."""
+    values = unit_values(rows, _planned_r)
     mean, std = _mean_std(values)
     t, df, p = one_sample_t(mean, std, len(values), 0.0)
     return {
-        "n": len(values), "mean_r": mean, "std_r": std,
+        "n": len(values), "n_rows": len(rows), "mean_r": mean, "std_r": std,
         "t_stat": t, "df": df, "p_value": p,
         "underpowered": len(values) < min_n,
         "comparison": Comparison(
             dimension="runner_setup_edge", level="all_candidates",
             n=len(values), mean_r=mean, std_r=std,
-            note="mean R across every runner candidate vs zero"),
+            note=(f"mean R across every runner candidate vs zero; "
+                  f"{len(values)} session x industry units from {len(rows)} rows")),
     }
 
 
@@ -214,17 +227,18 @@ def selection_edge(rows: list[dict], min_n: int = 8) -> dict:
     below MIN_CONTESTED_SESSIONS of them the comparison is underpowered however
     many rows each side holds.
     """
-    by_session: dict[Any, dict[str, list[float]]] = {}
+    by_session: dict[Any, dict[str, list[dict]]] = {}
     for r in rows:
         d = r.get("session_date")
         side = "selected" if r.get("selected") else "unselected"
-        by_session.setdefault(d, {"selected": [], "unselected": []})[side].append(
-            float(_planned_r(r)))
+        by_session.setdefault(d, {"selected": [], "unselected": []})[side].append(r)
 
     contested = {d: v for d, v in by_session.items()
                  if v["selected"] and v["unselected"]}
-    sel = [x for v in contested.values() for x in v["selected"]]
-    unsel = [x for v in contested.values() for x in v["unselected"]]
+    # Each side counts (session, industry) units, not rows (agent/clusters.py):
+    # six tanker picks off one tick are one selected observation, not six.
+    sel = [x for v in contested.values() for x in unit_values(v["selected"], _planned_r)]
+    unsel = [x for v in contested.values() for x in unit_values(v["unselected"], _planned_r)]
 
     m_sel, s_sel = _mean_std(sel)
     m_unsel, s_unsel = _mean_std(unsel)
@@ -306,7 +320,9 @@ def runner_md(setup: dict, selection: dict, comparisons: list[Comparison],
         lines += [pin, ""]
     lines += [
         "### 1. Setup edge — every candidate, traded or not, vs zero",
-        f"- n = {setup['n']} triggered candidates",
+        f"- n = {setup['n']} session x industry units "
+        f"({setup.get('n_rows', setup['n'])} triggered candidates; the rows of one "
+        "session in one industry are one observation)",
         f"- mean R = {_fmt(setup['mean_r'])} (sd {_fmt(setup['std_r'])})",
         f"- p = {_fmt(setup['p_value'], 4)}"
         + ("  **UNDERPOWERED**" if setup["underpowered"] else ""),
@@ -314,9 +330,9 @@ def runner_md(setup: dict, selection: dict, comparisons: list[Comparison],
         "### 2. Selection edge — did picking help?",
         f"- contested sessions (both a selected and an unselected candidate): "
         f"{selection['sessions_contested']}",
-        f"- selected:   n = {selection['n_selected']}, "
+        f"- selected:   n = {selection['n_selected']} units, "
         f"mean R = {_fmt(selection['mean_r_selected'])}",
-        f"- unselected: n = {selection['n_unselected']}, "
+        f"- unselected: n = {selection['n_unselected']} units, "
         f"mean R = {_fmt(selection['mean_r_unselected'])}",
         f"- delta = {_fmt(selection['delta_r'])} R, p = {_fmt(selection['p_value'], 4)}",
         f"- **{selection['verdict']}**",
@@ -327,6 +343,9 @@ def runner_md(setup: dict, selection: dict, comparisons: list[Comparison],
         "or a random N — do not write a playbook rule that assumes otherwise.",
         "",
         "### 3. Candidate dimensions",
+        "",
+        "n = session x industry units (rows of one session in one industry are one "
+        "observation; the row count is in the note).",
         "",
         "| dimension | bucket | n | mean R | q |",
         "|---|---|---|---|---|",

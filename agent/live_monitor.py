@@ -370,8 +370,12 @@ def reconcile_evening(con, cfg: Config, d: date) -> dict:
     if not (cfg.get("live_paper", {}) or {}).get("enabled"):
         return {"reconciled": 0, "divergence": []}
     picks = {p["pick_id"]: p for p in ledger.picks_for_date(con, d)}
+    # live_r is (exit - fill) over PLANNED risk, so the simulated side of the
+    # divergence is planned-risk R too. r_multiple divides by the fill-to-stop
+    # distance; comparing the two measured the denominators, not the fills.
     outcomes = {r[0]: r for r in con.execute(
-        "SELECT pick_id, r_multiple FROM outcomes WHERE eval_date = ?", [d]).fetchall()}
+        "SELECT pick_id, COALESCE(r_planned, r_multiple) FROM outcomes WHERE eval_date = ?",
+        [d]).fetchall()}
     divergence = []
     count = 0
     for row in ledger.live_orders_for_date(con, d):

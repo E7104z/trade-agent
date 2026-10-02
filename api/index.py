@@ -304,16 +304,22 @@ def _runner_payload(con, d) -> dict:
                                                     x["ticker"]))],
             # Same-day eyeball diagnostic, not a retuning signal -- one day's
             # top N out of hundreds of candidates is noise as training data.
-            # The FDR-corrected, many-session version already lives in
+            # Ranked by the move AFTER detection, (close - plan price) / ATR;
+            # change_pct (the move already made at detection) rides along as
+            # context only. The FDR-corrected, many-session comparison lives in
             # agent/runner_research.selection_edge() and feeds the weekly
             # miner, which is the only thing allowed to write a playbook rule.
-            "movers": [
-                {"ticker": r["ticker"], "change_pct": r["change_pct"],
-                 "r_multiple": r["r_multiple"],
-                 "exit_reason": r["exit_reason"], "selected": r["selected"],
-                 "rank": r["rank"]}
-                for r in runner_view.top_movers(s, 10)
+            "moves": [
+                {"ticker": r["ticker"], "post_move_atr": r["post_move_atr"],
+                 "change_pct": r["change_pct"], "r": r["r"],
+                 "exit_reason": r["exit_reason"], "invalid_reason": r["invalid_reason"],
+                 "selected": r["selected"], "rank": r["rank"]}
+                for r in runner_view.biggest_moves(s, 10)
             ],
+            # Selected vs field in planned-risk R, with fills, industry units
+            # and invalid fills counted -- one session, not evidence.
+            "outcomes": runner_view.outcome_summary(s) if s["graded"] else None,
+            "universe_note": runner_view.universe_line(s),
         }
     except Exception as e:
         return {"ran": False, "health": f"runner view unavailable ({e})",

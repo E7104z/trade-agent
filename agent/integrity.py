@@ -276,6 +276,13 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
                                                     search.comparisons, q),
                       looks)
 
+    # Runner rules whose forward n was counted per row (before scan_version 3)
+    # restart their clock BEFORE anything is promoted: a rule must never
+    # graduate on thirty correlated rows from one morning
+    # (research.restart_runner_forward_clocks; idempotent).
+    _safe("integrity", "runner forward-clock restart",
+          lambda: research.restart_runner_forward_clocks(con), [])
+
     # Decay FIRST, in code (FORWARD_VALIDATION_SPEC_v1 Phase 4): a validated
     # rule gone silent for 30 market sessions returns to quarantine, a reversed
     # one retires. Then the quarantine is evaluated with cohort FDR. Both are

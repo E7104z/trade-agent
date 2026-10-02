@@ -758,18 +758,26 @@ function renderRunner(){
         <span class="card-sub" id="rn-count"></span></div><div id="rn-table"></div>`
     : '';
   let moversHtml = '';
-  const movers = rn.movers || [];
-  if(movers.length){
-    const overlap = movers.filter(m=>m.selected).length;
-    const mvRows = movers.map(m=>{
-      const rc = m.change_pct==null ? '#8b949e' : (m.change_pct>=0 ? '#3fb950' : '#f85149');
+  const moves = rn.moves || [];
+  const exitLabel = (x) => x.exit_reason === 'invalid_fill' ? `invalid (${x.invalid_reason || 'fill'})` : (x.exit_reason || '');
+  if(moves.length){
+    const overlap = moves.filter(m=>m.selected).length;
+    const mvRows = moves.map(m=>{
+      const rc = m.post_move_atr==null ? '#8b949e' : (m.post_move_atr>=0 ? '#3fb950' : '#f85149');
       const tag = m.selected ? `<span style="color:#3fb950;font-weight:700">#${m.rank} picked</span>` : `<span style="color:#8b949e">not picked</span>`;
       const link = tickerLink(m.ticker, {date: state.today, lane:'runner', id: m.ticker.toUpperCase() + ':' + state.today});
-      return `<tr><td><b>${link}</b></td><td class="num" style="color:${rc}">${m.change_pct==null?'—':Number(m.change_pct).toFixed(1)+'%'}</td><td>${esc(m.exit_reason||'')}</td><td>${tag}</td></tr>`;
+      return `<tr><td><b>${link}</b></td><td class="num" style="color:${rc}">${m.post_move_atr==null?'—':Number(m.post_move_atr).toFixed(2)}</td><td class="num ${rCls(m.r)}">${m.r==null?'—':Number(m.r).toFixed(2)}</td><td>${esc(exitLabel(m)||'no fill')}</td><td class="num">${m.change_pct==null?'—':Number(m.change_pct).toFixed(1)+'%'}</td><td>${tag}</td></tr>`;
     }).join('');
-    moversHtml = `<h3>Top ${movers.length} movers today (by % move)</h3>
-      <p class="muted-note">${overlap} of ${movers.length} were selected. Same-day eyeball check, not a training signal — one day's winners are noise to retune a selector on. The FDR-corrected version, across many sessions, feeds the weekly miner instead.</p>
-      <div class="table-wrap"><table><thead><tr><th>Ticker</th><th class="num">% move</th><th>Exit</th><th></th></tr></thead><tbody>${mvRows}</tbody></table></div>`;
+    moversHtml = `<h3>Biggest ${moves.length} moves after detection</h3>
+      <p class="muted-note">Ranked by (session close − plan price) ÷ ATR14 — the move after the system could act. ${overlap} of ${moves.length} were selected. "Chg% at detection" is the move that had already happened when the scan flagged the name: context, not an outcome. Same-day eyeball check, not a training signal; the FDR-corrected version, across many sessions, feeds the weekly miner instead.</p>
+      <div class="table-wrap"><table><thead><tr><th>Ticker</th><th class="num">Move (ATR)</th><th class="num">R</th><th>Exit</th><th class="num">Chg% at detection</th><th></th></tr></thead><tbody>${mvRows}</tbody></table></div>`;
+  }
+  let outcomeHtml = '';
+  const oc = rn.outcomes;
+  if(oc){
+    const side = (label, x) => x && x.n ? `${label}: <b class="${rCls(x.mean_r)}">${Number(x.mean_r).toFixed(2)}R</b> over ${x.n} fills (${x.units} industry units; ${x.invalid} invalid fills not counted)` : '';
+    const parts = [side('Selected', oc.selected), side('Field', oc.field)].filter(Boolean);
+    if(parts.length) outcomeHtml = `<p class="muted-note">${parts.join(' · ')} — realized R in planned-risk units, one session, not evidence on its own.</p>`;
   }
   let picksHtml = '';
   if((rn.picks||[]).length){
@@ -783,6 +791,7 @@ function renderRunner(){
     <div class="card">
       <div class="card-head"><h2>Runner Lane — ${esc(state.today)}</h2><span class="pill ${bad?'bad':quiet?'warn':'ok'}">${esc(rn.health||'')}</span></div>
       ${rn.skipped_reason ? `<p class="muted-note">selection: ${esc(rn.skipped_reason)}</p>` : ''}
+      ${rn.universe_note ? `<p class="muted-note">universe: ${esc(rn.universe_note)}</p>` : ''}
       <div class="stat-grid">
         ${kpi('Scanned', rn.universe||0, '')}
         ${kpi('Candidates', rn.n_candidates||0, '')}
@@ -790,9 +799,10 @@ function renderRunner(){
         ${kpi('Live orders', rn.n_orders||0, '')}
       </div>
       ${picksHtml}
+      ${outcomeHtml}
       ${moversHtml}
       <h3>All candidates</h3>${table || '<div class="empty">No candidates.</div>'}
-      <p class="muted-note">Every candidate is priced by the evening simulator, selected or not — that is what makes "did picking help?" answerable. Each is entered no earlier than the scan tick that found it and the selection decision, so picks and field are priced from the same moment. Rows marked #N were chosen.</p>
+      <p class="muted-note">Every candidate is priced by the evening simulator, selected or not — that is what makes "did picking help?" answerable. Each is entered no earlier than the scan tick that found it and the selection decision, so picks and field are priced from the same moment. Held = when the VWAP/EMA conditions first held; Seen = the scan tick that formed the plan (price, stop, target). R is realized R in planned-risk units; a fill that left too little of the plan's reward is an invalid fill, not a trade. Rows marked #N were chosen.</p>
     </div>`;
   if(table){
     if(hadFocus){
@@ -819,16 +829,17 @@ function renderRunnerTable(){
   $('rn-count').textContent = rows.length === all.length ? `${all.length} candidates` : `${rows.length} of ${all.length}`;
   if(!rows.length){ box.innerHTML = '<div class="empty">No candidates match.</div>'; return; }
   const n = (v, dg) => (v==null ? '—' : Number(v).toFixed(dg==null?2:dg));
+  const exitLabel = (x) => x.exit_reason === 'invalid_fill' ? `invalid (${x.invalid_reason || 'fill'})` : (x.exit_reason || '');
   const body = rows.map(r=>{
     const sel = r.selected ? `<span class="pos" style="font-weight:700">#${esc(r.rank)}</span>` : '';
     const link = tickerLink(r.ticker, {date: state.today, lane:'runner', id: r.ticker.toUpperCase() + ':' + state.today});
-    return `<tr><td>${sel}</td><td><b>${link}</b></td><td>${esc(r.detection_et||'')}</td>
+    return `<tr><td>${sel}</td><td><b>${link}</b></td><td>${esc(r.industry||'')}</td><td>${esc(r.detection_et||'')}</td><td>${esc(r.seen_et||'')}</td>
       <td class="num">${n(r.price)}</td><td class="num">${n(r.stop)}</td><td class="num">${n(r.target)}</td>
       <td class="num">${n(r.rvol)}</td><td class="num">${n(r.vwap_pct)}</td><td class="num">${n(r.tc,1)}</td>
-      <td class="num">${n(r.change_pct)}</td><td class="num ${rCls(r.r_multiple)}">${n(r.r_multiple)}</td>
-      <td>${esc(r.exit_reason||'')}</td></tr>`;
+      <td class="num">${n(r.change_pct)}</td><td class="num ${rCls(r.r)}">${n(r.r)}</td><td class="num">${n(r.post_move_atr)}</td>
+      <td>${esc(exitLabel(r))}</td></tr>`;
   }).join('');
-  box.innerHTML = `<div class="table-wrap" style="max-height:620px"><table><thead><tr><th></th><th>Ticker</th><th>Det ET</th><th class="num">Price</th><th class="num">Stop</th><th class="num">Target</th><th class="num">RVOL</th><th class="num">VWAP%</th><th class="num">TC</th><th class="num">Chg%</th><th class="num">R</th><th>Exit</th></tr></thead><tbody>${body}</tbody></table></div>`;
+  box.innerHTML = `<div class="table-wrap" style="max-height:620px"><table><thead><tr><th></th><th>Ticker</th><th>Industry</th><th>Held</th><th>Seen</th><th class="num">Price</th><th class="num">Stop</th><th class="num">Target</th><th class="num">RVOL</th><th class="num">VWAP%</th><th class="num">TC</th><th class="num">Chg%</th><th class="num">R (plan)</th><th class="num">Move (ATR)</th><th>Exit</th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 function renderPlaybook(){
   const b = $('playbook-body');

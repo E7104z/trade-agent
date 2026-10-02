@@ -100,11 +100,11 @@ def test_api_status_includes_runner_movers(monkeypatch, tmp_path):
             [session, ticker, datetime(2026, 9, 18, 10, 30),
              10.0 + i, 9.5 + i, 11.0 + i, 0.5, chg])
     ledger.mark_runner_selected(con, session, "PICKED_LOSER", 1, None)
-    for ticker, r, _ in [("WINNER", 5.0, 18.0), ("PICKED_LOSER", -1.0, -6.0)]:
+    for ticker, r, move in [("WINNER", 1.9, 2.4), ("PICKED_LOSER", -1.0, -0.8)]:
         ledger.save_runner_candidate_outcome(con, {
             "session_date": session, "ticker": ticker, "eval_date": session,
-            "triggered": True, "r_multiple": r, "exit_reason": "eod",
-            "sim_version": 3,
+            "triggered": True, "r_multiple": r, "r_planned": r, "exit_reason": "eod",
+            "sim_version": 6, "post_move_atr": move,
         })
     ledger.upsert_runner_session(con, {
         "session_date": session, "universe_size": 100, "candidates_found": 2,
@@ -120,11 +120,15 @@ def test_api_status_includes_runner_movers(monkeypatch, tmp_path):
         "/api/status", headers={"Authorization": "Bearer test-secret"})
     assert response.status_code == 200
     body = response.get_json()
-    movers = body["runner"]["movers"]
-    assert [m["ticker"] for m in movers] == ["WINNER", "PICKED_LOSER"]
-    assert movers[0]["selected"] is False
-    assert movers[1]["selected"] is True
-    assert movers[1]["rank"] == 1
+    # Ranked by the move AFTER detection (post_move_atr), with planned-risk R.
+    moves = body["runner"]["moves"]
+    assert [m["ticker"] for m in moves] == ["WINNER", "PICKED_LOSER"]
+    assert moves[0]["selected"] is False and moves[0]["r"] == 1.9
+    assert moves[1]["selected"] is True
+    assert moves[1]["rank"] == 1
+    assert "movers" not in body["runner"]
+    oc = body["runner"]["outcomes"]
+    assert oc["selected"]["n"] == 1 and oc["field"]["n"] == 1
 
 
 def test_runner_is_a_runnable_loop_and_cron_target(monkeypatch):

@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime
+from functools import partial
 
 from .. import ledger
 from ..config import Config
 from ..delivery import evening_email_html, render_dashboard, send_email
-from ..grading import (CURRENT_SIM_VERSION, classify_shadow, grade_day,
-                       outcomes_md, simulate_pick)
+from ..grading import (CURRENT_SIM_VERSION, RUNNER_MIN_REWARD_R, classify_shadow,
+                       grade_day, outcomes_md, realized_r, simulate_pick)
 from ..grading_context import build_grading_context
 from ..llm import LLMClient, load_prompt, prompt_version
 from ..coverage import (OUTCOME_FIELDS, RUNNER_FIELDS, lane_of, outcome_coverage,
@@ -157,22 +158,26 @@ def _runner_grader_block(con, d: date) -> str:
     def _n(v, dg=2):
         return "" if v is None else f"{v:.{dg}f}"
 
-    lines = ["| sel | rank | ticker | det ET | price | rvol | vwap% | tc | stop_dist | stop_atr | 200d | R | exit |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| sel | rank | ticker | industry | det ET | price | rvol | vwap% | tc | stop_dist | stop_atr | 200d | R | exit |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     n_sel = 0
     for c in candidates:
         o = outcomes.get(c["ticker"]) or {}
         sel = bool(o.get("selected"))
         n_sel += 1 if sel else 0
         fp = c.get("first_pass_et")
-        # A fill that landed on the wrong side of its own stop is not a trade.
-        # Mask its R so no lesson is ever extracted from a structurally
-        # impossible outcome - the existing fill-validity hard gate, applied
-        # here before any runner row can reach lesson extraction.
+        # A fill that is not a trade (wrong side of its stop, or too little
+        # reward left at the fill) has no R. Mask it so no lesson is ever
+        # extracted from a structurally impossible outcome.
         invalid = o.get("exit_reason") == "invalid_fill"
-        r_txt = "INVALID FILL" if invalid else _n(o.get("r_multiple"))
+        # R is planned-risk R (r_planned), the measure every runner statistic
+        # reads. r_multiple divides by the fill-to-stop distance, so a fill a
+        # few cents above a stale stop printed +5..7R "wins" (2026-10-01).
+        r_val = o.get("r_planned") if o.get("r_planned") is not None else o.get("r_multiple")
+        r_txt = "INVALID FILL" if invalid else _n(r_val)
         lines.append(
             f"| {'YES' if sel else ''} | {o.get('selection_rank') or ''} | {c['ticker']} | "
+            f"{c.get('industry') or ''} | "
             f"{fp.strftime('%H:%M') if isinstance(fp, datetime) else ''} | "
             f"{_n(c.get('detection_price'))} | {_n(c.get('rvol'))} | "
             f"{_n(c.get('vwap_pct_above'))} | {_n(c.get('trend_consistency'), 1)} | "
@@ -185,9 +190,11 @@ def _runner_grader_block(con, d: date) -> str:
     body = chr(10).join(lines)
     return ("## RUNNER LANE - FULL CANDIDATE LIST (selected rows marked)" + chr(10) * 2
             + header + chr(10) * 2 + body + chr(10) * 2
-            + "Every row was priced by the same simulator, selected or not. Judge "
-              "whether the SELECTION was defensible on what was knowable at "
-              "decision time - not on which row happened to win.")
+            + "Every row was priced by the same simulator, selected or not. R is "
+              "realized R in PLANNED-risk units. Judge whether the SELECTION was "
+              "defensible on what was knowable at decision time - not on which row "
+              "happened to win. Several selected rows in one industry are one bet, "
+              "not several independent ones.")
 
 
 def _replay_exits(replays: list[dict], summary: dict, ticker: str, c: dict,
@@ -314,6 +321,17 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
                 entry_bars = [b for b in bars
                               if b["t"].replace(tzinfo=None) >= cutoff]
 
+        # The move AFTER the system could act, in ATR: what the dashboard
+        # ranks "biggest moves" by. change_pct is the move that had ALREADY
+        # happened at detection -- a feature the selector reads, not an
+        # outcome -- so ranking by it listed the most extended names and
+        # labelled the ones the selector passed over as misses.
+        session_close = bars[-1]["c"] if bars else None
+        det_px = c.get("detection_price")
+        atr = atr_map.get(ticker)
+        post_move_atr = (round((session_close - det_px) / atr, 3)
+                         if (session_close is not None and det_px and atr) else None)
+
         if not entry_bars:
             summary["no_bars"] += 1
             ledger.save_runner_candidate_outcome(con, {
@@ -324,6 +342,7 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
                 "atr14": atr_map.get(ticker),
                 "stop_dist_atr": _stop_dist_atr(c, atr_map.get(ticker)),
                 "trend_side_200d": _trend_side(trend_map.get(ticker)),
+                "session_close": session_close, "post_move_atr": post_move_atr,
             })
             continue
 
@@ -335,7 +354,7 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
                             flatten_at=flatten_at, min_bar_volume=min_bar_volume,
                             atr14=atr_map.get(ticker),
                             trend_snapshot=trend_map.get(ticker),
-                            session_date=d)
+                            session_date=d, min_reward_r=RUNNER_MIN_REWARD_R)
 
         ledger.save_runner_candidate_outcome(con, {
             "session_date": d, "ticker": ticker, "eval_date": d,
@@ -357,8 +376,12 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
             "atr14": sim.get("atr14"),
             "stop_dist_atr": sim.get("stop_dist_atr"),
             "trend_side_200d": sim.get("trend_side_200d"),
+            "invalid_reason": sim.get("invalid_reason"),
+            "session_close": session_close, "post_move_atr": post_move_atr,
         })
         summary["scored"] += 1
+        if sim.get("exit_reason") == "invalid_fill":
+            summary["invalid_fill"] = summary.get("invalid_fill", 0) + 1
         if sim.get("triggered"):
             summary["triggered"] += 1
             # Mean R is quoted as r_planned -- the number the weekly miner, the
@@ -586,6 +609,9 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
         if p.get("setup_type") == "sympathy":
             o = by_id.get(p["pick_id"], {})
             if len(picks) == 1:
+                # R here stays r_multiple: question_eval._q2 parses it back out
+                # of every note ever written, and those were all r_multiple.
+                # One series, one measure (see specs/RUNNER_POOL_INTEGRITY_v1.md).
                 ledger.add_question_progress(con, Q_SYMPATHY_STANDALONE, d, 1,
                                              f"{p['ticker']} standalone sympathy R={o.get('r_multiple')}")
                 counts["q_increments"] += 1
@@ -608,6 +634,8 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
                       "<5%" if abs(gap_pct) < 5 else
                       "5-10%" if abs(gap_pct) < 10 else
                       "10-15%" if abs(gap_pct) < 15 else ">15%")
+            # r_multiple, not planned R: question_eval._q4 parses this note
+            # and every earlier one carries r_multiple (one series, one measure).
             ledger.add_question_progress(con, Q_GAP_SIZE, d, 1,
                                          f"{p['ticker']} gap={gap_pct}% bucket={bucket} R={o.get('r_multiple')}")
             counts["q_increments"] += 1
@@ -638,7 +666,7 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
         if o.get("triggered") and o.get("rvol_at_1000") is not None:
             ledger.add_question_progress(
                 con, Q_RVOL_SEPARATION, d, 1,
-                f"{p['ticker']} RVOL@10:00={o['rvol_at_1000']:.2f}x R={o.get('r_multiple')}")
+                f"{p['ticker']} RVOL@10:00={o['rvol_at_1000']:.2f}x R={realized_r(o)}")
             counts["q_increments"] += 1
 
     # Q8 (indicator layer): VWAP-reclaim longs vs plain dip-buy longs -- same
@@ -652,7 +680,7 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
             ledger.add_question_progress(
                 con, Q_VWAP_REVERSAL_EDGE, d, 1,
                 f"{p['ticker']} thesis cited VWAP; side_at_fill={o.get('vwap_side_at_fill')} "
-                f"crosses={o.get('vwap_crosses')} R={o.get('r_multiple')}")
+                f"crosses={o.get('vwap_crosses')} R={realized_r(o)}")
             counts["q_increments"] += 1
 
     # Q9 (indicator layer v2): stop distance sweet spot -- every stopped trade
@@ -663,7 +691,7 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
         if o.get("exit_reason") == "stop" and o.get("stop_dist_atr") is not None:
             ledger.add_question_progress(
                 con, Q_STOP_ATR_SWEET_SPOT, d, 1,
-                f"{p['ticker']} stop_dist_atr={o['stop_dist_atr']:.2f} R={o.get('r_multiple')}")
+                f"{p['ticker']} stop_dist_atr={o['stop_dist_atr']:.2f} R={realized_r(o)}")
             counts["q_increments"] += 1
 
     # Q10: blue-sky (gap near the 52w high) vs overhead-supply (gap into the
@@ -673,7 +701,7 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
         if o.get("triggered") and p.get("setup_type") in ("gap_go", "gap_fade", "breakout"):
             ledger.add_question_progress(
                 con, Q_BLUE_SKY_VS_OVERHEAD, d, 1,
-                f"{p['ticker']} setup={p.get('setup_type')} R={o.get('r_multiple')}")
+                f"{p['ticker']} setup={p.get('setup_type')} R={realized_r(o)}")
             counts["q_increments"] += 1
 
     # Q11: trend alignment (the 200d question) -- every triggered pick with a
@@ -684,7 +712,7 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
             ledger.add_question_progress(
                 con, Q_TREND_ALIGNMENT_200D, d, 1,
                 f"{p['ticker']} {p.get('direction')} trend_side_200d={o['trend_side_200d']} "
-                f"R={o.get('r_multiple')}")
+                f"R={realized_r(o)}")
             counts["q_increments"] += 1
 
     # Q12: shortedness -- every triggered squeeze/momentum pick with a
@@ -695,7 +723,7 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
                 and p.get("setup_type") in ("short_squeeze", "catalyst_momentum")):
             ledger.add_question_progress(
                 con, Q_SHORTEDNESS, d, 1,
-                f"{p['ticker']} short_pct_float={o['short_pct_float']} R={o.get('r_multiple')}")
+                f"{p['ticker']} short_pct_float={o['short_pct_float']} R={realized_r(o)}")
             counts["q_increments"] += 1
 
     # Q13 / Q14: the two arms of the R:R threshold test. Both are written here
@@ -707,7 +735,7 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
         if o.get("triggered") and rr is not None and rr >= 2.0:
             ledger.add_question_progress(
                 con, Q_RR_TEST_TAKEN, d, 1,
-                f"{p['ticker']} planned R:R={rr:.2f} R={o.get('r_multiple')}")
+                f"{p['ticker']} planned R:R={rr:.2f} R={realized_r(o)}")
             counts["q_increments"] += 1
 
     for ticker, rr, eod_outcome, forgone in shadow.get("rr_band_notes", []):
@@ -1023,8 +1051,20 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                 except Exception as e:
                     log("evening", f"WARN friction stress bars fetch failed for {t}: {e}")
                     continue
+                sim_fn = simulate_pick
+                if p.get("setup_type") == ledger.RUNNER_SETUP:
+                    # Re-simulated exactly as grade_day graded it: from its
+                    # honest entry time, under the runner lane's rules. On the
+                    # full session an `open` runner pick fills at 09:30.
+                    cut = entry_after_map.get(t)
+                    if cut is not None:
+                        bars = [b for b in bars
+                                if b["t"].replace(tzinfo=None) >= cut.replace(tzinfo=None)]
+                    sim_fn = partial(simulate_pick, min_reward_r=RUNNER_MIN_REWARD_R)
+                    if not bars:
+                        continue
                 stress = integrity.stress_ladder_for_pick(
-                    p, bars, daily_bar, simulate_pick, fparams,
+                    p, bars, daily_bar, sim_fn, fparams,
                     atr_pct=atr_pct_map.get(t), adv20=adv20_map.get(t),
                     dollars_per_r=cfg.get("dollars_per_r", 500),
                     flatten_at=flatten_at, min_bar_volume=min_bar_volume)

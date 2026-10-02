@@ -670,7 +670,9 @@ def discovery_stats(pred: dict, comparisons: Iterable[Any], rows: list[dict]) ->
         if getattr(c, "dimension", None) == pair_dim and getattr(c, "level", None) == pair_level:
             return {"n": int(c.n or 0), "effect": c.mean_r, "q": c.q_value,
                     "note": "pre-registered 2-D pair, screened in this run's batch"}
-    vals = [realized_r(r) for r in rows if matches(pred, r) and realized_r(r) is not None]
+    from .clusters import unit_values
+    vals = unit_values([r for r in rows if matches(pred, r)], realized_r,
+                       pred.get("lane") or "morning")
     mean = (sum(vals) / len(vals)) if vals else None
     return {"n": len(vals), "effect": mean, "q": None,
             "note": "2-D cell outside this run's FDR batch — unscreened at discovery"}
@@ -734,14 +736,75 @@ def register_candidate(con: Any, candidate: dict, session_date: date,
     return {"rule_id": rid, "state": state, "created": True, "note": disc["note"]}
 
 
+# The first session whose runner evidence is counted in (session, industry)
+# UNITS under scan_version 3 (specs/RUNNER_POOL_INTEGRITY_v1.md). Before it,
+# runner forward observations were recorded one per candidate row -- thirty
+# correlated banks on one morning were thirty observations -- and described a
+# pool that held ETFs and stale-bracket fills.
+RUNNER_UNIT_COUNTING_FROM = date(2026, 10, 2)
+
+
+def _is_runner_rule(lane: Any, dimensions: Any) -> bool:
+    if lane == "runner":
+        return True
+    return "runner_" in str(dimensions or "")
+
+
+def restart_runner_forward_clocks(con: Any, anchor: date | None = None) -> list[str]:
+    """Restart the forward clock of every live runner rule quarantined before
+    `anchor`, so its forward evidence is all unit-counted, scan_version 3
+    evidence. Idempotent: a restarted rule's quarantined_at becomes the day
+    before `anchor`, which the test below no longer selects.
+
+    This can only DELAY validation -- it never lowers a bar. A VALIDATED
+    runner rule goes back to QUARANTINED: its validation was counted on rows
+    that were not independent, from a population that included funds. Its old
+    observations stay in research_observations as the record; they stop
+    counting because the running sums are zeroed.
+    """
+    from datetime import timedelta
+    anchor = anchor or RUNNER_UNIT_COUNTING_FROM
+    restart_at = anchor - timedelta(days=1)
+    rows = con.execute(
+        """SELECT rule_id, state, quarantined_at, lane, dimensions, forward_n
+           FROM research_rules WHERE state IN ('QUARANTINED', 'VALIDATED')"""
+    ).fetchall()
+    restarted: list[str] = []
+    for rid, state, q_at, lane, dims, fwd_n in rows:
+        if not _is_runner_rule(lane, dims):
+            continue
+        q = q_at.date() if hasattr(q_at, "date") and not isinstance(q_at, date) else q_at
+        if q is not None and q >= restart_at:
+            continue
+        note = (f" | forward clock restarted {anchor}: runner evidence is now counted in "
+                f"(session, industry) units under scan_version 3; {int(fwd_n or 0)} earlier "
+                f"row-level observation(s) no longer count"
+                + ("; was VALIDATED" if state == "VALIDATED" else ""))
+        con.execute(
+            """UPDATE research_rules
+               SET state = 'QUARANTINED', quarantined_at = ?, validated_at = NULL,
+                   forward_n = 0, forward_sum_r = 0.0, forward_sumsq_r = 0.0,
+                   last_observed_at = NULL, note = COALESCE(note, '') || ?
+               WHERE rule_id = ?""",
+            [restart_at, note, rid])
+        restarted.append(rid)
+    if restarted:
+        from .util import log
+        log("research", f"restarted the forward clock of {len(restarted)} runner rule(s): "
+                        f"{', '.join(restarted)}")
+    return restarted
+
+
 def observe_session(con: Any, d: date) -> dict:
     """Record every forward observation session `d` produced (Phase 3).
 
     For each QUARANTINED or VALIDATED rule with a predicate, every fill-valid
     row of its lane from `d` whose buckets match the predicate is one forward
-    observation. `record_rule_observation` keeps the forward-only guard and is
-    idempotent on source_key, so a retried evening changes nothing.
+    observation -- one per (session, industry) unit for the runner lane.
+    `record_rule_observation` keeps the forward-only guard and is idempotent on
+    source_key, so a retried evening changes nothing.
     """
+    restart_runner_forward_clocks(con)
     rules = con.execute(
         """SELECT rule_id, lane, predicate_json FROM research_rules
            WHERE state IN ('QUARANTINED', 'VALIDATED') AND predicate_json IS NOT NULL"""
@@ -759,15 +822,23 @@ def observe_session(con: Any, d: date) -> dict:
             continue
         if lane not in cache:
             cache[lane] = morning_rows(con, d) if lane == "morning" else runner_rows(con, d)
-        for row in cache[lane]:
-            if not matches(pred, row):
-                continue
-            if lane == "morning":
-                key, source = f"outcome:{row.get('pick_id')}", "taken"
-            else:
-                key, source = f"runner:{row.get('session_date')}:{row.get('ticker')}", "runner_field"
-            if record_rule_observation(con, rid, d, realized_r(row), key, source):
-                out["recorded"] += 1
+        hits = [row for row in cache[lane] if matches(pred, row)]
+        if lane == "morning":
+            for row in hits:
+                if record_rule_observation(con, rid, d, realized_r(row),
+                                           f"outcome:{row.get('pick_id')}", "taken"):
+                    out["recorded"] += 1
+        else:
+            # One observation per (session, industry) UNIT, valued at its rows'
+            # mean R (agent/clusters.py). Recorded per row, a runner rule could
+            # collect its whole forward n on one session: thirty-odd regional
+            # banks firing in one half hour are one event, not thirty.
+            from .clusters import units
+            for (sess, cluster), vals in units(hits, realized_r).items():
+                key = f"runner:{sess}:{cluster}"
+                if record_rule_observation(con, rid, d, sum(vals) / len(vals), key,
+                                           "runner_field"):
+                    out["recorded"] += 1
         # EVIDENCE_BACKLOG_SPEC_v1 Phase 5: the desk's counterfactual streams
         # -- rejected candidates (shadow ledger) and the gap population's
         # mechanical monkeys -- give every open morning thesis a confirming or

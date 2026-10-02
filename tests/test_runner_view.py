@@ -70,27 +70,34 @@ def _candidate(ticker, *, price=20.0, minutes=630, stop_dist=0.5,
 
 
 def _seed_graded_session(con, session=SESSION):
-    """A session with 4 candidates, 2 selected, all graded with distinct R AND
-    distinct change_pct -- the shape needed to exercise both the main table and
-    top_movers(), which now ranks by price movement, not realized R.
+    """A session with 4 candidates, 2 selected, all graded.
 
-    The change_pct order is deliberately DIFFERENT from the R order (RUNNERUP
-    is the biggest price mover even though WINNER realized the most R), so a
-    ranking-by-R regression cannot silently pass the movers assertions."""
-    tickers = [("WINNER", 5.0, 2.0), ("RUNNERUP", 2.0, 18.0),
-               ("PICKED_LOSER", -1.0, -6.0), ("ALSO_PICKED", 0.5, 1.5)]
-    for i, (t, _, chg) in enumerate(tickers):
+    Three orders differ on purpose, so a regression to any of the wrong
+    rankings fails loudly:
+      - change_pct (the move ALREADY made at detection): RUNNERUP first;
+      - post_move_atr (the move AFTER detection -- what the panel ranks by):
+        WINNER first;
+      - r_multiple (fill-based, inflated) vs r_planned (what is shown):
+        WINNER's r_multiple is a fake +5.0, its planned R +1.9.
+    """
+    tickers = [  # ticker, r_planned, r_multiple, change_pct, post_move_atr
+        ("WINNER", 1.9, 5.0, 2.0, 2.4),
+        ("RUNNERUP", 0.4, 0.4, 18.0, 0.3),
+        ("PICKED_LOSER", -1.0, -1.0, -6.0, -1.2),
+        ("ALSO_PICKED", 0.5, 0.5, 1.5, 0.6),
+    ]
+    for i, (t, _, _, chg, _) in enumerate(tickers):
         ledger.save_runner_candidate(con, _candidate(
             t, price=10.0 + i, change_pct=chg, session=session))
-    # Select the two that did WORST by price movement, so the mismatch
-    # top_movers surfaces is unambiguous rather than accidentally matching.
+    # Select the two that did WORST after detection, so the mismatch the
+    # panel surfaces is unambiguous rather than accidentally matching.
     ledger.mark_runner_selected(con, session, "PICKED_LOSER", 1, None)
     ledger.mark_runner_selected(con, session, "ALSO_PICKED", 2, None)
-    for t, r, _ in tickers:
+    for t, rp, rm, _, mv in tickers:
         ledger.save_runner_candidate_outcome(con, {
             "session_date": session, "ticker": t, "eval_date": session,
-            "triggered": True, "r_multiple": r, "exit_reason": "eod",
-            "sim_version": 3,
+            "triggered": True, "r_multiple": rm, "r_planned": rp,
+            "exit_reason": "eod", "sim_version": 6, "post_move_atr": mv,
         })
     ledger.upsert_runner_session(con, {
         "session_date": session, "universe_size": 500, "candidates_found": 4,
@@ -98,64 +105,98 @@ def _seed_graded_session(con, session=SESSION):
     })
 
 
-# --------------------------------------------------------- top_movers()
+# ------------------------------------------------------ biggest_moves()
 
-def test_top_movers_ranks_by_price_movement_descending(con):
-    """Movers are ranked by change_pct, not realized R: RUNNERUP out-moves
-    WINNER even though WINNER realized the bigger R."""
+def test_biggest_moves_ranks_by_the_move_after_detection_not_change_pct(con):
+    """2026-10-01: ranking by change_pct listed the most-extended names AT
+    detection (LITG +16.9%, a 2x ETF that exited at -0.60R) and labelled the
+    ones the selector skipped as misses. The panel ranks by what happened
+    after the system could act: (close - plan price) / ATR."""
     _seed_graded_session(con)
     s = runner_view.session_summary(con, SESSION)
-    movers = runner_view.top_movers(s, n=10)
-    assert [m["ticker"] for m in movers] == \
-        ["RUNNERUP", "WINNER", "ALSO_PICKED", "PICKED_LOSER"]
+    moves = runner_view.biggest_moves(s, n=10)
+    assert [m["ticker"] for m in moves] ==         ["WINNER", "ALSO_PICKED", "RUNNERUP", "PICKED_LOSER"]
 
 
-def test_top_movers_includes_ungraded_rows(con):
-    """A mover is a price move, not a realized R: a name the scan saw move but
-    that never triggered still belongs in the top-movers list."""
+def test_biggest_moves_excludes_rows_with_no_outcome_yet(con):
+    """An after-detection move is an outcome: an ungraded row has none, so it
+    is absent rather than ranked on its detection-time change."""
     ledger.save_runner_candidate(con, _candidate("UNGRADED", change_pct=99.0))
     _seed_graded_session(con)
     s = runner_view.session_summary(con, SESSION)
-    movers = runner_view.top_movers(s, n=10)
-    assert "UNGRADED" in [m["ticker"] for m in movers]
-    assert movers[0]["ticker"] == "UNGRADED"  # biggest move, never triggered
+    assert "UNGRADED" not in [m["ticker"] for m in runner_view.biggest_moves(s, n=10)]
 
 
-def test_top_movers_respects_n(con):
+def test_biggest_moves_respects_n(con):
     _seed_graded_session(con)
     s = runner_view.session_summary(con, SESSION)
-    assert len(runner_view.top_movers(s, n=2)) == 2
+    assert len(runner_view.biggest_moves(s, n=2)) == 2
 
 
-def test_top_movers_flags_selection_status_per_row(con):
-    """The exact mismatch this view exists to surface: the day's best mover
-    was never picked, while a genuinely bad pick was."""
+def test_biggest_moves_flags_selection_status_per_row(con):
     _seed_graded_session(con)
     s = runner_view.session_summary(con, SESSION)
-    by_ticker = {m["ticker"]: m for m in runner_view.top_movers(s, n=10)}
+    by_ticker = {m["ticker"]: m for m in runner_view.biggest_moves(s, n=10)}
     assert by_ticker["WINNER"]["selected"] is False
     assert by_ticker["PICKED_LOSER"]["selected"] is True
     assert by_ticker["PICKED_LOSER"]["rank"] == 1
 
 
+def test_rows_show_planned_r_never_the_fill_based_r_multiple(con):
+    """BALY/SEPN/FUL on 2026-10-01: a fill a few cents above a stale stop
+    printed +5..7R on r_multiple. The displayed R is r_planned."""
+    _seed_graded_session(con)
+    s = runner_view.session_summary(con, SESSION)
+    row = next(r for r in s["rows"] if r["ticker"] == "WINNER")
+    assert row["r"] == 1.9
+    assert "r_multiple" not in row
+
+
+def test_outcome_summary_is_planned_r_with_units_and_invalid_counts(con):
+    _seed_graded_session(con)
+    ledger.save_runner_candidate(con, _candidate("STALE", price=30.0))
+    ledger.save_runner_candidate_outcome(con, {
+        "session_date": SESSION, "ticker": "STALE", "eval_date": SESSION,
+        "triggered": False, "exit_reason": "invalid_fill",
+        "invalid_reason": "stale_bracket", "sim_version": 6})
+    o = runner_view.outcome_summary(runner_view.session_summary(con, SESSION))
+    assert o["selected"]["n"] == 2 and o["selected"]["mean_r"] == pytest.approx(-0.25)
+    assert o["field"]["n"] == 2 and o["field"]["mean_r"] == pytest.approx(1.15)
+    assert o["field"]["invalid"] == 1          # counted, never averaged in
+    assert o["delta_r"] == pytest.approx(-1.4)
+
+
 # ---------------------------------------------------------- render_text
 
-def test_render_text_shows_top_movers_section_with_overlap_count(con):
+def test_render_text_shows_biggest_moves_section_with_overlap_count(con):
     _seed_graded_session(con)
     text = runner_view.render_text(con, SESSION)
-    assert "TOP 4 MOVERS TODAY" in text
-    # 2 of the 4 movers shown were selected (PICKED_LOSER, ALSO_PICKED).
+    assert "BIGGEST 4 MOVES AFTER DETECTION" in text
     assert "2 of 4 were selected" in text
     assert "WINNER" in text and "not picked" in text
     assert "#1 PICKED" in text  # PICKED_LOSER, rank 1
+    assert "TOP 4 MOVERS" not in text
+    assert "planned-risk R" in text
 
 
-def test_render_text_omits_top_movers_when_nothing_graded(con):
+def test_render_text_omits_moves_when_nothing_graded(con):
     ledger.save_runner_candidate(con, _candidate("UNGRADED"))
     ledger.upsert_runner_session(con, {"session_date": SESSION,
                                        "universe_size": 100, "candidates_found": 1})
     text = runner_view.render_text(con, SESSION)
-    assert "TOP" not in text or "MOVERS" not in text
+    assert "BIGGEST" not in text
+
+
+def test_render_text_reports_what_the_universe_filters_removed(con):
+    _seed_graded_session(con)
+    ledger.upsert_runner_session(con, {
+        "session_date": SESSION,
+        "universe_stats": json.dumps({"dropped_instrument": {"fund": 61, "debt": 3},
+                                      "dropped_liquidity_by_source": {"movers": 4},
+                                      "instruments_classified": True})})
+    text = runner_view.render_text(con, SESSION)
+    assert "instrument filter removed 61 fund, 3 debt" in text
+    assert "liquidity floor removed 4 (movers 4)" in text
 
 
 def test_render_text_health_line_distinguishes_outage_from_standdown(con):
@@ -171,13 +212,15 @@ def test_render_text_health_line_distinguishes_outage_from_standdown(con):
 
 # ---------------------------------------------------------- render_html
 
-def test_render_html_includes_top_movers_table(con):
+def test_render_html_includes_biggest_moves_table(con):
     _seed_graded_session(con)
     html = runner_view.render_html(con, SESSION)
-    assert "Top 4 movers today" in html
+    assert "Biggest 4 moves after detection" in html
     assert "WINNER" in html
     assert "not picked" in html
     assert "picked</span>" in html  # the selected tag
+    assert "movers today" not in html
+    assert "5.00" not in html          # WINNER's fake fill-based +5.0R is never shown
 
 
 def test_render_html_empty_when_no_session(con):

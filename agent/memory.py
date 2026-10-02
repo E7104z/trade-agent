@@ -118,7 +118,7 @@ def _trades_table(trades: list[dict]) -> str:
         lines.append(
             f"| {t['plan_date']} | {t['ticker']} | {t['direction']} | {t['setup_type']} "
             f"| {f(t['conviction'],0)} | {f(t['size_r'])} | {'Y' if t['triggered'] else 'N'} "
-            f"| {t['exit_reason'] or ''} | {f(t['r_multiple'])} | {f(t['mfe_r'])} "
+            f"| {t['exit_reason'] or ''} | {f(t['r'])} | {f(t['mfe_r'])} "
             f"| {f(t['mae_r'])} | {t['grade'] or ''} |"
         )
     return "\n".join(lines)

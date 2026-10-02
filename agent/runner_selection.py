@@ -33,12 +33,20 @@ from .util import log, now_et
 __all__ = ["run_selection", "build_candidate_table", "parse_selection"]
 
 # Columns sent to the selector, in order (spec 2.2). Deliberately excludes
-# anything that would rank the list for it.
+# anything that would rank the list for it. `industry` (Yahoo's, from the same
+# info call as float) exists because the prompt told the selector that "several
+# names from one sector is one bet" and then gave it no sector to read: on
+# 2026-10-01 it picked six tanker/shipping names off one 10:25 tick.
 TABLE_COLUMNS = [
-    "ticker", "detection_time_et", "detection_minutes", "price", "price_tier",
-    "vwap_pct_above", "ema9_slope", "rvol", "trend_consistency", "change_pct",
-    "float_m", "stop_dist", "stop_dist_pct", "target_price",
+    "ticker", "industry", "detection_time_et", "detection_minutes", "price",
+    "price_tier", "vwap_pct_above", "ema9_slope", "rvol", "trend_consistency",
+    "change_pct", "float_m", "stop_dist", "stop_dist_pct", "target_price",
 ]
+
+# Picks allowed per industry when runner.max_picks_per_industry is unset. One
+# session's names in one industry move on one tape and one news flow; ten
+# picks from two industries are two bets sized as ten.
+DEFAULT_MAX_PICKS_PER_INDUSTRY = 2
 
 
 def _fmt(v, digits: int = 2) -> str:
@@ -65,6 +73,7 @@ def build_candidate_table(candidates: list[dict]) -> str:
         det_time = fp.strftime("%H:%M") if isinstance(fp, datetime) else ""
         lines.append(" | ".join([
             c["ticker"],
+            (c.get("industry") or "").replace("|", "/"),
             det_time,
             _fmt(c.get("detection_minutes"), 0),
             _fmt(price),
@@ -141,6 +150,49 @@ def parse_selection(text: str, valid_tickers: set[str]) -> tuple[list[dict], lis
     for i, p in enumerate(picks, start=1):
         p["rank"] = i
     return picks, hallucinated
+
+
+def apply_industry_cap(selected: list[dict], candidates: list[dict],
+                       cap: int) -> tuple[list[dict], list[dict]]:
+    """Keep at most `cap` picks per industry, in the selector's rank order.
+
+    Returns (kept, dropped); `kept` is re-ranked densely. A candidate with no
+    known industry is its own cluster and is never capped -- an unknown is
+    not evidence of a duplicate. cap <= 0 disables the cap.
+
+    Enforced in code, not only asked of the model: the selector sees the
+    industry column and the cap in its prompt, and this is the backstop that
+    makes the rule true whatever it returns. A dropped name is NOT selected
+    and NOT traded; it is priced with the rest of the field, so the measured
+    policy is "selector + cap", which is what the desk actually runs.
+    """
+    if cap <= 0:
+        return selected, []
+    industry = {c["ticker"]: (c.get("industry") or "").strip() for c in candidates}
+    counts: dict[str, int] = {}
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for sel in sorted(selected, key=lambda s: s.get("rank") or 999):
+        ind = industry.get(sel["ticker"], "")
+        if ind:
+            if counts.get(ind, 0) >= cap:
+                dropped.append({**sel, "industry": ind})
+                continue
+            counts[ind] = counts.get(ind, 0) + 1
+        kept.append(sel)
+    for i, sel in enumerate(kept, start=1):
+        sel["rank"] = i
+    return kept, dropped
+
+
+def _cap_note(dropped: list[dict], cap: int) -> str:
+    if not dropped:
+        return ""
+    by_ind: dict[str, list[str]] = {}
+    for d in dropped:
+        by_ind.setdefault(d["industry"], []).append(d["ticker"])
+    parts = [f"{ind}: {', '.join(t)}" for ind, t in sorted(by_ind.items())]
+    return f"industry cap {cap}/industry dropped {len(dropped)} ({'; '.join(parts)})"
 
 
 NO_RUNNER_RULES = "(no validated runner rules yet — do not assume any)"
@@ -244,14 +296,62 @@ def _playbook_version(con=None) -> str:
         return ""
 
 
+def _last_prices(md, tickers: list[str]) -> dict[str, float]:
+    """Latest trade price per ticker from one snapshots call; {} on failure."""
+    alp = getattr(md, "alpaca", None)
+    if alp is None or not tickers:
+        return {}
+    try:
+        snaps = alp.snapshots(tickers) or {}
+    except Exception as e:
+        log("runner", f"WARN could not read live prices before placement: {e}")
+        return {}
+    out: dict[str, float] = {}
+    for t, snap in snaps.items():
+        p = ((snap or {}).get("latestTrade") or {}).get("p")
+        if p:
+            out[str(t).upper()] = float(p)
+    return out
+
+
+def stale_bracket_reason(last: float | None, entry: float, stop: float,
+                         target: float) -> str | None:
+    """Why a market order bought at `last` would not test this plan, or None.
+
+    The live twin of the simulator's sim_version 6 rule (grading.
+    RUNNER_MIN_REWARD_R): a runner is bought at market at the decision tick on
+    a bracket formed at its detection bar, and when price has already run
+    toward the target the order buys a position whose take-profit is a few
+    cents away and whose stop is far below -- a trade the plan never
+    described. Unknown price: nothing to judge.
+    """
+    from .grading import RUNNER_MIN_REWARD_R
+    if last is None:
+        return None
+    risk = entry - stop
+    if risk <= 0:
+        return "invalid plan (stop not below entry)"
+    if last <= stop:
+        return f"price {last:.2f} at/below the stop {stop:.2f}"
+    reward_left = (target - last) / risk
+    if reward_left < RUNNER_MIN_REWARD_R:
+        return (f"stale bracket: {reward_left:.2f}R of reward left at {last:.2f} "
+                f"(< {RUNNER_MIN_REWARD_R}R)")
+    return None
+
+
 def _place_live_orders(cfg: Config, con, session_date: date,
-                       placements: list[tuple[dict, int]]) -> dict:
+                       placements: list[tuple[dict, int]], md=None) -> dict:
     """Place paper bracket orders for selected runner picks.
 
     Gated on BOTH live_paper.enabled and runner.live_orders_enabled. Uses a
     SEPARATE daily cap from live_paper.max_picks_per_day: sharing that budget
     would let an active runner morning starve the premarket plan the
     analyst/risk-manager pair already validated.
+
+    Each order is checked against the live price first (stale_bracket_reason):
+    the simulator refuses the same fill, so the paper account and the ledger
+    hold the same trades.
     """
     rcfg = cfg.get("runner", {}) or {}
     out = {"placed": 0, "skipped": [], "buying_power": None}
@@ -276,6 +376,7 @@ def _place_live_orders(cfg: Config, con, session_date: date,
     cap = int(rcfg.get("max_live_orders_per_day", 10))
     dollars_per_r = float(rcfg.get("dollars_per_r", 100))
     size_r = float(rcfg.get("size_r", cfg.get("min_size_r", 0.25)))
+    last = _last_prices(md, [c["ticker"] for c, _ in placements[:cap]])
 
     for c, pick_id in placements[:cap]:
         entry = c.get("detection_price")
@@ -283,6 +384,12 @@ def _place_live_orders(cfg: Config, con, session_date: date,
         target = c.get("target_price")
         if not (entry and stop and target):
             out["skipped"].append(f"{c['ticker']}: incomplete plan")
+            continue
+        why = stale_bracket_reason(last.get(c["ticker"].upper()), float(entry),
+                                   float(stop), float(target))
+        if why:
+            out["skipped"].append(f"{c['ticker']}: {why}")
+            log("runner", f"  live paper order {c['ticker']} NOT placed: {why}")
             continue
         qty = live_broker.quantity_for_r(size_r, dollars_per_r, entry, stop)
         if qty < 1:
@@ -322,6 +429,7 @@ def run_selection(cfg: Config, *, con, session_date: date,
     """The decision tick (spec 2.1). At most one LLM call per session."""
     rcfg = cfg.get("runner", {}) or {}
     max_picks = int(rcfg.get("max_picks", 10))
+    industry_cap = int(rcfg.get("max_picks_per_industry", DEFAULT_MAX_PICKS_PER_INDUSTRY))
     candidates = ledger.runner_candidates_for_date(con, session_date)
 
     # -- 0. idempotency -------------------------------------------------
@@ -347,8 +455,13 @@ def run_selection(cfg: Config, *, con, session_date: date,
         selected = [{"ticker": c["ticker"], "rank": i, "conviction": None,
                      "rationale": "auto-selected: candidates <= max_picks"}
                     for i, c in enumerate(sorted(candidates, key=lambda r: r["ticker"]), 1)]
-        result = _write_picks(cfg, con, session_date, candidates, selected)
-        result.update(_finish("candidates <= max_picks"))
+        # No choice was made, but the industry cap still holds: six names
+        # from one industry are one bet whether or not anyone chose them.
+        selected, dropped = apply_industry_cap(selected, candidates, industry_cap)
+        result = _write_picks(cfg, con, session_date, candidates, selected, md=md)
+        note = "; ".join(x for x in ("candidates <= max_picks",
+                                     _cap_note(dropped, industry_cap)) if x)
+        result.update(_finish(note))
         return result
 
     # -- 3. the one LLM call --------------------------------------------
@@ -356,6 +469,7 @@ def run_selection(cfg: Config, *, con, session_date: date,
     model = rcfg.get("selection_model", "claude-sonnet-4-6")
     system = load_prompt("runner_selector", {
         "MAX_PICKS": str(max_picks),
+        "MAX_PER_INDUSTRY": str(industry_cap) if industry_cap > 0 else "no limit",
         "REGIME_TAG": _regime_tag(con, session_date) or "(unknown)",
         "PLAYBOOK_SECTION": _playbook_section(con),
         "CANDIDATE_TABLE": build_candidate_table(candidates),
@@ -394,15 +508,19 @@ def run_selection(cfg: Config, *, con, session_date: date,
     if not selected:
         return _finish("selector returned no picks",
                        hallucinated=len(hallucinated))
+    selected, dropped = apply_industry_cap(selected, candidates, industry_cap)
 
-    result = _write_picks(cfg, con, session_date, candidates, selected)
+    result = _write_picks(cfg, con, session_date, candidates, selected, md=md)
     result["hallucinated"] = len(hallucinated)
     result["usage"] = res.usage
+    if dropped:
+        result["industry_cap_dropped"] = [d["ticker"] for d in dropped]
+        result.update(_finish(_cap_note(dropped, industry_cap)))
     return result
 
 
 def _write_picks(cfg: Config, con, session_date: date,
-                 candidates: list[dict], selected: list[dict]) -> dict:
+                 candidates: list[dict], selected: list[dict], md=None) -> dict:
     """Persist picks + selection stamps, then place live paper orders."""
     by_ticker = {c["ticker"]: c for c in candidates}
     placements: list[tuple[dict, int]] = []
@@ -422,7 +540,7 @@ def _write_picks(cfg: Config, con, session_date: date,
 
     log("runner", f"selected {len(selected)} of {len(candidates)} candidates: "
                   + ", ".join(s["ticker"] for s in selected))
-    orders = _place_live_orders(cfg, con, session_date, placements)
+    orders = _place_live_orders(cfg, con, session_date, placements, md=md)
     # Durable record of what reached the broker (and why the rest did not).
     note = f"placed {orders.get('placed', 0)}/{len(placements)}"
     if orders.get("skipped"):

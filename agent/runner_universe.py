@@ -36,19 +36,28 @@ Three guards against a silent repeat:
   - tests/test_runner_phases.py asserts the standing list survives, that the
     degraded flag fires, and that the cap cannot truncate the real population
     (a 1,500 cap against 4,224 symbols cost 8 of 11 candidates)
+
+── EVERY SOURCE PASSES THE SAME FILTERS (scan_version 3) ────────────────────
+Before v3 only the liquid list passed the dollar-volume floor, and nothing but
+the frozen DTO list and the crypto list screened out funds. The standing list
+and the two screeners were unioned in raw, so a $0.4M/day 2x Lumentum ETF that
+listed in August (LITG) entered through the movers screener, and on 2026-10-01
+70 of 534 candidates were ETFs, ETNs, closed-end funds or notes. Now every
+symbol, whatever its source, must be an operating company's stock by its
+registered name (agent/instruments.classify) and must clear the same floor.
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from . import ledger
+from . import instruments, ledger
 from .providers import is_common_stock_symbol
 from .runner_default_universe import DEFAULT_UNIVERSE
 from .runner_scan import EXCLUDED_TICKERS, LANE_EXCLUDED_TICKERS
 from .util import log, prev_market_day
 
-__all__ = ["build_universe", "liquid_universe", "EXPECTED_MIN_UNIVERSE",
-           "LIQUIDITY_FLOOR_USD"]
+__all__ = ["build_universe", "liquid_universe", "instrument_classes",
+           "below_liquidity_floor", "EXPECTED_MIN_UNIVERSE", "LIQUIDITY_FLOOR_USD"]
 
 # A healthy session unions ~1,095 standing names with the live screeners. If the
 # population collapses far below that, a provider is down or a filter has gone
@@ -59,6 +68,64 @@ EXPECTED_MIN_UNIVERSE = 800
 
 
 LIQUIDITY_FLOOR_USD = 5_000_000
+
+
+def below_liquidity_floor(prev_close, prev_volume,
+                          floor_usd: float = LIQUIDITY_FLOOR_USD) -> bool:
+    """True when the previous session's dollar volume is KNOWN and under the
+    floor. Unknown is not "below": a symbol with no prior-day bar is handled
+    by the RVOL gate, which cannot read it either."""
+    if not prev_close or not prev_volume:
+        return False
+    return float(prev_close) * float(prev_volume) < floor_usd
+
+
+def instrument_classes(md, con, d, *, force: bool = False) -> dict | None:
+    """{"common": {SYM: registered name}, "other": {SYM: class}} for every
+    active, tradable asset, cached per session (runner_universe_cache kind
+    "classes"). None when the asset list is unavailable -- the caller then
+    records the universe as unclassified rather than guessing.
+
+    Covers ALL tradable assets, not only DTO's fractionable subset that the
+    liquidity screen reads: 1,402 common stocks on 2026-10-01 were not
+    fractionable, and a screener can surface any of them.
+    """
+    if con is not None and not force:
+        cached = ledger.get_runner_universe_cache(con, d, kind="classes")
+        if cached and isinstance(cached["payload"].get("common"), dict):
+            return cached["payload"]
+    alp = getattr(md, "alpaca", None)
+    if alp is None or not hasattr(alp, "asset_records"):
+        return None
+    try:
+        records = alp.asset_records()
+    except Exception as e:
+        log("runner", f"WARN asset list unavailable for instrument classes: {e}")
+        return None
+    if not records:
+        return None
+    common: dict[str, str] = {}
+    other: dict[str, str] = {}
+    for a in records:
+        sym = str(a.get("symbol") or "").upper()
+        if not sym:
+            continue
+        cls = instruments.classify(a.get("name"))
+        if cls == instruments.COMMON:
+            common[sym] = a.get("name") or ""
+        else:
+            other[sym] = cls
+    payload = {"common": common, "other": other}
+    if con is not None:
+        try:
+            ledger.save_runner_universe_cache(
+                con, d, payload, kind="classes", n=len(common),
+                source=f"assets={len(records)} common={len(common)} other={len(other)}")
+        except Exception as e:
+            log("runner", f"WARN could not cache instrument classes: {e}")
+    log("runner", f"instrument classes built: {len(common)} common, {len(other)} other "
+                  f"of {len(records)} tradable assets")
+    return payload
 
 
 def liquid_universe(md, con, d, *, floor_usd: float = LIQUIDITY_FLOOR_USD,
@@ -163,23 +230,31 @@ def build_universe(md, cfg: dict, *, at: datetime,
     `md` is an agent.providers.MarketData, `cfg` the `runner` config block,
     `con` an open ledger connection (optional; used for sticky candidates).
     """
-    price_min = float(cfg.get("price_min", 5.0))
-    price_max = float(cfg.get("price_max", 50.0))
     cap = int(cfg.get("universe_size", 1500))
+    floor_usd = float(cfg.get("liquidity_floor_usd", LIQUIDITY_FLOOR_USD))
 
     sources = {"liquid": 0, "default": 0, "most_actives": 0, "movers": 0}
     raw: list[str] = []
+    # The FIRST source that contributed each symbol, so a drop can be
+    # attributed (the movers screener, not the liquid list, let LITG in).
+    origin: dict[str, str] = {}
     prev_daily: dict[str, dict] = {}
+    liquid_set: set[str] = set()
+
+    def _add(sym: str, src: str) -> None:
+        raw.append(sym)
+        sources[src] += 1
+        origin.setdefault(sym, src)
 
     # 0. The liquid tradable universe - the bulk of the population, and the
     #    thing whose absence made the first version of this lane scan 84
     #    symbols instead of ~4,200. Cached per session; see liquid_universe().
     if con is not None:
         try:
-            liquid, prev_daily = liquid_universe(md, con, at.date())
+            liquid, prev_daily = liquid_universe(md, con, at.date(), floor_usd=floor_usd)
+            liquid_set = set(liquid)
             for s_ in liquid:
-                raw.append(s_)
-                sources["liquid"] += 1
+                _add(s_, "liquid")
         except Exception as e:
             log("runner", f"WARN liquid universe unavailable, falling back to the "
                           f"standing list + screeners: {e}")
@@ -188,8 +263,7 @@ def build_universe(md, cfg: dict, *, at: datetime,
     #    network call, so a screener outage degrades the universe rather than
     #    emptying it.
     for s in DEFAULT_UNIVERSE:
-        raw.append(s)
-        sources["default"] += 1
+        _add(s, "default")
 
     alp = getattr(md, "alpaca", None)
     if alp is not None:
@@ -202,8 +276,7 @@ def build_universe(md, cfg: dict, *, at: datetime,
                 for row in data.get("most_actives", []) or []:
                     sym = (row.get("symbol") or "").upper()
                     if sym:
-                        raw.append(sym)
-                        sources["most_actives"] += 1
+                        _add(sym, "most_actives")
             except Exception as e:
                 log("runner", f"WARN most-actives({by}) fetch failed: {e}")
         # 3. Top movers.
@@ -213,8 +286,7 @@ def build_universe(md, cfg: dict, *, at: datetime,
                 for row in movers.get(side, []) or []:
                     sym = (row.get("symbol") or "").upper()
                     if sym:
-                        raw.append(sym)
-                        sources["movers"] += 1
+                        _add(sym, "movers")
         except Exception as e:
             log("runner", f"WARN movers fetch failed: {e}")
 
@@ -230,6 +302,57 @@ def build_universe(md, cfg: dict, *, at: datetime,
             if s not in EXCLUDED_TICKERS and s not in LANE_EXCLUDED_TICKERS]
     dropped_excluded = len(common) - len(kept)
 
+    # 6. What the instrument IS, for EVERY source (scan_version 3). The two
+    #    lists above are frozen; a registered name is not, so this catches the
+    #    2x single-stock ETFs, thematic and commodity funds, closed-end funds
+    #    and listed notes those lists never knew. A symbol absent from the
+    #    active tradable asset list is not a tradable common stock on these
+    #    venues and is dropped as `unlisted`. Without the asset list the
+    #    universe is recorded as unclassified, never silently trusted.
+    classes = None
+    if con is not None or alp is not None:
+        try:
+            classes = instrument_classes(md, con, at.date())
+        except Exception as e:
+            log("runner", f"WARN instrument classes unavailable: {e}")
+    dropped_instrument: dict[str, int] = {}
+    dropped_instrument_by_source: dict[str, int] = {}
+    if classes:
+        common_map = classes.get("common") or {}
+        other_map = classes.get("other") or {}
+        filtered = []
+        for s in kept:
+            if s in common_map:
+                filtered.append(s)
+                continue
+            cls = other_map.get(s, "unlisted")
+            dropped_instrument[cls] = dropped_instrument.get(cls, 0) + 1
+            src = origin.get(s, "?")
+            dropped_instrument_by_source[src] = dropped_instrument_by_source.get(src, 0) + 1
+        kept = filtered
+    else:
+        log("runner", "WARN universe NOT instrument-classified this tick (asset list "
+                      "unavailable) - funds can reach the gate chain; the survivor "
+                      "quoteType check still applies")
+
+    # 7. The dollar-volume floor, for every source. The liquid list cleared it
+    #    when it was built; the standing list and the screeners never did, and
+    #    a mover with $0.4M/day is not a name the lane can fill and exit. Only
+    #    symbols whose prior session is KNOWN here are judged; the rest are
+    #    judged in the scan once their daily bar is fetched.
+    dropped_liquidity_by_source: dict[str, int] = {}
+    if prev_daily:
+        filtered = []
+        for s in kept:
+            row = prev_daily.get(s)
+            if (s not in liquid_set and row
+                    and below_liquidity_floor(row.get("close"), row.get("volume"), floor_usd)):
+                src = origin.get(s, "?")
+                dropped_liquidity_by_source[src] = dropped_liquidity_by_source.get(src, 0) + 1
+                continue
+            filtered.append(s)
+        kept = filtered
+
     # NOTE: there is deliberately no snapshot price pre-filter here. An earlier
     # version called /v2/stocks/snapshots to drop out-of-band names before
     # fetching bars. At this population that is 12 extra requests to save
@@ -237,9 +360,10 @@ def build_universe(md, cfg: dict, *, at: datetime,
     # endpoint intermittently returns 403, which would silently shrink the
     # universe. The authoritative price gate runs on bars inside the scan.
 
-    # 6. Sticky candidates: once a ticker is detected today it stays in the
+    # 8. Sticky candidates: once a ticker is detected today it stays in the
     #    universe for the rest of the session even if it drops off the
-    #    screeners, so the session's own candidate stays re-observable.
+    #    screeners, so the session's own candidate stays re-observable. They
+    #    cleared every filter above when they were first admitted.
     sticky_added = 0
     if con is not None:
         try:
@@ -250,7 +374,7 @@ def build_universe(md, cfg: dict, *, at: datetime,
         except Exception as e:
             log("runner", f"WARN sticky-candidate union failed: {e}")
 
-    # 7. Cap. Sticky names are moved to the front so a truncation can never
+    # 9. Cap. Sticky names are moved to the front so a truncation can never
     #    drop a ticker already detected today.
     if len(kept) > cap:
         sticky = kept[len(kept) - sticky_added:] if sticky_added else []
@@ -269,6 +393,11 @@ def build_universe(md, cfg: dict, *, at: datetime,
         "universe_sources": sources,
         "dropped_not_common": dropped_not_common,
         "dropped_excluded": dropped_excluded,
+        "dropped_instrument": dropped_instrument,
+        "dropped_instrument_by_source": dropped_instrument_by_source,
+        "dropped_liquidity_by_source": dropped_liquidity_by_source,
+        "instruments_classified": bool(classes),
+        "names": (classes or {}).get("common") or {},
         "dropped_price": 0,
         "sticky_added": sticky_added,
         "provider_degraded": degraded,

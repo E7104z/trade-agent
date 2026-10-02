@@ -33,10 +33,25 @@ from typing import Any
 
 from .runner_scan import LANE_EXCLUDED_TICKERS
 
-__all__ = ["REGATE_FROM", "REGATE_TO", "v2_admits", "plan", "apply"]
+__all__ = ["REGATE_FROM", "REGATE_TO", "UNREACHABLE", "v2_admits", "plan", "apply"]
 
 REGATE_FROM = 1
 REGATE_TO = 2
+
+# Scan versions NO stored row can be relabelled into, and why. scan_version 3
+# (2026-10-02) changed what a row SAYS, not only which rows exist: the plan
+# (price, stop, target, every feature) moved from the walked-back bar to the
+# last completed bar at the tick, and the gate chain stopped reading the bar
+# still forming. A v2 row's stored inputs describe a different bar, so there
+# is no v2 -> v3 regate; v3's corpus starts with its first session. This tool
+# still relabels v1 -> v2 for the historical record, but v2 rows are no longer
+# mined. A future SCAN_VERSION must be added here (or get a real regate path)
+# before tests/test_integrity_repair.py passes again.
+UNREACHABLE = {
+    3: ("the plan moved from the walked-back bar to the last completed bar at "
+        "the tick, and the in-progress bar is no longer read; stored v2 inputs "
+        "describe a different bar"),
+}
 
 
 def v2_admits(row: dict, feed_downgraded: bool,

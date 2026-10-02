@@ -402,6 +402,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v24.STATEMENTS
 from . import migrations_v25  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v25.STATEMENTS
 
+# --- v26 runner pool integrity: plan bar, instrument/industry, post-move ----
+from . import migrations_v26  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v26.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -1088,14 +1092,18 @@ def cached_fundamentals(con: duckdb.DuckDBPyConnection, symbols: list[str],
     cutoff = _session_cutoff(con, max_age_sessions)
     placeholders = ",".join("?" for _ in symbols)
     rows = con.execute(
-        f"SELECT symbol, mkt_cap, float_shares, short_pct_float, short_asof, fetched_date "
+        f"SELECT symbol, mkt_cap, float_shares, short_pct_float, short_asof, fetched_date, "
+        f"quote_type, sector, industry "
         f"FROM fundamentals WHERE symbol IN ({placeholders})", symbols
     ).fetchall()
     out: dict[str, dict] = {}
-    for sym, mkt_cap, float_shares, short_pct, short_asof, fetched in rows:
-        if fetched is not None and fetched >= cutoff:
+    for sym, mkt_cap, float_shares, short_pct, short_asof, fetched, qt, sector, industry in rows:
+        # quote_type NULL = cached before v26 added it: refetch once rather
+        # than serve a row that cannot say whether the symbol is a fund.
+        if fetched is not None and fetched >= cutoff and qt is not None:
             out[sym] = {"mkt_cap": mkt_cap, "float_shares": float_shares,
-                       "short_pct_float": short_pct, "short_asof": short_asof}
+                       "short_pct_float": short_pct, "short_asof": short_asof,
+                       "quote_type": qt, "sector": sector, "industry": industry}
     return out
 
 
@@ -1106,9 +1114,13 @@ def save_fundamentals(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> None:
         con.execute("DELETE FROM fundamentals WHERE symbol = ?", [r["symbol"]])
         con.execute(
             "INSERT INTO fundamentals (symbol, mkt_cap, float_shares, short_pct_float, "
-            "short_asof, fetched_date) VALUES (?,?,?,?,?,?)",
+            "short_asof, fetched_date, quote_type, sector, industry) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             [r["symbol"], r.get("mkt_cap"), r.get("float_shares"), r.get("short_pct_float"),
-             r.get("short_asof"), today],
+             r.get("short_asof"), today,
+             # "" = fetched and Yahoo had none; NULL is reserved for pre-v26 rows.
+             r.get("quote_type") if r.get("quote_type") is not None else "",
+             r.get("sector"), r.get("industry")],
         )
 
 
@@ -1154,6 +1166,11 @@ def recent_regimes(con: duckdb.DuckDBPyConnection, n: int = 5) -> list[dict]:
 RUNNER_SETUP = "dto_runner"
 LANES = ("morning", "runner")
 
+# The realized R every headline and discipline number reads: planned-risk R,
+# with r_multiple only for a legacy row graded before r_planned existed. Same
+# measure as grading.realized_r, research.realized_r and the stats cells.
+_REALIZED_R = "COALESCE(o.r_planned, o.r_multiple)"
+
 
 def lane_clause(lane: str | None, alias: str = "p") -> str:
     """SQL predicate (with leading AND) restricting picks to one lane."""
@@ -1170,15 +1187,17 @@ def recent_trades(con: duckdb.DuckDBPyConnection, n: int = 20,
                   lane: str | None = None) -> list[dict]:
     rows = con.execute(
         f"""SELECT p.pick_id, p.plan_date, p.ticker, p.direction, p.setup_type, p.conviction,
-                  p.size_r, o.triggered, o.exit_reason, o.r_multiple, o.mfe_r, o.mae_r,
+                  p.size_r, o.triggered, o.exit_reason, {_REALIZED_R}, o.mfe_r, o.mae_r,
                   o.grade, p.regime_tag, o.missed_move_r
            FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
            WHERE 1=1{lane_clause(lane)}
            ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT ?""",
         [n],
     ).fetchall()
+    # "r" is planned-risk R (_REALIZED_R): this table is the morning analyst's
+    # view of its own record, and it used to show r_multiple.
     keys = ["pick_id", "plan_date", "ticker", "direction", "setup_type", "conviction",
-            "size_r", "triggered", "exit_reason", "r_multiple", "mfe_r", "mae_r",
+            "size_r", "triggered", "exit_reason", "r", "mfe_r", "mae_r",
             "grade", "regime_tag", "missed_move_r"]
     return [dict(zip(keys, r)) for r in rows]
 
@@ -1301,12 +1320,18 @@ def equity_curve(con: duckdb.DuckDBPyConnection, account_size: float, dollars_pe
     two lanes size differently, so pricing runner R at the morning rate
     overstated runner P&L by the ratio of the two (5x at the shipped config).
     `day_r`/`cum_r` stay in size-weighted R across whichever lanes are included.
+
+    R is planned-risk R (COALESCE(r_planned, r_multiple) -- r_multiple only for
+    a legacy row without r_planned). Position size is set off the PLANNED
+    risk, so planned R is the P&L in R; r_multiple divides by the fill-to-stop
+    distance, which inflated favorable fills (up to 4x) and shrank adverse
+    ones (a 1.5R loss on an adverse fill booked as -1.0R) in this curve.
     """
     rows = con.execute(
         f"""SELECT o.eval_date,
-                  SUM(COALESCE(o.r_multiple,0) * COALESCE(p.size_r,1)) AS day_r,
+                  SUM(COALESCE(o.r_planned, o.r_multiple, 0) * COALESCE(p.size_r,1)) AS day_r,
                   SUM(CASE WHEN p.setup_type = '{RUNNER_SETUP}'
-                           THEN COALESCE(o.r_multiple,0) * COALESCE(p.size_r,1)
+                           THEN COALESCE(o.r_planned, o.r_multiple, 0) * COALESCE(p.size_r,1)
                            ELSE 0 END) AS runner_r
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
            WHERE o.triggered{lane_clause(lane)}
@@ -1347,8 +1372,8 @@ def current_streak(con: duckdb.DuckDBPyConnection, lane: str | None = None,
     `judgment_only` leaves out TEST_LANES picks (see judgment_clause)."""
     extra = judgment_clause() if judgment_only else ""
     rows = con.execute(
-        f"""SELECT o.r_multiple FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND o.r_multiple IS NOT NULL{lane_clause(lane)}{extra}
+        f"""SELECT {_REALIZED_R} FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+           WHERE o.triggered AND {_REALIZED_R} IS NOT NULL{lane_clause(lane)}{extra}
            ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT 30"""
     ).fetchall()
     if not rows:
@@ -1367,9 +1392,9 @@ def overall_stats(con: duckdb.DuckDBPyConnection, lane: str | None = None) -> di
     row = con.execute(
         f"""SELECT COUNT(*),
                   SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END),
-                  SUM(CASE WHEN o.triggered AND o.r_multiple > 0 THEN 1 ELSE 0 END),
-                  AVG(CASE WHEN o.triggered THEN o.r_multiple END),
-                  SUM(CASE WHEN o.triggered THEN o.r_multiple * COALESCE(p.size_r,1) ELSE 0 END)
+                  SUM(CASE WHEN o.triggered AND {_REALIZED_R} > 0 THEN 1 ELSE 0 END),
+                  AVG(CASE WHEN o.triggered THEN {_REALIZED_R} END),
+                  SUM(CASE WHEN o.triggered THEN {_REALIZED_R} * COALESCE(p.size_r,1) ELSE 0 END)
            FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
            WHERE 1=1{lane_clause(lane)}"""
     ).fetchone()
@@ -1391,9 +1416,9 @@ def trailing_weighted_r(con: duckdb.DuckDBPyConnection, n: int = 10,
     `judgment_only` leaves out TEST_LANES picks (see judgment_clause)."""
     extra = judgment_clause() if judgment_only else ""
     rows = con.execute(
-        f"""SELECT o.r_multiple * COALESCE(p.size_r, 1)
+        f"""SELECT {_REALIZED_R} * COALESCE(p.size_r, 1)
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND o.r_multiple IS NOT NULL{lane_clause(lane)}{extra}
+           WHERE o.triggered AND {_REALIZED_R} IS NOT NULL{lane_clause(lane)}{extra}
            ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT ?""",
         [n],
     ).fetchall()
@@ -1541,9 +1566,9 @@ def all_trades_csv(con: duckdb.DuckDBPyConnection) -> str:
     rows = con.execute(
         """SELECT p.plan_date, p.ticker, p.direction, p.setup_type, p.conviction, p.size_r,
                   p.entry_price, p.stop_price, p.target_price, p.regime_tag,
-                  o.triggered, o.exit_reason, o.r_multiple, o.mfe_r, o.mae_r,
-                  o.missed_move_r, o.baseline_r, o.eod_r, o.target_hit_after_stop, o.grade,
-                  COALESCE(o.sim_version, 1)
+                  o.triggered, o.exit_reason, COALESCE(o.r_planned, o.r_multiple), o.mfe_r, o.mae_r,
+                  o.missed_move_r, o.baseline_r, COALESCE(o.eod_r_planned, o.eod_r),
+                  o.target_hit_after_stop, o.grade, COALESCE(o.sim_version, 1)
            FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
            ORDER BY p.plan_date, p.pick_id"""
     ).fetchall()
@@ -2125,8 +2150,9 @@ def save_runner_candidate(con: duckdb.DuckDBPyConnection, c: dict) -> bool:
             detection_price, vwap, vwap_pct_above, ema9, ema9_slope, rvol,
             trend_consistency, change_pct, float_shares, earnings_days_away,
             prev_close, prev_volume, price_tier, stop_price, target_price,
-            stop_dist, gates_status, scan_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            stop_dist, gates_status, scan_version, plan_bar_et, asset_name,
+            instrument_class, quote_type, sector, industry)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             c["session_date"], c["ticker"].upper(), c.get("first_pass_et"),
             c.get("detection_minutes"), c.get("scan_pass_et"),
@@ -2136,6 +2162,8 @@ def save_runner_candidate(con: duckdb.DuckDBPyConnection, c: dict) -> bool:
             c.get("earnings_days_away"), c.get("prev_close"), c.get("prev_volume"),
             c.get("price_tier"), c.get("stop_price"), c.get("target_price"),
             c.get("stop_dist"), c.get("gates_status"), c.get("scan_version"),
+            c.get("plan_bar_et"), c.get("asset_name"), c.get("instrument_class"),
+            c.get("quote_type"), c.get("sector"), c.get("industry"),
         ],
     )
     return True
@@ -2185,6 +2213,7 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
         o.get("mae_r"), o.get("eod_r"), bool(selected), rank, pick_id,
         o.get("sim_version"), o.get("atr14"), o.get("stop_dist_atr"),
         o.get("trend_side_200d"), o.get("entry_after_et"),
+        o.get("invalid_reason"), o.get("session_close"), o.get("post_move_atr"),
     ]
     key = [o["session_date"], o["ticker"].upper()]
     # One statement either way. This was DELETE-then-INSERT, each committed on
@@ -2198,7 +2227,8 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
                  exit_reason = ?, r_multiple = ?, r_planned = ?, eod_r_planned = ?,
                  mfe_r = ?, mae_r = ?, eod_r = ?, selected = ?, selection_rank = ?,
                  pick_id = ?, sim_version = ?, atr14 = ?, stop_dist_atr = ?,
-                 trend_side_200d = ?, entry_after_et = ?
+                 trend_side_200d = ?, entry_after_et = ?, invalid_reason = ?,
+                 session_close = ?, post_move_atr = ?
                WHERE session_date = ? AND ticker = ?""",
             values + key,
         )
@@ -2208,8 +2238,9 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
            (session_date, ticker, eval_date, triggered, entry_fill, exit_price,
             exit_reason, r_multiple, r_planned, eod_r_planned, mfe_r, mae_r, eod_r, selected,
             selection_rank, pick_id, sim_version, atr14, stop_dist_atr,
-            trend_side_200d, entry_after_et)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            trend_side_200d, entry_after_et, invalid_reason, session_close,
+            post_move_atr)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         key + values,
     )
 
@@ -2316,7 +2347,7 @@ _RUNNER_SESSION_FIELDS = [
     "rejected_earnings", "rejected_excluded", "rejected_no_bars",
     "rejected_too_few_bars", "gates_unavailable", "provider_degraded",
     "selection_made", "selection_skipped_reason", "scan_version",
-    "live_orders_note",
+    "live_orders_note", "universe_stats", "rejected_liquidity", "rejected_instrument",
 ]
 
 
@@ -2427,14 +2458,16 @@ def get_runner_universe_cache(con: duckdb.DuckDBPyConnection, d: date,
 
 def save_runner_universe_cache(con: duckdb.DuckDBPyConnection, d: date,
                                payload: dict, *, kind: str = "liquid",
-                               source: str = "") -> None:
-    """Store the per-session universe payload. Rewritten if rebuilt."""
+                               source: str = "", n: int | None = None) -> None:
+    """Store the per-session universe payload. Rewritten if rebuilt. `n`
+    defaults to the size of the payload's liquid list."""
     con.execute("DELETE FROM runner_universe_cache WHERE session_date = ? AND kind = ?",
                 [d, kind])
     con.execute(
         "INSERT INTO runner_universe_cache (session_date, kind, built_at, n, source, payload) "
         "VALUES (?,?,current_timestamp,?,?,?)",
-        [d, kind, len(payload.get("liquid") or []), source, json.dumps(payload)],
+        [d, kind, len(payload.get("liquid") or []) if n is None else int(n), source,
+         json.dumps(payload)],
     )
 
 

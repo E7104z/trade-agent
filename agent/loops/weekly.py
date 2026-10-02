@@ -790,11 +790,14 @@ def _runner_section(research_block: dict, states: list[dict]) -> list[str]:
                     else "positive expectancy as detected and simulated"))
         p_s = "n/a" if p is None else ("<0.001" if p < 0.001 else f"{p:.3f}")
         lines.append(f"Setup edge (every triggered candidate, current scan/sim version, vs 0): "
-                     f"n={setup['n']}, mean R {_fmt_r(setup.get('mean_r'))}, p={p_s} -> {reading}.  ")
+                     f"n={setup['n']} session x industry units "
+                     f"({setup.get('n_rows', setup['n'])} candidates), "
+                     f"mean R {_fmt_r(setup.get('mean_r'))}, p={p_s} -> {reading}.  ")
     else:
         lines.append("Setup edge: no triggered candidates under the current scan/sim version.  ")
     sel = research_block.get("runner_selection_edge") or {}
-    lines.append(f"Selection edge (selected vs unselected, contested sessions only): "
+    lines.append(f"Selection edge (selected vs unselected, contested sessions only; n = "
+                 f"session x industry units): "
                  f"{sel.get('n_selected', 0)} selected / {sel.get('n_unselected', 0)} unselected "
                  f"across {sel.get('sessions_contested', 0)} session(s) -> "
                  f"{sel.get('verdict', 'not computed')}.  ")

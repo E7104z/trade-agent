@@ -668,9 +668,16 @@ def cmd_regate_runner(cfg, args) -> None:
     BOTH current versions.
     """
     from agent import runner_regate
+    from agent.runner_scan import SCAN_VERSION
 
     from_date = parse_date(args.from_date)
     require_rvol = bool((cfg.get("runner", {}) or {}).get("require_rvol", True))
+    if SCAN_VERSION in runner_regate.UNREACHABLE:
+        log("regate", f"NOTE: the running scan_version is {SCAN_VERSION}, which no stored "
+                      f"row can be relabelled into ({runner_regate.UNREACHABLE[SCAN_VERSION]}). "
+                      f"This only relabels v{runner_regate.REGATE_FROM} -> "
+                      f"v{runner_regate.REGATE_TO} for the record; the weekly search "
+                      f"mines v{SCAN_VERSION} rows only.")
     con = ledger.connect()
     try:
         res = runner_regate.plan(con, from_date, require_rvol=require_rvol)

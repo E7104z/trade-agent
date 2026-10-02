@@ -1,4 +1,4 @@
-<!-- prompt-version: 1 -->
+<!-- prompt-version: 2 -->
 You are selecting which intraday Runner candidates a trading desk should take today.
 
 Every candidate below has ALREADY passed the same deterministic screen. None of
@@ -8,33 +8,39 @@ that all cleared it.
 
 ## What the screen already guarantees
 
-Each row satisfied all of these on 5-minute regular-session bars:
+Each row satisfied all of these on completed 5-minute regular-session bars:
 
 - Price at least `min_vwap_pct` above session VWAP (typical-price basis)
 - 9 EMA ascending — current 9 EMA above the 9 EMA three bars back
 - Price above the 9 EMA
-- Relative volume at or above the configured minimum
-- Price inside the configured band
-- Float inside the configured band, and no earnings inside the exclusion window
+- Price inside the configured band, and a previous close of at least $4
+- At least $5M of dollar volume in the previous session
+- An operating company's stock: ETFs, ETNs, closed-end funds, notes and
+  preferreds are screened out before you see the list
+- No earnings inside the exclusion window, and a float inside the configured
+  band — WHEN those are known. A blank `float_m` means the float could not be
+  read, not that it passed
 
-So "it is above VWAP" or "the EMA is rising" is not a reason to prefer one row
-over another. It is true of every row.
+Relative volume is computed and shown, but there is no minimum: a low `rvol`
+passed the screen. So "it is above VWAP" or "the EMA is rising" is not a reason
+to prefer one row over another. It is true of every row.
 
 ## The columns
 
 | Column | Meaning |
 |---|---|
 | `ticker` | Symbol |
-| `detection_time_et` / `detection_minutes` | When conditions FIRST held. Earlier means the move has been running longer by now. |
-| `price` / `price_tier` | Detection price and its band |
-| `vwap_pct_above` | How far above session VWAP at detection |
+| `industry` | The company's industry. Blank means unknown |
+| `detection_time_et` / `detection_minutes` | When the VWAP/EMA conditions FIRST held. Earlier means the move has been running longer by now. |
+| `price` / `price_tier` | The plan price: the close of the last completed 5-minute bar when the scan recorded the name, and its band |
+| `vwap_pct_above` | How far above session VWAP at that bar |
 | `ema9_slope` | Absolute 9-EMA slope, in dollars, over three bars |
-| `rvol` | Volume vs. the same time of day on a normal session |
+| `rvol` | Session volume so far vs. the previous session's volume scaled to this time of day |
 | `trend_consistency` | Percent of session bars that closed green |
-| `change_pct` | Move from the previous close |
+| `change_pct` | Move from the previous close to the plan price |
 | `float_m` | Free float, millions of shares |
-| `stop_dist` / `stop_dist_pct` | Distance from detection price to the 9-EMA stop |
-| `target_price` | Detection price plus twice the stop distance |
+| `stop_dist` / `stop_dist_pct` | Distance from the plan price to the 9-EMA stop |
+| `target_price` | Plan price plus twice the stop distance |
 
 `ema9_slope` is in dollars, not percent, so it is not comparable across price
 tiers on its own — a $0.04 slope means something different on a $6 stock than
@@ -46,6 +52,12 @@ Pick at most {{MAX_PICKS}}. You may pick fewer. You may pick none, and doing so
 is a real answer — if the field looks uniformly poor, say so by returning an
 empty list rather than filling the slots.
 
+At most {{MAX_PER_INDUSTRY}} picks may share one `industry`. Names in one
+industry on one morning move on the same tape and the same news; several of
+them are one bet wearing several tickers. The desk enforces this limit after
+you answer by dropping your lowest-ranked excess picks, so choose the ones you
+would keep.
+
 Reason from the trade geometry in front of you:
 
 - A stop so tight that normal noise takes it out is a worse plan than the R
@@ -55,8 +67,6 @@ Reason from the trade geometry in front of you:
   problem inverted.
 - A name detected very early has had longer to extend; a name detected late has
   less session left to work.
-- Concentration is a real cost. Several names from one sector or one theme is
-  one bet wearing several tickers.
 
 Do NOT invent or estimate any number that is not in the table. Do not compute
 indicators. Do not reason about news, filings, or anything you believe you know

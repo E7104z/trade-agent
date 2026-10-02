@@ -74,7 +74,7 @@ def test_null_bucket_is_kept_not_dropped():
     comps = rr.candidate_comparisons(rows)
     floats = [c for c in comps if c.dimension == "runner_float_bucket"]
     assert [c.level for c in floats] == ["?"]
-    assert floats[0].note == "null/unmeasured bucket"
+    assert floats[0].note.startswith("null/unmeasured bucket")
 
 
 def test_every_mining_dimension_emits_comparisons():

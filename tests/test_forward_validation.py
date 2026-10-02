@@ -232,6 +232,8 @@ def test_observe_session_records_only_fill_valid_matching_forward_rows(con):
 
 def test_observe_session_matches_runner_rules_on_current_versions_only(con, monkeypatch):
     from agent import runner_research as rr
+    # This fixture's dates predate unit counting; keep the clock restart out of it.
+    monkeypatch.setattr(research, "RUNNER_UNIT_COUNTING_FROM", date(2026, 1, 1))
     pred = {"lane": "runner", "conditions": [{"dimension": "runner_rvol_bucket", "level": "2-3"}]}
     q_day, d = date(2026, 9, 1), date(2026, 9, 2)
     reg = research.register_candidate(con, {"statement": "rvol 2-3", "predicate": pred},
@@ -246,7 +248,9 @@ def test_observe_session_matches_runner_rules_on_current_versions_only(con, monk
     assert research.observe_session(con, d)["recorded"] == 1
     obs = con.execute("SELECT source, source_key FROM research_observations WHERE rule_id = ?",
                       [reg["rule_id"]]).fetchall()
-    assert obs == [("runner_field", f"runner:{d}:A")]
+    # One observation per (session, industry) unit; A has no industry, so it
+    # is its own unit, keyed by ticker (agent/clusters.py).
+    assert obs == [("runner_field", f"runner:{d}:ticker:A")]
 
 
 def test_counterfactual_sources_are_recorded_but_not_counted(con):

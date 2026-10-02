@@ -26,7 +26,8 @@ from datetime import date
 
 from . import ledger
 
-__all__ = ["session_summary", "render_text", "render_html", "top_movers"]
+__all__ = ["session_summary", "render_text", "render_html", "biggest_moves",
+           "outcome_summary", "universe_line"]
 
 
 def _f(v, digits=2, dash="-"):
@@ -36,6 +37,17 @@ def _f(v, digits=2, dash="-"):
         return f"{float(v):.{digits}f}"
     except (TypeError, ValueError):
         return str(v)
+
+
+def _hhmm(ts) -> str:
+    return ts.strftime("%H:%M") if hasattr(ts, "strftime") else ""
+
+
+def _realized(o: dict):
+    """Planned-risk R (r_planned) -- the R every runner statistic reads. A
+    legacy row graded before r_planned existed falls back to r_multiple."""
+    v = o.get("r_planned")
+    return v if v is not None else o.get("r_multiple")
 
 
 def session_summary(con, d: date) -> dict:
@@ -66,6 +78,13 @@ def session_summary(con, d: date) -> dict:
         except (TypeError, ValueError):
             gates = {}
 
+    universe = {}
+    if sess.get("universe_stats"):
+        try:
+            universe = json.loads(sess["universe_stats"]) or {}
+        except (TypeError, ValueError):
+            universe = {}
+
     rows = []
     for c in cands:
         o = outcomes.get(c["ticker"]) or {}
@@ -74,8 +93,11 @@ def session_summary(con, d: date) -> dict:
             "ticker": c["ticker"],
             "selected": bool(o.get("selected")),
             "rank": o.get("selection_rank"),
-            "detection_et": (c["first_pass_et"].strftime("%H:%M")
-                             if c.get("first_pass_et") else ""),
+            # When the VWAP/EMA conditions first held (walked back) and when
+            # the scan saw it and formed the plan -- two different moments.
+            "detection_et": _hhmm(c.get("first_pass_et")),
+            "seen_et": _hhmm(c.get("scan_pass_et")),
+            "industry": c.get("industry"),
             "price": c.get("detection_price"),
             "stop": c.get("stop_price"),
             "target": c.get("target_price"),
@@ -89,53 +111,99 @@ def session_summary(con, d: date) -> dict:
             "float_m": c.get("float_shares"),
             "conviction": p[2] if p else None,
             "thesis": (p[7] if p else "") or "",
-            "r_multiple": o.get("r_multiple"),
+            # `r` is realized R in PLANNED-risk units. r_multiple (fill-to-stop
+            # risk) is kept off the page: a fill a few cents above a stale stop
+            # printed +5..7R "wins" on 2026-10-01 that were ~2R on the plan.
+            "r": _realized(o) if o.get("triggered") else None,
+            "post_move_atr": o.get("post_move_atr"),
             "exit_reason": o.get("exit_reason"),
+            "invalid_reason": o.get("invalid_reason"),
             "triggered": o.get("triggered"),
+            "scan_version": c.get("scan_version"),
+            "sim_version": o.get("sim_version"),
         })
 
     return {
         "date": d,
         "session": sess,
         "gates": gates,
+        "universe": universe,
         "rows": rows,
         "n_candidates": len(rows),
         "n_selected": sum(1 for r in rows if r["selected"]),
         "n_picks": len(picks),
         "orders": [{"ticker": o[0], "qty": o[1], "status": o[2], "fill": o[3]}
                    for o in orders],
-        "graded": [r for r in rows if r["r_multiple"] is not None],
+        "graded": [r for r in rows if r["r"] is not None],
     }
 
 
-def top_movers(s: dict, n: int = 10) -> list[dict]:
-    """The n biggest price movers today, by detection-time `change_pct`,
-    regardless of whether the selector picked them or whether they triggered.
+def outcome_summary(s: dict) -> dict:
+    """Selected vs field for ONE session, in planned-risk R, with the counts
+    that say how little one session is.
 
-    A "mover" is a price move, not a realized R. `change_pct` is measured on
-    every candidate the scan saw, so names that moved hard but never filled an
-    entry still appear here -- which is exactly the point: the question this
-    view answers is "did we even scan/see what moved today". An R-sort cannot
-    answer that (a stop-out that still gapped is invisible to it, and a name
-    that moved without triggering has no R at all).
-
-    This is a read-only diagnostic, not a training signal. One day's top
-    movers are ~n out of hundreds of candidates -- far too few to safely
-    re-derive a selection rule from without fitting noise (see the mismatch
-    on 2026-09-17: the actual top 10 movers and the 10 selected candidates
-    had ZERO overlap, and mean R for "selected" was actually LOWER than the
-    field average -- a real, single-session result, not evidence of a broken
-    selector). That comparison, done properly across many CONTESTED sessions
-    with FDR correction, already lives in
-    agent/runner_research.selection_edge() and feeds the weekly miner, which
-    is the only thing allowed to turn a pattern into a playbook rule.
-
-    This function exists so a person can eyeball "did we even scan/see what
-    moved today" without waiting for that -- nothing here writes back into the
-    selector prompt or any rule table.
+    `units` are (session, industry) clusters (agent/clusters.py): the rows of
+    one industry on one morning are one observation, which is how the weekly
+    search counts them. Invalid fills are counted, never averaged in.
     """
-    ranked = [r for r in s["rows"] if r.get("change_pct") is not None]
-    return sorted(ranked, key=lambda r: r["change_pct"], reverse=True)[:n]
+    from .clusters import unit_count
+
+    def side(rows: list[dict]) -> dict:
+        trig = [r for r in rows if r["r"] is not None]
+        vals = [float(r["r"]) for r in trig]
+        unit_rows = [{"session_date": s["date"], "ticker": r["ticker"],
+                      "industry": r.get("industry")} for r in trig]
+        return {"n": len(vals), "units": unit_count(unit_rows),
+                "mean_r": (sum(vals) / len(vals)) if vals else None,
+                "invalid": sum(1 for r in rows if r.get("exit_reason") == "invalid_fill"),
+                "untriggered": sum(1 for r in rows if r.get("triggered") is False
+                                   and r.get("exit_reason") != "invalid_fill")}
+
+    sel = side([r for r in s["rows"] if r["selected"]])
+    field = side([r for r in s["rows"] if not r["selected"]])
+    delta = (sel["mean_r"] - field["mean_r"]
+             if sel["mean_r"] is not None and field["mean_r"] is not None else None)
+    return {"selected": sel, "field": field, "delta_r": delta}
+
+
+def biggest_moves(s: dict, n: int = 10) -> list[dict]:
+    """The n candidates that moved most AFTER the system could act, in ATR:
+    (session close - plan price) / ATR14, from the evening simulator.
+
+    This replaced a ranking by `change_pct`. That column is the move that had
+    ALREADY happened when the scan flagged the name (detection price vs the
+    previous close) -- a feature the selector reads, not an outcome -- so the
+    list was really the most-extended names at detection, and "not picked"
+    beside them implied misses the data did not show (2026-10-01: LITG, a 2x
+    ETF, topped it at +16.9% and exited at -0.60R; CNXC at +10.5% stopped
+    out). change_pct is still shown beside each row as context.
+
+    Ungraded rows (no close yet) are absent: an after-detection move is an
+    outcome. Read-only, one session -- a same-day eyeball check, never a
+    training signal; the FDR-corrected comparison across many contested
+    sessions is runner_research.selection_edge in the weekly miner.
+    """
+    ranked = [r for r in s["rows"] if r.get("post_move_atr") is not None]
+    return sorted(ranked, key=lambda r: r["post_move_atr"], reverse=True)[:n]
+
+
+def universe_line(s: dict) -> str:
+    """What each lane filter removed from the universe this session."""
+    u = s.get("universe") or {}
+    if not u:
+        return ""
+    bits = []
+    inst = u.get("dropped_instrument") or {}
+    if inst:
+        bits.append("instrument filter removed " + ", ".join(
+            f"{v} {k}" for k, v in sorted(inst.items(), key=lambda kv: -kv[1])))
+    liq = u.get("dropped_liquidity_by_source") or {}
+    if liq:
+        bits.append(f"liquidity floor removed {sum(liq.values())} "
+                    f"({', '.join(f'{k} {v}' for k, v in sorted(liq.items()))})")
+    if u.get("instruments_classified") is False:
+        bits.append("NOT instrument-classified (asset list unavailable)")
+    return "; ".join(bits)
 
 
 def _health_line(s: dict) -> str:
@@ -199,6 +267,12 @@ def _health_line(s: dict) -> str:
     return f"Healthy: {uni} symbols scanned, {s['n_candidates']} candidates.{note}"
 
 
+def _exit_label(r: dict) -> str:
+    if r.get("exit_reason") == "invalid_fill":
+        return f"invalid ({r.get('invalid_reason') or 'fill'})"
+    return r.get("exit_reason") or ""
+
+
 def render_text(con, d: date) -> str:
     s = session_summary(con, d)
     sess = s["session"]
@@ -210,6 +284,9 @@ def render_text(con, d: date) -> str:
         out.append(
             f"scan passes {sess.get('scan_passes') or 0}  |  "
             + "  ".join(f"{k} {v}" for k, v in rej.items() if v))
+        uline = universe_line(s)
+        if uline:
+            out.append(f"universe: {uline}")
         if sess.get("selection_skipped_reason"):
             out.append(f"selection: {sess['selection_skipped_reason']}")
 
@@ -218,19 +295,22 @@ def render_text(con, d: date) -> str:
 
     out += ["", f"{s['n_candidates']} candidates, {s['n_selected']} selected, "
                 f"{s['n_picks']} picks written, {len(s['orders'])} live orders", ""]
-    out.append(f"{'':3}{'TICKER':8}{'DET':6}{'PRICE':>9}{'STOP':>9}{'TARGET':>9}"
-               f"{'RVOL':>7}{'VWAP%':>7}{'TC':>6}{'CHG%':>8}{'SDA':>6}{'TRD200':>8}{'R':>7}  EXIT")
-    out.append("-" * 118)
+    out.append(f"{'':3}{'TICKER':8}{'HELD':6}{'SEEN':6}{'PRICE':>9}{'STOP':>9}{'TARGET':>9}"
+               f"{'RVOL':>7}{'VWAP%':>7}{'TC':>6}{'CHG%':>8}{'SDA':>6}{'R':>7}{'MOVE':>7}  EXIT")
+    out.append("-" * 124)
     for r in sorted(s["rows"], key=lambda x: (not x["selected"],
                                               x["rank"] or 99, x["ticker"])):
         mark = f"#{r['rank']}" if r["selected"] else "  "
         out.append(
-            f"{mark:3}{r['ticker']:8}{r['detection_et']:6}"
+            f"{mark:3}{r['ticker']:8}{r['detection_et']:6}{r['seen_et']:6}"
             f"{_f(r['price']):>9}{_f(r['stop']):>9}{_f(r['target']):>9}"
             f"{_f(r['rvol']):>7}{_f(r['vwap_pct']):>7}{_f(r['tc'],1):>6}"
             f"{_f(r['change_pct']):>8}{_f(r['stop_dist_atr']):>6}"
-            f"{(r['trend_side_200d'] or ''):>8}{_f(r['r_multiple'],2):>7}  "
-            f"{r['exit_reason'] or ''}")
+            f"{_f(r['r'],2):>7}{_f(r['post_move_atr'],2):>7}  "
+            f"{_exit_label(r)}")
+    out.append("HELD = conditions first held (walked back); SEEN = the scan tick that "
+               "formed the plan. R = realized R in planned-risk units; MOVE = (close - "
+               "plan price) / ATR14.")
 
     sel = [r for r in s["rows"] if r["selected"] and r["thesis"]]
     if sel:
@@ -239,33 +319,29 @@ def render_text(con, d: date) -> str:
             out.append(f"  #{r['rank']} {r['ticker']} (conv {r['conviction']}): "
                        f"{r['thesis'][:110]}")
 
-    graded = s["graded"]
-    if graded:
-        picked = [r["r_multiple"] for r in graded if r["selected"]]
-        passed = [r["r_multiple"] for r in graded if not r["selected"]]
-        out += ["", "OUTCOMES (every candidate is priced, traded or not):"]
-        if picked:
-            out.append(f"  selected   n={len(picked):3}  mean R "
-                       f"{sum(picked)/len(picked):+.3f}")
-        if passed:
-            out.append(f"  passed over n={len(passed):3}  mean R "
-                       f"{sum(passed)/len(passed):+.3f}")
-        if picked and passed:
-            edge = sum(picked) / len(picked) - sum(passed) / len(passed)
-            out.append(f"  selection edge today: {edge:+.3f} R "
+    if s["graded"]:
+        o = outcome_summary(s)
+        out += ["", "OUTCOMES (every candidate is priced, traded or not; planned-risk R):"]
+        for label, side in (("selected   ", o["selected"]), ("passed over", o["field"])):
+            if side["n"]:
+                out.append(f"  {label} n={side['n']:3} ({side['units']} industry units)  "
+                           f"mean R {side['mean_r']:+.3f}  | invalid fills {side['invalid']}, "
+                           f"untriggered {side['untriggered']}")
+        if o["delta_r"] is not None:
+            out.append(f"  selection edge today: {o['delta_r']:+.3f} R "
                        f"(one session - not evidence on its own)")
 
-        movers = top_movers(s, 10)
-        if movers:
-            overlap = sum(1 for r in movers if r["selected"])
-            out += ["", f"TOP {len(movers)} MOVERS TODAY (by % move, "
-                        f"regardless of selection) - {overlap} of "
-                        f"{len(movers)} were selected:"]
-            for r in movers:
+        moves = biggest_moves(s, 10)
+        if moves:
+            overlap = sum(1 for r in moves if r["selected"])
+            out += ["", f"BIGGEST {len(moves)} MOVES AFTER DETECTION (close vs plan "
+                        f"price, in ATR) - {overlap} of {len(moves)} were selected:"]
+            for r in moves:
                 mark = f"#{r['rank']} PICKED" if r["selected"] else "not picked"
-                out.append(f"  {r['ticker']:8}{_f(r['change_pct'], 1):>7}%  "
-                           f"({r['exit_reason'] or 'no fill'})  {mark}")
-            out.append("  (one day's winners are noise as a training signal --")
+                out.append(f"  {r['ticker']:8}{_f(r['post_move_atr'], 2):>7} ATR  "
+                           f"R {_f(r['r'], 2):>6}  ({_exit_label(r) or 'no fill'})  "
+                           f"chg-at-detection {_f(r['change_pct'], 1)}%  {mark}")
+            out.append("  (one day's moves are noise as a training signal --")
             out.append("   this is for eyeballing, not for retuning selection.")
             out.append("   See the weekly miner for the FDR-corrected version.)")
     return "\n".join(out)
@@ -287,66 +363,89 @@ def render_html(con, d: date) -> str:
                                               x["rank"] or 99, x["ticker"])):
         sel = ("<span style='color:#3fb950;font-weight:700'>"
                f"#{r['rank']}</span>" if r["selected"] else "")
-        rmul = r["r_multiple"]
-        rcol = "#8b949e" if rmul is None else ("#3fb950" if rmul > 0 else "#f85149")
+        rv = r["r"]
+        rcol = "#8b949e" if rv is None else ("#3fb950" if rv > 0 else "#f85149")
         rows_html.append(
             f"<tr><td>{sel}</td><td><b>{r['ticker']}</b></td>"
-            f"<td>{r['detection_et']}</td><td>{_f(r['price'])}</td>"
+            f"<td>{r['industry'] or ''}</td>"
+            f"<td>{r['detection_et']}</td><td>{r['seen_et']}</td><td>{_f(r['price'])}</td>"
             f"<td>{_f(r['stop'])}</td><td>{_f(r['target'])}</td>"
             f"<td>{_f(r['rvol'])}</td><td>{_f(r['vwap_pct'])}</td>"
             f"<td>{_f(r['tc'],1)}</td><td>{_f(r['change_pct'])}</td>"
-            f"<td>{_f(r['stop_dist_atr'])}</td><td>{r['trend_side_200d'] or ''}</td>"
-            f"<td style='color:{rcol}'>{_f(rmul)}</td>"
-            f"<td>{r['exit_reason'] or ''}</td></tr>")
+            f"<td>{_f(r['stop_dist_atr'])}</td>"
+            f"<td style='color:{rcol}'>{_f(rv)}</td><td>{_f(r['post_move_atr'])}</td>"
+            f"<td>{_exit_label(r)}</td></tr>")
 
-    movers = top_movers(s, 10)
-    movers_html = ""
-    if movers:
-        overlap = sum(1 for r in movers if r["selected"])
+    moves = biggest_moves(s, 10)
+    moves_html = ""
+    if moves:
+        overlap = sum(1 for r in moves if r["selected"])
         mv_rows = []
-        for r in movers:
+        for r in moves:
             tag = (f"<span style='color:#3fb950;font-weight:700'>"
                    f"#{r['rank']} picked</span>" if r["selected"]
                    else "<span style='color:#8b949e'>not picked</span>")
-            chg = r["change_pct"]
-            ccol = "#3fb950" if (chg or 0) >= 0 else "#f85149"
+            mv = r["post_move_atr"]
+            ccol = "#3fb950" if (mv or 0) >= 0 else "#f85149"
             mv_rows.append(
                 f"<tr><td><b>{r['ticker']}</b></td>"
-                f"<td style='color:{ccol}'>{_f(chg, 1)}%</td>"
-                f"<td>{r['exit_reason'] or 'no fill'}</td><td>{tag}</td></tr>")
-        movers_html = f"""
-  <h3 style="margin-top:18px">Top {len(movers)} movers today (by % move)</h3>
+                f"<td style='color:{ccol}'>{_f(mv, 2)}</td><td>{_f(r['r'])}</td>"
+                f"<td>{_exit_label(r) or 'no fill'}</td><td>{_f(r['change_pct'], 1)}%</td>"
+                f"<td>{tag}</td></tr>")
+        moves_html = f"""
+  <h3 style="margin-top:18px">Biggest {len(moves)} moves after detection</h3>
   <p style="color:#8b949e;font-size:12px">
-    {overlap} of {len(movers)} were selected. This is a same-day eyeball check,
-    not a training signal — one day's winners are far too few (~{len(movers)}
-    out of {s['n_candidates']}) to safely re-derive a selection rule from.
-    The FDR-corrected version of this comparison, across many sessions, feeds
-    the weekly miner instead.
+    Ranked by (session close − plan price) ÷ ATR14: the move after the system
+    could act. {overlap} of {len(moves)} were selected. Chg% is the move that had
+    already happened at detection — context, not outcome. A same-day eyeball
+    check, not a training signal; the FDR-corrected comparison across many
+    sessions feeds the weekly miner instead.
   </p>
-  <table><tr><th>Ticker</th><th>% move</th><th>Exit</th><th></th></tr>
+  <table><tr><th>Ticker</th><th>Move (ATR)</th><th>R</th><th>Exit</th><th>Chg% at detection</th><th></th></tr>
     {''.join(mv_rows)}
   </table>"""
 
+    summary_html = ""
+    if s["graded"]:
+        o = outcome_summary(s)
+        bits = []
+        for label, side in (("Selected", o["selected"]), ("Field", o["field"])):
+            if side["n"]:
+                bits.append(f"{label}: {side['mean_r']:+.2f}R over {side['n']} fills "
+                            f"({side['units']} industry units; {side['invalid']} invalid "
+                            f"fills not counted)")
+        if bits:
+            summary_html = ("<p style='font-size:12px'>" + " · ".join(bits)
+                            + " — planned-risk R, one session.</p>")
+
+    uline = universe_line(s)
+    universe_html = (f'<p style="color:#8b949e;font-size:12px">Universe: {uline}</p>'
+                     if uline else "")
     return f"""
 <div class="card">
   <h2>Runner lane — {d}</h2>
   <p style="color:{colour};font-weight:600">{health}</p>
+  {universe_html}
   <div class="grid">
     <div class="stat"><div class="v">{s['session'].get('universe_size') or 0}</div>scanned</div>
     <div class="stat"><div class="v">{s['n_candidates']}</div>candidates</div>
     <div class="stat"><div class="v">{s['n_selected']}</div>selected</div>
     <div class="stat"><div class="v">{len(s['orders'])}</div>live orders</div>
   </div>
-  {movers_html}
+  {summary_html}
+  {moves_html}
   <h3 style="margin-top:18px">All candidates</h3>
   <table style="margin-top:6px">
-    <tr><th></th><th>Ticker</th><th>Det ET</th><th>Price</th><th>Stop</th>
-        <th>Target</th><th>RVOL</th><th>VWAP%</th><th>TC</th><th>Chg%</th>
-        <th>StopΔATR</th><th>200d</th><th>R</th><th>Exit</th></tr>
+    <tr><th></th><th>Ticker</th><th>Industry</th><th>Held</th><th>Seen</th><th>Price</th>
+        <th>Stop</th><th>Target</th><th>RVOL</th><th>VWAP%</th><th>TC</th><th>Chg%</th>
+        <th>StopΔATR</th><th>R</th><th>Move (ATR)</th><th>Exit</th></tr>
     {''.join(rows_html)}
   </table>
   <p style="color:#8b949e;font-size:12px;margin-top:10px">
     Every candidate is priced by the evening simulator, selected or not — that
-    is what makes "did picking help?" answerable. Rows marked #N were chosen.
+    is what makes "did picking help?" answerable. Held = when the conditions
+    first held; Seen = the scan tick that formed the plan (price, stop, target)
+    and the earliest an order could go in. R is realized R in planned-risk
+    units. Rows marked #N were chosen.
   </p>
 </div>"""

@@ -35,6 +35,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from .clusters import unit_count, unit_values
 from .stats import Comparison, fisher_exact_2x2
 
 __all__ = ["PAIR_SPEC_VERSION", "PAIR_SPEC", "PAIR_SEP", "lane_rows", "pair_comparisons",
@@ -99,13 +100,21 @@ def lane_rows(con: Any) -> dict[str, list[dict]]:
 
 
 def _level_counts(rows: list[dict], lane: str, dim: str) -> dict[str, int]:
+    """n per level: rows for the morning lane, (session, industry) units for the
+    runner lane (agent/clusters.py)."""
     from . import buckets
-    counts: dict[str, int] = {}
+    cells: dict[str, list[dict]] = {}
     for r in rows:
         lev = buckets.label(lane, dim, r)
         if lev != "?":
-            counts[lev] = counts.get(lev, 0) + 1
-    return counts
+            cells.setdefault(lev, []).append(r)
+    return {lev: unit_count(cell, lane) for lev, cell in cells.items()}
+
+
+def _values(rows: list[dict], lane: str) -> list[float]:
+    """Realized R per observation: one per row (morning), one per (session,
+    industry) unit (runner) -- see agent/clusters.py."""
+    return unit_values(rows, _r, lane)
 
 
 def admissible(rows: list[dict], lane: str, dim: str, min_n: int = 8) -> bool:
@@ -125,13 +134,14 @@ def pair_comparisons(rows_by_lane: dict[str, list[dict]], min_n: int = 8
             status.append({"lane": lane, "pair": pair_dimension(dims), "admitted": False})
             continue
         status.append({"lane": lane, "pair": pair_dimension(dims), "admitted": True})
-        cells: dict[tuple, list[float]] = {}
+        cells: dict[tuple, list[dict]] = {}
         for r in rows:
             levels = tuple(buckets.label(lane, d, r) for d in dims)
             if "?" in levels:
                 continue
-            cells.setdefault(levels, []).append(_r(r))
-        for levels, values in sorted(cells.items()):
+            cells.setdefault(levels, []).append(r)
+        for levels, cell in sorted(cells.items()):
+            values = _values(cell, lane)
             m, s = _mean_std(values)
             comps.append(Comparison(dimension=pair_dimension(dims), level=PAIR_SEP.join(levels),
                                     n=len(values), mean_r=m, std_r=s, n_dimensions=2,
@@ -146,20 +156,23 @@ def winrate_comparisons(rows_by_lane: dict[str, list[dict]]) -> list[Comparison]
     for lane, rows in rows_by_lane.items():
         if not rows:
             continue
-        wins_total = sum(1 for r in rows if _r(r) > 0)
-        n_total = len(rows)
         for dim in buckets.dimensions(lane):
-            cells: dict[str, list[int]] = {}
-            for r in rows:
-                lev = buckets.label(lane, dim, r)
+            labels = [buckets.label(lane, dim, r) for r in rows]
+            cells: dict[str, list[dict]] = {}
+            for r, lev in zip(rows, labels):
                 if lev == "?":
                     continue
-                c = cells.setdefault(lev, [0, 0])
-                c[0] += 1 if _r(r) > 0 else 0
-                c[1] += 1
-            for lev, (w, n) in sorted(cells.items()):
+                cells.setdefault(lev, []).append(r)
+            for lev, cell in sorted(cells.items()):
+                # A "win" is an observation with realized R > 0: a row in the
+                # morning lane, a (session, industry) unit's mean in the runner
+                # lane. The rest of the lane is counted the same way.
+                inside = _values(cell, lane)
+                rest = _values([r for r, l in zip(rows, labels) if l != lev], lane)
+                w, n = sum(1 for v in inside if v > 0), len(inside)
                 a, b = w, n - w
-                c_, d_ = wins_total - w, (n_total - wins_total) - (n - w)
+                c_ = sum(1 for v in rest if v > 0)
+                d_ = len(rest) - c_
                 comps.append(Comparison(
                     dimension=f"winrate:{dim}", level=lev, n=n, mean_r=None, std_r=None,
                     p_value=fisher_exact_2x2(a, b, c_, d_), test="fisher",
@@ -278,16 +291,16 @@ def consistency(search: Any, rows_by_lane: dict[str, list[dict]], min_n: int = 8
         want = 1 if c.mean_r > 0 else -1
         cell = [r for r in rows_by_lane.get(lane) or []
                 if all(buckets.label(lane, d, r) == lv for d, lv in zip(dims, levels))]
-        strata: dict[str, list[float]] = {}
+        strata_rows: dict[str, list[dict]] = {}
         for r in cell:
-            v = _r(r)
             if r.get("regime_tag"):
-                strata.setdefault(f"regime={r['regime_tag']}", []).append(v)
+                strata_rows.setdefault(f"regime={r['regime_tag']}", []).append(r)
             if lane == "morning" and r.get("direction"):
-                strata.setdefault(f"direction={r['direction']}", []).append(v)
+                strata_rows.setdefault(f"direction={r['direction']}", []).append(r)
             d = _row_date(r)
             if d is not None:
-                strata.setdefault(f"month={str(d)[:7]}", []).append(v)
+                strata_rows.setdefault(f"month={str(d)[:7]}", []).append(r)
+        strata: dict[str, list[float]] = {k: _values(v, lane) for k, v in strata_rows.items()}
         if len(dims) == 1 and dims[0] in CROSS_LANE:
             other_dim = CROSS_LANE[dims[0]]
             other_lane = "runner" if lane == "morning" else "morning"
@@ -303,7 +316,8 @@ def consistency(search: Any, rows_by_lane: dict[str, list[dict]], min_n: int = 8
                 def _hit(r, dim=other_dim):
                     return buckets.label("morning", dim, r) == levels[0]
             other = ([] if (lane == "runner" and levels[0] in coarse) else
-                     [_r(r) for r in rows_by_lane.get(other_lane) or [] if _hit(r)])
+                     _values([r for r in rows_by_lane.get(other_lane) or [] if _hit(r)],
+                             other_lane))
             if other:
                 strata[f"lane={other_lane}"] = other
         powered = {k: v for k, v in strata.items() if len(v) >= min_n}

@@ -36,6 +36,7 @@ __all__ = [
     "first_pass_index",
     "earliest_entry_time",
     "honest_entry_time",
+    "completed_bars",
 ]
 
 # Bump on ANY change to detection semantics, exactly as `sim_version` works
@@ -53,7 +54,28 @@ __all__ = [
 # Every one of those REMOVES rows that v1 admitted, so a pooled mean R would
 # be a mixture of two populations with the selector's own gate as the hidden
 # variable -- exactly the confound this counter exists to prevent.
-SCAN_VERSION = 2
+#
+# v3 (2026-10-02, specs/RUNNER_POOL_INTEGRITY_v1.md) changes WHAT a row says,
+# not only which rows exist, so v2 rows cannot be relabelled v3 from stored
+# inputs (agent/runner_regate.py stops at v2):
+#   - the gate chain reads COMPLETED 5-minute bars only. Alpaca returns the
+#     bar still forming at the tick (a 10:20:02 scan saw a 10:20 bar two
+#     seconds old), so conditions, RVOL and the plan were read off a
+#     partial bar;
+#   - the trade plan -- detection_price, stop, target and every feature in
+#     the snapshot -- is taken at the last completed bar at the tick that
+#     recorded the candidate (plan_bar_et), the moment the system could act.
+#     v2 took it at the walked-back first_pass_et bar, up to an hour earlier,
+#     while the fill happened at the tick: a name that kept running was
+#     entered on a stale stop/target pair, and a fill a cent under the old
+#     target was booked as a "target" exit at a loss. first_pass_et is still
+#     walked back; it is a research timestamp ("when did the conditions first
+#     hold"), never a plan;
+#   - every universe source passes the instrument-class filter (no ETFs, ETNs,
+#     funds, notes, preferreds -- agent/instruments.py) and the $5M/day
+#     dollar-volume floor, and a survivor whose yfinance quoteType is not
+#     EQUITY (or that looks like a closed-end fund) is rejected.
+SCAN_VERSION = 3
 
 # ---------------------------------------------------------------------------
 # EXCLUDED_TICKERS - ported verbatim from js/constants.js:539.
@@ -135,7 +157,29 @@ def earliest_entry_time(first_pass_et):
 
 
 def _naive(ts):
-    return ts.replace(tzinfo=None) if getattr(ts, "tzinfo", None) is not None else ts
+    """ET wall-clock without tzinfo. A tz-aware value is converted to ET
+    first -- stripping a UTC timestamp's tzinfo would move it four hours."""
+    if getattr(ts, "tzinfo", None) is None:
+        return ts
+    return ts.astimezone(ET).replace(tzinfo=None)
+
+
+def completed_bars(bars: list[dict], at, minutes: int = DETECTION_BAR_MINUTES) -> list[dict]:
+    """The bars that had CLOSED by `at` (open time + `minutes` <= at).
+
+    Alpaca's bars endpoint returns the bar still forming: a scan at 10:20:02
+    receives a 10:20 bar holding two seconds of prints (measured in the local
+    ledger, 2026-09-23: first_pass_et 10:20 with walkback 0 at a 10:20:02
+    tick). Its close is the live price, but its volume, high and low are a
+    sliver, and the 9 EMA and RVOL read it as a whole bar. scan_version 3
+    evaluates completed bars only, so the plan describes a bar that is over.
+    """
+    if at is None:
+        return list(bars or [])
+    cut = _naive(at)
+    from datetime import timedelta
+    span = timedelta(minutes=minutes)
+    return [b for b in (bars or []) if _naive(b["t"]) + span <= cut]
 
 
 def honest_entry_time(first_pass_et, scan_pass_et=None, selection_at=None):
@@ -310,11 +354,12 @@ def first_pass_index(bars: list[dict], min_vwap_pct: float = 0.5,
     Caller must have already confirmed `check_runner_conditions(bars).passes`;
     this returns len(bars) - 1 if the walk finds nothing earlier.
 
-    NOTE for Phase 1: DTO stamps firstSeenAt from this walkback but takes
-    `entryPriceAtDetection` from the CURRENT bar's close, so its detection
-    time and detection price describe different bars. See the Phase 0 report -
-    this needs a decision before detection_minutes is used as a research
-    dimension.
+    DTO stamps firstSeenAt from this walkback but takes
+    `entryPriceAtDetection` from the CURRENT bar's close. scan_version 3 does
+    the same, deliberately: the walked-back index is a research timestamp
+    (first_pass_et, detection_minutes), and the trade plan is taken at the bar
+    the system acts on (runner_scan.scan, plan_bar_et). v2 took the plan here,
+    which entered the trade at the tick on a stop and target up to an hour old.
     """
     idx = len(bars) - 1
     floor = max(9, len(bars) - walkback)
@@ -617,6 +662,7 @@ def _fetch_gate_inputs(md, symbols: list[str], d, con=None) -> tuple[dict, dict]
     if need:
         floats: dict[str, float | None] = {}
         earnings: dict[str, int | None] = {}
+        profiles: dict[str, dict] = {}
         try:
             # `con` routes this through the ledger-backed fundamentals cache
             # (3-session TTL). The in-process cache above only helps inside one
@@ -625,6 +671,10 @@ def _fetch_gate_inputs(md, symbols: list[str], d, con=None) -> tuple[dict, dict]
             for s, row in (fund or {}).items():
                 fs = (row or {}).get("float_shares")
                 floats[s] = (float(fs) / 1e6) if fs else None
+                # What the security is, from the same info call (scan_version
+                # 3): the instrument check and the industry cluster key.
+                profiles[s] = {k: (row or {}).get(k)
+                               for k in ("quote_type", "sector", "industry")}
         except Exception as e:
             log("runner", f"WARN fundamentals fetch failed for {len(need)} symbols: {e}")
         # Earnings dates do not move intraday: read today's already-checked
@@ -654,11 +704,19 @@ def _fetch_gate_inputs(md, symbols: list[str], d, con=None) -> tuple[dict, dict]
         except Exception as e:
             log("runner", f"WARN next_earnings fetch failed for {len(fetch)} symbols: {e}")
         for s in need:
-            cache[(d, s)] = {"float_m": floats.get(s), "earnings_days_away": earnings.get(s)}
+            cache[(d, s)] = {"float_m": floats.get(s), "earnings_days_away": earnings.get(s),
+                             "profile": profiles.get(s) or {}}
 
     out_f = {s: cache.get((d, s), {}).get("float_m") for s in symbols}
     out_e = {s: cache.get((d, s), {}).get("earnings_days_away") for s in symbols}
     return out_f, out_e
+
+
+def _gate_profiles(d, symbols: list[str]) -> dict[str, dict]:
+    """{SYM: {quote_type, sector, industry}} for symbols _fetch_gate_inputs
+    has looked up this session. Absent or empty = unmeasured."""
+    cache = _session_gate_cache(d)
+    return {s: (cache.get((d, s)) or {}).get("profile") or {} for s in symbols}
 
 
 def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
@@ -683,14 +741,15 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
     if owns_con:
         from . import ledger as _ledger
         con = _ledger.connect()
-    from . import ledger
+    from . import instruments, ledger
     from . import runner_universe
 
     d = at.date()
     counters = {"rejected_no_bars": 0, "rejected_too_few_bars": 0,
                 "rejected_price": 0, "rejected_rvol": 0,
                 "rejected_conditions": 0, "rejected_float": 0,
-                "rejected_earnings": 0, "rejected_excluded": 0}
+                "rejected_earnings": 0, "rejected_excluded": 0,
+                "rejected_liquidity": 0, "rejected_instrument": 0}
     unavailable = {"float": 0, "earnings": 0, "prev_volume": 0, "prev_close": 0}
 
     try:
@@ -781,6 +840,10 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
             # No bars for ANY symbol during the session window is an outage,
             # never a market state. Say so, loudly and durably.
             bars_failed = True
+        # Completed bars only (scan_version 3): the bar still forming at the
+        # tick is dropped, so every condition, RVOL and plan below reads bars
+        # that are over. See completed_bars().
+        bars_by_sym = {s: completed_bars(b, at) for s, b in bars_by_sym.items()}
 
         # -- 3. previous-session close/volume --------------------------------
         # Normally these arrive with the liquid universe: the same daily-bar
@@ -806,6 +869,16 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
                 log("runner", f"WARN previous-session daily fetch failed for "
                               f"{len(missing)} uncached symbols: {e}")
 
+        # -- 3b. the dollar-volume floor, for symbols the universe build could
+        #        not judge (no cached prior session). Same floor as the liquid
+        #        list; a candidate already detected today keeps its place.
+        floor_usd = float(cfg.get("liquidity_floor_usd", runner_universe.LIQUIDITY_FLOOR_USD))
+        sticky = set(ledger.runner_candidate_tickers(con, d))
+        illiquid = {s_ for s_ in missing
+                    if s_ not in sticky and runner_universe.below_liquidity_floor(
+                        prev_close.get(s_), prev_volume.get(s_), floor_usd)}
+        counters["rejected_liquidity"] += len(illiquid)
+
         # -- 4. cheap gates first, for the WHOLE universe --------------------
         # Nothing here touches the network. At ~1,190 symbols that matters: the
         # float and earnings lookups are per-symbol yfinance calls, and running
@@ -814,6 +887,8 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
         end_min = int(cfg.get("scan_end_et_minutes", 900))
         survivors: list[tuple[str, dict]] = []
         for ticker in sorted(universe):
+            if ticker in illiquid:
+                continue
             bars = bars_by_sym.get(ticker) or []
             res = evaluate_ticker(
                 ticker, bars,
@@ -841,6 +916,9 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
         # -- 5. network gates, for survivors ONLY ----------------------------
         floats, earnings = _fetch_gate_inputs(
             md, [t for t, _ in survivors], d, con)
+        profiles = _gate_profiles(d, [t for t, _ in survivors])
+        names = ustats.get("names") or {}
+        classified = bool(ustats.get("instruments_classified"))
 
         found = 0
         for ticker, res in survivors:
@@ -862,27 +940,46 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
                 counters[_counter_column(res)] += 1
                 continue
 
+            # What the survivor IS, from Yahoo (scan_version 3). The registered
+            # name already screened the universe; this is the independent
+            # second read, and the only one that sees a closed-end fund whose
+            # name does not say so (Destiny Tech100 Inc.).
+            prof = profiles.get(ticker) or {}
+            fund_reason = instruments.fund_from_profile(
+                prof.get("quote_type"), prof.get("industry"), floats.get(ticker))
+            if fund_reason:
+                counters["rejected_instrument"] += 1
+                log("runner", f"  reject {ticker}: not an operating company's stock "
+                              f"({fund_reason})")
+                continue
+
             mkt = market_hours_bars(bars, end_min)
 
-            # First-pass anchoring. DTO walks firstSeenAt back up to 12 bars to
-            # find when conditions actually turned true, but then takes its
-            # detectionPrice from the CURRENT bar - so its detection time and
-            # detection price describe different bars. That is incoherent for a
-            # simulator that enters at "the open of the bar following
-            # first_pass_et": the entry would be anchored to a bar whose price
-            # was never recorded. Here the whole snapshot is taken AT the
-            # walked-back bar, so first_pass_et, detection_price, ema9, vwap,
-            # stop and target all describe one bar.
+            # Two different bars, deliberately (scan_version 3):
+            #
+            # first_pass_et is WALKED BACK up to 12 bars to where the VWAP/EMA
+            # conditions first held -- DTO's firstSeenAt, kept as a research
+            # timestamp (detection_minutes, "how long had it been running").
+            #
+            # The PLAN -- detection_price, the 9-EMA stop, the 2R target and
+            # every feature in the snapshot -- is the last completed bar at
+            # this tick, the bar the gate chain just passed (res["check"]) and
+            # the moment the system could act. DTO took its price from the
+            # current bar too. v2 took the whole snapshot at the walked-back
+            # bar, which made sense while the simulator entered there; once it
+            # entered at the tick (sim v4, honest_entry_time), a name that kept
+            # running was bought at the tick on a stop and target up to an
+            # hour old -- the 2026-10-01 "target" exits at a loss and the
+            # +5..7R "wins" off fills a few cents above a stale stop.
             idx = first_pass_index(mkt, float(cfg.get("min_vwap_pct", 0.5))) \
                 if cfg.get("walkback", True) else len(mkt) - 1
-            snap_bars = mkt[: idx + 1]
-            snap = check_runner_conditions(snap_bars, float(cfg.get("min_vwap_pct", 0.5)))
-            if not snap["passes"]:
-                # Defensive: first_pass_index only returns indices where the
-                # check passed, so this is unreachable by construction. If it
-                # ever fires, fall back to the confirmed final bar rather than
-                # storing a snapshot that never satisfied the conditions.
-                snap_bars, snap = mkt, res["check"]
+            snap_bars = mkt
+            snap = res.get("check") or {}
+            if not snap.get("passes"):
+                # Defensive: evaluate_ticker only passes a survivor whose check
+                # passed on these bars. Never store a plan that did not.
+                counters["rejected_conditions"] += 1
+                continue
 
             detection_price = snap["price"]
             ema9 = snap["ema9"]
@@ -914,14 +1011,16 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
                               f"minimum {min_stop:.4f} (price sits on the 9 EMA)")
                 continue
 
-            first_pass_et = snap_bars[-1]["t"]
+            first_pass_et = mkt[idx]["t"]
+            plan_bar_et = snap_bars[-1]["t"]
             pc = prev_close.get(ticker)
             row = {
                 "session_date": d,
                 "ticker": ticker,
-                "first_pass_et": first_pass_et.replace(tzinfo=None),
+                "first_pass_et": _naive(first_pass_et),
                 "detection_minutes": ri.et_minutes(first_pass_et),
-                "scan_pass_et": at.replace(tzinfo=None),
+                "scan_pass_et": _naive(at),
+                "plan_bar_et": _naive(plan_bar_et),
                 "detection_price": detection_price,
                 "vwap": snap["vwap"],
                 "vwap_pct_above": snap["vwap_pct_above"],
@@ -951,7 +1050,13 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
                     "feed": feed,
                     "rvol_unavailable_reason": ("feed_downgraded_iex"
                                                 if feed_downgraded else None),
+                    "instrument": ("classified" if classified else "unclassified"),
                 }),
+                "asset_name": names.get(ticker),
+                "instrument_class": instruments.COMMON if classified else None,
+                "quote_type": prof.get("quote_type") or None,
+                "sector": prof.get("sector"),
+                "industry": prof.get("industry"),
                 "scan_version": SCAN_VERSION,
             }
             if ledger.save_runner_candidate(con, row):
@@ -975,6 +1080,14 @@ def scan(md, cfg: dict, *, at: datetime, con=None) -> dict:
             "gates_unavailable": json.dumps({**unavailable, "feed": feed,
                                              "feed_downgraded": feed_downgraded,
                                              "bars_failed": bars_failed}),
+            # Where the universe came from and what each lane filter removed,
+            # so a shrinking universe is explained, never inferred.
+            "universe_stats": json.dumps({
+                k: ustats.get(k) for k in (
+                    "universe_sources", "dropped_not_common", "dropped_excluded",
+                    "dropped_instrument", "dropped_instrument_by_source",
+                    "dropped_liquidity_by_source", "instruments_classified",
+                    "sticky_added")}),
             "provider_degraded": degraded,
             "scan_version": SCAN_VERSION,
         }
@@ -1005,6 +1118,8 @@ def _counter_column(res: dict) -> str:
     is what actually makes a zero-candidate day diagnosable.
     """
     reason = res.get("reason") or ""
+    if res["counter"] in ("liquidity", "instrument"):
+        return f"rejected_{res['counter']}"
     if res["counter"] == "conditions":
         if reason == "excluded ticker":
             return "rejected_excluded"

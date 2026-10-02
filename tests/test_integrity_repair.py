@@ -281,11 +281,16 @@ def test_unknown_table_still_404s(monkeypatch, tmp_path):
 # ----------------------------------------------------------------- Phase 4
 
 def test_regate_targets_the_current_scan_version():
-    """A SCAN_VERSION bump past 2 must fail here until regate is re-derived
-    for it: v3 may change detection itself, which stored inputs cannot replay."""
+    """A SCAN_VERSION bump must fail here until regate is re-derived for it OR
+    the new version is declared unreachable with its reason: a version that
+    changes detection itself cannot be replayed from stored inputs, and that
+    has to be said, not discovered. scan_version 3 is such a version."""
     from agent import runner_regate
     from agent.runner_scan import SCAN_VERSION
-    assert runner_regate.REGATE_TO == SCAN_VERSION
+    assert (runner_regate.REGATE_TO == SCAN_VERSION
+            or SCAN_VERSION in runner_regate.UNREACHABLE)
+    if SCAN_VERSION in runner_regate.UNREACHABLE:
+        assert runner_regate.UNREACHABLE[SCAN_VERSION].strip()
 
 
 @pytest.mark.parametrize("row, downgraded, expected", [

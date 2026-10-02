@@ -125,7 +125,42 @@ _CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 # the "eod" exit of every hold-to-close trade (on an early close, every bar
 # 13:00-16:00); and r_planned is scored from the worse of the planned entry
 # and the fill, so an adverse market or gap-through fill is never hidden.
-CURRENT_SIM_VERSION = 5
+# v6 = RUNNER LANE ONLY (runner candidates and dto_runner picks): a fill must
+# leave at least RUNNER_MIN_REWARD_R of PLANNED risk between it and the target,
+# else it is invalid_fill (invalid_reason "stale_bracket"). The runner buys at
+# market at the decision tick on a bracket formed earlier; on 2026-10-01 PKE,
+# PGY and FLR filled a cent under their targets and were booked as "target"
+# exits at a loss, and 62 of 194 target exits filled more than 0.5 planned R
+# from the plan. The live runner path applies the same rule before it places
+# an order (runner_selection._place_live_orders). Morning and shadow semantics
+# are UNCHANGED from v5 -- their exact-target gate stays -- so a morning row
+# graded under v5 is equivalent to one graded under v6 (SAME_SEMANTICS).
+CURRENT_SIM_VERSION = 6
+
+# The least reward, in planned R, a runner fill must leave below the target.
+# It is the execution_anomaly line (fill_vs_plan_r > 0.5) read from the other
+# side: a fill that has used up more than 1.5 of the plan's 2R has stopped
+# testing the plan. Part of sim_version 6's semantics -- not a config knob,
+# because changing it without a version bump would pool two rule sets.
+RUNNER_MIN_REWARD_R = 0.5
+
+# Versions whose semantics are identical FOR A LANE. Used where a stored
+# version is compared to the running one (the chart drawer's replay guard),
+# so a v6 bump that changed nothing for the morning lane does not flag every
+# morning chart as "graded under another simulator".
+SAME_SEMANTICS = {"morning": frozenset({5, 6}), "shadow": frozenset({5, 6}),
+                  "runner": frozenset({6}), "live": frozenset({5, 6})}
+
+
+def same_semantics(stored_version, lane: str | None) -> bool:
+    """True when a row graded under `stored_version` was graded by rules
+    identical, for `lane`, to the running simulator's."""
+    if stored_version is None:
+        return True
+    if stored_version == CURRENT_SIM_VERSION:
+        return True
+    return stored_version in SAME_SEMANTICS.get(lane or "", frozenset()) \
+        and CURRENT_SIM_VERSION in SAME_SEMANTICS.get(lane or "", frozenset())
 
 
 def _risk_per_share(entry: float, stop: float) -> float:
@@ -373,8 +408,14 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                   atr14: float | None = None, trend_snapshot: dict | None = None,
                   fundamentals: dict | None = None, prev_close: float | None = None,
                   or_minutes: int = 15, session_date: date | None = None,
-                  session_bars: list[dict] | None = None) -> dict:
+                  session_bars: list[dict] | None = None,
+                  min_reward_r: float = 0.0) -> dict:
     """Returns an outcome dict ready for ledger.save_outcome (minus grade fields).
+
+    min_reward_r (sim_version 6): the least reward, in PLANNED R, a fill must
+    leave below the target. 0 (every caller but the runner lane) keeps the v4
+    rule -- invalid only when the fill is AT or PAST the target. The runner
+    lane passes RUNNER_MIN_REWARD_R.
 
     atr14/trend_snapshot/fundamentals/prev_close are the indicator-layer-v2
     grading inputs (agent/loops/evening.py passes these from one batched
@@ -610,6 +651,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     if (long and fill_price <= stop) or (not long and fill_price >= stop):
         out["entry_fill"] = round(fill_price, 4)
         out["exit_reason"] = "invalid_fill"
+        out["invalid_reason"] = "wrong_side_of_stop"
         out["invalid_fill_detail"] = (
             f"{'long' if long else 'short'} fill {fill_price:.4f} landed on the wrong side of "
             f"stop {stop:.4f} (planned entry {entry:.4f}, type {entry_type}) -- not a real trade"
@@ -623,13 +665,32 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     # rejected by the broker -- so it is not a trade either. Seen when an open
     # entry gaps over its target, or when a runner candidate had already run
     # past its target before anything could act on it.
-    if (long and fill_price >= target) or (not long and fill_price <= target):
+    reward_left = (target - fill_price) if long else (fill_price - target)
+    if reward_left <= 0:
         out["entry_fill"] = round(fill_price, 4)
         out["exit_reason"] = "invalid_fill"
+        out["invalid_reason"] = "no_reward_left"
         out["invalid_fill_detail"] = (
             f"{'long' if long else 'short'} fill {fill_price:.4f} is already at/past "
             f"target {target:.4f} (planned entry {entry:.4f}, type {entry_type}) -- "
             f"no reward left in the plan; not a real trade"
+        )
+        log("grade", f"pick {pick.get('pick_id')}: INVALID FILL -- {out['invalid_fill_detail']}")
+        return out
+    # ...and, for the runner lane (sim_version 6), a fill that has used up
+    # most of the plan's reward before it was entered. The runner buys at
+    # market at the decision tick on a bracket formed earlier; a fill a cent
+    # under the target that slippage turns into a loss is not a target hit,
+    # and the live path refuses the same order (runner_selection).
+    if min_reward_r > 0 and reward_left < min_reward_r * risk:
+        out["entry_fill"] = round(fill_price, 4)
+        out["exit_reason"] = "invalid_fill"
+        out["invalid_reason"] = "stale_bracket"
+        out["invalid_fill_detail"] = (
+            f"{'long' if long else 'short'} fill {fill_price:.4f} leaves "
+            f"{reward_left / risk:.2f} planned R to target {target:.4f} "
+            f"(< {min_reward_r} required; planned entry {entry:.4f}) -- the bracket "
+            f"was stale by the fill; not a test of the plan"
         )
         log("grade", f"pick {pick.get('pick_id')}: INVALID FILL -- {out['invalid_fill_detail']}")
         return out
@@ -875,17 +936,26 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
               entry_after_map: dict[str, Any] | None = None) -> list[dict]:
     """Grade a day's picks.
 
-    `entry_after_map` maps ticker -> the earliest datetime a pick may fill.
-    A pick detected INTRADAY cannot be simulated from the session open: an
-    entry_type of "open" fills at bars[0], which for a runner pick detected
+    `entry_after_map` maps ticker -> the earliest datetime a RUNNER pick may
+    fill. A pick detected INTRADAY cannot be simulated from the session open:
+    an entry_type of "open" fills at bars[0], which for a runner pick detected
     at 10:20 meant buying the 09:30 print against a stop derived from a
     10:20 EMA. The fill then sits below its own stop and the trade grades as
     invalid_fill -- which is how an entire lane's picks became ungradeable,
     and therefore produced no lessons, while looking like a market result.
+
+    The map is keyed by ticker and built from the runner candidate list, so it
+    applies to runner picks ONLY. Applied to every pick, a morning gap-and-go
+    on a name the runner also detected that day was graded from the runner's
+    10:30 entry instead of the open. Runner picks are also graded under the
+    runner lane's minimum-remaining-reward rule (sim_version 6), exactly as
+    their runner_candidate_outcomes row is.
     """
+    from .ledger import RUNNER_SETUP
     outcomes = []
     for p in picks:
         t = p["ticker"].upper()
+        runner_pick = p.get("setup_type") == RUNNER_SETUP
         try:
             bars = md.minute_bars(p["ticker"], d)
         except Exception as e:
@@ -898,7 +968,7 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
         # participation must still be read off the whole session, not an
         # entry-time suffix (else "RVOL@10:00" reads a single post-entry bar).
         full_bars = bars
-        cutoff = (entry_after_map or {}).get(t)
+        cutoff = (entry_after_map or {}).get(t) if runner_pick else None
         if cutoff is not None and bars:
             before = len(bars)
             bars = [b for b in bars
@@ -918,12 +988,25 @@ def grade_day(md: MarketData, picks: list[dict], d: date,
                           fundamentals=(fundamentals_map or {}).get(t),
                           prev_close=(prev_close_map or {}).get(t),
                           or_minutes=or_minutes, session_date=d,
-                          session_bars=full_bars)
+                          session_bars=full_bars,
+                          min_reward_r=RUNNER_MIN_REWARD_R if runner_pick else 0.0)
         o["eval_date"] = d
         outcomes.append(o)
         log("grade", f"{p['ticker']} {p['direction']}: triggered={o['triggered']} "
-                     f"exit={o['exit_reason']} R={o['r_multiple']}")
+                     f"exit={o['exit_reason']} R={realized_r(o)}")
     return outcomes
+
+
+def realized_r(o: dict) -> float | None:
+    """The realized R every report shows: planned-risk R (r_planned), falling
+    back to r_multiple only for a legacy row that has none. r_multiple divides
+    by the fill-to-stop distance (floored at 25% of plan), so it inflates a
+    fill near the stop and deflates an adverse fill -- a diagnostic, never the
+    headline (see the module docstring)."""
+    v = o.get("r_planned")
+    if v is None:
+        v = o.get("r_multiple")
+    return v
 
 
 def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
@@ -941,7 +1024,7 @@ def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
         if o.get("triggered"):
             times = f" [{o['fill_time']} -> {o['exit_time']}]" if o.get("fill_time") and o.get("exit_time") else ""
             lines.append(f"- OUTCOME: filled @ {o['entry_fill']}, exit @ {o['exit_price']} "
-                         f"({o['exit_reason']}), R = {o['r_multiple']:+.2f}, "
+                         f"({o['exit_reason']}), R = {realized_r(o):+.2f} (planned-risk R), "
                          f"MFE {o['mfe_r']:+.2f}R, MAE {o['mae_r']:+.2f}R{times}")
             if o.get("execution_anomaly"):
                 lines.append(

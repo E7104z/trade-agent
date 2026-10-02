@@ -29,7 +29,8 @@ from . import indicators as ind
 from . import ledger
 from . import runner_indicators as ri
 from .config import Config
-from .grading import CURRENT_SIM_VERSION, classify_shadow, simulate_pick
+from .grading import (CURRENT_SIM_VERSION, RUNNER_MIN_REWARD_R, classify_shadow,
+                      realized_r, same_semantics, simulate_pick)
 from .grading_context import build_grading_context
 from .providers import MarketData
 from .runner_scan import DETECTION_BAR_MINUTES, earliest_entry_time, honest_entry_time
@@ -321,16 +322,24 @@ def _replay_morning(md: MarketData, con, cfg: Config, pick: dict, d: date,
     slippage = float(cfg.get("slippage_bps", 0) or 0)
     flatten_at = cfg.get("flatten_at")
     min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
-    entry_after = (gctx["entry_after_map"] or {}).get(t)
+    # The runner entry time and the runner fill rule apply to RUNNER picks only,
+    # exactly as grading.grade_day applies them: a morning pick on a name the
+    # runner also detected that day is still graded from the open.
+    runner_pick = pick.get("setup_type") == ledger.RUNNER_SETUP
+    entry_after = (gctx["entry_after_map"] or {}).get(t) if runner_pick else None
     sim_bars = bars
     if entry_after is not None and bars:
-        sim_bars = [b for b in bars if _naive(b["t"]) >= _naive(entry_after)] or bars
+        sim_bars = [b for b in bars if _naive(b["t"]) >= _naive(entry_after)]
+        if not sim_bars:
+            return {"triggered": False, "exit_reason": "no_data",
+                    "sim_version": CURRENT_SIM_VERSION}
     return simulate_pick(pick, sim_bars, daily, slippage_bps=slippage, flatten_at=flatten_at,
                          min_bar_volume=min_bar_volume, adv20=gctx["adv20_map"].get(t),
                          atr14=gctx["atr_map"].get(t), trend_snapshot=gctx["trend_map"].get(t),
                          fundamentals=gctx["fundamentals_map"].get(t),
                          prev_close=gctx["prev_close_map"].get(t),
-                         or_minutes=gctx["or_minutes"], session_date=d, session_bars=bars)
+                         or_minutes=gctx["or_minutes"], session_date=d, session_bars=bars,
+                         min_reward_r=RUNNER_MIN_REWARD_R if runner_pick else 0.0)
 
 
 def _replay_shadow(cfg: Config, rejection: dict, d: date, bars: list[dict]) -> dict:
@@ -370,20 +379,24 @@ def _replay_runner(md: MarketData, con, cfg: Config, candidate: dict, d: date,
            "target_price": candidate.get("target_price")}
     sim = simulate_pick(shim, entry_bars, None, slippage_bps=slippage, flatten_at=flatten_at,
                         min_bar_volume=min_bar_volume, atr14=atr14, trend_snapshot=trend_snapshot,
-                        session_date=d)
+                        session_date=d, min_reward_r=RUNNER_MIN_REWARD_R)
     return sim, cutoff
 
 
 # ---------------------------------------------------------------------- guard
 
 def _replay_guard(name: str, stored: float | None, replayed: float | None,
-                  stored_sim_version: int | None, graded: bool = True) -> dict:
+                  stored_sim_version: int | None, graded: bool = True,
+                  lane: str | None = None) -> dict:
     # An ungraded row (evening loop hasn't run for it yet) has no ledger value
     # to disagree with -- that's "nothing to compare", not a mismatch, and
     # flagging it put a red banner on every same-day chart.
     if not graded:
         return {"name": name, "ok": True, "detail": "not graded yet -- replay only"}
-    if stored_sim_version is not None and stored_sim_version != CURRENT_SIM_VERSION:
+    # A version bump that changed nothing for this lane (sim v6 is runner-only)
+    # is not a disagreement: grading.same_semantics knows which versions grade
+    # a lane identically.
+    if stored_sim_version is not None and not same_semantics(stored_sim_version, lane):
         return {"name": name, "ok": False,
                "detail": f"graded under sim v{stored_sim_version}, replayed under v{CURRENT_SIM_VERSION}"}
     if stored is None and replayed is None:
@@ -568,7 +581,9 @@ def trade_summary(out: dict) -> dict:
                 result = {"label": "Forgone", "r": outcome.get("forgone_r")}
                 status = _humanize(outcome.get("eod_outcome"), _SHADOW_LABELS)
         else:
-            result = {"label": "Result", "r": outcome.get("r_multiple")}
+            # Planned-risk R, the one realized-R measure (grading.realized_r);
+            # r_multiple only for a legacy row that has nothing else.
+            result = {"label": "Result", "r": realized_r(outcome)}
             if outcome.get("triggered") is False:
                 why = _humanize(outcome.get("untriggered_reason"), {})
                 status = "Not triggered" + (f" ({why.lower()})" if why else "")
@@ -631,10 +646,12 @@ def _build_morning(con, cfg, md, out, t, d, pick_id, bars, daily, tf, asof, warn
                         "label": f"No trigger ({untriggered or 'unknown'})", "source": "replay"})
     out["markers"] = markers
 
-    stored_r = (outcome_row or {}).get("r_multiple")
+    stored_r = realized_r(outcome_row or {})
     stored_sim = (outcome_row or {}).get("sim_version")
-    guards.append(_replay_guard("replay_vs_ledger", stored_r, sim.get("r_multiple"), stored_sim,
-                                graded=outcome_row is not None))
+    guards.append(_replay_guard("replay_vs_ledger", stored_r, realized_r(sim), stored_sim,
+                                graded=outcome_row is not None,
+                                lane=("runner" if pick.get("setup_type") == ledger.RUNNER_SETUP
+                                      else "morning")))
     if not guards[-1]["ok"]:
         for m in markers:
             if m.get("source") == "replay":
@@ -648,7 +665,9 @@ def _build_morning(con, cfg, md, out, t, d, pick_id, bars, daily, tf, asof, warn
         "outcome": None if asof else ({
             "triggered": (outcome_row or {}).get("triggered"),
             "exit_reason": (outcome_row or {}).get("exit_reason"),
-            "r_multiple": stored_r, "mfe_r": (outcome_row or {}).get("mfe_r"),
+            "r_planned": (outcome_row or {}).get("r_planned"),
+            "r_multiple": (outcome_row or {}).get("r_multiple"),
+            "mfe_r": (outcome_row or {}).get("mfe_r"),
             "mae_r": (outcome_row or {}).get("mae_r"), "sim_version": stored_sim,
             "untriggered_reason": (outcome_row or {}).get("untriggered_reason"),
         } if outcome_row else None),
@@ -755,10 +774,10 @@ def _build_runner(con, cfg, md, out, t, d, bars, tf, asof, warnings, guards):
     out["markers"] = markers
     out["windows"] = windows
 
-    stored_r = (stored or {}).get("r_multiple")
+    stored_r = realized_r(stored or {})
     stored_sim = (stored or {}).get("sim_version")
-    guards.append(_replay_guard("replay_vs_ledger", stored_r, sim.get("r_multiple"), stored_sim,
-                                graded=stored is not None))
+    guards.append(_replay_guard("replay_vs_ledger", stored_r, realized_r(sim), stored_sim,
+                                graded=stored is not None, lane="runner"))
     if not guards[-1]["ok"]:
         for m in out["markers"]:
             if m.get("source") == "replay":
@@ -769,7 +788,10 @@ def _build_runner(con, cfg, md, out, t, d, bars, tf, asof, warnings, guards):
         "selection_rank": (stored or {}).get("selection_rank"),
         "outcome": None if asof else ({
             "triggered": (stored or {}).get("triggered"), "exit_reason": (stored or {}).get("exit_reason"),
-            "r_multiple": stored_r, "mfe_r": (stored or {}).get("mfe_r"),
+            "r_planned": (stored or {}).get("r_planned"),
+            "r_multiple": (stored or {}).get("r_multiple"),
+            "invalid_reason": (stored or {}).get("invalid_reason"),
+            "mfe_r": (stored or {}).get("mfe_r"),
             "mae_r": (stored or {}).get("mae_r"), "sim_version": stored_sim,
         } if stored else None),
     }

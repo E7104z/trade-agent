@@ -255,17 +255,32 @@ class Alpaca:
     def tradable_assets(self) -> list[str]:
         """Active, tradable US common-stock symbols from /v2/assets.
 
+        The filter reproduces DTO's (js/alpaca.js:307-309): tradable,
+        fractionable is not False, no digit in the symbol, at most 5
+        characters. That leaves ~7,182 symbols, which the caller then screens
+        on dollar volume. See asset_records() for the fetch itself.
+        """
+        out = [
+            a["symbol"] for a in self.asset_records()
+            if a.get("tradable")
+            and a.get("fractionable") is not False
+            and not re.search(r"\d", a.get("symbol", ""))
+            and len(a.get("symbol", "")) <= 5
+        ]
+        return sorted(set(out))
+
+    def asset_records(self) -> list[dict]:
+        """Every active, TRADABLE asset on NYSE/NASDAQ/ARCA/BATS from /v2/assets,
+        as {"symbol", "name", "tradable", "fractionable"} -- the registered
+        name included, which agent/instruments.classify reads to tell an
+        operating company's stock from an ETF, a fund, a note or a preferred.
+
         /v2/assets lives on the TRADING host, not the data host, and the two
         take different key pairs. DTO's notes say its live keys worked on
         api.alpaca.markets and 401'd on paper-api; this account is the mirror
         image — measured 2026-09-15, paper-api returns 200 with 12,890 assets
         and api.alpaca.markets 401s. So the paper host is tried first here and
         the live host is the fallback, which covers either key type.
-
-        The filter reproduces DTO's (js/alpaca.js:307-309): tradable,
-        fractionable is not False, no digit in the symbol, at most 5
-        characters. That leaves ~7,182 symbols, which the caller then screens
-        on dollar volume.
         """
         hosts = ["https://paper-api.alpaca.markets", "https://api.alpaca.markets"]
         params = {"status": "active", "asset_class": "us_equity",
@@ -292,14 +307,13 @@ class Alpaca:
                 log("data", f"WARN /v2/assets failed on {host}: {e}")
                 continue
             out = [
-                a["symbol"] for a in data
-                if a.get("tradable")
-                and a.get("fractionable") is not False
-                and not re.search(r"\d", a.get("symbol", ""))
-                and len(a.get("symbol", "")) <= 5
+                {"symbol": str(a.get("symbol") or "").upper(), "name": a.get("name") or "",
+                 "tradable": bool(a.get("tradable")), "fractionable": a.get("fractionable")}
+                for a in (data if isinstance(data, list) else [])
+                if a.get("tradable") and a.get("symbol")
             ]
             if out:
-                return sorted(set(out))
+                return out
         log("data", "WARN /v2/assets returned nothing on either host")
         return []
 
@@ -497,6 +511,20 @@ def _yf():
     return yf
 
 
+_SHARE_CLASS_RE = re.compile(r"[A-Z]{1,5}\.[A-Z]{1,2}")
+
+
+def yf_symbol(sym: str) -> str:
+    """The Yahoo spelling of an exchange symbol. Share classes are dotted on the
+    exchange and in Alpaca (BF.B, BRK.B) but dashed on Yahoo (BF-B, BRK-B);
+    sent as-is every yfinance lookup 404s ("Quote not found for symbol: BF.B")
+    and float, earnings, industry and history all come back empty for the name.
+    Only a plain share-class symbol is rewritten -- index and futures symbols
+    (^N225, ES=F, DX-Y.NYB) are passed through untouched."""
+    s = str(sym or "").upper().strip()
+    return s.replace(".", "-") if _SHARE_CLASS_RE.fullmatch(s) else s
+
+
 def yf_quote_change(symbols: dict[str, str]) -> list[dict]:
     """Last price + % change vs previous close for a dict of {ticker: label}."""
     yf = _yf()
@@ -529,7 +557,7 @@ def regular_session_window(d: date) -> tuple[datetime, datetime]:
 
 def yf_minute_bars(symbol: str, d: date) -> list[dict]:
     yf = _yf()
-    hist = yf.Ticker(symbol).history(
+    hist = yf.Ticker(yf_symbol(symbol)).history(
         start=d.isoformat(), end=(d + timedelta(days=1)).isoformat(),
         interval="1m", prepost=False,
     )
@@ -546,7 +574,7 @@ def yf_minute_bars(symbol: str, d: date) -> list[dict]:
 
 def yf_daily_bar(symbol: str, d: date) -> dict | None:
     yf = _yf()
-    hist = yf.Ticker(symbol).history(
+    hist = yf.Ticker(yf_symbol(symbol)).history(
         start=d.isoformat(), end=(d + timedelta(days=1)).isoformat(),
         interval="1d", auto_adjust=True)
     if hist.empty:
@@ -559,14 +587,16 @@ def yf_daily_bar(symbol: str, d: date) -> dict | None:
 def yf_history_closes(symbols: list[str], days: int = 70) -> dict[str, list[float]]:
     """Daily closes per symbol (oldest -> newest), one batched download."""
     yf = _yf()
+    ysym = {sym: yf_symbol(sym) for sym in symbols}
     df = yf.download(
-        symbols, period=f"{days}d", interval="1d",
+        sorted(set(ysym.values())), period=f"{days}d", interval="1d",
         progress=False, threads=True, auto_adjust=True, group_by="ticker",
     )
     out: dict[str, list[float]] = {}
     for sym in symbols:
         series = None
-        for accessor in (lambda: df[sym]["Close"], lambda: df["Close"][sym], lambda: df["Close"]):
+        for accessor in (lambda: df[ysym[sym]]["Close"], lambda: df["Close"][ysym[sym]],
+                         lambda: df["Close"]):
             try:
                 series = accessor()
                 break
@@ -584,14 +614,16 @@ def yf_history_volumes(symbols: list[str], days: int = 40) -> dict[str, list[flo
     Fallback source for ADV20 when Alpaca's multi-symbol daily bars miss a
     ticker (mirrors yf_history_closes)."""
     yf = _yf()
+    ysym = {sym: yf_symbol(sym) for sym in symbols}
     df = yf.download(
-        symbols, period=f"{days}d", interval="1d",
+        sorted(set(ysym.values())), period=f"{days}d", interval="1d",
         progress=False, threads=True, auto_adjust=True, group_by="ticker",
     )
     out: dict[str, list[float]] = {}
     for sym in symbols:
         series = None
-        for accessor in (lambda: df[sym]["Volume"], lambda: df["Volume"][sym], lambda: df["Volume"]):
+        for accessor in (lambda: df[ysym[sym]]["Volume"], lambda: df["Volume"][ysym[sym]],
+                         lambda: df["Volume"]):
             try:
                 series = accessor()
                 break
@@ -609,14 +641,15 @@ def yf_history_bars(symbols: list[str], days: int = 380) -> dict[str, list[dict]
     download. Fallback source for MarketData.daily_context when Alpaca's
     multi_bars(1Day) misses a ticker (mirrors yf_history_closes/_volumes)."""
     yf = _yf()
+    ysym = {sym: yf_symbol(sym) for sym in symbols}
     df = yf.download(
-        symbols, period=f"{days}d", interval="1d",
+        sorted(set(ysym.values())), period=f"{days}d", interval="1d",
         progress=False, threads=True, auto_adjust=True, group_by="ticker",
     )
     out: dict[str, list[dict]] = {}
     for sym in symbols:
         sub = None
-        for accessor in (lambda: df[sym], lambda: df):
+        for accessor in (lambda: df[ysym[sym]], lambda: df):
             try:
                 sub = accessor()
                 break
@@ -1227,25 +1260,35 @@ class MarketData:
         return out
 
     def fundamentals(self, symbols: list[str], con: Any = None) -> dict[str, dict]:
-        """Float shares, market cap, and short-%-of-float per symbol —
-        yfinance, cached in the ledger DB with a 3-session TTL (this data
-        moves slowly; short interest itself is only exchange-reported
-        roughly biweekly). short_asof always accompanies short_pct_float —
-        stale-and-labeled beats fresh-looking fiction. A symbol this can't
-        compute for is simply absent; callers treat that as unmeasured,
-        never a fabricated number.
+        """Float shares, market cap, short-%-of-float, and what the security
+        is (quote_type, sector, industry) per symbol — yfinance, cached in the
+        ledger DB with a 3-session TTL (this data moves slowly; short interest
+        itself is only exchange-reported roughly biweekly). short_asof always
+        accompanies short_pct_float — stale-and-labeled beats fresh-looking
+        fiction. A symbol this can't compute for is simply absent; callers
+        treat that as unmeasured, never a fabricated number.
+
+        quote_type/sector/industry ride the SAME info call as float, so the
+        runner lane's instrument check and industry clusters cost no extra
+        request. An unknown quote_type is stored as "" (fetched, Yahoo had
+        none) so it is never confused with NULL (a row cached before the
+        column existed, which is refetched once).
         """
         syms = sorted({str(s).upper().strip() for s in symbols if s})
         out: dict[str, dict] = {}
         if not syms:
             return out
         if self.cfg.offline:
+            industries = ("Biotechnology", "Banks - Regional", "Semiconductors",
+                          "Oil & Gas Midstream", "Software - Application")
             for s in syms:
                 seed = int(hashlib.sha256(s.encode()).hexdigest(), 16)
                 out[s] = {"mkt_cap": float(1_000_000_000 + seed % 400_000_000_000),
                           "float_shares": float(10_000_000 + seed % 500_000_000),
                           "short_pct_float": round((seed % 300) / 10, 1),
-                          "short_asof": now_et().date().isoformat()}
+                          "short_asof": now_et().date().isoformat(),
+                          "quote_type": "EQUITY", "sector": "Offline",
+                          "industry": industries[seed % len(industries)]}
             return out
         from . import ledger
         owns_con = con is None
@@ -1260,7 +1303,7 @@ class MarketData:
 
             def _fetch_one(s: str) -> dict | None:
                 try:
-                    t = yf.Ticker(s)
+                    t = yf.Ticker(yf_symbol(s))
                     info = t.get_info() if hasattr(t, "get_info") else t.info
                     mkt_cap = info.get("marketCap")
                     float_shares = info.get("floatShares")
@@ -1275,7 +1318,10 @@ class MarketData:
                     return {"symbol": s, "mkt_cap": float(mkt_cap) if mkt_cap else None,
                             "float_shares": float(float_shares) if float_shares else None,
                             "short_pct_float": round(float(short_pct) * 100, 2) if short_pct else None,
-                            "short_asof": asof}
+                            "short_asof": asof,
+                            "quote_type": str(info.get("quoteType") or "").upper(),
+                            "sector": (info.get("sector") or None),
+                            "industry": (info.get("industry") or None)}
                 except Exception as e:
                     log("data", f"WARN fundamentals fetch failed for {s}: {e}")
                     return None
@@ -1320,7 +1366,7 @@ class MarketData:
 
         def _fetch_one(s: str):
             try:
-                cal = yf.Ticker(s).get_earnings_dates(limit=4)
+                cal = yf.Ticker(yf_symbol(s)).get_earnings_dates(limit=4)
                 if cal is None or cal.empty:
                     return no_date
                 future = [ts.date() for ts in cal.index if ts.date() >= today]

@@ -116,19 +116,24 @@ def _question_items(con: Any, since: date) -> list[dict]:
 
 def _cell_items(con: Any, since: date) -> list[dict]:
     from . import buckets, research
+    from .clusters import unit_count
     out = []
     for lane, rows, date_key in (("morning", research.morning_rows(con), "plan_date"),
                                  ("runner", research.runner_rows(con), "session_date")):
-        counts: dict[tuple, list[int]] = {}
+        cells: dict[tuple, list[dict]] = {}
         for r in rows:
-            recent = 1 if (r.get(date_key) is not None and r.get(date_key) >= since) else 0
             for dim in buckets.dimensions(lane):
                 level = buckets.label(lane, dim, r)
                 if level == "?":
                     continue
-                c = counts.setdefault((dim, level), [0, 0])
-                c[0] += 1
-                c[1] += recent
+                cells.setdefault((dim, level), []).append(r)
+        # n is what the weekly search will count: rows for the morning lane,
+        # (session, industry) units for the runner lane (agent/clusters.py).
+        counts: dict[tuple, list[int]] = {}
+        for key, cell in cells.items():
+            recent_rows = [r for r in cell
+                           if r.get(date_key) is not None and r.get(date_key) >= since]
+            counts[key] = [unit_count(cell, lane), unit_count(recent_rows, lane)]
         for (dim, level), (n, rate) in counts.items():
             if 1 <= n < CELL_FLOOR:
                 out.append({"item_type": "cell", "item_id": f"{lane}:{dim}={level}",

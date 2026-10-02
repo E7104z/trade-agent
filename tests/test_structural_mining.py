@@ -123,12 +123,24 @@ def test_a_finding_that_holds_everywhere_is_structural():
 
 def test_a_shared_dimension_is_read_in_the_other_lane_too():
     morning = [_row("gap_go", "up", 1.0, stop_dist_atr=0.7) for _ in range(10)]
-    runner = [{"stop_dist_atr": 0.7, "r_multiple": -1.0, "session_date": date(2026, 9, 1)}
-              for _ in range(9)]
+    # Nine runner rows in nine DIFFERENT industries: nine units.
+    runner = [{"stop_dist_atr": 0.7, "r_multiple": -1.0, "session_date": date(2026, 9, 1),
+               "ticker": f"T{i}", "industry": f"Industry {i}"} for i in range(9)]
     res = structural.consistency(_survivor("stop_atr_bucket", "0.5-1", 1.0),
                                  {"morning": morning, "runner": runner})
     assert res[0]["detail"]["lane=runner"] == {"n": 9, "sign": "-"}
     assert res[0]["structural"] is False
+
+
+def test_one_sessions_industry_is_one_runner_observation_not_nine():
+    """Nine banks on one morning are one event: as a stratum they are n=1, so
+    they can neither confirm nor contradict a finding (agent/clusters.py)."""
+    morning = [_row("gap_go", "up", 1.0, stop_dist_atr=0.7) for _ in range(10)]
+    runner = [{"stop_dist_atr": 0.7, "r_multiple": -1.0, "session_date": date(2026, 9, 1),
+               "ticker": f"B{i}", "industry": "Banks - Regional"} for i in range(9)]
+    res = structural.consistency(_survivor("stop_atr_bucket", "0.5-1", 1.0),
+                                 {"morning": morning, "runner": runner})
+    assert "lane=runner" not in res[0]["detail"]
 
 
 # ------------------------------------------------------------------ Phase 3
