@@ -156,3 +156,12 @@ def test_mock_mode_uses_the_canned_draft_and_persists_nothing(con):
     row = tl.generate(con, cfg, D)
     assert row["status"] == "ok" and row["raw_text"] == CLEAN
     assert _rows(con) == [] and con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+def test_no_api_key_is_an_error_row_not_an_exit(con):
+    seed_session(con)
+    cfg = _cfg()
+    cfg.anthropic_api_key = ""
+    row = tl.generate(con, cfg, D)                 # LLMClient would SystemExit here
+    assert row["status"] == "error" and "LLM client unavailable" in row["violations_json"]
+    assert row["rendered_text"].startswith("FACTS ONLY")

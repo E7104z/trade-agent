@@ -25,3 +25,14 @@ os.environ.pop("DATABASE_URL", None)
 @pytest.fixture(autouse=True)
 def _no_production_ledger(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_paid_llm_calls(monkeypatch):
+    """No test may reach the Anthropic API. Tests stub LLMClient (or run in
+    mock mode); this catches the call that slipped past a stub -- e.g. a loop
+    hook switched on in config.json -- before it spends money. A test that
+    needs the transport sets its own _create_with_retry, which wins."""
+    def _refuse(self, kwargs, attempts=3):
+        raise RuntimeError("network LLM calls are disabled in the test suite")
+    monkeypatch.setattr("agent.llm.LLMClient._create_with_retry", _refuse)

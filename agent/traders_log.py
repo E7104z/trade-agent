@@ -553,7 +553,10 @@ def generate(con: Any, cfg: Any, session_date: date, *, llm_client: Any = None,
         row["persona_version"] = persona_version(cfg) if persona else None
         system = load_prompt("traders_log", {"PERSONA": persona})
         user = facts_prompt(facts)
-        client = llm_client or LLMClient(cfg)
+        try:
+            client = llm_client or LLMClient(cfg)
+        except SystemExit as e:   # no API key: LLMClient exits; the evening must not
+            raise RuntimeError(f"LLM client unavailable: {e}") from None
         mock_name = lcfg.get("mock_name") or "traders_log"
 
         def _call(u: str):
