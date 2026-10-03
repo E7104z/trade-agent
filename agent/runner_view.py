@@ -25,9 +25,10 @@ import json
 from datetime import date
 
 from . import ledger
+from .buckets import index_tape
 
 __all__ = ["session_summary", "render_text", "render_html", "biggest_moves",
-           "outcome_summary", "universe_line"]
+           "outcome_summary", "universe_line", "construction_summary"]
 
 
 def _f(v, digits=2, dash="-"):
@@ -116,6 +117,14 @@ def session_summary(con, d: date) -> dict:
             # printed +5..7R "wins" on 2026-10-01 that were ~2R on the plan.
             "r": _realized(o) if o.get("triggered") else None,
             "post_move_atr": o.get("post_move_atr"),
+            # At entry, and after it (schema v28): how stale the plan was, how
+            # extended above VWAP, the index tape it was bought into, and
+            # whether price kept going up from the first enterable price.
+            "staleness_min": o.get("staleness_min"),
+            "ext_vwap_atr": o.get("ext_vwap_atr"),
+            "index_tape": (index_tape(o.get("spy_vwap_pct"), o.get("qqq_vwap_pct"))
+                           if o.get("entry_px") is not None else None),
+            "drift_atr": o.get("drift_atr"),
             "exit_reason": o.get("exit_reason"),
             "invalid_reason": o.get("invalid_reason"),
             "triggered": o.get("triggered"),
@@ -164,6 +173,45 @@ def outcome_summary(s: dict) -> dict:
     delta = (sel["mean_r"] - field["mean_r"]
              if sel["mean_r"] is not None and field["mean_r"] is not None else None)
     return {"selected": sel, "field": field, "delta_r": delta}
+
+
+def construction_summary(con, s: dict) -> dict:
+    """ONE session's plan vs the construction arms, and its continuation after
+    entry (specs/RUNNER_TRADE_CONSTRUCTION_v1.md). Read back from the replay
+    table and the outcome rows; descriptive, never evidence on its own -- the
+    arms are tested as per-session paired ΔR across many sessions, weekly."""
+    from . import runner_exits
+    d = s["date"]
+    try:
+        rows = [r for r in ledger.runner_exit_replays_since(con, d)
+                if r.get("session_date") == d
+                and r.get("policy_version") == runner_exits.POLICY_VERSION
+                and r.get("r_planned") is not None]
+    except Exception:
+        rows = []
+    questions = {p.name: p.question for p in runner_exits.POLICIES}
+    arms = []
+    for name in (runner_exits.REFERENCE,) + runner_exits.ARMS:
+        vals = [float(r["r_planned"]) for r in rows if r["policy"] == name]
+        arms.append({"policy": name, "question": questions.get(name, ""), "n": len(vals),
+                     "mean_r": (sum(vals) / len(vals)) if vals else None,
+                     "win_rate": (sum(v > 0 for v in vals) / len(vals)) if vals else None})
+
+    drift = [r for r in s["rows"] if r.get("drift_atr") is not None]
+
+    def cell(rs: list[dict]) -> dict:
+        v = [float(r["drift_atr"]) for r in rs]
+        return {"n": len(v), "up": sum(1 for x in v if x > 0),
+                "mean_drift_atr": (sum(v) / len(v)) if v else None}
+
+    by_tape: dict[str, list[dict]] = {}
+    for r in drift:
+        by_tape.setdefault(r.get("index_tape") or "?", []).append(r)
+    return {"arms": arms,
+            "policy_version": runner_exits.POLICY_VERSION,
+            "continuation": {**cell(drift),
+                             "by_tape": [{"tape": k, **cell(v)}
+                                         for k, v in sorted(by_tape.items())]}}
 
 
 def biggest_moves(s: dict, n: int = 10) -> list[dict]:
@@ -330,6 +378,25 @@ def render_text(con, d: date) -> str:
         if o["delta_r"] is not None:
             out.append(f"  selection edge today: {o['delta_r']:+.3f} R "
                        f"(one session - not evidence on its own)")
+
+        cs = construction_summary(con, s)
+        cont = cs["continuation"]
+        if cont["n"]:
+            out += ["", f"CONTINUATION AFTER ENTRY (close vs first enterable price, ATR): "
+                        f"{cont['up']} of {cont['n']} closed above entry, mean drift "
+                        f"{_f(cont['mean_drift_atr'], 2)} ATR"]
+            for t in cont["by_tape"]:
+                out.append(f"  index tape {t['tape']:<11} n={t['n']:4}  up {t['up']:4}  "
+                           f"mean drift {_f(t['mean_drift_atr'], 2)} ATR")
+        if any(a["n"] for a in cs["arms"]):
+            out += ["", f"CONSTRUCTION ARMS (replay family v{cs['policy_version']}, same "
+                        "candidates; R in each arm's own risk unit):"]
+            for a in cs["arms"]:
+                win = "n/a" if a["win_rate"] is None else f"{100 * a['win_rate']:.0f}%"
+                out.append(f"  {a['policy']:<23} n={a['n']:4}  mean R {_f(a['mean_r'], 3):>7}"
+                           f"  win {win:>4}  {a['question'][:70]}")
+            out.append("  (one session; the weekly search tests per-session paired dR, "
+                       "never win rate)")
 
         moves = biggest_moves(s, 10)
         if moves:

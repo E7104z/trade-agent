@@ -319,6 +319,9 @@ def _runner_payload(con, d) -> dict:
             # Selected vs field in planned-risk R, with fills, industry units
             # and invalid fills counted -- one session, not evidence.
             "outcomes": runner_view.outcome_summary(s) if s["graded"] else None,
+            # Plan vs the construction arms, and continuation after entry --
+            # one session, descriptive (RUNNER_TRADE_CONSTRUCTION_v1).
+            "construction": runner_view.construction_summary(con, s) if s["graded"] else None,
             "universe_note": runner_view.universe_line(s),
         }
     except Exception as e:

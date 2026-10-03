@@ -410,6 +410,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v26.STATEMENTS
 from . import migrations_v27  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v27.STATEMENTS
 
+# --- v28 runner trade construction: entry context, continuation, arm stops --
+from . import migrations_v28  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v28.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -2240,7 +2244,7 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
         o.get("sim_version"), o.get("atr14"), o.get("stop_dist_atr"),
         o.get("trend_side_200d"), o.get("entry_after_et"),
         o.get("invalid_reason"), o.get("session_close"), o.get("post_move_atr"),
-    ]
+    ] + [o.get(c) for c in _ENTRY_CONTEXT_COLS]
     key = [o["session_date"], o["ticker"].upper()]
     # One statement either way. This was DELETE-then-INSERT, each committed on
     # its own: a connection lost between the two (Neon dropped one mid-regrade
@@ -2254,8 +2258,9 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
                  mfe_r = ?, mae_r = ?, eod_r = ?, selected = ?, selection_rank = ?,
                  pick_id = ?, sim_version = ?, atr14 = ?, stop_dist_atr = ?,
                  trend_side_200d = ?, entry_after_et = ?, invalid_reason = ?,
-                 session_close = ?, post_move_atr = ?
-               WHERE session_date = ? AND ticker = ?""",
+                 session_close = ?, post_move_atr = ?, """
+            + ", ".join(f"{c} = ?" for c in _ENTRY_CONTEXT_COLS)
+            + " WHERE session_date = ? AND ticker = ?",
             values + key,
         )
         return
@@ -2265,10 +2270,18 @@ def save_runner_candidate_outcome(con: duckdb.DuckDBPyConnection, o: dict) -> No
             exit_reason, r_multiple, r_planned, eod_r_planned, mfe_r, mae_r, eod_r, selected,
             selection_rank, pick_id, sim_version, atr14, stop_dist_atr,
             trend_side_200d, entry_after_et, invalid_reason, session_close,
-            post_move_atr)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            post_move_atr, """ + ", ".join(_ENTRY_CONTEXT_COLS) + ") VALUES ("
+        + ",".join("?" for _ in key + values) + ")",
         key + values,
     )
+
+
+# Entry-time context and exit-independent continuation (schema v28,
+# specs/RUNNER_TRADE_CONSTRUCTION_v1.md). Written by the evening for every
+# candidate with bars; NULL on rows graded before v28 until `regrade-runner`.
+_ENTRY_CONTEXT_COLS = ("entry_px", "entry_et", "staleness_min", "vwap_at_entry",
+                       "ext_vwap_atr", "spy_vwap_pct", "qqq_vwap_pct", "drift_atr",
+                       "run_up_atr", "draw_down_atr")
 
 
 def restore_runner_selection(con: duckdb.DuckDBPyConnection, d: date) -> list[str]:
@@ -2304,7 +2317,8 @@ def runner_outcomes_for_date(con: duckdb.DuckDBPyConnection, d: date) -> list[di
 
 
 _REPLAY_COLS = ("session_date", "ticker", "policy", "policy_version", "sim_version",
-                "r_planned", "exit_reason", "exit_et", "mfe_r", "mfe_et")
+                "r_planned", "exit_reason", "exit_et", "mfe_r", "mfe_et",
+                "stop_used", "target_used", "cost_r")
 
 
 def save_runner_exit_replays(con: duckdb.DuckDBPyConnection, d: date,

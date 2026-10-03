@@ -199,8 +199,10 @@ def _runner_grader_block(con, d: date) -> str:
 
 def _replay_exits(replays: list[dict], summary: dict, ticker: str, c: dict,
                   bars: list[dict], cutoff, sim: dict, d: date,
-                  slippage: float, min_bar_volume: float, flatten_at) -> None:
-    """Append one triggered candidate's exit-policy replays (RUNNER_EXIT_SPEC_v1).
+                  slippage: float, min_bar_volume: float, flatten_at,
+                  atr14: float | None = None) -> None:
+    """Append one triggered candidate's exit-policy replays (RUNNER_EXIT_SPEC_v1,
+    and the construction arms of RUNNER_TRADE_CONSTRUCTION_v1).
 
     The `plan` arm must reproduce the grader's r_planned for this exact trade.
     If it does not, the replay engine has drifted from simulate_pick, and every
@@ -213,7 +215,7 @@ def _replay_exits(replays: list[dict], summary: dict, ticker: str, c: dict,
             bars, runner_exits.fill_index(bars, cutoff),
             float(c.get("detection_price")), float(c.get("stop_price")),
             slippage_bps=slippage, min_bar_volume=min_bar_volume,
-            flatten_at=flatten_at, session_date=d)
+            flatten_at=flatten_at, session_date=d, atr14=atr14)
     except Exception as e:
         log("evening", f"  runner {ticker}: exit replay failed ({e})")
         return
@@ -292,6 +294,19 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
         above = snapshot.get("above_ma200")
         return "above" if above is True else ("below" if above is False else None)
 
+    # The index tape every candidate was bought into (schema v28): SPY and QQQ
+    # against their session VWAP just before each entry. Two fetches a
+    # session; a failure leaves the tape null (the '?' bucket), never the
+    # grading pass.
+    from ..runner_entry import INDEX_SYMBOLS, IndexTape, entry_context
+    tapes: dict[str, IndexTape] = {}
+    for sym in INDEX_SYMBOLS:
+        try:
+            tapes[sym] = IndexTape(md.minute_bars(sym, d))
+        except Exception as e:
+            log("evening", f"  runner index tape {sym}: bar fetch failed ({e}) - tape null")
+    summary["entry_context"] = 0
+
     for c in candidates:
         ticker = c["ticker"]
         try:
@@ -356,7 +371,20 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
                             trend_snapshot=trend_map.get(ticker),
                             session_date=d, min_reward_r=RUNNER_MIN_REWARD_R)
 
+        # At-entry context and exit-independent continuation, for EVERY
+        # candidate with an enterable bar -- invalid fills included: "does
+        # price keep going up after entry" does not depend on whether this
+        # plan's bracket was still valid (specs/RUNNER_TRADE_CONSTRUCTION_v1.md).
+        try:
+            ctx_fields = entry_context(bars, cutoff, first_pass, atr, tapes)
+        except Exception as e:
+            log("evening", f"  runner {ticker}: entry context failed ({e}) - left null")
+            ctx_fields = {}
+        if ctx_fields:
+            summary["entry_context"] += 1
+
         ledger.save_runner_candidate_outcome(con, {
+            **ctx_fields,
             "session_date": d, "ticker": ticker, "eval_date": d,
             "triggered": sim.get("triggered"),
             "entry_fill": sim.get("entry_fill"),
@@ -394,7 +422,7 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
             if sim.get("r_planned") is not None:
                 summary["sum_r"] += sim["r_planned"]
             _replay_exits(replays, summary, ticker, c, bars, cutoff, sim, d,
-                          slippage, min_bar_volume, flatten_at)
+                          slippage, min_bar_volume, flatten_at, atr14=atr)
 
     # Exit-policy replays (RUNNER_EXIT_SPEC_v1). Measurement only: nothing here
     # changes a live exit, and a failure here must never fail the grading pass.
@@ -409,6 +437,7 @@ def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
     log("evening", f"Runner candidates priced: {summary['scored']} scored, "
                    f"{summary['triggered']} triggered, mean R "
                    f"{summary['mean_r'] if summary['mean_r'] is not None else 'n/a'}; "
+                   f"entry context {summary['entry_context']}; "
                    f"exit replays {summary['exit_replays']}"
                    + (f" ({summary['exit_replay_parity_fail']} parity failures)"
                       if summary["exit_replay_parity_fail"] else ""))

@@ -18,8 +18,12 @@ Trade Agent CLI.
                                            that pass every v2 gate (dry run
                                            unless --apply)
   python run.py runner-exits [--from YYYY-MM-DD]
-                                           runner exit-policy replay report
+                                           runner exit-policy replay report, incl.
+                                           the construction arms A/B/C
                                            (read-only; fill it with regrade-runner)
+  python run.py runner-evidence           runner continuation after entry (drift
+                                           in ATR by bucket) + why each session is
+                                           or is not contested (read-only)
   python run.py research [--full]         research-integrity report: selection
                                            ablation + population baseline
                                            (zero API cost, read-only)
@@ -898,6 +902,11 @@ def main() -> None:
     p_rexits.add_argument("--from", dest="from_date", type=str, default=None,
                           help="YYYY-MM-DD (default: last 120 days)")
 
+    sub.add_parser(
+        "runner-evidence",
+        help="runner continuation after entry (drift in ATR by bucket) and selection "
+             "coverage per session (read-only, zero API cost)")
+
     p_research = sub.add_parser("research", help="research integrity report (selection ablation + population baseline, zero API cost)")
     p_research.add_argument("--full", action="store_true", help="also render the full weekly research block (FDR looks, quarantine, paired arms)")
 
@@ -956,6 +965,15 @@ def main() -> None:
                     if r.get("policy_version") == runner_exits.POLICY_VERSION
                     and r.get("r_planned") is not None]
             print(runner_exits.report_text(rows))
+        finally:
+            con.close()
+    elif args.cmd == "runner-evidence":
+        from agent import runner_research
+        con = ledger.connect()
+        try:
+            print(runner_research.evidence_report_text(
+                runner_research.current_drift_rows(con),
+                runner_research.selection_coverage(con)))
         finally:
             con.close()
     elif args.cmd == "runner-status":

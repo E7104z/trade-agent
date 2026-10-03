@@ -27,6 +27,7 @@ from typing import Any, Callable
 __all__ = [
     "MORNING_PICK_DIMS", "MORNING_OUTCOME_DIMS", "MORNING_DIMS", "RUNNER_DIMS",
     "LANES", "sql", "label", "runner_label", "dimensions", "RUNNER_STOP_ATR_COARSE",
+    "index_tape",
 ]
 
 
@@ -161,7 +162,26 @@ RUNNER_DIMS: tuple[str, ...] = (
     "runner_stop_atr_bucket",
     "runner_trend_side_200d",
     "runner_regime",
+    # At-entry context (schema v28, specs/RUNNER_TRADE_CONSTRUCTION_v1.md):
+    # the three suspects the 2026-10-02 review named, measured from bars that
+    # had closed before the entry bar opened.
+    "runner_index_tape",
+    "runner_ext_bucket",
+    "runner_staleness_bucket",
 )
+
+
+def index_tape(spy_pct, qqq_pct) -> str:
+    """SPY and QQQ against their session VWAP just before entry: both above,
+    both below, or split. Exactly at VWAP counts as above (not fading)."""
+    if spy_pct is None or qqq_pct is None:
+        return "?"
+    spy_up, qqq_up = float(spy_pct) >= 0, float(qqq_pct) >= 0
+    if spy_up and qqq_up:
+        return "both_above"
+    if not spy_up and not qqq_up:
+        return "both_below"
+    return "split"
 
 
 def runner_label(dimension: str, row: dict) -> str:
@@ -220,6 +240,22 @@ def runner_label(dimension: str, row: dict) -> str:
         return row.get("trend_side_200d") or "?"
     if dimension == "runner_regime":
         return row.get("regime_tag") or "?"
+    if dimension == "runner_index_tape":
+        return index_tape(row.get("spy_vwap_pct"), row.get("qqq_vwap_pct"))
+    if dimension == "runner_ext_bucket":
+        # (entry - VWAP) / daily ATR14, on the same ATR grid as the stop
+        # bucket (0.15 / 0.3 / 0.5 / 1.0). The scan's 0.5%-above-VWAP gate is
+        # ~0.1-0.15 ATR on a typical runner, so the low cells are the gate
+        # itself; "<0" means price had already lost VWAP by the entry bar.
+        # Edges fixed 2026-10-02 before any outcome under them was seen.
+        return _b(row.get("ext_vwap_atr"), [0.0, 0.15, 0.3, 0.5, 1.0],
+                  ["<0", "0-0.15", "0.15-0.3", "0.3-0.5", "0.5-1", "1+"])
+    if dimension == "runner_staleness_bucket":
+        # Minutes from Held (conditions first held) to the entry bar. The plan
+        # is formed at the scan tick, but a candidate found before the
+        # selection tick is bought at it, up to ~1.5 hours later.
+        return _b(row.get("staleness_min"), [15, 30, 60, 120],
+                  ["<15m", "15-30m", "30-60m", "60-120m", "120m+"])
     return "?"
 
 

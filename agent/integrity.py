@@ -223,13 +223,29 @@ def build_search(con: Any, ledger_mod: Any, q: float = 0.10, min_n: int = 8):
         comps.append(runner_research.setup_edge(runner_rows, min_n=min_n)["comparison"])
         comps.append(runner_research.selection_edge(runner_rows, min_n=min_n)["comparison"])
 
+    # RUNNER_TRADE_CONSTRUCTION_v1: continuation after entry -- drift in ATR
+    # from the first enterable price, every candidate, every runner dimension.
+    # Same batch: it asks the 1-D question again on a different outcome, and
+    # correcting it apart would hide that width.
+    drift_rows = _safe("integrity", "runner drift rows",
+                       lambda: runner_research.current_drift_rows(con), [])
+    if drift_rows:
+        comps.extend(_safe("integrity", "runner continuation family",
+                           lambda: runner_research.drift_comparisons(drift_rows), []))
+
     # RUNNER_EXIT_SPEC_v1: every pre-registered exit policy vs the plan exit,
     # paired, per session. Same batch -- each policy is a look whether or not
     # it has rows yet.
     from . import runner_exits
+    replay_rows = _safe("integrity", "runner exit replay rows",
+                        lambda: runner_exits.current_replay_rows(con), [])
     comps.extend(_safe("integrity", "runner exit policies",
-                       lambda: runner_exits.exit_policy_comparisons(
-                           runner_exits.current_replay_rows(con)), []))
+                       lambda: runner_exits.exit_policy_comparisons(replay_rows), []))
+    # RUNNER_TRADE_CONSTRUCTION_v1: does each construction (plan, arms A/B/C)
+    # make money at all? Beating the plan can be nothing more than holding
+    # fewer shares into a falling field; this is the absolute test beside it.
+    comps.extend(_safe("integrity", "runner construction expectancy",
+                       lambda: runner_exits.arm_expectancy_comparisons(replay_rows), []))
 
     # STRUCTURAL_MINING_SPEC_v1: pre-registered 2-D pairs, exact win-frequency
     # tests, and the population family (the short side). All in THIS batch --
@@ -283,6 +299,15 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
     _safe("integrity", "runner forward-clock restart",
           lambda: research.restart_runner_forward_clocks(con), [])
 
+    # A construction arm or exit policy that beat the plan in THIS batch is
+    # quarantined by the system (RUNNER_TRADE_CONSTRUCTION_v1): the family is
+    # pre-registered in code, so its candidacy is computed, not nominated.
+    # Quarantine starts today; only sessions after today count forward.
+    exit_registered = _safe(
+        "integrity", "exit-policy quarantine",
+        lambda: research.register_exit_policy_candidates(
+            con, session_date, getattr(search, "comparisons", None) or []), [])
+
     # Decay FIRST, in code (FORWARD_VALIDATION_SPEC_v1 Phase 4): a validated
     # rule gone silent for 30 market sessions returns to quarantine, a reversed
     # one retires. Then the quarantine is evaluated with cohort FDR. Both are
@@ -329,13 +354,24 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
     runner_random = _safe("integrity", "runner random control",
                           lambda: runner_research.runner_random_ablation(runner_rows),
                           {})
+    runner_coverage = _safe("integrity", "runner selection coverage",
+                            lambda: runner_research.selection_coverage(con), [])
+    drift_rows = _safe("integrity", "runner drift rows",
+                       lambda: runner_research.current_drift_rows(con), [])
     # Reuse the scored comparisons from the search so the q-values shown to the
     # miner are the corrected ones, not a second uncorrected pass.
-    runner_comps = [c for c in (getattr(search, "comparisons", None) or [])
+    all_comps = getattr(search, "comparisons", None) or []
+    runner_comps = [c for c in all_comps
                     if str(getattr(c, "dimension", "")).startswith("runner_")]
+    drift_comps = [c for c in all_comps
+                   if str(getattr(c, "dimension", "")).startswith(runner_research.DRIFT_PREFIX)]
     from . import runner_exits
     exit_comps = [c for c in runner_comps if c.dimension == runner_exits.DIMENSION]
-    runner_comps = [c for c in runner_comps if c.dimension != runner_exits.DIMENSION]
+    expectancy_comps = [c for c in runner_comps
+                        if c.dimension == runner_exits.EXPECTANCY_DIMENSION]
+    runner_comps = [c for c in runner_comps
+                    if c.dimension not in (runner_exits.DIMENSION,
+                                           runner_exits.EXPECTANCY_DIMENSION)]
 
     counterfactual = _safe("integrity", "counterfactual summary",
                            lambda: research.counterfactual_summary(con), {})
@@ -347,11 +383,15 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         ablation.ablation_md(abl),
         _safe("integrity", "runner markdown",
               lambda: runner_research.runner_md(runner_setup, runner_selection_edge,
-                                                runner_comps, runner_versions), ""),
+                                                runner_comps, runner_versions,
+                                                runner_coverage), ""),
         _safe("integrity", "runner random markdown",
               lambda: runner_research.runner_random_ablation_md(runner_random), ""),
         _safe("integrity", "runner exit markdown",
-              lambda: runner_exits.exit_md(exit_comps, runner_exits.current_replay_rows(con)), ""),
+              lambda: runner_exits.exit_md(exit_comps, runner_exits.current_replay_rows(con),
+                                           expectancy_comps), ""),
+        _safe("integrity", "runner continuation markdown",
+              lambda: runner_research.continuation_md(drift_comps, drift_rows), ""),
     ]
     if paired_mod is not None:
         parts.append(paired_mod.paired_md(paired_cmp))
@@ -378,6 +418,13 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         "runner_selection_edge": runner_selection_edge,
         "runner_random": runner_random,
         "runner_comps": runner_comps,
+        "runner_exit_comps": exit_comps,
+        "runner_expectancy_comps": expectancy_comps,
+        "runner_exit_registered": exit_registered,
+        "runner_drift_comps": drift_comps,
+        "runner_drift_rows": len(drift_rows),
+        "runner_drift_sessions": len({r.get("session_date") for r in drift_rows}),
+        "runner_coverage": runner_coverage,
     }
 
 
@@ -446,9 +493,11 @@ def _underpowered_md(search) -> str:
         "a rule on any of these, and do not describe them as 'promising'.\n",
     ]
     for c in rows[:25]:
-        avg = f"{c.mean_r:+.2f}R" if c.mean_r is not None else "n/a"
-        lines.append(f"- {c.dimension}/{c.level}: n={c.n}, avgR={avg}, "
-                     f"MDE={c.mde:.2f}R — cannot detect anything smaller")
+        # The continuation family (runner_research.DRIFT_PREFIX) is in ATR.
+        unit = "ATR" if str(c.dimension).startswith(runner_research.DRIFT_PREFIX) else "R"
+        avg = f"{c.mean_r:+.2f}{unit}" if c.mean_r is not None else "n/a"
+        lines.append(f"- {c.dimension}/{c.level}: n={c.n}, avg{unit}={avg}, "
+                     f"MDE={c.mde:.2f}{unit} — cannot detect anything smaller")
     return "\n".join(lines)
 
 

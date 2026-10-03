@@ -42,7 +42,7 @@ __all__ = ["PAIR_SPEC_VERSION", "PAIR_SPEC", "PAIR_SEP", "lane_rows", "pair_comp
            "winrate_comparisons", "population_rows", "population_comparisons",
            "consistency", "consistency_md", "width_md", "pair_dimension"]
 
-PAIR_SPEC_VERSION = 1
+PAIR_SPEC_VERSION = 2
 PAIR_SPEC: tuple[tuple[str, str, str], ...] = (
     ("morning", "setup_type", "regime_tag"),
     ("morning", "direction", "trend_side_200d"),
@@ -51,6 +51,12 @@ PAIR_SPEC: tuple[tuple[str, str, str], ...] = (
     ("runner", "runner_stop_atr_bucket", "runner_rvol_bucket"),
     ("runner", "runner_regime", "runner_detection_bucket"),
     ("runner", "runner_trend_side_200d", "runner_tc_bucket"),
+    # v2 (2026-10-02, RUNNER_TRADE_CONSTRUCTION_v1), declared the day the two
+    # dimensions were first recorded, before any outcome under them existed:
+    # long momentum bought into a fading index tape, and extended above VWAP,
+    # are the review's two named suspects -- and the question is whether they
+    # compound.
+    ("runner", "runner_index_tape", "runner_ext_bucket"),
 )
 PAIR_SEP = "|"
 MIN_STRATA = 2

@@ -779,6 +779,20 @@ function renderRunner(){
     const parts = [side('Selected', oc.selected), side('Field', oc.field)].filter(Boolean);
     if(parts.length) outcomeHtml = `<p class="muted-note">${parts.join(' · ')} — realized R in planned-risk units, one session, not evidence on its own.</p>`;
   }
+  // Plan vs the construction arms, and continuation after entry -- one
+  // session, descriptive (specs/RUNNER_TRADE_CONSTRUCTION_v1.md).
+  let constructionHtml = '';
+  const cs = rn.construction;
+  if(cs){
+    const ct = cs.continuation || {};
+    const tapes = (ct.by_tape||[]).map(t=>`${esc(t.tape)} ${t.up}/${t.n} up (${t.mean_drift_atr==null?'—':Number(t.mean_drift_atr).toFixed(2)} ATR)`).join(' · ');
+    const contLine = ct.n ? `<p class="muted-note">Continuation after entry: <b>${ct.up} of ${ct.n}</b> closed above their first enterable price; mean drift <b class="${rCls(ct.mean_drift_atr)}">${ct.mean_drift_atr==null?'—':Number(ct.mean_drift_atr).toFixed(2)} ATR</b>. By index tape at entry: ${tapes||'—'}. Where price does not keep rising after entry, no stop or target rule can win.</p>` : '';
+    const armRows = (cs.arms||[]).filter(a=>a.n).map(a=>`<tr><td><b>${esc(a.policy)}</b></td><td class="num">${a.n}</td><td class="num ${rCls(a.mean_r)}">${a.mean_r==null?'—':Number(a.mean_r).toFixed(3)}</td><td class="num">${a.win_rate==null?'—':Math.round(100*a.win_rate)+'%'}</td><td class="wrap">${esc(a.question||'')}</td></tr>`).join('');
+    const armTable = armRows ? `<h3>Construction arms — same candidates, replayed</h3>
+      <p class="muted-note">Each arm's R is in its own risk unit (sized by risk: a wider stop buys fewer shares for the same dollars), so mean R compares dollars at risk. One session; the weekly search tests per-session paired ΔR, never win rate — a 1R partial wins more often by construction. Live orders keep the plan bracket until an arm validates forward.</p>
+      <div class="table-wrap"><table><thead><tr><th>Policy</th><th class="num">n</th><th class="num">Mean R</th><th class="num">Win%</th><th>Rule</th></tr></thead><tbody>${armRows}</tbody></table></div>` : '';
+    constructionHtml = contLine + armTable;
+  }
   let picksHtml = '';
   if((rn.picks||[]).length){
     const pRows = rn.picks.map(p=>`<tr><td><b>${tickerLink(p.ticker, {date: state.today, lane:'runner', id: p.ticker.toUpperCase() + ':' + state.today})}</b></td><td>${esc(p.direction)}</td><td>${esc(p.conviction||'')}</td>
@@ -800,6 +814,7 @@ function renderRunner(){
       </div>
       ${picksHtml}
       ${outcomeHtml}
+      ${constructionHtml}
       ${moversHtml}
       <h3>All candidates</h3>${table || '<div class="empty">No candidates.</div>'}
       <p class="muted-note">Every candidate is priced by the evening simulator, selected or not — that is what makes "did picking help?" answerable. Each is entered no earlier than the scan tick that found it and the selection decision, so picks and field are priced from the same moment. Held = when the VWAP/EMA conditions first held; Seen = the scan tick that formed the plan (price, stop, target). R is realized R in planned-risk units; a fill that left too little of the plan's reward is an invalid fill, not a trade. Rows marked #N were chosen.</p>
@@ -836,10 +851,11 @@ function renderRunnerTable(){
     return `<tr><td>${sel}</td><td><b>${link}</b></td><td>${esc(r.industry||'')}</td><td>${esc(r.detection_et||'')}</td><td>${esc(r.seen_et||'')}</td>
       <td class="num">${n(r.price)}</td><td class="num">${n(r.stop)}</td><td class="num">${n(r.target)}</td>
       <td class="num">${n(r.rvol)}</td><td class="num">${n(r.vwap_pct)}</td><td class="num">${n(r.tc,1)}</td>
-      <td class="num">${n(r.change_pct)}</td><td class="num ${rCls(r.r)}">${n(r.r)}</td><td class="num">${n(r.post_move_atr)}</td>
+      <td class="num">${n(r.change_pct)}</td><td class="num">${n(r.staleness_min,0)}</td><td class="num">${n(r.ext_vwap_atr)}</td><td>${esc(r.index_tape||'')}</td>
+      <td class="num ${rCls(r.r)}">${n(r.r)}</td><td class="num">${n(r.post_move_atr)}</td><td class="num ${rCls(r.drift_atr)}">${n(r.drift_atr)}</td>
       <td>${esc(exitLabel(r))}</td></tr>`;
   }).join('');
-  box.innerHTML = `<div class="table-wrap" style="max-height:620px"><table><thead><tr><th></th><th>Ticker</th><th>Industry</th><th>Held</th><th>Seen</th><th class="num">Price</th><th class="num">Stop</th><th class="num">Target</th><th class="num">RVOL</th><th class="num">VWAP%</th><th class="num">TC</th><th class="num">Chg%</th><th class="num">R (plan)</th><th class="num">Move (ATR)</th><th>Exit</th></tr></thead><tbody>${body}</tbody></table></div>`;
+  box.innerHTML = `<div class="table-wrap" style="max-height:620px"><table><thead><tr><th></th><th>Ticker</th><th>Industry</th><th>Held</th><th>Seen</th><th class="num">Price</th><th class="num">Stop</th><th class="num">Target</th><th class="num">RVOL</th><th class="num">VWAP%</th><th class="num">TC</th><th class="num">Chg%</th><th class="num" title="minutes from Held to the entry bar">Stale (min)</th><th class="num" title="(entry - VWAP) / ATR14 at entry">Ext (ATR)</th><th title="SPY / QQQ vs session VWAP at entry">Tape</th><th class="num">R (plan)</th><th class="num">Move (ATR)</th><th class="num" title="(close - first enterable price) / ATR14">Drift (ATR)</th><th>Exit</th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 function renderPlaybook(){
   const b = $('playbook-body');

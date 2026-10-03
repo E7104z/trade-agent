@@ -259,7 +259,9 @@ def test_evening_stores_replays_and_r_planned(con):
             return bars
 
         def daily_context(self, syms):
-            raise RuntimeError("offline")
+            # ATR14 is what the stop-floor arms (A, C) need; without it they
+            # have no row (tests/test_runner_trade_construction.py).
+            return {"RUNR": {"atr14": 0.6}}
 
     summary = evening._grade_runner_candidates(con, _MD(), SESSION,
                                                Config(raw={"slippage_bps": 5}))

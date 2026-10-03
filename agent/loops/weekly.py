@@ -764,9 +764,13 @@ def _selection_edge_section(history: list[dict]) -> list[str]:
 
 
 def _runner_section(research_block: dict, states: list[dict]) -> list[str]:
-    from ..runner_research import MIN_CONTESTED_SESSIONS
+    from ..research import EXIT_LANE
+    from ..runner_research import DRIFT_ALL, MIN_CONTESTED_SESSIONS
     from ..runner_selection import NO_RUNNER_RULES
+    # Exit-policy / construction-arm rules say HOW to trade a candidate, not
+    # WHICH; they are listed below, never as selection rules.
     validated = [s for s in states if s.get("state") == "VALIDATED"
+                 and s.get("lane") != EXIT_LANE
                  and (s.get("lane") == "runner" or "runner" in " ".join(s.get("dimensions") or []))]
     lines = [""]
     if validated:
@@ -820,6 +824,78 @@ def _runner_section(research_block: dict, states: list[dict]) -> list[str]:
     if degenerate:
         lines.append("Not tested (one cell holds >= 90% of its dimension, so it restates the "
                      "lane mean): " + ", ".join(degenerate) + ".")
+
+    # Continuation after entry (drift in ATR, no stop/target): where price
+    # kept going up after the first enterable price. A map, not a rule.
+    drift = research_block.get("runner_drift_comps") or []
+    overall = next((c for c in drift if c.dimension == DRIFT_ALL), None)
+    if overall is not None and overall.n:
+        pos = [c for c in drift if c.significant and c.dimension != DRIFT_ALL
+               and (c.mean_r or 0) > 0]
+        q_s = "n/a" if overall.q_value is None else f"{overall.q_value:.3f}"
+        mean_s = (f"mean drift {_fmt_r(overall.mean_r).rstrip('R')} ATR"
+                  if overall.n >= _RUNNER_MIN_N else f"mean suppressed (n < {_RUNNER_MIN_N})")
+        lines.append(f"Continuation after entry (close vs first enterable price, ATR, every "
+                     f"candidate): n={overall.n} units, {mean_s}, q={q_s}. Buckets with "
+                     "significantly POSITIVE drift after FDR: "
+                     + ("; ".join(f"{c.dimension.split(':', 1)[1]}={c.level} n={c.n} "
+                                  f"{_fmt_r(c.mean_r).rstrip('R')} ATR" for c in pos[:6])
+                        or "none") + ".  ")
+    else:
+        lines.append("Continuation after entry: not measured yet under the current versions.  ")
+
+    # The construction arms (stop floor, dashboard rules, both) and the exit
+    # grid: paired ΔR vs the plan, and where each stands in forward validation.
+    exits = {c.level: c for c in research_block.get("runner_exit_comps") or []}
+    expect = {c.level: c for c in research_block.get("runner_expectancy_comps") or []}
+    arm_state = {(s.get("predicate") or {}).get("conditions", [{}])[0].get("level"): s
+                 for s in states if s.get("lane") == EXIT_LANE}
+
+    def _pays(name: str) -> bool:
+        e = expect.get(name)
+        return bool(e is not None and e.significant and (e.mean_r or 0) > 0)
+
+    from ..runner_exits import ARMS
+    bits = []
+    for name in ARMS:
+        c, st = exits.get(name), arm_state.get(name)
+        if c is None or not c.n:
+            bits.append(f"{name}: no replays yet")
+            continue
+        if c.n < _RUNNER_MIN_N:
+            # n<8 suppression: the selector reads this section the same day.
+            bits.append(f"{name}: {c.n} session(s), under n={_RUNNER_MIN_N}, ΔR suppressed")
+            continue
+        q_s = "n/a" if c.q_value is None else f"{c.q_value:.3f}"
+        e = expect.get(name)
+        e_s = ("" if e is None or e.mean_r is None else
+               f", own mean {_fmt_r(e.mean_r)}/session"
+               f"{' (positive after FDR)' if _pays(name) else ' (not a positive expectancy)'}")
+        status = (f"{st['state']} (forward n={st['forward_n']}/{st['forward_n_required']})"
+                  if st else ("candidate" if c.significant and (c.mean_r or 0) > 0
+                              else "not a candidate"))
+        bits.append(f"{name}: ΔR {_fmt_r(c.mean_r)}/session over {c.n} session(s), "
+                    f"q={q_s}{e_s}, {status}")
+    lines.append("Construction arms vs the plan (paired, same candidates, R in each arm's "
+                 "own risk unit; a wider stop holds fewer shares, so beating the plan can be "
+                 "a smaller loss, not an edge): " + "; ".join(bits) + ".  ")
+    from ..runner_research import lane_verdict
+    lines.append(lane_verdict(int(research_block.get("runner_drift_sessions") or 0),
+                              drift, list(exits.values()), list(expect.values())) + "  ")
+    validated = [lvl for lvl, s in arm_state.items() if s.get("state") == "VALIDATED"]
+    live_ok = [lvl for lvl in validated if _pays(lvl)]
+    not_paying = [lvl for lvl in validated if not _pays(lvl)]
+    msg = "Live runner orders keep the plan bracket (9 EMA stop, 2R target). "
+    if live_ok:
+        msg += ("Forward-VALIDATED, with positive expectancy of its own, awaiting Jason's "
+                "approval for live management: " + ", ".join(map(str, live_ok)) + ". ")
+    if not_paying:
+        msg += ("Forward-validated as better than the plan but NOT making money on its own, "
+                "so not a live candidate: " + ", ".join(map(str, not_paying)) + ". ")
+    if not validated:
+        msg += ("No arm or exit policy has validated on forward sessions, so none may "
+                "change a live order.")
+    lines.append(msg.rstrip())
     lines.append("")
     return lines
 

@@ -60,6 +60,10 @@ __all__ = [
     "canonical_predicate",
     "validate_predicate",
     "register_candidate",
+    "register_exit_policy_candidates",
+    "exit_rule_predicate",
+    "EXIT_LANE",
+    "EXIT_DIMENSION",
     "observe_session",
     "apply_decay",
     "morning_rows",
@@ -267,11 +271,21 @@ def advance_quarantine(con: Any, rule_id: str, session_date: date) -> str:
 # Observation sources that count toward validation. `taken` = a fill-valid
 # trade the desk actually took (morning lane); `runner_field` = a runner
 # candidate priced by the same simulator (runner rules are statements about the
-# candidate population, selected or not). Counterfactual streams -- `shadow`
-# (rejected candidates) and `population` (mechanical monkeys) -- are RECORDED
-# as confirming/disconfirming evidence but never counted: the desk did not
-# take them, so they cannot validate a rule about what the desk takes.
-COUNTED_SOURCES = ("taken", "runner_field")
+# candidate population, selected or not); `runner_exit` = one session's mean
+# paired ΔR of an exit policy / construction arm against the plan, over that
+# session's triggered candidates (lane EXIT_LANE). Counterfactual streams --
+# `shadow` (rejected candidates) and `population` (mechanical monkeys) -- are
+# RECORDED as confirming/disconfirming evidence but never counted: the desk
+# did not take them, so they cannot validate a rule about what the desk takes.
+COUNTED_SOURCES = ("taken", "runner_field", "runner_exit")
+
+# Exit policies and construction arms (agent/runner_exits.py) are rules about
+# HOW a runner candidate is traded, not WHICH: their one dimension is the
+# policy, their unit is the session (a few hundred candidates on one tape are
+# one observation of "did this beat the plan today"), and their value is the
+# paired ΔR. RUNNER_EXIT_SPEC_v1 Phase 3 / RUNNER_TRADE_CONSTRUCTION_v1.
+EXIT_LANE = "runner_exit"
+EXIT_DIMENSION = "runner_exit_policy"
 
 
 def record_rule_observation(
@@ -560,7 +574,7 @@ def validate_predicate(pred: Any, comparisons: Iterable[Any]) -> tuple[dict | No
     canon = canonical_predicate(pred)
     if canon is None:
         return None, "REJECTED_UNMATCHABLE", "no machine-readable predicate"
-    if canon["lane"] not in buckets.LANES:
+    if canon["lane"] not in buckets.LANES + (EXIT_LANE,):
         return None, "REJECTED_UNMATCHABLE", f"unknown lane {canon['lane']!r}"
     conds = canon["conditions"]
     if not conds:
@@ -571,7 +585,8 @@ def validate_predicate(pred: Any, comparisons: Iterable[Any]) -> tuple[dict | No
             f"more than {MAX_RULE_DIMENSIONS} at any realistic sample size")
     if len({c["dimension"] for c in conds}) != len(conds):
         return None, "REJECTED_UNMATCHABLE", "the same dimension appears twice"
-    lane_dims = set(buckets.dimensions(canon["lane"]))
+    lane_dims = ({EXIT_DIMENSION} if canon["lane"] == EXIT_LANE
+                 else set(buckets.dimensions(canon["lane"])))
     levels = emitted_levels(comparisons)
     for c in conds:
         if c["dimension"] not in lane_dims:
@@ -745,9 +760,85 @@ RUNNER_UNIT_COUNTING_FROM = date(2026, 10, 2)
 
 
 def _is_runner_rule(lane: Any, dimensions: Any) -> bool:
+    if lane == EXIT_LANE:
+        return False   # session-unit evidence from the start; nothing to restart
     if lane == "runner":
         return True
     return "runner_" in str(dimensions or "")
+
+
+def exit_rule_predicate(policy: str) -> dict:
+    return {"lane": EXIT_LANE,
+            "conditions": [{"dimension": EXIT_DIMENSION, "level": str(policy)}]}
+
+
+def register_exit_policy_candidates(con: Any, session_date: date,
+                                    comparisons: Iterable[Any]) -> list[dict]:
+    """Quarantine every exit policy / construction arm whose paired ΔR against
+    the plan survived THIS run's FDR batch with a positive sign.
+
+    The system does this itself, not the miner: the family is pre-registered
+    in code (agent/runner_exits.py), so "which arm is a candidate" is a
+    computed fact, and leaving it to a prose nomination would let a surviving
+    arm sit unvalidated -- or an unsurvived one be talked into quarantine.
+    A policy that tests significantly WORSE than the plan is not a candidate
+    for anything and is not registered. Idempotent: the rule id comes from the
+    predicate, so a policy already in the registry keeps its state and clock.
+    """
+    out: list[dict] = []
+    for c in comparisons or []:
+        if getattr(c, "dimension", None) != EXIT_DIMENSION or not getattr(c, "significant", False):
+            continue
+        if c.mean_r is None or c.mean_r <= 0:
+            continue
+        canon = canonical_predicate(exit_rule_predicate(c.level))
+        rid = rule_id_for_predicate(canon)
+        if con.execute("SELECT 1 FROM research_rules WHERE rule_id = ?", [rid]).fetchone():
+            continue
+        statement = (f"Runner exit policy `{c.level}` beats the plan exit: paired ΔR "
+                     f"{c.mean_r:+.3f}R per session over n={c.n} sessions (q={c.q_value}).")
+        con.execute(
+            """INSERT INTO research_rules
+               (rule_id, statement, dimensions, n_dimensions, state, source,
+                discovered_at, discovery_n, discovery_effect, discovery_q,
+                quarantined_at, validated_at, retired_at, forward_n_required,
+                forward_n, forward_sum_r, forward_sumsq_r, note, predicate_json, lane,
+                decay_count, last_observed_at)
+               VALUES (?,?,?,1,'DISCOVERED','system',?,?,?,?,NULL,NULL,NULL,?,0,0.0,0.0,?,?,?,0,NULL)""",
+            [rid, statement, json.dumps([EXIT_DIMENSION]), session_date, int(c.n or 0),
+             c.mean_r, c.q_value, DEFAULT_FORWARD_N,
+             "construction arm / exit policy, registered by the system from the weekly batch; "
+             "forward observations are per-session paired ΔR",
+             json.dumps(canon), EXIT_LANE])
+        state = advance_quarantine(con, rid, session_date)
+        out.append({"rule_id": rid, "policy": c.level, "state": state})
+    return out
+
+
+def _exit_session_deltas(con: Any, d: date) -> dict[str, float]:
+    """{policy: session d's mean paired ΔR vs the plan}, current versions only."""
+    from . import ledger, runner_exits
+    from .runner_research import current_versions
+    scan_v, sim_v = current_versions()
+    try:
+        rows = [r for r in ledger.runner_exit_replays_since(con, d)
+                if r.get("session_date") == d and r.get("scan_version") == scan_v
+                and r.get("sim_version") == sim_v
+                and r.get("policy_version") == runner_exits.POLICY_VERSION
+                and r.get("r_planned") is not None]
+    except Exception:
+        return {}
+    by_cand: dict[str, dict[str, float]] = {}
+    for r in rows:
+        by_cand.setdefault(r["ticker"], {})[r["policy"]] = float(r["r_planned"])
+    deltas: dict[str, list[float]] = {}
+    for m in by_cand.values():
+        if runner_exits.REFERENCE not in m:
+            continue
+        for pol, v in m.items():
+            if pol != runner_exits.REFERENCE:
+                deltas.setdefault(pol, []).append(v - m[runner_exits.REFERENCE])
+    return {p: sum(v) / len(v) for p, v in deltas.items() if v}
 
 
 def restart_runner_forward_clocks(con: Any, anchor: date | None = None) -> list[str]:
@@ -814,11 +905,23 @@ def observe_session(con: Any, d: date) -> dict:
         return out
     cache: dict[str, list[dict]] = {}
     counterfactual: list[tuple[str, str, dict]] | None = None
+    exit_deltas: dict[str, float] | None = None
     out["counterfactual"] = 0
     for rid, lane, pred_json in rules:
         try:
             pred = json.loads(pred_json)
         except (TypeError, ValueError):
+            continue
+        if lane == EXIT_LANE:
+            # One observation per SESSION: that session's mean paired ΔR of
+            # the policy against the plan, on the same candidates and fills.
+            if exit_deltas is None:
+                exit_deltas = _exit_session_deltas(con, d)
+            policy = (pred.get("conditions") or [{}])[0].get("level")
+            if policy in exit_deltas and record_rule_observation(
+                    con, rid, d, exit_deltas[policy], f"runner_exit:{d}:{policy}",
+                    "runner_exit"):
+                out["recorded"] += 1
             continue
         if lane not in cache:
             cache[lane] = morning_rows(con, d) if lane == "morning" else runner_rows(con, d)
@@ -961,9 +1064,10 @@ def apply_decay(con: Any, session_date: date, alpha: float = 0.05,
             continue
         rid = r["rule_id"]
         # reversal first: a rule that reversed is falsified, not merely quiet
+        counted = ", ".join(f"'{s}'" for s in COUNTED_SOURCES)
         obs = con.execute(
-            """SELECT r_multiple FROM research_observations
-               WHERE rule_id = ? AND COALESCE(source, 'taken') IN ('taken', 'runner_field')
+            f"""SELECT r_multiple FROM research_observations
+               WHERE rule_id = ? AND COALESCE(source, 'taken') IN ({counted})
                ORDER BY session_date DESC LIMIT ?""",
             [rid, int(r["forward_n_required"])]).fetchall()
         vals = [float(o[0]) for o in obs if o[0] is not None]

@@ -1,6 +1,6 @@
 # RUNNER EXIT SPEC v1 — measure every exit before changing one
 
-**Status:** Phases 1–2 implemented and deployed 2026-09-26 (`83ede5a`, fix `de736bf`; 1004 tests pass). Phase 0 steps 1–2 blocked for Claude (production reads are refused); steps 3–4 are Jason's to run. Phases 3–5 are proposed, not built.
+**Status:** Phases 1–2 implemented and deployed 2026-09-26 (`83ede5a`, fix `de736bf`; 1004 tests pass). Phase 0 steps 1–2 blocked for Claude (production reads are refused); steps 3–4 are Jason's to run. **Phase 3 built 2026-10-02** with the construction arms (family v4) in [RUNNER_TRADE_CONSTRUCTION_v1.md](RUNNER_TRADE_CONSTRUCTION_v1.md): the system quarantines a significant positive policy and records one forward ΔR per session. Phases 4–5 are proposed, not built.
 **Goals served:** 1 (primary), 3, 5, 4
 **Scope:** new `agent/runner_exits.py`, `agent/migrations_v24.py`; `agent/ledger.py`, `agent/loops/evening.py`, `agent/integrity.py`, `api/index.py`, `run.py`; `tests/test_runner_exits.py`.
 **Depends on:** nothing new. Phase 3 reuses S2 (FORWARD_VALIDATION_SPEC_v1) as it stands.
