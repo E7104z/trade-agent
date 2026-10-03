@@ -907,6 +907,12 @@ def main() -> None:
         help="runner continuation after entry (drift in ATR by bucket) and selection "
              "coverage per session (read-only, zero API cost)")
 
+    p_pmon = sub.add_parser(
+        "persona-monitor",
+        help="persona on/off sessions: counts and distributions only (read-only, zero API cost)")
+    p_pmon.add_argument("--sessions", type=int, default=10,
+                        help="most recent N sessions per group (0 = all; default 10)")
+
     p_research = sub.add_parser("research", help="research integrity report (selection ablation + population baseline, zero API cost)")
     p_research.add_argument("--full", action="store_true", help="also render the full weekly research block (FDR looks, quarantine, paired arms)")
 
@@ -974,6 +980,14 @@ def main() -> None:
             print(runner_research.evidence_report_text(
                 runner_research.current_drift_rows(con),
                 runner_research.selection_coverage(con)))
+        finally:
+            con.close()
+    elif args.cmd == "persona-monitor":
+        from agent import persona_monitor
+        con = ledger.connect()
+        try:
+            n = args.sessions or None
+            print(persona_monitor.render_text(persona_monitor.collect(con, n), n))
         finally:
             con.close()
     elif args.cmd == "runner-status":

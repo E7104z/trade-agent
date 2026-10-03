@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,9 +27,102 @@ def load_prompt(name: str, replacements: dict[str, str]) -> str:
     """Load prompts/<name>.md and substitute {{PLACEHOLDER}} tokens."""
     path = PROMPTS_DIR / f"{name}.md"
     text = path.read_text(encoding="utf-8")
+    # The persona goes in first, so text a caller substitutes later (a
+    # playbook section, a candidate table) can never be read as a PERSONA
+    # token. Not passed, or passed empty, it renders as nothing at all --
+    # the placeholder AND the blank line it occupies -- so a prompt with the
+    # persona off is byte-identical to the same prompt before the persona
+    # existed (PERSONA_CHARACTER_SHEET_SPEC_v1 P-5).
+    persona = (replacements or {}).get("PERSONA") or ""
+    if persona:
+        text = text.replace("{{PERSONA}}", persona)
+    else:
+        text = _PERSONA_SLOT.sub("", text)
     for key, val in replacements.items():
+        if key == "PERSONA":
+            continue
         text = text.replace("{{" + key + "}}", val if val is not None else "")
     return text
+
+
+# ---------------------------------------------------------------- persona
+# PERSONA_CHARACTER_SHEET_SPEC_v1: one character sheet, shared by the five
+# system prompts, each also getting its own role section. It is a TREATMENT:
+# flag-gated (`persona.enabled`, default off), stamped on every row it
+# influences (`persona_version`), and watched by agent/persona_monitor.py.
+# It changes voice and attention only -- the file carries no digit below its
+# version header, so it can add no number to any prompt or to the grader's
+# grounding corpus.
+
+PERSONA_ROLES = ("analyst", "risk", "grader", "miner", "selector")
+
+# The placeholder plus the one blank line it sits on. Removed whole when the
+# persona is off; see load_prompt.
+_PERSONA_SLOT = re.compile(r"\{\{PERSONA\}\}[ \t]*\n?\n?")
+
+
+def _persona_sections() -> tuple[str | None, dict[str, str]]:
+    """Parse prompts/persona.md into (file version, {section: body}).
+    Section keys are 'shared' and each role name. Raises on a missing file."""
+    text = (PROMPTS_DIR / "persona.md").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    version = None
+    if lines and "persona-version:" in lines[0]:
+        version = lines[0].split("persona-version:")[1].strip(" ->!<")
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in lines[1:]:
+        if line.startswith("## Shared"):
+            current = "shared"
+            sections[current] = []
+        elif line.startswith("## Role:"):
+            current = line[len("## Role:"):].strip()
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    return version, {k: "\n".join(v).strip() for k, v in sections.items()}
+
+
+def _persona_parts(cfg: Config, role: str | None) -> tuple[str, str | None]:
+    """(block text, file version) when the persona is on and loads cleanly,
+    else ("", None). Never raises: a missing or malformed character sheet
+    must not cost the desk a loop, it only turns the treatment off."""
+    pcfg = getattr(cfg, "persona_cfg", None) or {}
+    if pcfg.get("enabled") is not True:
+        return "", None
+    try:
+        version, sections = _persona_sections()
+        wanted = pcfg.get("version")
+        if wanted is not None and str(wanted) != str(version):
+            # The config pins the sheet the owner switched on. A different
+            # file is a different treatment, so it does not run silently.
+            raise ValueError(f"persona.md is version {version!r}, config pins {wanted!r}")
+        shared = sections.get("shared") or ""
+        if not shared:
+            raise ValueError("persona.md has no '## Shared' section")
+        parts = [shared]
+        if role is not None:
+            body = sections.get(role)
+            if not body:
+                raise ValueError(f"persona.md has no '## Role: {role}' section")
+            parts.append(body)
+        return "\n\n".join(parts), (version or "?")
+    except Exception as e:  # noqa: BLE001 -- the persona never breaks a loop
+        log("persona", f"WARN persona disabled for this prompt: {e}")
+        return "", None
+
+
+def persona_block(cfg: Config, role: str | None) -> str:
+    """The text that replaces {{PERSONA}}: the shared sheet plus `role`'s own
+    section (role None = the shared sheet alone). "" when the persona is off
+    or cannot be loaded."""
+    return _persona_parts(cfg, role)[0]
+
+
+def persona_version(cfg: Config) -> str | None:
+    """The stamp for rows the persona influenced: the character sheet's
+    version when it is on and loads, else None (stored as NULL)."""
+    return _persona_parts(cfg, None)[1]
 
 
 def prompt_version(name: str) -> str:

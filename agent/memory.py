@@ -244,7 +244,9 @@ def build_morning_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
     backlog_md = ""
     if backlog_items:
         from .backlog import morning_block
-        backlog_md = morning_block(backlog_items) + "\n\n"
+        from .llm import persona_version
+        backlog_md = morning_block(backlog_items,
+                                   persona=persona_version(cfg) is not None) + "\n\n"
 
     text = f"""## YOUR PLAYBOOK (v{version} — your accumulated, evidence-backed rules)
 

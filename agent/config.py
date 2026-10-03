@@ -197,6 +197,13 @@ _DEFAULTS: dict[str, Any] = {
         "arm_b_playbook_version": None,
     },
     "ablation_sim_version": None,       # restrict the selection ablation to one sim_version
+    # --- persona (specs/PERSONA_CHARACTER_SHEET_SPEC_v1.md) -----------------
+    # One character sheet (prompts/persona.md) shared by the five system
+    # prompts. A treatment: off by default, and with it off every rendered
+    # prompt is byte-identical to the pre-persona text. `version` pins the
+    # sheet that was switched on; a persona.md carrying another version is
+    # not used. Rows it influenced carry persona_version (migration v29).
+    "persona": {"enabled": False, "version": 1},
 }
 
 # Approximate USD per million tokens (input, output) — for run-cost logging only.
@@ -263,6 +270,10 @@ class Config:
     @property
     def memory_cfg(self) -> dict:
         return self.raw["memory"]
+
+    @property
+    def persona_cfg(self) -> dict:
+        return self.raw.get("persona") or {}
 
     @property
     def has_alpaca(self) -> bool:

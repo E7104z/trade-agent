@@ -414,6 +414,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v27.STATEMENTS
 from . import migrations_v28  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v28.STATEMENTS
 
+# --- v29 the persona stamp (persona_version on daily_plans, picks, runs) ----
+from . import migrations_v29  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v29.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -593,8 +597,9 @@ def save_daily_plan(
             notes_for_evening, gates_failed_open, provider_degraded,
             analyst_candidate_count, risk_rejection_count, validator_proposed_count,
             validator_drop_count, persisted_rejection_count,
-            data_health, session_degraded, canonical_plan_run_id, no_trade_category)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            data_health, session_degraded, canonical_plan_run_id, no_trade_category,
+            persona_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             plan_date,
             bool(plan.get("no_trade")),
@@ -614,6 +619,7 @@ def save_daily_plan(
             bool((plan.get("data_health") or {}).get("degraded")),
             None,
             plan.get("no_trade_category"),
+            plan.get("persona_version"),
         ],
     )
     # The run lock normally makes this path single-writer; keep the first plan
@@ -630,8 +636,8 @@ def save_daily_plan(
                 size_r, entry_type, entry_price, stop_price, target_price, target2_price,
                 time_stop, invalidation, regime_tag, prompt_version, playbook_version,
                     in_scan_universe, exploration_lane, exploration_rr, probe_for,
-                    entry_not_before)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    entry_not_before, persona_version)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                RETURNING pick_id""",
             [
                 plan_date,
@@ -657,6 +663,7 @@ def save_daily_plan(
                 p.get("exploration_rr"),
                 p.get("probe_for"),
                 p.get("entry_not_before"),
+                plan.get("persona_version"),
             ],
         ).fetchone()
         ids.append(row[0])
@@ -1639,20 +1646,22 @@ def graded_picks_since(con: duckdb.DuckDBPyConnection, from_date: date) -> list[
 
 def log_run(con: duckdb.DuckDBPyConnection, loop: str, run_date: date, started: datetime,
             status: str, model: str = "", usage: dict | None = None, error: str = "",
-            stages: dict | None = None) -> None:
+            stages: dict | None = None, persona_version: str | None = None) -> None:
     """One runs row. `stages` (v19) is per-stage outcome and elapsed seconds,
-    e.g. {"deterministic": "complete", "llm": "failed", "timings_s": {...}}."""
+    e.g. {"deterministic": "complete", "llm": "failed", "timings_s": {...}}.
+    `persona_version` (v29) stamps a run whose LLM call carried the persona."""
     u = usage or {}
     finished = now_et().replace(tzinfo=None)  # same naive ET clock as `started`
     con.execute(
         """INSERT INTO runs (loop, run_date, started_at, finished_at, status, model,
                              input_tokens, output_tokens, web_searches, cost_usd, error,
-                             stages)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                             stages, persona_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [loop, run_date, started, finished, status, model,
          u.get("input_tokens", 0), u.get("output_tokens", 0),
          u.get("web_searches", 0), u.get("cost_usd", 0.0), error[:2000],
-         json.dumps(stages, default=str)[:4000] if stages else None],
+         json.dumps(stages, default=str)[:4000] if stages else None,
+         persona_version],
     )
 
 

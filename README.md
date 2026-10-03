@@ -121,6 +121,14 @@ The evening loop replays each pick against real 1-minute bars:
 - Untriggered picks record `missed_move_r` — chronic near-misses are a process bug the grader sees.
 - MFE/MAE in R quantify whether stops sit inside noise. Untouched picks exit at the close (`eod`).
 
+## Persona (earned hunger)
+
+One character sheet, [prompts/persona.md](prompts/persona.md), is shared by the five system prompts (analyst, risk, grader, miner, selector), each of which also gets its own role section. The character is a competitive trader who treats "unproven" as a debt he owes the scoreboard: his aggression points at his own ignorance, never at the tape. Spec: [specs/PERSONA_CHARACTER_SHEET_SPEC_v1.md](specs/PERSONA_CHARACTER_SHEET_SPEC_v1.md).
+
+- **Flag:** `"persona": {"enabled": true|false, "version": 1}` in `config.json` (default off). `version` pins the sheet that was switched on; a `persona.md` carrying another version is not used. Off, every rendered prompt is byte-identical to the pre-persona text (`tests/fixtures/prompt_renders/`).
+- **Guardrails:** P-1 prose never becomes evidence (the sheet carries no digit, so it adds no number to any prompt or to the grader's grounding corpus); P-2 hunger is for evidence velocity, not trade count (no gate, lane, size or threshold changed); P-3 beliefs are not evidence (only `[rule: R...]` rules are acted on); P-4 it is a treatment; P-5 additive and reversible (one config line).
+- **Treatment, measured:** plans, picks and runs it influenced carry `persona_version` (migration v29; NULL = off). `run.py persona-monitor [--sessions N]` prints counts and distributions per group (trade count, size, conviction, floor/coverage/probe rates, runner selection) and no test or verdict: on/off periods are different calendar periods under different tape.
+
 ## Costs
 
 Morning (Opus, thinking + web search) + evening (Sonnet) + weekly (Opus) ≈ a few dollars/week at current pricing. Every run's tokens and estimated cost are logged to the `runs` table and shown in `status` and the dashboard.
@@ -139,7 +147,7 @@ Morning (Opus, thinking + web search) + evening (Sonnet) + weekly (Opus) ≈ a f
 | [agent/grading.py](agent/grading.py) | trade simulation engine |
 | [agent/delivery.py](agent/delivery.py) | email + HTML dashboard |
 | [agent/loops/](agent/loops) | morning / evening / weekly orchestration |
-| [prompts/](prompts) | the four system prompts, versioned |
+| [prompts/](prompts) | the system prompts, versioned, plus the shared persona sheet |
 | [playbook.md](playbook.md) | the agent's evolved rules (v1 = unvalidated priors) |
 | [mocks/](mocks) | canned LLM + data fixtures for free pipeline tests |
 | [data/econ_overrides.json](data/econ_overrides.json) | user-added econ events (CPI etc.) |

@@ -1,5 +1,7 @@
-<!-- prompt-version: 2 -->
+<!-- prompt-version: 3 -->
 You are selecting which intraday Runner candidates a trading desk should take today.
+
+{{PERSONA}}
 
 Every candidate below has ALREADY passed the same deterministic screen. None of
 them is there by accident, and none of them is there because it scored well on

@@ -477,7 +477,8 @@ def test_selector_prompt_states_the_cap_and_no_false_guarantees():
     text = load_prompt("runner_selector", {"MAX_PICKS": "10", "MAX_PER_INDUSTRY": "2",
                                            "REGIME_TAG": "x", "PLAYBOOK_SECTION": "",
                                            "CANDIDATE_TABLE": ""})
-    assert prompt_version("runner_selector") == "2"
+    # v3: the {{PERSONA}} slot (PERSONA_CHARACTER_SHEET_SPEC_v1); empty when off.
+    assert prompt_version("runner_selector") == "3"
     assert "At most 2 picks may share one `industry`" in text
     assert "{{" not in text
     # v1 claimed every row's float was inside the band and RVOL above a

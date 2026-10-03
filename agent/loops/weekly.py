@@ -21,7 +21,7 @@ from .. import ledger, open_questions, question_eval
 from ..config import BASE_DIR, Config
 from ..failures import classify_failure, format_failure
 from ..delivery import render_dashboard, send_email, weekly_email_html
-from ..llm import LLMClient, load_prompt
+from ..llm import LLMClient, load_prompt, persona_block, persona_version
 from ..memory import build_weekly_memory, write_playbook
 from ..util import is_half_day, log, now_et, today_et
 
@@ -1351,7 +1351,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             f"- {r['date']}: {r['tag']}" for r in mem["regimes"]
         ) or "(no regime history)"
 
-        system = load_prompt("weekly_miner", {})
+        system = load_prompt("weekly_miner", {"PERSONA": persona_block(cfg, "miner")})
         user = (
             f"# WEEKLY REVIEW — {d.isoformat()}\n\n"
             f"## OVERALL RECORD\n\n{json.dumps(overall, indent=2)}\n\n"
@@ -1520,7 +1520,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         else:
             log("weekly", "WARN: miner returned no usable playbook — keeping current version")
 
-        ledger.log_run(con, "weekly", d, started, "ok", model, result.usage)
+        ledger.log_run(con, "weekly", d, started, "ok", model, result.usage,
+                       persona_version=persona_version(cfg))
         ledger.finish_run_lock(con, d, "weekly", lock["request_id"], "complete")
 
         log("weekly", f"Summary: {mined.get('summary_for_email','(none)')}")

@@ -19,7 +19,8 @@ from ..delivery import morning_email_html, render_dashboard, send_email
 from ..failures import classify_failure, format_failure
 from ..grading import MORNING_ENTRY_NOT_BEFORE, entry_not_before_for
 from ..indicators import beta_corr
-from ..llm import LLMClient, load_prompt, merge_usage, prompt_version
+from ..llm import (LLMClient, load_prompt, merge_usage, persona_block, persona_version,
+                   prompt_version)
 from ..memory import build_morning_memory
 from ..providers import (EXCLUDED_PRODUCTS, MarketData, is_common_stock_symbol,
                          render_bundle_md, yf_history_closes)
@@ -1333,7 +1334,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         mem = build_morning_memory(con, cfg)
 
         # 4. build prompts
-        analyst_system = load_prompt("morning_analyst", _coverage_prompt_text(cfg))
+        persona_stamp = persona_version(cfg)
+        analyst_system = load_prompt("morning_analyst", {
+            **_coverage_prompt_text(cfg), "PERSONA": persona_block(cfg, "analyst")})
         user_block = (
             f"# TODAY: {d.isoformat()} ({d.strftime('%A')})\n\n"
             f"## MARKET DATA\n\n{bundle_md}\n\n"
@@ -1380,6 +1383,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             "FLOOR_SIZE_R": str((cfg.get("daily_floor", {}) or {}).get(
                 "size_r", cfg.get("min_size_r", 0.25))),
             **_coverage_prompt_text(cfg),
+            "PERSONA": persona_block(cfg, "risk"),
         })
 
         from . import paired as paired_mod
@@ -1464,6 +1468,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         plan["regime_tag"] = reg.get("tag", "")
         plan["prompt_version"] = f"analyst_v{prompt_version('morning_analyst')}/risk_v{prompt_version('morning_risk')}"
         plan["playbook_version"] = mem["playbook_version"]
+        # v29: the persona is a treatment; the plan, its picks and the run say
+        # whether it was in the prompts (None -> NULL when off).
+        plan["persona_version"] = persona_stamp
         usage = merge_usage(analyst.usage, risk.usage)
 
         if cfg.mock:
@@ -1503,7 +1510,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                            + "; ".join(health.get("degraded_reasons") or ["(unspecified)"])
                            + ". This is logged as an outage, NOT as a stand-down decision.")
         ledger.log_run(con, "morning", d, started,
-                       "degraded" if health.get("degraded") else "ok", model, usage)
+                       "degraded" if health.get("degraded") else "ok", model, usage,
+                       persona_version=persona_stamp)
         _mark("persist")
 
         # Before today's orders: close anything a missed end-of-day flatten

@@ -24,7 +24,7 @@ from ..delivery import evening_email_html, render_dashboard, send_email
 from ..grading import (CURRENT_SIM_VERSION, RUNNER_MIN_REWARD_R, classify_shadow,
                        grade_day, outcomes_md, realized_r, simulate_pick)
 from ..grading_context import build_grading_context
-from ..llm import LLMClient, load_prompt, prompt_version
+from ..llm import LLMClient, load_prompt, persona_block, persona_version, prompt_version
 from ..coverage import (OUTCOME_FIELDS, RUNNER_FIELDS, lane_of, outcome_coverage,
                         plumbing)
 from ..coverage import describe as describe_plumbing
@@ -1211,7 +1211,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             for l in lessons_now
         ) or "(lesson bank empty)"
 
-        system = load_prompt("evening_grader", {})
+        system = load_prompt("evening_grader", {"PERSONA": persona_block(cfg, "grader")})
         shadow_md = (f"{shadow['scored']} rejected candidates scored; net forgone "
                      f"{shadow['net_forgone_r']:+.2f}R today (positive = filters cost us)")
         user = (
@@ -1325,7 +1325,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         _mark("persist")
 
         ledger.log_run(con, "evening", d, started, "degraded" if plumbing_bad else "ok",
-                       model, result.usage, stages=_finish_stages())
+                       model, result.usage, stages=_finish_stages(),
+                       persona_version=persona_version(cfg))
 
         # 4. console + delivery — the nightly eyeball summary (spec §5)
         log("evening", f"Plan grade: {review.get('plan_grade','?')} — {review.get('plan_notes','')}")

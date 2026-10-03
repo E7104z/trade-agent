@@ -27,7 +27,7 @@ from datetime import date, datetime
 
 from . import ledger, live_broker
 from .config import Config
-from .llm import LLMClient, load_prompt, prompt_version
+from .llm import LLMClient, load_prompt, persona_block, persona_version, prompt_version
 from .util import log, now_et
 
 __all__ = ["run_selection", "build_candidate_table", "parse_selection"]
@@ -249,8 +249,9 @@ def save_runner_pick(con, session_date: date, c: dict, sel: dict,
         """INSERT INTO picks
            (plan_date, ticker, direction, setup_type, catalyst, thesis, conviction,
             size_r, entry_type, entry_price, stop_price, target_price,
-            regime_tag, prompt_version, playbook_version, in_scan_universe)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            regime_tag, prompt_version, playbook_version, in_scan_universe,
+            persona_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            RETURNING pick_id""",
         [
             session_date, c["ticker"].upper(), "long", "dto_runner",
@@ -269,6 +270,9 @@ def save_runner_pick(con, session_date: date, c: dict, sel: dict,
             prompt_version("runner_selector"),
             _playbook_version(con),
             False,
+            # Set only on picks the selector call chose; an auto-selected
+            # session made no call and carries no persona.
+            sel.get("persona_version"),
         ],
     ).fetchone()
     return row[0] if row else None
@@ -473,6 +477,7 @@ def run_selection(cfg: Config, *, con, session_date: date,
         "REGIME_TAG": _regime_tag(con, session_date) or "(unknown)",
         "PLAYBOOK_SECTION": _playbook_section(con),
         "CANDIDATE_TABLE": build_candidate_table(candidates),
+        "PERSONA": persona_block(cfg, "selector"),
     })
     client = LLMClient(cfg)
     try:
@@ -492,8 +497,9 @@ def run_selection(cfg: Config, *, con, session_date: date,
         # selection comparison this whole design exists to produce.
         return _finish(f"selection_failed: {e}"[:500])
 
+    persona_stamp = persona_version(cfg)
     ledger.log_run(con, "runner", session_date, started, "ok",
-                   model=model, usage=res.usage)
+                   model=model, usage=res.usage, persona_version=persona_stamp)
 
     valid = {c["ticker"] for c in candidates}
     try:
@@ -505,6 +511,8 @@ def run_selection(cfg: Config, *, con, session_date: date,
         log("runner", f"selector returned {len(hallucinated)} ticker(s) not in the "
                       f"candidate list; dropped: {hallucinated}")
     selected = selected[:max_picks]
+    for sel in selected:
+        sel["persona_version"] = persona_stamp
     if not selected:
         return _finish("selector returned no picks",
                        hallucinated=len(hallucinated))

@@ -205,13 +205,24 @@ def morning_selection(items: list[dict], n: int = TOP_N) -> list[dict]:
     return out
 
 
-def morning_block(items: list[dict]) -> str:
-    """The DATA-STARVED block for the morning analyst. Counts only, as stored."""
+# PERSONA_CHARACTER_SHEET_SPEC_v1 §2.1: with the persona on, the same counts
+# are addressed to the trader as his proof deficit. One added paragraph, no
+# number, sign or direction; everything after it is the block as it always was.
+PERSONA_LEAD_IN = ("Here is what you still cannot prove, by the numbers. These are your debts "
+                   "to the scoreboard. A debt is not a finding, and nothing below says any of "
+                   "these cells works.")
+
+
+def morning_block(items: list[dict], persona: bool = False) -> str:
+    """The DATA-STARVED block for the morning analyst. Counts only, as stored.
+    `persona` adds PERSONA_LEAD_IN; off, the block is byte-identical to the
+    pre-persona text."""
     if not items:
         return ""
     lines = [
         f"## DATA-STARVED (system backlog — top {len(items)})",
         "",
+        *([PERSONA_LEAD_IN, ""] if persona else []),
         "Evidence the desk is short of, ranked by the system. These are COUNTS toward a "
         "threshold, not findings: nothing here says any of these cells works. A candidate "
         "that would produce one of these observations may be proposed as a labeled probe "
