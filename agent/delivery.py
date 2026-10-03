@@ -93,11 +93,17 @@ def morning_email_html(plan_date: date, plan: dict, regime_md: str) -> str:
     """
 
 
-def evening_email_html(plan_date: date, review: dict, outcomes_summary: str) -> str:
+def evening_email_html(plan_date: date, review: dict, outcomes_summary: str,
+                       traders_log: dict | None = None, day_contrast: str = "") -> str:
+    """The evening email. `traders_log` (a stored traders_log row) and
+    `day_contrast` (traders_log.day_contrast) append two optional sections at
+    the end (TRADERS_LOG_SPEC_v1 §4); absent, the HTML is byte-identical to the
+    email before the log existed."""
     rows = "".join(
         f"<tr><td>{r['ticker']}</td><td>{r['grade']}</td><td>{r['why']}</td></tr>"
         for r in review.get("pick_reviews", [])
     )
+    extra = _traders_log_html(traders_log) + _contrast_html(day_contrast)
     return f"""
     <html><body style="font-family:sans-serif">
       <h2>Trade Agent — Evening Review — {plan_date.isoformat()}</h2>
@@ -109,8 +115,51 @@ def evening_email_html(plan_date: date, review: dict, outcomes_summary: str) -> 
       <h3>Lessons extracted</h3>
       <ul>{''.join(f"<li>{l['lesson']}</li>" for l in review.get('lessons', []))}</ul>
       <pre style="white-space:pre-wrap;font-family:monospace;font-size:12px">{outcomes_summary}</pre>
-    </body></html>
+{extra}    </body></html>
     """
+
+
+def _log_markdown_html(text: str) -> str:
+    """The log's three headings and paragraphs as plain HTML (escaped)."""
+    import html as _html
+    out = []
+    for block in [b.strip() for b in text.replace("\r\n", "\n").split("\n\n") if b.strip()]:
+        if block.startswith("## "):
+            out.append(f"<h4 style=\"margin:14px 0 4px\">{_html.escape(block[3:])}</h4>")
+        else:
+            out.append(f"<p style=\"margin:4px 0\">{_html.escape(block).replace(chr(10), '<br>')}</p>")
+    return "".join(out)
+
+
+def _traders_log_html(row: dict | None) -> str:
+    """The `Trader's log` section: the written log, or the labeled facts-only
+    fallback. Nothing for a session with no log (or no facts)."""
+    import html as _html
+    if not row or not row.get("rendered_text") or row.get("status") == "skipped":
+        return ""
+    if row.get("status") == "ok":
+        body = _log_markdown_html(row["rendered_text"])
+        note = ""
+    else:
+        reason = row.get("violations_json") or ""
+        note = ("facts-only: the evening ran out of time before the log could be written"
+                if "not_generated" in reason else
+                "facts-only: the written log could not be generated"
+                if row.get("status") == "error" else
+                "facts-only: the written log failed its checks")
+        note = f'<p style="color:#888;font-size:12px">{note}</p>'
+        body = ('<pre style="white-space:pre-wrap;font-family:monospace;font-size:12px">'
+                f"{_html.escape(row['rendered_text'])}</pre>")
+    return f"      <h3>Trader's log</h3>{note}{body}\n"
+
+
+def _contrast_html(text: str) -> str:
+    import html as _html
+    if not text:
+        return ""
+    return ("      <h3>Today's winners and losers (descriptive)</h3>"
+            '<pre style="white-space:pre-wrap;font-family:monospace;font-size:12px">'
+            f"{_html.escape(text)}</pre>\n")
 
 
 def weekly_email_html(result: dict, violations: list[dict] | None = None) -> str:

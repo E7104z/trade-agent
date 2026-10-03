@@ -204,6 +204,19 @@ _DEFAULTS: dict[str, Any] = {
     # sheet that was switched on; a persona.md carrying another version is
     # not used. Rows it influenced carry persona_version (migration v29).
     "persona": {"enabled": False, "version": 1},
+    # --- trader's log (specs/TRADERS_LOG_SPEC_v1.md) -------------------------
+    # A first-person daily entry for the owner, written after the evening
+    # grading and appended to the evening email. Numbers reach it only as
+    # slots the system already computed; the agent never reads it back.
+    "traders_log": {
+        "enabled": False,
+        "model": None,            # None = models.evening (Sonnet-class)
+        "max_chars": 3000,        # rendered length cap; over it is a violation, not a cut
+        "max_tokens": 1500,
+        "call_timeout_s": 45,     # one attempt per call, bounded: the evening has a 300s budget
+        "reserve_s": 45,          # budget left for email, dashboard and lock after the log
+        "mock_name": "traders_log",
+    },
 }
 
 # Approximate USD per million tokens (input, output) — for run-cost logging only.

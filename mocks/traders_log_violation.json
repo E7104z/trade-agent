@@ -1,0 +1,3 @@
+{
+  "text": "## What I still can't prove\n\nI have not proven anything yet. No cell has cleared the ledger's bar for me, and every open count on the list is a debt I owe the scoreboard.\n\n## What happened\n\nI took 3 morning picks. Runner picks taken: {{day.picks_runner}}. Fill-valid trades: {{day.triggered}}, with {{day.wins}} winners and {{day.losses}} losers, net {{day.net_r}}. One session, not evidence. Invalid fills: {{day.invalid_fills}}; those were not trades.\n\n## What I believe (not evidence, not acted on)\n\nI suspect the open was harder to read than the plan assumed. That is a belief, not a finding, and nobody acts on it.\n\nTomorrow: no change"
+}

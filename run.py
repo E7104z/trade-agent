@@ -701,6 +701,45 @@ def cmd_regate_runner(cfg, args) -> None:
         con.close()
 
 
+def cmd_traders_log(cfg, args, run_date) -> None:
+    """Show (--show) or regenerate a session's trader's log
+    (specs/TRADERS_LOG_SPEC_v1.md). Regeneration refuses a session whose
+    evening grading has not completed: the log is written from what the
+    evening stored, and a half-graded day would be narrated as a whole one."""
+    from agent import traders_log
+    d = run_date or today_et()
+    con = ledger.connect()
+    try:
+        if args.show:
+            row = traders_log.load(con, d)
+            if not row:
+                print(f"No trader's log stored for {d}.")
+                return
+            print(f"{d}  status={row['status']}  persona={row['persona_version']}  "
+                  f"model={row['model']}  cost=${float(row['cost_usd'] or 0):.4f}")
+            if row["violations_json"]:
+                print(f"validator: {row['violations_json']}")
+            print()
+            print(row["rendered_text"] or "(nothing rendered)")
+            return
+        graded = con.execute(
+            "SELECT COUNT(*) FROM runs WHERE loop = 'evening' AND run_date = ? "
+            "AND status IN ('ok', 'degraded')", [d]).fetchone()[0]
+        if not graded and not cfg.mock:
+            log("traders-log", f"Refusing: the evening grading for {d} has not completed "
+                               "(no ok/degraded evening run). Run the evening first.")
+            sys.exit(1)
+        row = traders_log.generate(con, cfg, d)
+        print(f"{d}  status={row['status']}  cost=${float(row['cost_usd'] or 0):.4f}"
+              + ("  (mock: not stored)" if cfg.mock else ""))
+        if row.get("violations_json"):
+            print(f"validator: {row['violations_json']}")
+        print()
+        print(row.get("rendered_text") or "(nothing rendered)")
+    finally:
+        con.close()
+
+
 def cmd_runner(cfg, args) -> None:
     """One intraday Runner tick (or a loop of them) from this machine.
 
@@ -907,6 +946,14 @@ def main() -> None:
         help="runner continuation after entry (drift in ATR by bucket) and selection "
              "coverage per session (read-only, zero API cost)")
 
+    p_tlog = sub.add_parser(
+        "traders-log",
+        help="show (--show) or regenerate a session's trader's log (refuses an ungraded session)")
+    p_tlog.add_argument("--date", type=str, default=None, help="YYYY-MM-DD (default: today ET)")
+    p_tlog.add_argument("--show", action="store_true", help="print the stored log, change nothing")
+    p_tlog.add_argument("--mock", action="store_true",
+                        help="use the canned draft (mocks/traders_log.json); stores nothing")
+
     p_pmon = sub.add_parser(
         "persona-monitor",
         help="persona on/off sessions: counts and distributions only (read-only, zero API cost)")
@@ -982,6 +1029,8 @@ def main() -> None:
                 runner_research.selection_coverage(con)))
         finally:
             con.close()
+    elif args.cmd == "traders-log":
+        cmd_traders_log(cfg, args, run_date)
     elif args.cmd == "persona-monitor":
         from agent import persona_monitor
         con = ledger.connect()

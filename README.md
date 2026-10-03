@@ -129,6 +129,14 @@ One character sheet, [prompts/persona.md](prompts/persona.md), is shared by the 
 - **Guardrails:** P-1 prose never becomes evidence (the sheet carries no digit, so it adds no number to any prompt or to the grader's grounding corpus); P-2 hunger is for evidence velocity, not trade count (no gate, lane, size or threshold changed); P-3 beliefs are not evidence (only `[rule: R...]` rules are acted on); P-4 it is a treatment; P-5 additive and reversible (one config line).
 - **Treatment, measured:** plans, picks and runs it influenced carry `persona_version` (migration v29; NULL = off). `run.py persona-monitor [--sessions N]` prints counts and distributions per group (trade count, size, conviction, floor/coverage/probe rates, runner selection) and no test or verdict: on/off periods are different calendar periods under different tape.
 
+## Trader's log
+
+After the evening grading, the desk writes a short first-person log for its owner, appended to the evening email with a counts-only "winners and losers" table. Spec: [specs/TRADERS_LOG_SPEC_v1.md](specs/TRADERS_LOG_SPEC_v1.md).
+
+- **Flag:** `"traders_log": {"enabled": true|false, ...}` in `config.json` (default off). One Sonnet call per session, about three cents.
+- **Numbers by reference:** the model is given slots the system already computed and writes `{{slot}}` tokens; any digit (or number word past "two") in its own text is refused. One retry, then a labeled facts-only fallback. A failure never touches grading, the playbook or the email.
+- **Write-only:** no loop, prompt, memory builder, miner, selector or grader reads it; `tests/test_traders_log_firewall.py` enforces that. Browse it at `/api/table/traders_log` or with `run.py traders-log --show [--date YYYY-MM-DD]`.
+
 ## Costs
 
 Morning (Opus, thinking + web search) + evening (Sonnet) + weekly (Opus) ≈ a few dollars/week at current pricing. Every run's tokens and estimated cost are logged to the `runs` table and shown in `status` and the dashboard.

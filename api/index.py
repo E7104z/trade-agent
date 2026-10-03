@@ -599,6 +599,9 @@ _QUERYABLE_TABLES = {
     # the daily diagnostics digest.
     "evidence_backlog": "session_date",
     "daily_diagnostics": "session_date",
+    # TRADERS_LOG_SPEC_v1: the owner's daily log, browsable here. The agent
+    # never reads it (tests/test_traders_log_firewall.py).
+    "traders_log": "session_date",
     # Not date-filterable, but ordered newest-first (see _TABLE_ORDER) so
     # ?limit=N returns the latest: a lost weekly rewrite is recovered from
     # llm_archive, and every playbook the miner ever wrote is in

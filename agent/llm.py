@@ -243,7 +243,16 @@ class LLMClient:
         web_search: bool = False,
         expect_json: bool = True,
         max_tokens: int | None = None,
+        attempts: int = 3,
+        timeout: float | None = None,
+        archive: bool = True,
     ) -> LLMResult:
+        """`attempts`/`timeout` default to the long-standing behavior (three
+        tries with back-off, the SDK's own timeout). A caller inside a tight
+        budget -- the trader's log runs at the end of a 300s evening -- asks for
+        one bounded attempt instead. `archive=False` skips the response
+        archive for a caller that stores its own raw text (the trader's log,
+        whose prose must persist in exactly one place)."""
         if self.cfg.mock:
             result = self._mock_response(mock_name)
             if expect_json:
@@ -261,6 +270,8 @@ class LLMClient:
             budget = int(self.cfg.get("thinking_budget_tokens", 8000))
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4000)
+        if timeout is not None:
+            kwargs["timeout"] = float(timeout)
         if web_search and self.cfg.get("enable_web_search"):
             kwargs["tools"] = [{
                 "type": "web_search_20250305",
@@ -268,10 +279,11 @@ class LLMClient:
                 "max_uses": int(self.cfg.get("web_search_max_uses", 6)),
             }]
 
-        resp = self._create_with_retry(kwargs)
+        resp = self._create_with_retry(kwargs, attempts=attempts)
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
         usage = self._usage(resp, model)
-        _archive_response(mock_name, model, text, usage)
+        if archive:
+            _archive_response(mock_name, model, text, usage)
 
         result = LLMResult(text=text, usage=usage)
         if expect_json:
@@ -320,6 +332,9 @@ class LLMClient:
                                f"permanent, not retrying")
                     raise RuntimeError(
                         f"Anthropic API failed permanently (not retried): {e}") from e
+                if attempts == 1:
+                    # A single bounded attempt has no back-off to wait out.
+                    break
                 wait = 15 * (i + 1)
                 log("llm", f"API error ({type(e).__name__}): {e} — retrying in {wait}s")
                 time.sleep(wait)

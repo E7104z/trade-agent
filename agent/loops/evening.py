@@ -1360,10 +1360,26 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         except Exception as e:  # noqa: BLE001
             log("evening", f"WARN daily diagnostics digest failed: {e}")
 
+        # TRADERS_LOG_SPEC_v1: the owner's first-person log, written after
+        # everything above is stored, and the day's winner/loser counts. Off by
+        # default; guarded and bounded by what is left of the function budget,
+        # so it can never cost the evening its grading, playbook or email.
+        email_log: dict = {}
+        if (cfg.get("traders_log", {}) or {}).get("enabled"):
+            try:
+                from .. import traders_log
+                reserve = float((cfg.get("traders_log", {}) or {}).get("reserve_s") or 45)
+                email_log["traders_log"] = traders_log.generate(
+                    con, cfg, d, deadline=t_start + FUNCTION_BUDGET_S - reserve)
+                email_log["day_contrast"] = traders_log.day_contrast(con, d)
+                stages["traders_log"] = email_log["traders_log"].get("status")
+            except Exception as e:  # noqa: BLE001 -- the log never breaks the evening
+                log("evening", f"WARN trader's log failed; the evening is unaffected: {e}")
+
         send_email(cfg, f"Trade Agent — Evening Review {d.isoformat()}",
                    evening_email_html(d, review, out_md + (
                        f"\n\nCOMPUTED TAPE\n{tape_md}" if tape_md else "") + (
-                       f"\n\n{digest_txt}" if digest_txt else "")))
+                       f"\n\n{digest_txt}" if digest_txt else ""), **email_log))
         render_dashboard(con, cfg, d)
         ledger.finish_run_lock(con, d, "evening", lock["request_id"], "complete")
 

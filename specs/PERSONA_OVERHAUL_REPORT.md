@@ -262,3 +262,86 @@ all three tables; second `connect()` ran no DDL. Monitor on that copy:
 - The three spec files and this report are in `specs/`.
 
 Gate 4: suite **1,350 passed**. Flag still off in config.json.
+
+---
+
+## L Phase 1 — Schema and the facts builder
+
+- `agent/migrations_v30.py`: `traders_log` exactly as specified (PK `session_date, lane`), appended after v29.
+- `agent/traders_log.py::build_facts(con, d)` → `{session_date, slots, menu, menu_item_ids, errors}`. Each slot:
+  `name, value (pre-formatted), scope, source, label`. Families (closed): `day.*`, `pick.<lane>.<ticker>`, `shadow.*`,
+  `runner.*` (incl. `runner.exit.<policy>` for plan and arms A/B/C via `runner_exits.policy_summary`, the function
+  `run.py runner-exits` prints), `deficit.*` + `menu.*` (`backlog.morning_selection(backlog.latest(con, d))`, the
+  morning's list), `calibration.conviction_N` (only cells `calibration_aggregate` does not suppress),
+  `verdict.calibration_q3` / `verdict.runner_lane` (lines copied verbatim from the weekly-rendered playbook).
+- Fill validity is the evening's own definition (`_fill_valid_rows`): triggered, not `invalid_fill`, not an execution
+  anomaly. Wins/losses/net by `r_planned` only. A fill-valid trade with no `r_planned` (legacy rows) is counted in
+  `day.unmeasured_r`, never backfilled from `r_multiple` (found on the local sample, see below).
+- `day.stand_down_reason` (only when the morning lane has no picks), from what is stored: `no_trade_category` /
+  `session_degraded` (`data_incomplete` → "data outage"), else the morning `runs` status, else "not distinguished by
+  the system".
+- `render_facts_only(facts)`: deterministic labeled list, every value tagged with its scope.
+- Tests: `tests/test_traders_log_facts.py` (16), seed helper `tests/_traders_log_seed.py`.
+
+Gate 1 sample (local DuckDB copy, **not production**; latest locally graded session 2026-09-21, runner-only):
+`day.picks_runner = 10`, `day.triggered = 8`, `day.execution_anomalies = 2`, `day.exits = stop 4, target 4`,
+`day.unmeasured_r = 8` (graded before `r_planned`), `runner.candidates = 322`, `runner.selected = 10`,
+`day.stand_down_reason = no morning plan and no morning run recorded (not distinguished by the system)`,
+`menu_item_ids = ['no change']` (no local backlog snapshot that day).
+
+## L Phase 2 — Rendering and the validator
+
+`render(raw, facts, max_chars=3000) -> (rendered, violations)`. Rules: unknown or malformed slot; any digit outside
+a slot; **number words from "three" up and ordinals from "third" up** (added: the spec forbids restating a slot in
+words, and "one"/"two" stay legal); headings exactly the three, in order, nothing before the first; the last line
+starts `Tomorrow:` and names exactly one menu slot or `no change` (not both), no other slot, one clause of at most
+160 characters; belief section has no slot and no digit; rendered length over `traders_log.max_chars` (3000, about
+one screen of the single-column email) is a violation, never a cut. `one_session` values get ` (one session)`,
+`computed_verdict` values are quoted. A surrounding code fence and curly apostrophes are tolerated.
+Tests: `tests/test_traders_log_render.py` (32, incl. the parametrized digits `13`, `3/20`, `0.5`, `1R`, `2026`,
+`10:30`, and a seeded fuzz).
+
+## L Phase 3 — Prompt and generation
+
+- `prompts/traders_log.md` (v1): role, the slot rule, the three sections plus the `Tomorrow:` line, the
+  prohibitions; `{{PERSONA}}` takes the shared sheet only (no role section). No digit below the header.
+- `generate(con, cfg, d, llm_client=None, deadline=None)`: facts → (empty → `skipped`, no call) → one call
+  (`attempts=1`, bounded `timeout`, `archive=False`) → render → one retry with the violation list → else
+  `fallback_facts_only`. Any exception → `error`, facts-only text kept for the email. Never raises. Re-running a
+  date replaces its row. Cost: `runs` row `loop='traders_log'` (status `ok` / `degraded` for a fallback / `error`),
+  stamped with `persona_version`. Mock mode uses `mocks/traders_log.json` and stores nothing;
+  `mocks/traders_log_violation.json` is the violating twin.
+- `LLMClient.call` gained `attempts`, `timeout`, `archive` (defaults = the old behavior).
+- Tests: `tests/test_traders_log_generate.py` (11).
+
+Gate 3 sample: one real call (claude-sonnet-4-5, persona on) on the scratch copy, session 2026-09-21. First draft
+wrote the word "four" → refused → the retry passed: status `ok`, 4,911 in / 856 out tokens, **$0.028**. Observation
+for the owner: the mandated ` (one session)` suffix on every day slot makes sentences read mechanically
+("10 (one session) runner-lane picks"). Kept as specified.
+
+## L Phase 4 — Wiring
+
+- Evening hook (`agent/loops/evening.py`), after `backlog.daily_digest`, before `send_email`, only when
+  `traders_log.enabled`: `generate(..., deadline=t_start + 300s − reserve_s)` then `day_contrast`; any exception is
+  logged and the email goes out without the sections. `stages["traders_log"]` records the status.
+- `evening_email_html(..., traders_log=None, day_contrast="")`: two sections appended at the end; with neither, the
+  HTML is byte-identical to `2697dd2` (fixture `tests/fixtures/evening_email_before_log.html`). Fallback notes:
+  "facts-only: the written log failed its checks" / "...could not be generated" / "...evening ran out of time".
+- `day_contrast`: counts of winners and losers (by `r_planned`) per dimension from `buckets.dimensions(lane)` over
+  `research.morning_rows(con, on=d)` and `research.runner_rows(con, on=d)`, with the verbatim header. No rate, no sign.
+- `run.py traders-log [--date] [--show] [--mock]`; regeneration refuses a date with no `ok`/`degraded` evening run.
+- `_QUERYABLE_TABLES["traders_log"] = "session_date"`; one `<option>` in the dashboard's raw-ledger inspector.
+- Tests: `tests/test_traders_log_wiring.py` (10), including the real evening loop with the hook off, on, and raising.
+
+## L Phase 5 — The firewall
+
+`tests/test_traders_log_firewall.py` (29 incl. parametrized): (1) every `.py`/`prompts/*.md` line naming
+`traders_log` is in a file on the allowlist, with line-level rules for `api/index.py` and `agent/webui.py`, and the
+evening names it only inside the hook block; `generate()` is called only by the hook and the CLI. (2) twenty
+learning/prompt-building modules neither import nor name it. (3) no other prompt mentions the log; only
+`agent/traders_log.py` loads its prompt. (4) with sentinel-filled log rows for today and yesterday, the real morning
+and weekly loops (mock), the real evening grader call, morning/weekly memory and the runner selector's playbook
+section never carry the sentinel. (5) the module writes only its own table, and the draft skips both the
+`llm_archive` and `runs.error` (two leaks found and closed while writing these tests).
+
+Gate 5: suite **1,447 passed**.

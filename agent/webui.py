@@ -281,6 +281,7 @@ window.TA = (function(){
               <option value="rule_confirmations">Rule confirmations</option>
               <option value="open_question_progress">Question progress</option>
               <option value="runs">Run history</option>
+              <option value="traders_log">Trader's log</option>
               <option value="runner_sessions">Runner sessions</option>
               <option value="runner_candidates">Runner candidates</option>
               <option value="runner_candidate_outcomes">Runner outcomes</option>

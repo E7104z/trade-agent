@@ -418,6 +418,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v28.STATEMENTS
 from . import migrations_v29  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v29.STATEMENTS
 
+# --- v30 the trader's log (write-only for the machine; see migrations_v30) --
+from . import migrations_v30  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v30.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
