@@ -1407,11 +1407,26 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                 hyp_txt = hypotheses.evening_text(con, d, hyp_summary)
             except Exception as e:  # noqa: BLE001
                 log("evening", f"WARN hypothesis summary failed: {e}")
+        # EDGE_ACCELERATION_SPEC_v1 Part 3: the agent asks its own production
+        # data the questions every spec's Phase 0 used to ask a person. Cheap
+        # SQL, guarded; it never changes trading and never breaks the evening.
+        check_txt = ""
+        if not cfg.mock:
+            try:
+                from .. import selfcheck
+                checks = selfcheck.run(con, cfg, d)
+                check_txt = selfcheck.text(checks)
+                stages["selfcheck"] = max(
+                    (c["status"] for c in checks),
+                    key=lambda s: {"bad": 3, "warn": 2, "info": 1}.get(s, 0), default="ok")
+            except Exception as e:  # noqa: BLE001
+                log("evening", f"WARN self-check failed; the evening is unaffected: {e}")
         send_email(cfg, f"Trade Agent — Evening Review {d.isoformat()}",
                    evening_email_html(d, review, out_md + (
                        f"\n\nCOMPUTED TAPE\n{tape_md}" if tape_md else "") + (
                        f"\n\n{digest_txt}" if digest_txt else "") + (
-                       f"\n\n{hyp_txt}" if hyp_txt else ""), **email_log))
+                       f"\n\n{hyp_txt}" if hyp_txt else "") + (
+                       f"\n\n{check_txt}" if check_txt else ""), **email_log))
         render_dashboard(con, cfg, d)
         ledger.finish_run_lock(con, d, "evening", lock["request_id"], "complete")
 

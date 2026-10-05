@@ -31,6 +31,19 @@ LIMITATION = ("No paired persona on/off arm exists: the paired challenger arm va
               "memory context and receives arm A's system prompts, so with the persona on both "
               "arms carry it. Calendar periods are the only split available.")
 
+# The hypothesis lane went live on the persona's first sessions (2026-10-05).
+# It adds trades of its own (exploration_lane = 'hypothesis') and lets the
+# analyst bring extra candidates tagged to an idea. Both are shown APART, and
+# the pick counts are also given without the lane, so trades the lane added
+# are never read as trades the persona added.
+HYPOTHESIS_NOTE = ("Hypothesis-lane picks and hypothesis-tagged candidates are counted apart; "
+                   "'excluding the hypothesis lane' is the like-for-like pick count.")
+
+# The daily floor (50106eb) went live 2026-09-29: before it, a day could end
+# with no picks at all, so persona-off sessions before it are not a baseline
+# for trade counts. `collect(since=FLOOR_LIVE)` reads only sessions after it.
+FLOOR_LIVE = "2026-09-29"
+
 _CAP_NOTE = re.compile(r"industry cap \S+ dropped (\d+)")
 _OUTAGE = "data_incomplete"
 _RUNNER = "dto_runner"
@@ -51,15 +64,21 @@ def _recent(dates: list, n: int | None) -> set:
     return set(sorted(dates)[-n:]) if n else set(dates)
 
 
-def collect(con: Any, sessions: int | None = 10) -> dict[str, dict]:
+def _on_or_after(d: Any, since: Any) -> bool:
+    return since is None or str(d)[:10] >= str(since)[:10]
+
+
+def collect(con: Any, sessions: int | None = 10, since: Any = None) -> dict[str, dict]:
     """{group label: readings} for the most recent `sessions` sessions of each
-    group (None = all). Morning sessions are daily_plans rows; runner sessions
-    are runner_sessions rows. Never raises."""
+    group (None = all), on or after `since` when given. Morning sessions are
+    daily_plans rows; runner sessions are runner_sessions rows. Never raises."""
     groups: dict[str, dict] = {}
 
     # --- morning lane: one session per daily_plans row ---------------------
-    plans = _q(con, """SELECT plan_date, no_trade, no_trade_category, session_degraded,
-                              analyst_json, persona_version FROM daily_plans""")
+    plans = [r for r in _q(con, """SELECT plan_date, no_trade, no_trade_category,
+                                          session_degraded, analyst_json, persona_version
+                                   FROM daily_plans""")
+             if _on_or_after(r[0], since)]
     by_group: dict[str, list[tuple]] = {}
     for row in plans:
         by_group.setdefault(_label(row[5]), []).append(row)
@@ -76,7 +95,7 @@ def collect(con: Any, sessions: int | None = 10) -> dict[str, dict]:
         g["_flag"] = {r[0]: (bool(r[1]), r[2]) for r in rows}
         g["degraded_sessions"] = sum(1 for r in rows if r[3])
         cand_conv: Counter = Counter()
-        n_cand = n_probe = 0
+        n_cand = n_probe = n_hyp = 0
         for r in rows:
             try:
                 cands = (json.loads(r[4] or "{}") or {}).get("candidates") or []
@@ -87,7 +106,10 @@ def collect(con: Any, sessions: int | None = 10) -> dict[str, dict]:
                 cand_conv[c.get("conviction")] += 1
                 if c.get("probe_for"):
                     n_probe += 1
+                if c.get("hypothesis_id"):
+                    n_hyp += 1
         g["candidates"] = n_cand
+        g["hypothesis_candidates"] = n_hyp
         g["candidate_conviction"] = dict(cand_conv)
         g["probe_candidates"] = n_probe
         g["_dates"] = sorted(keep)
@@ -99,11 +121,14 @@ def collect(con: Any, sessions: int | None = 10) -> dict[str, dict]:
         if not dates:
             continue
         marks = ",".join("?" for _ in dates)
-        picks = _q(con, f"""SELECT p.conviction, p.size_r, p.exploration_lane,
-                                   COALESCE(o.triggered, FALSE), p.plan_date
-                            FROM picks p LEFT JOIN outcomes o ON o.pick_id = p.pick_id
-                            WHERE p.plan_date IN ({marks})
-                              AND COALESCE(p.setup_type, '') <> '{_RUNNER}'""", list(dates))
+        sql = f"""SELECT p.conviction, p.size_r, p.exploration_lane,
+                         COALESCE(o.triggered, FALSE), p.plan_date, {{tag}}
+                  FROM picks p LEFT JOIN outcomes o ON o.pick_id = p.pick_id
+                  WHERE p.plan_date IN ({marks})
+                    AND COALESCE(p.setup_type, '') <> '{_RUNNER}'"""
+        picks = _q(con, sql.format(tag="p.hypothesis_id"), list(dates))
+        if not picks:   # a pre-v31 ledger has no hypothesis_id column
+            picks = _q(con, sql.format(tag="NULL"), list(dates))
         g["picks"] = len(picks)
         g["pick_conviction"] = dict(Counter(p[0] for p in picks))
         sizes = [float(p[1]) for p in picks if p[1] is not None]
@@ -111,7 +136,11 @@ def collect(con: Any, sessions: int | None = 10) -> dict[str, dict]:
         lanes = Counter(p[2] for p in picks)
         g["daily_floor_picks"] = lanes.get("daily_floor", 0)
         g["coverage_picks"] = lanes.get("coverage", 0)
+        g["hypothesis_lane_picks"] = lanes.get("hypothesis", 0)
+        g["hypothesis_tagged_picks"] = sum(1 for p in picks if p[5])
+        g["picks_ex_hypothesis_lane"] = len(picks) - g["hypothesis_lane_picks"]
         g["triggered"] = sum(1 for p in picks if p[3])
+        g["triggered_ex_hypothesis_lane"] = sum(1 for p in picks if p[3] and p[2] != "hypothesis")
         with_picks = {p[4] for p in picks}
         g["taken_days"] = sum(1 for d in dates if d in with_picks)
         g["no_trade_days"] = sum(1 for d in dates if d not in with_picks)
@@ -133,7 +162,8 @@ def collect(con: Any, sessions: int | None = 10) -> dict[str, dict]:
     notes = dict(_q(con, "SELECT session_date, selection_skipped_reason FROM runner_sessions"))
     runner_by_group: dict[str, list] = {}
     for d in set(cands) | set(notes):
-        runner_by_group.setdefault(_label(stamps.get(d)), []).append(d)
+        if _on_or_after(d, since):
+            runner_by_group.setdefault(_label(stamps.get(d)), []).append(d)
     for label, dates in runner_by_group.items():
         keep = _recent(dates, sessions)
         g = groups.setdefault(label, {})
@@ -161,10 +191,12 @@ def _per(n: int | None, d: int | None) -> str:
     return f"{(n or 0) / d:.2f}"
 
 
-def render_text(groups: dict[str, dict], sessions: int | None = 10) -> str:
+def render_text(groups: dict[str, dict], sessions: int | None = 10, since: Any = None) -> str:
     """Plain text for `run.py persona-monitor`. Counts and distributions only."""
     window = f"most recent {sessions} session(s) per group" if sessions else "all sessions"
-    out = ["PERSONA MONITOR (" + window + ")", "", HEADER, "", LIMITATION, ""]
+    if since:
+        window += f", on or after {since}"
+    out = ["PERSONA MONITOR (" + window + ")", "", HEADER, "", LIMITATION, "", HYPOTHESIS_NOTE, ""]
     if not groups:
         out.append("No sessions recorded yet.")
         return "\n".join(out)
@@ -182,6 +214,13 @@ def render_text(groups: dict[str, dict], sessions: int | None = 10) -> str:
                 f"  degraded sessions: {g.get('degraded_sessions', 0)}",
                 f"  picks: {g.get('picks', 0)}; triggered: {g.get('triggered', 0)}; "
                 f"triggered per session: {_per(g.get('triggered'), n)}",
+                f"  excluding the hypothesis lane: picks {g.get('picks_ex_hypothesis_lane', 0)} "
+                f"(per session {_per(g.get('picks_ex_hypothesis_lane'), n)}); triggered "
+                f"{g.get('triggered_ex_hypothesis_lane', 0)} (per session "
+                f"{_per(g.get('triggered_ex_hypothesis_lane'), n)})",
+                f"  hypothesis lane picks: {g.get('hypothesis_lane_picks', 0)}; picks tagged to "
+                f"an idea (any lane): {g.get('hypothesis_tagged_picks', 0)}; candidates tagged to "
+                f"an idea: {g.get('hypothesis_candidates', 0)}",
                 f"  daily_floor picks: {g.get('daily_floor_picks', 0)} "
                 f"(per session {_per(g.get('daily_floor_picks'), n)}); coverage picks: "
                 f"{g.get('coverage_picks', 0)} (per session {_per(g.get('coverage_picks'), n)})",

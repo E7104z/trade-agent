@@ -203,3 +203,26 @@ def test_a_flagged_no_trade_day_that_still_traded_counts_as_taken(con):
     g = persona_monitor.collect(con)["persona off"]
     assert g["taken_days"] == 1 and g["no_trade_days"] == 0
     assert g["no_trade_flag_days"] == 1 and g["stand_down_reasons"] == {}
+
+
+def test_monitor_counts_the_hypothesis_lane_apart_and_reads_a_baseline_window(con):
+    # The hypothesis lane went live with the persona: its trades and tagged
+    # candidates are shown apart, and the pick count is also given without it.
+    analyst = {"candidates": [{"ticker": "AAA", "conviction": 3},
+                              {"ticker": "BBB", "conviction": 2, "hypothesis_id": "H-1"}]}
+    ledger.save_daily_plan(con, date(2026, 10, 5), _plan(persona_version="1"), analyst, "chop")
+    pid = con.execute("SELECT pick_id FROM picks WHERE plan_date = ?", [date(2026, 10, 5)]).fetchone()[0]
+    con.execute("UPDATE picks SET exploration_lane = 'hypothesis', hypothesis_id = 'H-1' "
+                "WHERE pick_id = ?", [pid])
+    con.execute("INSERT INTO outcomes (pick_id, triggered, exit_reason) VALUES (?, TRUE, 'stop')", [pid])
+    ledger.save_daily_plan(con, date(2026, 9, 25), _plan(), {"candidates": []}, "chop")
+    on = persona_monitor.collect(con, None)["persona v1"]
+    assert on["hypothesis_lane_picks"] == 1 and on["picks_ex_hypothesis_lane"] == on["picks"] - 1
+    assert on["hypothesis_candidates"] == 1 and on["hypothesis_tagged_picks"] == 1
+    assert on["triggered_ex_hypothesis_lane"] == 0
+    # A pre-floor persona-off session drops out of a baseline read since the floor.
+    assert persona_monitor.collect(con, None)["persona off"]["sessions"] == 1
+    assert "persona off" not in persona_monitor.collect(con, None, since=persona_monitor.FLOOR_LIVE)
+    text = persona_monitor.render_text(persona_monitor.collect(con, None), None, since="2026-09-29")
+    _clean(text)
+    assert persona_monitor.HYPOTHESIS_NOTE in text and "excluding the hypothesis lane" in text

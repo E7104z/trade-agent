@@ -606,6 +606,9 @@ _QUERYABLE_TABLES = {
     # pre-registration and verdict) and the grader's per-trade notes on it.
     "trader_hypotheses": "opened_at",
     "hypothesis_reviews": "session_date",
+    # EDGE_ACCELERATION_SPEC_v1: the evening self-check, one row per check
+    # per session (the production questions no one had to paste for).
+    "self_checks": "session_date",
     # Not date-filterable, but ordered newest-first (see _TABLE_ORDER) so
     # ?limit=N returns the latest: a lost weekly rewrite is recovered from
     # llm_archive, and every playbook the miner ever wrote is in

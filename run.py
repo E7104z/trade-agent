@@ -959,6 +959,9 @@ def main() -> None:
         help="persona on/off sessions: counts and distributions only (read-only, zero API cost)")
     p_pmon.add_argument("--sessions", type=int, default=10,
                         help="most recent N sessions per group (0 = all; default 10)")
+    p_pmon.add_argument("--since", type=str, default=None,
+                        help="only sessions on or after YYYY-MM-DD (e.g. 2026-09-29, the "
+                             "daily floor going live, for a like-for-like baseline)")
 
     p_hyp = sub.add_parser(
         "hypotheses",
@@ -1042,7 +1045,8 @@ def main() -> None:
         con = ledger.connect()
         try:
             n = args.sessions or None
-            print(persona_monitor.render_text(persona_monitor.collect(con, n), n))
+            print(persona_monitor.render_text(
+                persona_monitor.collect(con, n, since=args.since), n, since=args.since))
         finally:
             con.close()
     elif args.cmd == "hypotheses":

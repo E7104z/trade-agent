@@ -430,6 +430,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v31.STATEMENTS
 from . import migrations_v32  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v32.STATEMENTS
 
+# --- v33 the evening self-check (EDGE_ACCELERATION_SPEC_v1 Part 3) ----------
+from . import migrations_v33  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v33.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the

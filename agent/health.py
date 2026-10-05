@@ -281,6 +281,20 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
                                  f"Playbook mined {age} day(s) ago ({last_ok['run_date']})",
                                  detail, last=last_ok))
 
+    # --- the evening self-check (EDGE_ACCELERATION_SPEC_v1 Part 3) --------
+    try:
+        from .selfcheck import latest as _selfcheck_latest
+        sc = _selfcheck_latest(con)
+    except Exception:  # noqa: BLE001
+        sc = {}
+    if sc:
+        sc_status = sc["worst"] if sc["worst"] in ("bad", "warn") else "ok"
+        stages.append(_stage(
+            "selfcheck", "Self-check", sc_status,
+            (f"{len(sc['flagged'])} finding(s) on {sc['session_date']}" if sc["flagged"]
+             else f"All checks clean on {sc['session_date']}"),
+            " | ".join(sc["flagged"])[:1500]))
+
     # --- wedged locks -----------------------------------------------------
     from .ledger import STALE_LOCK_MINUTES
     stale = _q(con, f"""SELECT trading_date, run_type FROM run_locks
