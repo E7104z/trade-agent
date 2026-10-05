@@ -249,3 +249,16 @@ Where the build differs from the draft above:
 8. **The morning email** labels each test trade with the idea it tests and prints any idea written down that morning with its refutation. The evening email ends with the notebook's counts. The weekly email carries the verdicts.
 
 Shipping: the deploy carries migration v31, so warm the schema right after `vercel --prod` and before the 10:45 UTC morning cron (load the logged-in dashboard, or run `scripts\intraday_cron.ps1 -Once`).
+
+## Revised 2026-10-04 (before any idea was judged): verdicts spend one budget across looks
+
+The two-look schedule above (n = 8 and 16 at α/2, REFUTED on a mean ≤ 0 at the first look) is replaced by `agent/sequential.py` (specs/EDGE_ACCELERATION_SPEC_v1.md Part 1). Simulated, the old schedule supported a real +0.5R idea about one time in five, and it refuted a real +0.3R idea about a third of the time on its first eight sessions alone.
+
+How verdicts work now:
+- The first look comes at `target_n` (8) sessions with a valid test, and after that one look a week as tests accrue.
+- Every look spends part of one one-sided budget of 0.025 over a 96-session horizon.
+- An idea is SUPPORTED when it is significant after cohort BH, and REFUTED when its 80% upper bound rules out +0.10R or the budget is spent. Otherwise it keeps collecting.
+
+The change was made before any idea had been looked at, so it moves no goalpost. Rows registered under the old schedule (max_n = 16) are judged over the new horizon.
+
+Throughput was raised so ideas actually reach their looks: `hypothesis_lane.max_picks` 2 → 4, `max_open` 6 → 8, and the broker cap 22 → 24.

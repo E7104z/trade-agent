@@ -40,9 +40,9 @@
     "enabled": true,
     "size_r": 0.25,
     "min_rr": 1.0,
-    "max_picks": 2,
+    "max_picks": 4,
     "max_new_per_day": 1,
-    "max_open": 6,
+    "max_open": 8,
     "blocking_kills": ["grounding", "entry_type", "event_risk", "hypothesis_fit"]
   },
   "slippage_bps": 5,
@@ -53,7 +53,7 @@
     "alpaca_paper": true,
     "breakout_two_step": false,
     "trading_base": "https://paper-api.alpaca.markets",
-    "max_picks_per_day": 22,
+    "max_picks_per_day": 24,
     "intraday_check_secret_env": "CRON_SECRET"
   },
   "min_bar_volume": 0,
