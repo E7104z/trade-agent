@@ -404,3 +404,44 @@ def test_weekly_block_reports_decay_as_applied_fact(con, monkeypatch):
     blk = integrity.weekly_block(con, Config(raw={}), ledger, date(2026, 8, 20))
     assert "DECAYED back to QUARANTINED" in blk["markdown"]
     assert rid in blk["markdown"]
+
+
+# ------------------------------------------- EDGE_ACCELERATION_SPEC_v1 Part 2
+
+def _survivors():
+    return [
+        Comparison("setup_type", "gap_go", 20, 0.3, 1.0, q_value=0.04, significant=True),
+        Comparison("setup_type", "breakout", 30, -0.4, 1.0, q_value=0.02, significant=True),
+        Comparison("stop_atr_bucket", "0.5-1", 15, 0.2, 1.1, q_value=0.4),            # not significant
+        Comparison("runner_rvol_bucket", "2-3", 40, 0.25, 1.2, q_value=0.06, significant=True),
+        Comparison("winrate:setup_type", "gap_go", 20, None, None, q_value=0.01, significant=True),
+        Comparison("drift:runner_rvol_bucket", "2-3", 40, 0.3, 1.0, q_value=0.01, significant=True),
+        Comparison("setup_type|stop_atr_bucket", "gap_go|0.5-1", 12, 0.5, 1.0, q_value=0.05,
+                   significant=True),
+    ]
+
+
+def test_every_batch_survivor_is_quarantined_by_the_system(con):
+    out = research.register_batch_survivors(con, date(2026, 10, 3), _survivors(), {})
+    cells = {r["cell"] for r in out}
+    assert cells == {"setup_type=gap_go", "setup_type=breakout", "runner_rvol_bucket=2-3",
+                     "setup_type=gap_go AND stop_atr_bucket=0.5-1"}
+    # smallest q first; losers too (a validated loser is an exclusion)
+    assert out[0]["cell"] == "setup_type=breakout"
+    states = {s["rule_id"]: s for s in research.rule_states(con)}
+    for r in out:
+        st = states[r["rule_id"]]
+        assert st["state"] == "QUARANTINED" and st["source"] == "system"
+        assert st["quarantined_at"] == "2026-10-03"
+    # the 1-D discovery numbers are the batch's own
+    gap = states[next(r["rule_id"] for r in out if r["cell"] == "setup_type=gap_go")]
+    assert gap["discovery_n"] == 20 and gap["discovery_q"] == 0.04
+
+
+def test_survivor_registration_is_idempotent_and_capped(con):
+    first = research.register_batch_survivors(con, date(2026, 10, 3), _survivors(), {}, max_new=2)
+    assert len(first) == 2
+    again = research.register_batch_survivors(con, date(2026, 10, 10), _survivors(), {})
+    assert len(again) == 2            # the two left over; the first two keep their clocks
+    assert {r["rule_id"] for r in first}.isdisjoint({r["rule_id"] for r in again})
+    assert research.register_batch_survivors(con, date(2026, 10, 17), _survivors(), {}) == []

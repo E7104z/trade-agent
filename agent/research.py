@@ -60,6 +60,7 @@ __all__ = [
     "canonical_predicate",
     "validate_predicate",
     "register_candidate",
+    "register_batch_survivors",
     "register_exit_policy_candidates",
     "exit_rule_predicate",
     "EXIT_LANE",
@@ -780,7 +781,8 @@ def discovery_stats(pred: dict, comparisons: Iterable[Any], rows: list[dict]) ->
 
 
 def register_candidate(con: Any, candidate: dict, session_date: date,
-                       comparisons: Iterable[Any], rows_by_lane: dict[str, list[dict]]) -> dict:
+                       comparisons: Iterable[Any], rows_by_lane: dict[str, list[dict]],
+                       source: str = "miner") -> dict:
     """Register one miner-nominated rule candidate, the system's way.
 
     The predicate is validated against the cells this run emitted, the
@@ -811,7 +813,7 @@ def register_candidate(con: Any, candidate: dict, session_date: date,
                 decay_count, last_observed_at)
                VALUES (?,?,?,?,?,?,?,0,NULL,NULL,NULL,NULL,NULL,?,0,0.0,0.0,?,NULL,NULL,0,NULL)""",
             [rid, statement, json.dumps(candidate.get("dimensions") or []),
-             len(candidate.get("dimensions") or []), rej_state, "miner", session_date,
+             len(candidate.get("dimensions") or []), rej_state, source, session_date,
              DEFAULT_FORWARD_N, " | ".join(x for x in (reason, audit) if x)[:1000]])
         return {"rule_id": rid, "state": rej_state, "created": True, "note": reason}
 
@@ -828,13 +830,79 @@ def register_candidate(con: Any, candidate: dict, session_date: date,
             quarantined_at, validated_at, retired_at, forward_n_required,
             forward_n, forward_sum_r, forward_sumsq_r, note, predicate_json, lane,
             decay_count, last_observed_at)
-           VALUES (?,?,?,?,'DISCOVERED','miner',?,?,?,?,NULL,NULL,NULL,?,0,0.0,0.0,?,?,?,0,NULL)""",
-        [rid, statement, json.dumps(dims), len(dims), session_date, int(disc["n"] or 0),
+           VALUES (?,?,?,?,'DISCOVERED',?,?,?,?,?,NULL,NULL,NULL,?,0,0.0,0.0,?,?,?,0,NULL)""",
+        [rid, statement, json.dumps(dims), len(dims), source, session_date, int(disc["n"] or 0),
          disc["effect"], disc["q"], DEFAULT_FORWARD_N,
          " | ".join(x for x in (disc["note"], audit) if x)[:1000],
          json.dumps(canon), canon["lane"]])
     state = advance_quarantine(con, rid, session_date)
     return {"rule_id": rid, "state": state, "created": True, "note": disc["note"]}
+
+
+# How many NEW rules the system may quarantine from one weekly batch. A budget
+# choice, not an edge claim: each quarantined rule is a forward test, and the
+# cohort correction at graduation gets stricter as the cohort grows.
+SYSTEM_MAX_NEW_PER_RUN = 12
+
+
+def register_batch_survivors(con: Any, session_date: date, comparisons: Iterable[Any],
+                             rows_by_lane: dict[str, list[dict]],
+                             max_new: int = SYSTEM_MAX_NEW_PER_RUN) -> list[dict]:
+    """Quarantine every mean-R cell that survived THIS run's FDR batch.
+
+    EDGE_ACCELERATION_SPEC_v1 Part 2. A cell that survives the corrected
+    batch is a computed fact, and until now it reached the forward test only
+    if the miner happened to nominate it in prose that week -- so a real
+    survivor could sit unvalidated forever on the strength of one LLM's
+    attention. The system now does what it already did for exit policies:
+    every surviving 1-D cell and admitted 2-D pair of the morning and runner
+    lanes is registered through `register_candidate` (predicate validated
+    against the cells emitted this run, discovery numbers from the batch)
+    and quarantined today. Losers are registered too: a validated losing cell
+    is an exclusion the desk can enforce.
+
+    Win-frequency, drift, population and selection-edge comparisons are not
+    cells a trade can be matched to and are skipped. Identity comes from the
+    predicate, so a cell already registered keeps its state and clock (a
+    RETIRED one stays in the graveyard). At most `max_new` new rules per run,
+    smallest q first.
+    """
+    from .structural import PAIR_SEP, _parse
+    comparisons = list(comparisons or [])
+    survivors = []
+    for c in comparisons:
+        if not getattr(c, "significant", False) or c.mean_r is None or c.mean_r == 0:
+            continue
+        parsed = _parse(str(c.dimension))
+        if not parsed:
+            continue
+        lane, dims = parsed
+        levels = str(c.level).split(PAIR_SEP) if len(dims) > 1 else [str(c.level)]
+        if len(levels) != len(dims) or any(lv in ("", "?") for lv in levels):
+            continue
+        survivors.append((c, lane, dims, levels))
+    survivors.sort(key=lambda t: (t[0].q_value if t[0].q_value is not None else 1.0,
+                                  -abs(t[0].mean_r)))
+    out: list[dict] = []
+    for c, lane, dims, levels in survivors:
+        if len(out) >= max_new:
+            break
+        cell = " AND ".join(f"{d_}={lv}" for d_, lv in zip(dims, levels))
+        unit = "unit" if lane == "runner" else "trade"
+        statement = (f"[system] {lane} cell {cell}: mean {c.mean_r:+.3f}R per {unit} over "
+                     f"n={c.n}, a survivor of the {session_date} FDR batch (q={c.q_value})")
+        pred = {"lane": lane, "conditions": [{"dimension": d_, "level": lv}
+                                             for d_, lv in zip(dims, levels)]}
+        reg = register_candidate(con, {"statement": statement, "predicate": pred},
+                                 session_date, comparisons, rows_by_lane, source="system")
+        if reg.get("created"):
+            out.append({"rule_id": reg["rule_id"], "state": reg["state"], "cell": cell,
+                        "lane": lane, "mean_r": c.mean_r, "n": c.n, "q": c.q_value})
+    if out:
+        from .util import log
+        log("research", f"system quarantined {len(out)} batch survivor(s): "
+                        + ", ".join(f"{r['rule_id']} {r['cell']}" for r in out))
+    return out
 
 
 # The first session whose runner evidence is counted in (session, industry)

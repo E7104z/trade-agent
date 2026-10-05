@@ -312,6 +312,14 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         "integrity", "exit-policy quarantine",
         lambda: research.register_exit_policy_candidates(
             con, session_date, getattr(search, "comparisons", None) or []), [])
+    # EDGE_ACCELERATION_SPEC_v1 Part 2: every mean-R cell that survived this
+    # batch goes to the forward test now, nominated or not. Same footing as
+    # the exit policies above: a survivor is a computed fact.
+    system_registered = _safe(
+        "integrity", "batch-survivor quarantine",
+        lambda: research.register_batch_survivors(
+            con, session_date, getattr(search, "comparisons", None) or [],
+            getattr(search, "rows_by_lane", None) or {}), [])
 
     # Decay FIRST, in code (FORWARD_VALIDATION_SPEC_v1 Phase 4): a validated
     # rule gone silent for 30 market sessions returns to quarantine, a reversed
@@ -391,6 +399,7 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
                            lambda: research.counterfactual_summary(con), {})
     parts = [
         research.provenance_md(states, looks, counterfactual),
+        _system_registered_md(system_registered),
         _graduation_md(graduation),
         hyp_md,
         _cumulative_md(cumulative),
@@ -438,6 +447,7 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         "runner_exit_comps": exit_comps,
         "runner_expectancy_comps": expectancy_comps,
         "runner_exit_registered": exit_registered,
+        "system_registered": system_registered,
         "runner_drift_comps": drift_comps,
         "runner_drift_rows": len(drift_rows),
         "runner_drift_sessions": len({r.get("session_date") for r in drift_rows}),
@@ -454,6 +464,19 @@ def check_playbook(playbook_md: str, states: list[dict]) -> list[str]:
 # --------------------------------------------------------------------------
 # Rendering helpers
 # --------------------------------------------------------------------------
+
+def _system_registered_md(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    lines = [f"## QUARANTINED BY THE SYSTEM THIS RUN ({len(rows)} batch survivor(s))", ""]
+    for r in rows:
+        lines.append(f"- [{r['rule_id']}] {r['lane']}: {r['cell']} — mean {r['mean_r']:+.3f}R, "
+                     f"n={r['n']}, q={r['q']}")
+    lines += ["", "Each survived this run's FDR batch and is now in forward test. They are "
+              "QUARANTINED, not edge: do not cite them as rules. You need not nominate them "
+              "again as rule_candidates."]
+    return "\n".join(lines)
+
 
 def _graduation_md(g: dict) -> str:
     lines = ["## QUARANTINE DECISIONS THIS RUN (applied by the system)\n"]
