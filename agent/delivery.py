@@ -58,6 +58,8 @@ def morning_email_html(plan_date: date, plan: dict, regime_md: str) -> str:
             lane = p.get("exploration_lane")
             floor = floor or lane == "daily_floor"
             setup = p.get('setup_type', '') + (f" [{lane.replace('_', ' ')}]" if lane else "")
+            if p.get("hypothesis_id"):
+                setup += f" (tests {p['hypothesis_id']})"
             live_at = (" (live " + str(p["entry_not_before"]) + " ET)"
                        if p.get("entry_not_before") else "")
             rows.append(f"""
@@ -75,6 +77,19 @@ def morning_email_html(plan_date: date, plan: dict, regime_md: str) -> str:
             floor_note += (f"<p><b>{n_cov} coverage trade{'s' if n_cov != 1 else ''}:</b> setups the "
                            "risk manager rejected, traded at minimum size so every strategy the "
                            "analyst found is tested today.</p>")
+        # TRADER_HYPOTHESIS_SPEC_v1: the trader's own ideas, tested at minimum
+        # size, and any idea written down this morning. Absent when the lane
+        # is off (no pick carries the label and the plan has no notebook).
+        n_hyp = sum(1 for p in plan.get("picks", []) if p.get("exploration_lane") == "hypothesis")
+        if n_hyp:
+            floor_note += (f"<p><b>{n_hyp} hypothesis test{'s' if n_hyp != 1 else ''}:</b> the "
+                           "trader testing its own written-down ideas at minimum size; the "
+                           "system judges each idea at a sample fixed in advance.</p>")
+        for o in (plan.get("hypotheses") or {}).get("opened") or []:
+            import html as _html
+            floor_note += (f"<p><b>New idea written down — {_html.escape(str(o['hyp_id']))}:</b> "
+                           f"{_html.escape(str(o['statement']))} <i>Wrong if: "
+                           f"{_html.escape(str(o['refutation']))}</i></p>")
         picks_html = floor_note + f"""
         <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:monospace;font-size:13px">
           <tr style="background:#eee"><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th><th>Stop</th>
@@ -179,6 +194,11 @@ def weekly_email_html(result: dict, violations: list[dict] | None = None) -> str
             f"{v.get('action')}] {_html.escape(str(v.get('message') or '')[:220])}</li>"
             for v in violations[:5])
         viol_html = f"<h3>Write-time integrity</h3><p>{head}</p><ul>{items}</ul>"
+    if result.get("hypotheses_md"):
+        # TRADER_HYPOTHESIS_SPEC_v1: the week's verdicts on the trader's own
+        # ideas, as the system applied them. Absent, the email is unchanged.
+        from .hypotheses import weekly_html
+        viol_html += weekly_html(result["hypotheses_md"])
     return f"""
     <html><body style="font-family:sans-serif">
       <h2>Trade Agent — Weekly Review</h2>

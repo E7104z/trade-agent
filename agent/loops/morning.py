@@ -13,7 +13,7 @@ import threading
 from collections import Counter
 from datetime import date
 
-from .. import ledger
+from .. import hypotheses, ledger
 from ..config import REPORTS_DIR, Config
 from ..delivery import morning_email_html, render_dashboard, send_email
 from ..failures import classify_failure, format_failure
@@ -652,7 +652,10 @@ def _attach_overlay_context(plan: dict, bundle: dict) -> None:
 
 _KILL_CHECK_ENUM = {"staleness", "chase", "entry_type", "grounding", "crowding",
                     "stop_quality", "rr", "regime_fit", "correlation", "event_risk",
-                    "conviction"}
+                    "conviction",
+                    # TRADER_HYPOTHESIS_SPEC_v1: the trade does not test the idea
+                    # it is tagged with. Named only when the hypothesis lane is on.
+                    "hypothesis_fit"}
 
 
 def _build_rejections(candidates: dict, plan: dict,
@@ -908,7 +911,7 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config,
 _FLOOR_KILL_RANK = {
     "rr": 0, "conviction": 0,
     "regime_fit": 1, "crowding": 1, "correlation": 1, "stop_quality": 1,
-    "chase": 1, "staleness": 1,
+    "chase": 1, "staleness": 1, "hypothesis_fit": 1,
     "event_risk": 2,
     "grounding": 3, "entry_type": 3,
 }
@@ -916,7 +919,7 @@ _FLOOR_KILL_RANK = {
 # Lanes that put a candidate the risk manager rejected on the tape anyway, at
 # minimum size, to test the setup (ledger.TEST_LANES). Such a pick keeps its
 # shadow row, so the shadow ledger still prices every kill.
-_TEST_LANES = frozenset({"coverage", "daily_floor"})
+_TEST_LANES = frozenset({"coverage", "daily_floor", "hypothesis"})
 
 
 def _normalize_floor_picks(plan: dict, cfg: Config) -> None:
@@ -1140,18 +1143,142 @@ def _coverage_prompt_text(cfg: Config) -> dict[str, str]:
     }
 
 
+def _hypothesis_tags_by_ticker(candidates: dict, tags: dict[str, str],
+                               plan: dict | None = None) -> dict[str, str]:
+    """ticker -> the hyp_id its candidate tests, for tags that resolve (an
+    open idea's id, or "new:k" for an idea registered this morning). The
+    first resolving tag for a ticker wins, as the first candidate does.
+
+    A candidate the risk manager killed on `hypothesis_fit` -- "this trade
+    does not test the idea" -- resolves to nothing: coverage may still trade
+    it as a setup, but it never counts as an observation of the idea."""
+    unfit = {str(r.get("ticker", "")).upper() for r in (plan or {}).get("rejected") or []
+             if str(r.get("primary_kill_check") or "").strip().lower() == "hypothesis_fit"}
+    out: dict[str, str] = {}
+    for c in candidates.get("candidates", []) or []:
+        t = str(c.get("ticker", "")).upper().strip()
+        hid = tags.get(str(c.get("hypothesis_id") or "").strip())
+        if t and hid and t not in out and t not in unfit:
+            out[t] = hid
+    return out
+
+
+def _stamp_hypotheses(plan: dict, by_ticker: dict[str, str]) -> None:
+    """Every pick carries the resolved idea its candidate was tagged with, or
+    nothing: a raw "new:0", or an id that did not resolve, never reaches the
+    ledger. Coverage, floor and exploration picks copy the analyst's
+    candidate wholesale, so this runs over every lane's picks."""
+    for p in plan.get("picks") or []:
+        hid = by_ticker.get(str(p.get("ticker", "")).upper())
+        if hid:
+            p["hypothesis_id"] = hid
+        else:
+            p.pop("hypothesis_id", None)
+
+
+def _run_hypothesis_lane(plan: dict, candidates: dict, cfg: Config, validate_one,
+                         hyp: dict | None) -> list[str]:
+    """The trader tests its own written-down ideas (TRADER_HYPOTHESIS_SPEC_v1).
+
+    1. Stamp: a pick already in the plan (an approval, a coverage or
+       exploration pick) whose candidate was tagged gets the resolved idea id
+       and no extra pick. An approved trade that expresses the idea is a valid
+       observation; R is in units of risk, so its size does not matter.
+    2. Drop a `novel` pick that tests no idea: the label exists only for one.
+    3. Admit: a tagged candidate the plan does not hold goes on at
+       `hypothesis_lane.size_r`, labeled `hypothesis`, unless its
+       primary_kill_check is in `blocking_kills` (a broken order, or
+       hypothesis_fit: it does not test the idea). Unfinished ideas first,
+       closest to a verdict first, then new ones. One test per idea per day:
+       several names on one tape are one observation. Up to `max_picks`, each
+       through validate_one; outside max_picks and the 3R total, like coverage.
+
+    Off, it only strips any tag a candidate copied onto a pick, so the plan is
+    exactly what it was before the lane existed.
+    """
+    lane = hypotheses.lane_cfg(cfg)
+    if not lane.get("enabled") or not hyp:
+        for p in plan.get("picks") or []:
+            p.pop("hypothesis_id", None)
+        return []
+    by_ticker = _hypothesis_tags_by_ticker(candidates, hyp.get("tags") or {}, plan)
+    _stamp_hypotheses(plan, by_ticker)
+    notes: list[str] = []
+    kept = []
+    for p in plan.get("picks") or []:
+        if str(p.get("setup_type") or "").strip().lower() == hypotheses.NOVEL_SETUP \
+                and not p.get("hypothesis_id"):
+            notes.append(f"hypothesis {p.get('ticker')}: setup `novel` tests no registered idea — dropped")
+            continue
+        kept.append(p)
+    if len(kept) != len(plan.get("picks") or []):
+        plan["picks"] = kept
+        plan["total_risk_r"] = round(sum(float(p.get("size_r") or 0) for p in kept), 2)
+    if not by_ticker:
+        return notes
+    size = float(lane.get("size_r", cfg.get("min_size_r", 0.25)))
+    blocked = frozenset(str(k).lower() for k in lane.get("blocking_kills") or ())
+    priority = hyp.get("priority") or {}
+    ranked = [p for p in _ranked_rejects(candidates, plan, hypotheses.LANE, size,
+                                         float(lane.get("min_rr", 1.0)), blocked)
+              if by_ticker.get(p["ticker"])]
+    # Stable: _ranked_rejects' softest-kill order holds within one priority.
+    ranked.sort(key=lambda p: priority.get(by_ticker[p["ticker"]], hypotheses.TARGET_N + 1))
+    used = {p.get("hypothesis_id") for p in plan.get("picks") or [] if p.get("hypothesis_id")}
+    admitted: list[dict] = []
+    for pick in ranked:
+        if len(admitted) >= int(lane.get("max_picks", 2)):
+            break
+        hid = by_ticker[pick["ticker"]]
+        if hid in used:
+            continue
+        pick["hypothesis_id"] = hid
+        trial, warnings = validate_one({"no_trade": False, "picks": [pick]})
+        notes += [f"hypothesis {pick['ticker']}: {w}" for w in warnings]
+        if trial.get("picks"):
+            admitted.append(trial["picks"][0])
+            used.add(hid)
+    if admitted:
+        _admit(plan, admitted)
+        plan["hypothesis_pick_count"] = len(admitted)
+        notes.append(f"HYPOTHESIS: {len(admitted)} idea(s) tested at {size}R: " + ", ".join(
+            f"{p['ticker']} -> {p['hypothesis_id']}" for p in admitted))
+    return notes
+
+
 def _run_test_lanes(plan: dict, candidates: dict, cfg: Config, md: MarketData,
                     bundle: dict, cand_quotes: dict[str, float],
-                    streak: dict | None, drawdown: dict | None) -> list[str]:
+                    streak: dict | None, drawdown: dict | None,
+                    hyp: dict | None = None) -> list[str]:
     """After validation: coverage (every setup found gets traded), then the
-    daily floor (the day is never empty). Both arms call this, so the paired
-    comparison is not confounded by one arm having the lanes and the other
-    not."""
+    trader's own hypothesis tests, then the daily floor (the day is never
+    empty). Both arms call this, so the paired comparison is not confounded
+    by one arm having the lanes and the other not. Coverage runs first so its
+    selection is exactly what it was before the hypothesis lane existed."""
     validate_one = _trial_validator(cfg, md, bundle, candidates, cand_quotes, streak, drawdown)
     notes = _run_coverage(plan, candidates, cfg, validate_one)
+    notes += _run_hypothesis_lane(plan, candidates, cfg, validate_one, hyp)
     if not plan.get("picks"):
         notes += _apply_daily_floor(plan, _floor_candidates(candidates, plan, cfg), validate_one)
+        if hypotheses.enabled(cfg) and hyp:
+            _stamp_hypotheses(plan, _hypothesis_tags_by_ticker(candidates, hyp.get("tags") or {}, plan))
+        else:
+            for p in plan.get("picks") or []:
+                p.pop("hypothesis_id", None)
     return notes
+
+
+def _hypothesis_plan(con, d: date, candidates: dict, cfg: Config) -> dict | None:
+    """hypotheses.plan_for_morning, or None when the lane is off or the
+    notebook cannot be read. Read-only: both paired arms call it; only arm A
+    commits what it decided (hypotheses.commit_morning)."""
+    if not hypotheses.enabled(cfg):
+        return None
+    try:
+        return hypotheses.plan_for_morning(con, d, candidates, cfg)
+    except Exception as e:  # noqa: BLE001 -- a notebook fault never costs the plan
+        log("morning", f"WARN hypothesis notebook unavailable; lane skipped: {e}")
+        return None
 
 
 def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: str,
@@ -1204,7 +1331,8 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
                 earnings_map=_grounded_earnings(md2, p, bundle),
                 session_health={**_bundle_health(md2, bundle), **armb_health})
             warnings += _run_test_lanes(p, armb_cands, cfg, md2, bundle, armb_quotes,
-                                        streak, drawdown)
+                                        streak, drawdown,
+                                        hyp=_hypothesis_plan(con2, d, armb_cands, cfg))
             return p, warnings
 
         return paired_mod.run_challenger_arm(
@@ -1336,7 +1464,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # 4. build prompts
         persona_stamp = persona_version(cfg)
         analyst_system = load_prompt("morning_analyst", {
-            **_coverage_prompt_text(cfg), "PERSONA": persona_block(cfg, "analyst")})
+            **_coverage_prompt_text(cfg), **hypotheses.analyst_prompt_text(cfg),
+            "PERSONA": persona_block(cfg, "analyst")})
         user_block = (
             f"# TODAY: {d.isoformat()} ({d.strftime('%A')})\n\n"
             f"## MARKET DATA\n\n{bundle_md}\n\n"
@@ -1383,6 +1512,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             "FLOOR_SIZE_R": str((cfg.get("daily_floor", {}) or {}).get(
                 "size_r", cfg.get("min_size_r", 0.25))),
             **_coverage_prompt_text(cfg),
+            **hypotheses.risk_prompt_text(cfg),
             "PERSONA": persona_block(cfg, "risk"),
         })
 
@@ -1461,8 +1591,12 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             session_health=session_health)
         plan["validator_drop_count"] = max(
             0, plan["validator_proposed_count"] - len(plan.get("picks", []) or []))
+        # TRADER_HYPOTHESIS_SPEC_v1: what each of the analyst's tags resolves
+        # to, decided read-only here and committed below (arm A only, never
+        # under mock) before the plan is saved.
+        hyp_plan = _hypothesis_plan(con, d, candidates, cfg)
         warnings += _run_test_lanes(plan, candidates, cfg, md, bundle, cand_quotes,
-                                    streak, drawdown)
+                                    streak, drawdown, hyp=hyp_plan)
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = reg.get("tag", "")
@@ -1495,6 +1629,18 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             str(cfg.get("morning_entry_not_before", MORNING_ENTRY_NOT_BEFORE) or ""))
         plan["persisted_rejection_count"] = len(rejections)
         plan["no_trade_category"] = _no_trade_category(plan, rejections)
+        if hyp_plan:
+            try:
+                committed = hypotheses.commit_morning(con, d, hyp_plan, plan)
+                plan["hypotheses"] = committed
+                if any(committed.values()):
+                    log("morning", f"HYPOTHESES: opened {committed['created'] or 'none'}, "
+                                   f"tested {committed['tested'] or 'none'}, "
+                                   f"abandoned {committed['abandoned'] or 'none'}")
+            except Exception as e:  # noqa: BLE001 -- the notebook never costs the plan
+                log("morning", f"WARN hypothesis notebook commit failed; plan unaffected: {e}")
+                for p in plan.get("picks") or []:
+                    p.pop("hypothesis_id", None)
         pick_ids = ledger.save_daily_plan(con, d, plan, candidates, reg.get("tag", ""))
         ledger.append_plan_run(con, d, "morning", lock["request_id"], plan)
         n_rej = ledger.save_rejections(con, d, rejections)

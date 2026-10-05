@@ -67,6 +67,19 @@ _DEFAULTS: dict[str, Any] = {
         "max_picks": 12,
         "blocking_kills": ["grounding", "entry_type", "event_risk"],
     },
+    # TRADER_HYPOTHESIS_SPEC_v1: the trader writes its own ideas down and
+    # tests them at minimum size; the system judges them at a pre-registered
+    # sample. max_picks / max_new_per_day / max_open are budget choices, not
+    # edge claims. hypothesis_fit = "this trade does not test the idea".
+    "hypothesis_lane": {
+        "enabled": False,
+        "size_r": 0.25,
+        "min_rr": 1.0,
+        "max_picks": 2,
+        "max_new_per_day": 1,
+        "max_open": 6,
+        "blocking_kills": ["grounding", "entry_type", "event_risk", "hypothesis_fit"],
+    },
     "max_entry_ref_distance_pct": 15.0,  # entry further than this from last price = ungrounded, dropped
     "atr_gate": "warn",         # "warn" | "enforce" -- noise-stop gate rollout switch, default warn-only
     "earnings_gate": "warn",    # "warn" | "enforce" -- binary-event gate rollout switch, default warn-only

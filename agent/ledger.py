@@ -422,6 +422,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v29.STATEMENTS
 from . import migrations_v30  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v30.STATEMENTS
 
+# --- v31 the trader's hypothesis notebook (TRADER_HYPOTHESIS_SPEC_v1) -------
+from . import migrations_v31  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v31.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -640,8 +644,8 @@ def save_daily_plan(
                 size_r, entry_type, entry_price, stop_price, target_price, target2_price,
                 time_stop, invalidation, regime_tag, prompt_version, playbook_version,
                     in_scan_universe, exploration_lane, exploration_rr, probe_for,
-                    entry_not_before, persona_version)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    entry_not_before, persona_version, hypothesis_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                RETURNING pick_id""",
             [
                 plan_date,
@@ -668,6 +672,9 @@ def save_daily_plan(
                 p.get("probe_for"),
                 p.get("entry_not_before"),
                 plan.get("persona_version"),
+                # v31: the idea this pick tests, stamped by the morning loop
+                # before any outcome exists (agent/hypotheses.py).
+                p.get("hypothesis_id"),
             ],
         ).fetchone()
         ids.append(row[0])
@@ -1392,9 +1399,10 @@ def equity_curve(con: duckdb.DuckDBPyConnection, account_size: float, dollars_pe
 
 
 # Lanes that trade a setup to TEST it, not because the desk's judgment chose
-# it: every valid candidate the risk manager rejected (coverage), and the
-# one-a-day minimum (daily_floor). Both go on at minimum size.
-TEST_LANES = ("coverage", "daily_floor")
+# it: every valid candidate the risk manager rejected (coverage), the
+# one-a-day minimum (daily_floor), and the trader's own written-down ideas
+# (hypothesis, TRADER_HYPOTHESIS_SPEC_v1). All go on at minimum size.
+TEST_LANES = ("coverage", "daily_floor", "hypothesis")
 
 
 def judgment_clause(alias: str = "p") -> str:

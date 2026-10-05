@@ -248,6 +248,19 @@ def build_morning_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
         backlog_md = morning_block(backlog_items,
                                    persona=persona_version(cfg) is not None) + "\n\n"
 
+    # TRADER_HYPOTHESIS_SPEC_v1: the trader's own notebook -- open ideas as
+    # counts, judged ideas with their registered verdicts. Empty when the
+    # lane is off, so the memory text is exactly what it was before.
+    notebook_md, hypothesis_ids = "", []
+    try:
+        from . import hypotheses
+        if hypotheses.enabled(cfg):
+            from .util import today_et
+            notebook_md, hypothesis_ids = hypotheses.notebook_md(con, today_et(), cfg)
+            notebook_md += "\n\n"
+    except Exception:  # noqa: BLE001 -- the notebook never costs the morning
+        notebook_md, hypothesis_ids = "", []
+
     text = f"""## YOUR PLAYBOOK (v{version} — your accumulated, evidence-backed rules)
 
 {playbook}
@@ -272,12 +285,13 @@ def build_morning_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:
 
 {_regime_block(regimes)}
 
-{backlog_md}## SELF-AWARENESS CHECK (computed from your ledger — obey these)
+{backlog_md}{notebook_md}## SELF-AWARENESS CHECK (computed from your ledger — obey these)
 
 {_self_awareness(con, cfg)}
 """
     return {"text": text, "playbook_version": version,
-            "backlog_ids": [i["item_id"] for i in backlog_items]}
+            "backlog_ids": [i["item_id"] for i in backlog_items],
+            "hypothesis_ids": hypothesis_ids}
 
 
 def build_weekly_memory(con: duckdb.DuckDBPyConnection, cfg: Config) -> dict:

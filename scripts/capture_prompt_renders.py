@@ -26,14 +26,22 @@ _COVERAGE_ANALYST = (" The desk trades every candidate that is a valid order: th
                      " approvals at full size, the rest at minimum size as coverage.")
 _COVERAGE_SECTION = "# COVERAGE (every setup found gets tested)\n\nCoverage fixture text.\n\n"
 
+# TRADER_HYPOTHESIS_SPEC_v1: the hypothesis placeholders render as nothing
+# when the lane is off -- which is what the fixtures pin.
+_HYP_ANALYST_OFF = {"HYPOTHESIS_TAXONOMY": "", "HYPOTHESIS_SECTION": "",
+                    "HYPOTHESIS_FIELD": "", "HYPOTHESIS_TOPLEVEL": ""}
+_HYP_RISK_OFF = {"HYPOTHESIS_KILL": "", "HYPOTHESIS_RISK": ""}
+_HYP_GRADER_OFF = {"HYPOTHESIS_GRADER": "", "HYPOTHESIS_REVIEW_FIELD": "",
+                   "HYPOTHESIS_GRADER_FIELD": ""}
+
 RENDER_CASES: dict[str, dict[str, str]] = {
     "morning_analyst": {"COVERAGE_ANALYST": _COVERAGE_ANALYST,
-                        "COVERAGE_SECTION": _COVERAGE_SECTION},
+                        "COVERAGE_SECTION": _COVERAGE_SECTION, **_HYP_ANALYST_OFF},
     "morning_risk": {"MAX_PICKS": "4", "MIN_SIZE_R": "0.25", "MAX_SIZE_R": "1.5",
                      "MAX_TOTAL_RISK_R": "3.0", "FLOOR_SIZE_R": "0.25",
                      "COVERAGE_ANALYST": _COVERAGE_ANALYST,
-                     "COVERAGE_SECTION": _COVERAGE_SECTION},
-    "evening_grader": {},
+                     "COVERAGE_SECTION": _COVERAGE_SECTION, **_HYP_RISK_OFF},
+    "evening_grader": dict(_HYP_GRADER_OFF),
     "weekly_miner": {},
     "runner_selector": {"MAX_PICKS": "10", "MAX_PER_INDUSTRY": "2",
                         "REGIME_TAG": "uptrend/risk_on/lowvol",

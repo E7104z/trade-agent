@@ -1543,7 +1543,8 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         log("weekly", f"Tokens ~${result.usage['cost_usd']:.3f}")
 
         send_email(cfg, f"Trade Agent — Weekly Review {d.isoformat()}",
-                   weekly_email_html(mined, violation_rows))
+                   weekly_email_html({**mined, "hypotheses_md": research_block.get("hypotheses_md")},
+                                     violation_rows))
         render_dashboard(con, cfg, None)
 
     except Exception as e:

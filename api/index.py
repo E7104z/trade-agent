@@ -602,6 +602,10 @@ _QUERYABLE_TABLES = {
     # TRADERS_LOG_SPEC_v1: the owner's daily log, browsable here. The agent
     # never reads it (tests/test_traders_log_firewall.py).
     "traders_log": "session_date",
+    # TRADER_HYPOTHESIS_SPEC_v1: the trader's notebook (every idea, its frozen
+    # pre-registration and verdict) and the grader's per-trade notes on it.
+    "trader_hypotheses": "opened_at",
+    "hypothesis_reviews": "session_date",
     # Not date-filterable, but ordered newest-first (see _TABLE_ORDER) so
     # ?limit=N returns the latest: a lost weekly rewrite is recovered from
     # llm_archive, and every playbook the miner ever wrote is in

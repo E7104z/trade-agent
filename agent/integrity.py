@@ -321,6 +321,15 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
     graduation = {**graduation,
                   "decayed": decay.get("decayed", []),
                   "failed": list(graduation.get("failed", [])) + list(decay.get("retired", []))}
+    # TRADER_HYPOTHESIS_SPEC_v1: the trader's own ideas are judged here, in
+    # code, at their pre-registered looks. A SUPPORTED idea with a predicate
+    # is quarantined as a rule, so it runs BEFORE `states` is read: the miner
+    # is shown the registry including it.
+    from . import hypotheses
+    hyp_result = _safe("integrity", "hypothesis verdicts",
+                       lambda: hypotheses.evaluate(con, session_date), {})
+    hyp_md = _safe("integrity", "hypothesis markdown",
+                   lambda: hypotheses.weekly_md(hyp_result or {}, con), "")
     states = _safe("integrity", "rule states", lambda: research.rule_states(con), [])
     cumulative = _safe("integrity", "looks summary", lambda: research.looks_summary(con), {})
 
@@ -378,6 +387,7 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
     parts = [
         research.provenance_md(states, looks, counterfactual),
         _graduation_md(graduation),
+        hyp_md,
         _cumulative_md(cumulative),
         population.population_md(pop),
         ablation.ablation_md(abl),
@@ -411,6 +421,8 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         "search": search,
         "looks": looks,
         "graduation": graduation,
+        "hypotheses": hyp_result,
+        "hypotheses_md": hyp_md,
         "population": pop,
         "ablation": abl,
         "paired": paired_cmp,

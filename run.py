@@ -960,6 +960,12 @@ def main() -> None:
     p_pmon.add_argument("--sessions", type=int, default=10,
                         help="most recent N sessions per group (0 = all; default 10)")
 
+    p_hyp = sub.add_parser(
+        "hypotheses",
+        help="the trader's hypothesis notebook: every idea, its count and verdict (read-only)")
+    p_hyp.add_argument("--show", type=str, default=None,
+                       help="one idea (H-...): its pre-registration, verdict and tagged trades")
+
     p_research = sub.add_parser("research", help="research integrity report (selection ablation + population baseline, zero API cost)")
     p_research.add_argument("--full", action="store_true", help="also render the full weekly research block (FDR looks, quarantine, paired arms)")
 
@@ -1037,6 +1043,13 @@ def main() -> None:
         try:
             n = args.sessions or None
             print(persona_monitor.render_text(persona_monitor.collect(con, n), n))
+        finally:
+            con.close()
+    elif args.cmd == "hypotheses":
+        from agent import hypotheses
+        con = ledger.connect()
+        try:
+            print(hypotheses.render_text(con, run_date or today_et(), args.show))
         finally:
             con.close()
     elif args.cmd == "runner-status":

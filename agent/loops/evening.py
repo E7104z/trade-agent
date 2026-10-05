@@ -1211,7 +1211,19 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             for l in lessons_now
         ) or "(lesson bank empty)"
 
-        system = load_prompt("evening_grader", {"PERSONA": persona_block(cfg, "grader")})
+        # TRADER_HYPOTHESIS_SPEC_v1: the grader reviews each tagged trade and
+        # may write an anecdote down as an idea to test. Off, every
+        # placeholder renders as nothing and the prompt is unchanged.
+        from .. import hypotheses
+        hyp_on = hypotheses.enabled(cfg)
+        hyp_md = ""
+        if hyp_on:
+            try:
+                hyp_md = hypotheses.grader_block(con, picks)
+            except Exception as e:  # noqa: BLE001
+                log("evening", f"WARN hypothesis block unavailable: {e}")
+        system = load_prompt("evening_grader", {"PERSONA": persona_block(cfg, "grader"),
+                                                **hypotheses.grader_prompt_text(cfg)})
         shadow_md = (f"{shadow['scored']} rejected candidates scored; net forgone "
                      f"{shadow['net_forgone_r']:+.2f}R today (positive = filters cost us)")
         user = (
@@ -1240,7 +1252,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             + (f"{_runner_grader_block(con, d)}\n\n" if runner_summary.get("scored") else "")
             + f"## MARKET RECAP TODAY\n\n{recap_md or '(recap unavailable)'}\n\n"
             + f"## ACTIVE LESSONS (for confirm/contradict updates — use these IDs)\n\n{lessons_md}\n\n"
-            "Grade the day now, following the output contract exactly."
+            + (f"{hyp_md}\n\n" if hyp_md else "")
+            + "Grade the day now, following the output contract exactly."
         )
 
         model = cfg.models["evening"]
@@ -1322,6 +1335,18 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # v3: rule confirmations -- the one v3 event that needs the grader.
         # (Calibration and open-question progress were written before the call.)
         counts["confirmations"] = _llm_events(con, d, picks, outcomes, review)
+
+        # TRADER_HYPOTHESIS_SPEC_v1: the grader's per-trade notes and the
+        # ideas it wrote down. Guarded: the notebook never costs the evening.
+        hyp_summary: dict = {}
+        if hyp_on:
+            try:
+                hyp_summary = hypotheses.record_evening(con, cfg, d, review, picks,
+                                                        corpus=f"{system}\n{user}")
+                stages["hypotheses"] = {k: (len(v) if isinstance(v, list) else v)
+                                        for k, v in hyp_summary.items()}
+            except Exception as e:  # noqa: BLE001
+                log("evening", f"WARN hypothesis notebook update failed: {e}")
         _mark("persist")
 
         ledger.log_run(con, "evening", d, started, "degraded" if plumbing_bad else "ok",
@@ -1376,10 +1401,17 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             except Exception as e:  # noqa: BLE001 -- the log never breaks the evening
                 log("evening", f"WARN trader's log failed; the evening is unaffected: {e}")
 
+        hyp_txt = ""
+        if hyp_on:
+            try:
+                hyp_txt = hypotheses.evening_text(con, d, hyp_summary)
+            except Exception as e:  # noqa: BLE001
+                log("evening", f"WARN hypothesis summary failed: {e}")
         send_email(cfg, f"Trade Agent — Evening Review {d.isoformat()}",
                    evening_email_html(d, review, out_md + (
                        f"\n\nCOMPUTED TAPE\n{tape_md}" if tape_md else "") + (
-                       f"\n\n{digest_txt}" if digest_txt else ""), **email_log))
+                       f"\n\n{digest_txt}" if digest_txt else "") + (
+                       f"\n\n{hyp_txt}" if hyp_txt else ""), **email_log))
         render_dashboard(con, cfg, d)
         ledger.finish_run_lock(con, d, "evening", lock["request_id"], "complete")
 
