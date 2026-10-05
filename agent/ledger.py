@@ -434,6 +434,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v32.STATEMENTS
 from . import migrations_v33  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v33.STATEMENTS
 
+# --- v34 the gap field: every liquid gapper, both arms (EDGE_ACCELERATION) --
+from . import migrations_v34  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v34.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the

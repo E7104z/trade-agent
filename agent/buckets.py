@@ -266,7 +266,14 @@ RUNNER_STOP_ATR_COARSE = {"<0.15": "<0.5", "0.15-0.3": "<0.5", "0.3-0.5": "<0.5"
 
 # ------------------------------------------------------------------- unified
 
-LANES = ("morning", "runner")
+LANES = ("morning", "runner", "gapfield")
+
+
+def _gapfield_dims() -> tuple[str, ...]:
+    # The gap field's dimensions are declared in agent/gapfield.py, next to the
+    # rows they label (EDGE_ACCELERATION_SPEC_v1 Part 4).
+    from .gapfield import DIMS, STRATEGY_DIM
+    return (STRATEGY_DIM,) + tuple(DIMS)
 
 
 def dimensions(lane: str) -> tuple[str, ...]:
@@ -274,6 +281,8 @@ def dimensions(lane: str) -> tuple[str, ...]:
         return tuple(MORNING_DIMS)
     if lane == "runner":
         return RUNNER_DIMS
+    if lane == "gapfield":
+        return _gapfield_dims()
     return ()
 
 
@@ -285,4 +294,7 @@ def label(lane: str, dimension: str, row: dict) -> str:
         return _morning_label(dimension, row)
     if lane == "runner" and dimension in RUNNER_DIMS:
         return runner_label(dimension, row)
+    if lane == "gapfield" and dimension in _gapfield_dims():
+        from .gapfield import label as _gapfield_label
+        return _gapfield_label(dimension, row)
     return "?"

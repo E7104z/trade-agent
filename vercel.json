@@ -31,6 +31,10 @@
     {
       "path": "/cron/weekly",
       "schedule": "0 14 * * 6"
+    },
+    {
+      "path": "/cron/nightly",
+      "schedule": "0 3 * * *"
     }
   ]
 }

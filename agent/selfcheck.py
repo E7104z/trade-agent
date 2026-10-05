@@ -324,6 +324,38 @@ def check_persona(con: Any, cfg: Any, d: date) -> dict:
                                       for k, v in groups.items()})
 
 
+def check_gapfield(con: Any, cfg: Any, d: date) -> dict:
+    """Is the nightly job pricing each session, and how far is the history?"""
+    from . import gapfield
+    from .util import prev_market_day
+    st = gapfield.status(con)
+    job = st.get("job") or {}
+    fwd = st.get("forward") or {}
+    if not job and not fwd:
+        return _res("info", "the nightly job has not run yet (it prices the gap field after "
+                            "each close and fills ~2 years of history over a few nights)")
+    last = _as_date(fwd.get("last"))
+    # The nightly prices session d after the evening runs, so by this evening
+    # the newest forward session should be the previous one.
+    expect = prev_market_day(d)
+    status = "ok"
+    parts = []
+    if fwd:
+        parts.append(f"forward {fwd['rows']} rows over {fwd['sessions']} session(s), last {last}")
+    if job:
+        parts.append("history complete" if job.get("finished_at") else
+                     f"history {job.get('next_index')}/{job.get('n_symbols')} symbols")
+    if (st.get("backfill") or {}).get("rows"):
+        parts.append(f"{st['backfill']['rows']} backfilled rows over "
+                     f"{st['backfill']['sessions']} sessions")
+    if last is not None and last < expect:
+        status = "warn"
+        parts.insert(0, f"no forward gap field since {last} (expected {expect}): is the "
+                        "nightly cron running?")
+    return _res(status, "; ".join(parts), forward=fwd, job={k: str(v) for k, v in job.items()},
+                backfill=st.get("backfill") or {})
+
+
 CHECKS: tuple[tuple[str, str, Callable[[Any, Any, date], dict]], ...] = (
     ("plumbing", "Data collected today", check_plumbing),
     ("lanes", "Lanes and broker cap", check_lanes),
@@ -331,6 +363,7 @@ CHECKS: tuple[tuple[str, str, Callable[[Any, Any, date], dict]], ...] = (
     ("hypotheses", "Hypothesis notebook", check_hypotheses),
     ("lessons", "Lessons steering untested", check_lessons),
     ("edge_pipeline", "From data to edge", check_edge_pipeline),
+    ("gapfield", "Gap field (nightly)", check_gapfield),
     ("persona", "Persona check", check_persona),
 )
 

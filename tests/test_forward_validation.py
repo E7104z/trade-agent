@@ -278,10 +278,11 @@ def _decisions(monkeypatch, states, p_adj, on=date(2026, 8, 30), futile=(), fina
     from agent import sequential
     monkeypatch.setattr(research, "rule_states", lambda con: [dict(s) for s in states])
 
-    def _look(n, mean, std, direction, spent_before, n_max=sequential.N_MAX):
+    def _look(n, mean, std, direction, spent_before, n_max=sequential.N_MAX, min_useful_r=None):
         rid = next(s["rule_id"] for s in states if s["forward_mean_r"] == mean and s["forward_n"] == n)
         return {"status": "looked", "design": sequential.DESIGN, "n": n, "n_max": n_max,
                 "info": 0.5, "spent_before": 0.0, "direction": direction,
+                "min_useful_r": min_useful_r or sequential.MIN_USEFUL_R,
                 "alpha_look": 0.01, "spent": 0.01, "p": p_adj[rid] * 0.4,
                 "p_adj": p_adj[rid], "upper": 0.5, "futile": rid in futile,
                 "reversed": False, "final": rid in final}
@@ -438,10 +439,14 @@ def test_every_batch_survivor_is_quarantined_by_the_system(con):
     assert gap["discovery_n"] == 20 and gap["discovery_q"] == 0.04
 
 
-def test_survivor_registration_is_idempotent_and_capped(con):
+def test_survivor_registration_is_idempotent_and_capped_per_lane(con):
+    # Cap 2 PER LANE: the morning lane's three survivors yield its two smallest
+    # q; the runner lane's one survivor is not crowded out by them.
     first = research.register_batch_survivors(con, date(2026, 10, 3), _survivors(), {}, max_new=2)
-    assert len(first) == 2
+    assert sorted((r["lane"], r["cell"]) for r in first) == [
+        ("morning", "setup_type=breakout"), ("morning", "setup_type=gap_go"),
+        ("runner", "runner_rvol_bucket=2-3")]
     again = research.register_batch_survivors(con, date(2026, 10, 10), _survivors(), {})
-    assert len(again) == 2            # the two left over; the first two keep their clocks
+    assert [r["cell"] for r in again] == ["setup_type=gap_go AND stop_atr_bucket=0.5-1"]
     assert {r["rule_id"] for r in first}.isdisjoint({r["rule_id"] for r in again})
     assert research.register_batch_survivors(con, date(2026, 10, 17), _survivors(), {}) == []

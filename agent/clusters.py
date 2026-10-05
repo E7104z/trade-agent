@@ -52,11 +52,17 @@ def units(rows: Iterable[dict], value: Callable[[dict], Any]) -> dict[tuple, lis
     return out
 
 
+# Lanes whose rows are a FIELD (every instance the scan finds, many per
+# session), so a session's rows in one industry are one event. The gap field
+# joined the runner here (EDGE_ACCELERATION_SPEC_v1 Part 4).
+UNIT_LANES = ("runner", "gapfield")
+
+
 def unit_values(rows: Iterable[dict], value: Callable[[dict], Any],
                 lane: str = "runner") -> list[float]:
-    """One value per unit (the mean of its rows) for the runner lane; one per
+    """One value per unit (the mean of its rows) for a field lane; one per
     row for any other lane."""
-    if lane != "runner":
+    if lane not in UNIT_LANES:
         vals = (value(r) for r in rows)
         return [float(v) for v in vals if v is not None]
     return [sum(v) / len(v) for v in units(rows, value).values()]
@@ -65,6 +71,6 @@ def unit_values(rows: Iterable[dict], value: Callable[[dict], Any],
 def unit_count(rows: Iterable[dict], lane: str = "runner") -> int:
     """How many independent observations `rows` are."""
     rows = list(rows)
-    if lane != "runner":
+    if lane not in UNIT_LANES:
         return len(rows)
     return len({unit_key(r) for r in rows})

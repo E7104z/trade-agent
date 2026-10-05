@@ -852,6 +852,17 @@ def main() -> None:
     p_weekly = sub.add_parser("weekly", help="mine the ledger and rewrite the playbook")
     add_common(p_weekly)
 
+    p_nightly = sub.add_parser(
+        "nightly", help="the nightly research job: price the gap field's forward session(s), "
+                        "advance its history backfill, refresh its cells (no LLM, no orders)")
+    add_common(p_nightly)
+    p_nightly.add_argument("--budget", type=float, default=300.0,
+                           help="seconds to spend (default 300, the function budget)")
+
+    p_gf = sub.add_parser("gapfield", help="the gap field: backfill progress, rows and its "
+                                           "strongest cells (read-only)")
+    p_gf.add_argument("--top", type=int, default=15, help="cells to list, by |t| (default 15)")
+
     sub.add_parser("dashboard", help="regenerate the HTML dashboard")
     sub.add_parser("status", help="print ledger and performance snapshot")
     sub.add_parser("init", help="initialize directories, DB, credentials template")
@@ -1014,6 +1025,17 @@ def main() -> None:
     elif args.cmd == "weekly":
         from agent.loops import weekly
         weekly.run(cfg, run_date)
+    elif args.cmd == "nightly":
+        import json as _json
+        from agent.loops import nightly
+        print(_json.dumps(nightly.run(cfg, run_date, budget_s=args.budget), indent=2, default=str))
+    elif args.cmd == "gapfield":
+        from agent import gapfield
+        con = ledger.connect()
+        try:
+            print(gapfield.report_text(con, args.top))
+        finally:
+            con.close()
     elif args.cmd == "runner":
         cmd_runner(cfg, args)
     elif args.cmd == "runner-exits":

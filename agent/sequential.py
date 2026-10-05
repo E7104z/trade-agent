@@ -50,6 +50,24 @@ after the ten-day quarantine):
       false positive                            1.5%            0.3%
       true edge +0.5R supported                  21%             76%
 
+FIELD LANES
+-----------
+The runner and the gap field price EVERY instance their scan finds, so a rule
+there gathers 5-20 (session, industry) units a session, and the edges such a
+field can hold are small per trade but frequent (twenty fades a day at +0.1R
+is +2R a day). A 96-unit horizon with a +0.10R floor would retire exactly
+those. Field lanes therefore spend the same budget over FIELD_N_MAX units with
+a FIELD_MIN_USEFUL_R floor (simulated, ~8 units/session, unit sd 0.95):
+
+                                  96 / 0.10R      768 / 0.05R
+      false positive                 2.2%            0.7%
+      true edge +0.12R validated      22%             77%  (~50 sessions)
+      true edge +0.20R validated      52%             99%  (~30 sessions)
+      true edge +0.30R validated      86%            ~100% (~15 sessions)
+
+The design is fixed by lane in code (`design_for`), so it is pre-registered:
+no rule's horizon can move with its data.
+
 The forward-only guard, n >= 8 before any look, the ten-day quarantine floor,
 cohort FDR and the sign requirement are all unchanged. Nothing here is a
 number the LLM can move.
@@ -61,6 +79,7 @@ from typing import Any, Sequence
 
 __all__ = [
     "ALPHA", "N_MAX", "RHO", "FUTILITY_CONF", "MIN_USEFUL_R", "DESIGN",
+    "FIELD_LANES", "FIELD_N_MAX", "FIELD_MIN_USEFUL_R", "design_for",
     "spent_at", "p_one_sided", "t_quantile", "upper_bound", "look", "cohort",
     "describe",
 ]
@@ -71,6 +90,17 @@ RHO = 2.0              # spending shape: A(t) = ALPHA * t**RHO (back-loaded)
 FUTILITY_CONF = 0.80   # one-sided upper bound used to call a rule futile
 MIN_USEFUL_R = 0.10    # an edge below this is not worth trading after friction
 DESIGN = "spend-v1"    # stamped on every look, so a later design is never confused with this one
+
+FIELD_LANES = ("runner", "gapfield")
+FIELD_N_MAX = 768
+FIELD_MIN_USEFUL_R = 0.05
+
+
+def design_for(lane: str | None) -> tuple[int, float]:
+    """(horizon, futility floor) for a rule's lane, fixed in code."""
+    if lane in FIELD_LANES:
+        return FIELD_N_MAX, FIELD_MIN_USEFUL_R
+    return N_MAX, MIN_USEFUL_R
 
 _EPS = 1e-12
 
@@ -122,7 +152,8 @@ def upper_bound(mean: float | None, std: float | None, n: int | None,
 
 
 def look(n: int, mean: float | None, std: float | None, direction: int,
-         spent_before: float | None, n_max: int = N_MAX) -> dict[str, Any]:
+         spent_before: float | None, n_max: int = N_MAX,
+         min_useful_r: float | None = None) -> dict[str, Any]:
     """The numbers for one look. Does not decide significance: that is the
     cohort's job (`cohort`), because rules looked at in the same run are one
     family.
@@ -135,11 +166,13 @@ def look(n: int, mean: float | None, std: float | None, direction: int,
                             bound and whether the rule is futile or final
     """
     spent_before = float(spent_before or 0.0)
+    mue = MIN_USEFUL_R if min_useful_r is None else float(min_useful_r)
     spent_now = spent_at(n, n_max)
     alpha_look = spent_now - spent_before
     info = min(1.0, float(n) / float(n_max)) if n_max else 1.0
     base = {"design": DESIGN, "n": int(n), "n_max": int(n_max), "info": round(info, 4),
-            "spent_before": round(spent_before, 8), "direction": 1 if direction >= 0 else -1}
+            "spent_before": round(spent_before, 8), "direction": 1 if direction >= 0 else -1,
+            "min_useful_r": mue}
     if alpha_look <= _EPS:
         return {**base, "status": "no_new_information", "spent": spent_before}
     p = p_one_sided(mean, std, n, direction)
@@ -150,7 +183,7 @@ def look(n: int, mean: float | None, std: float | None, direction: int,
             "alpha_look": alpha_look, "spent": spent_now,
             "p": p, "p_adj": min(1.0, p * ALPHA / alpha_look),
             "upper": ub,
-            "futile": ub is not None and ub < MIN_USEFUL_R,
+            "futile": ub is not None and ub < mue,
             "reversed": ub is not None and ub < 0.0,
             "final": n >= n_max}
 

@@ -280,7 +280,7 @@ def advance_quarantine(con: Any, rule_id: str, session_date: date) -> str:
 # `shadow` (rejected candidates) and `population` (mechanical monkeys) -- are
 # RECORDED as confirming/disconfirming evidence but never counted: the desk
 # did not take them, so they cannot validate a rule about what the desk takes.
-COUNTED_SOURCES = ("taken", "runner_field", "runner_exit")
+COUNTED_SOURCES = ("taken", "runner_field", "runner_exit", "gapfield")
 
 # Exit policies and construction arms (agent/runner_exits.py) are rules about
 # HOW a runner candidate is traded, not WHICH: their one dimension is the
@@ -473,9 +473,10 @@ def eligible_for_production(
                 and r["_elapsed"] is not None and r["_elapsed"] >= min_quarantine_sessions):
             continue
         direction = -1 if (r.get("discovery_effect") or 0) < 0 else 1
+        n_max, mue = seq.design_for(r.get("lane"))
         looks[r["rule_id"]] = seq.look(
             r["forward_n"], r.get("forward_mean_r"), r.get("forward_std_r"),
-            direction, r.get("alpha_spent"))
+            direction, r.get("alpha_spent"), n_max=n_max, min_useful_r=mue)
     tested = [rid for rid, lk in looks.items() if lk["status"] == "looked"]
     rejected, qvals = seq.cohort([looks[rid]["p_adj"] for rid in tested])
     cohort = {rid: (rej, qv) for rid, rej, qv in zip(tested, rejected, qvals)}
@@ -524,7 +525,7 @@ def eligible_for_production(
                       f"against a discovery of {r.get('discovery_effect')}, n={lk['n']})")
         elif lk["futile"]:
             reason = (f"futile: the forward evidence rules out an edge of "
-                      f"+{seq.MIN_USEFUL_R:.2f}R ({int(seq.FUTILITY_CONF * 100)}% upper bound "
+                      f"+{lk['min_useful_r']:.2f}R ({int(seq.FUTILITY_CONF * 100)}% upper bound "
                       f"{lk['upper']:+.3f}R at n={lk['n']})")
         elif lk["final"]:
             reason = (f"not shown: forward evidence not significant with the whole budget "
@@ -637,13 +638,21 @@ def rule_id_for_predicate(pred: dict) -> str:
 
 
 def emitted_levels(comparisons: Iterable[Any]) -> dict[str, set[str]]:
-    """Every (dimension -> levels) the system emitted in a search batch."""
+    """Every (dimension -> levels) the system emitted in a search batch. A
+    2-D pair (`a|b` = `x|y`) emits each of its levels for its own dimension
+    too: the gap field's cells exist only as strategy x dimension pairs."""
+    from .structural import PAIR_SEP
     out: dict[str, set[str]] = {}
     for c in comparisons or []:
         dim = getattr(c, "dimension", None) or (c.get("dimension") if isinstance(c, dict) else None)
         lev = getattr(c, "level", None) or (c.get("level") if isinstance(c, dict) else None)
-        if dim is not None and lev is not None:
-            out.setdefault(str(dim), set()).add(str(lev))
+        if dim is None or lev is None:
+            continue
+        out.setdefault(str(dim), set()).add(str(lev))
+        dims, levs = str(dim).split(PAIR_SEP), str(lev).split(PAIR_SEP)
+        if len(dims) > 1 and len(dims) == len(levs):
+            for d_, l_ in zip(dims, levs):
+                out.setdefault(d_, set()).add(l_)
     return out
 
 
@@ -839,9 +848,11 @@ def register_candidate(con: Any, candidate: dict, session_date: date,
     return {"rule_id": rid, "state": state, "created": True, "note": disc["note"]}
 
 
-# How many NEW rules the system may quarantine from one weekly batch. A budget
-# choice, not an edge claim: each quarantined rule is a forward test, and the
-# cohort correction at graduation gets stricter as the cohort grows.
+# How many NEW rules the system may quarantine from one weekly batch, PER
+# LANE. A budget choice, not an edge claim: each quarantined rule is a forward
+# test, and the cohort correction at graduation gets stricter as the cohort
+# grows. Per lane so two years of gap-field history cannot crowd the morning
+# and runner survivors out of the forward test.
 SYSTEM_MAX_NEW_PER_RUN = 12
 
 
@@ -858,14 +869,15 @@ def register_batch_survivors(con: Any, session_date: date, comparisons: Iterable
     every surviving 1-D cell and admitted 2-D pair of the morning and runner
     lanes is registered through `register_candidate` (predicate validated
     against the cells emitted this run, discovery numbers from the batch)
-    and quarantined today. Losers are registered too: a validated losing cell
-    is an exclusion the desk can enforce.
+    and quarantined today (the gap field's strategy x dimension cells too).
+    Losers are registered too: a validated losing cell is an exclusion the
+    desk can enforce.
 
     Win-frequency, drift, population and selection-edge comparisons are not
     cells a trade can be matched to and are skipped. Identity comes from the
     predicate, so a cell already registered keeps its state and clock (a
-    RETIRED one stays in the graveyard). At most `max_new` new rules per run,
-    smallest q first.
+    RETIRED one stays in the graveyard). At most `max_new` new rules per lane
+    per run, smallest q first.
     """
     from .structural import PAIR_SEP, _parse
     comparisons = list(comparisons or [])
@@ -884,11 +896,12 @@ def register_batch_survivors(con: Any, session_date: date, comparisons: Iterable
     survivors.sort(key=lambda t: (t[0].q_value if t[0].q_value is not None else 1.0,
                                   -abs(t[0].mean_r)))
     out: list[dict] = []
+    per_lane: dict[str, int] = {}
     for c, lane, dims, levels in survivors:
-        if len(out) >= max_new:
-            break
+        if per_lane.get(lane, 0) >= max_new:
+            continue
         cell = " AND ".join(f"{d_}={lv}" for d_, lv in zip(dims, levels))
-        unit = "unit" if lane == "runner" else "trade"
+        unit = "unit" if lane in ("runner", "gapfield") else "trade"
         statement = (f"[system] {lane} cell {cell}: mean {c.mean_r:+.3f}R per {unit} over "
                      f"n={c.n}, a survivor of the {session_date} FDR batch (q={c.q_value})")
         pred = {"lane": lane, "conditions": [{"dimension": d_, "level": lv}
@@ -896,6 +909,7 @@ def register_batch_survivors(con: Any, session_date: date, comparisons: Iterable
         reg = register_candidate(con, {"statement": statement, "predicate": pred},
                                  session_date, comparisons, rows_by_lane, source="system")
         if reg.get("created"):
+            per_lane[lane] = per_lane.get(lane, 0) + 1
             out.append({"rule_id": reg["rule_id"], "state": reg["state"], "cell": cell,
                         "lane": lane, "mean_r": c.mean_r, "n": c.n, "q": c.q_value})
     if out:
@@ -1041,7 +1055,13 @@ def restart_runner_forward_clocks(con: Any, anchor: date | None = None) -> list[
     return restarted
 
 
-def observe_session(con: Any, d: date) -> dict:
+def gapfield_rows(con: Any, d: date) -> list[dict]:
+    """Session d's FORWARD gap-field rows (never backfilled history)."""
+    from . import gapfield
+    return gapfield.forward_rows(con, d)
+
+
+def observe_session(con: Any, d: date, lanes: Iterable[str] | None = None) -> dict:
     """Record every forward observation session `d` produced (Phase 3).
 
     For each QUARANTINED or VALIDATED rule with a predicate, every fill-valid
@@ -1056,6 +1076,9 @@ def observe_session(con: Any, d: date) -> dict:
         """SELECT rule_id, lane, predicate_json FROM research_rules
            WHERE state IN ('QUARANTINED', 'VALIDATED') AND predicate_json IS NOT NULL"""
     ).fetchall()
+    if lanes is not None:
+        keep = set(lanes)
+        rules = [r for r in rules if r[1] in keep]
     out = {"rules": len(rules), "recorded": 0}
     if not rules:
         return out
@@ -1080,7 +1103,9 @@ def observe_session(con: Any, d: date) -> dict:
                 out["recorded"] += 1
             continue
         if lane not in cache:
-            cache[lane] = morning_rows(con, d) if lane == "morning" else runner_rows(con, d)
+            cache[lane] = (morning_rows(con, d) if lane == "morning"
+                           else gapfield_rows(con, d) if lane == "gapfield"
+                           else runner_rows(con, d))
         hits = [row for row in cache[lane] if matches(pred, row)]
         if lane == "morning":
             for row in hits:
@@ -1093,10 +1118,11 @@ def observe_session(con: Any, d: date) -> dict:
             # collect its whole forward n on one session: thirty-odd regional
             # banks firing in one half hour are one event, not thirty.
             from .clusters import units
+            prefix, source = (("gapfield", "gapfield") if lane == "gapfield"
+                              else ("runner", "runner_field"))
             for (sess, cluster), vals in units(hits, realized_r).items():
-                key = f"runner:{sess}:{cluster}"
-                if record_rule_observation(con, rid, d, sum(vals) / len(vals), key,
-                                           "runner_field"):
+                key = f"{prefix}:{sess}:{cluster}"
+                if record_rule_observation(con, rid, d, sum(vals) / len(vals), key, source):
                     out["recorded"] += 1
         # EVIDENCE_BACKLOG_SPEC_v1 Phase 5: the desk's counterfactual streams
         # -- rejected candidates (shadow ledger) and the gap population's

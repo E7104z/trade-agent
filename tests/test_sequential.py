@@ -165,3 +165,16 @@ def test_underpowered_retirements_reopen_once_on_fresh_evidence(con):
     assert research.record_rule_observation(con, "Runder0000001", date(2026, 10, 6), 1.0)
     # Idempotent: a second pass reopens nothing.
     assert research.reopen_underpowered_retirements(con, date(2026, 10, 12)) == []
+
+
+def test_field_lanes_spend_over_a_longer_horizon_with_a_lower_floor():
+    assert seq.design_for("runner") == (seq.FIELD_N_MAX, seq.FIELD_MIN_USEFUL_R)
+    assert seq.design_for("gapfield") == (seq.FIELD_N_MAX, seq.FIELD_MIN_USEFUL_R)
+    assert seq.design_for("morning") == (seq.N_MAX, seq.MIN_USEFUL_R)
+    assert seq.design_for("runner_exit") == (seq.N_MAX, seq.MIN_USEFUL_R)
+    # A +0.08R field cell at n=200 with sd 0.9: the morning floor (0.10R) would
+    # call it futile; the field floor (0.05R) keeps it collecting.
+    n_max, mue = seq.design_for("gapfield")
+    lk = seq.look(200, 0.0, 0.9, 1, 0.0, n_max=n_max, min_useful_r=mue)
+    assert lk["upper"] < seq.MIN_USEFUL_R and lk["upper"] > mue and not lk["futile"]
+    assert not lk["final"] and lk["n_max"] == seq.FIELD_N_MAX

@@ -679,7 +679,7 @@ def api_table(name: str):
 
 # ------------------------------------------------------------------ run loops
 
-_VALID_LOOPS = {"morning", "evening", "weekly", "runner"}
+_VALID_LOOPS = {"morning", "evening", "weekly", "runner", "nightly"}
 
 
 def _weekly_run_date():
@@ -699,6 +699,13 @@ def _execute_loop(loop_name: str, cfg, force: bool) -> dict:
             if loop_name == "morning":
                 from agent.loops import morning
                 morning.run(cfg, force=force)
+            elif loop_name == "nightly":
+                # EDGE_ACCELERATION_SPEC_v1 Part 4: no LLM, no orders -- the gap
+                # field's forward session and its history backfill, on a
+                # budget of its own so no trading loop pays for it.
+                from agent.loops import nightly
+                result = nightly.run(cfg)
+                print(json.dumps(result, indent=2, default=str))
             elif loop_name == "evening":
                 from agent.loops import evening
                 evening.run(cfg, force=force)
@@ -776,10 +783,12 @@ def run_loop(loop_name: str):
 # least one tick inside the scan window and past the decision time. Two ticks
 # are safe by construction: candidates dedupe per session and selection is
 # claimed once per session in the database.
+# nightly: "0 3" UTC lands 23:00-23:59 ET in summer, 22:00-22:59 in winter --
+# after the evening cron in every season, long before the morning's.
 _CRON_WINDOWS = {"morning": (5, 10), "evening": (15, 19), "runner": (9, 12),
-                 "runner-late": (9, 12), "weekly": (6, 14)}
+                 "runner-late": (9, 12), "weekly": (6, 14), "nightly": (21, 23)}
 _CRON_LOOP = {"morning": "morning", "evening": "evening", "runner": "runner",
-              "runner-late": "runner", "weekly": "weekly"}
+              "runner-late": "runner", "weekly": "weekly", "nightly": "nightly"}
 
 
 @app.route("/cron/<loop_name>", methods=["GET"])

@@ -262,6 +262,12 @@ def build_search(con: Any, ledger_mod: Any, q: float = 0.10, min_n: int = 8):
     comps.extend(_safe("integrity", "population family",
                        lambda: structural.population_comparisons(structural.population_rows(con)),
                        []))
+    # EDGE_ACCELERATION_SPEC_v1 Part 4: the gap field -- every liquid gapper,
+    # both arms, history included -- as strategy x dimension cells counted in
+    # (session, industry) units, from the nightly summary. Same batch: these
+    # are looks like any other, and history can only ever nominate.
+    from . import gapfield
+    comps.extend(_safe("integrity", "gap field family", lambda: gapfield.comparisons(con), []))
     result = evaluate_search(comps, q=q, min_n=min_n)
     result.pair_status = pair_status
     result.rows_by_lane = rows_by_lane
@@ -417,6 +423,10 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         _safe("integrity", "runner continuation markdown",
               lambda: runner_research.continuation_md(drift_comps, drift_rows), ""),
     ]
+    from . import gapfield
+    parts.append(_safe("integrity", "gap field markdown",
+                       lambda: gapfield.weekly_md(getattr(search, "comparisons", None) or [], con),
+                       ""))
     if paired_mod is not None:
         parts.append(paired_mod.paired_md(paired_cmp))
     if search is not None:

@@ -270,7 +270,7 @@ def _parse(dim: str) -> tuple[str, list[str]] | None:
     """(lane, [dims]) for a 1-D or pair comparison this check can stratify."""
     from . import buckets
     dims = dim.split(PAIR_SEP)
-    for lane in ("morning", "runner"):
+    for lane in ("morning", "runner", "gapfield"):
         if all(d in buckets.dimensions(lane) for d in dims):
             return lane, dims
     return None
