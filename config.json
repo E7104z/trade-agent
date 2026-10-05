@@ -36,6 +36,15 @@
     "max_picks": 12,
     "blocking_kills": ["grounding", "entry_type", "event_risk"]
   },
+  "hypothesis_lane": {
+    "enabled": true,
+    "size_r": 0.25,
+    "min_rr": 1.0,
+    "max_picks": 2,
+    "max_new_per_day": 1,
+    "max_open": 6,
+    "blocking_kills": ["grounding", "entry_type", "event_risk", "hypothesis_fit"]
+  },
   "slippage_bps": 5,
   "leveraged_gate": "warn",
   "flatten_at": null,
@@ -44,7 +53,7 @@
     "alpaca_paper": true,
     "breakout_two_step": false,
     "trading_base": "https://paper-api.alpaca.markets",
-    "max_picks_per_day": 20,
+    "max_picks_per_day": 22,
     "intraday_check_secret_env": "CRON_SECRET"
   },
   "min_bar_volume": 0,
