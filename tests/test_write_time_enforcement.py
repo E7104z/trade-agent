@@ -312,9 +312,14 @@ def test_weekly_run_persists_findings_and_writes_a_clean_document(wired):
     text, version = memory.read_playbook(con)
     rows = con.execute("SELECT checker, severity, action, version FROM playbook_violations").fetchall()
     summary = ledger.latest_playbook_violations(con)
+    from datetime import datetime
+
     from agent.config import load_config
     from agent.health import loop_health
-    health = loop_health(con, load_config())
+    from agent.util import ET
+    # Health is read the day after the run: on the real clock this test went
+    # stale (age > WEEKLY_MAX_AGE_DAYS -> 'bad') nine days after 2026-09-25.
+    health = loop_health(con, load_config(), now=datetime(2026, 9, 26, 12, 0, tzinfo=ET))
     con.close()
 
     # The fixture carries setup rules quoting WR/avgR at n<8: they must be
