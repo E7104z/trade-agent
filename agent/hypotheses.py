@@ -15,13 +15,17 @@ A disciplined human trader learns like this, and this module is that loop:
   1. notice something (morning on the tape, or evening in review);
   2. write it down -- the claim, and what would prove it wrong -- BEFORE
      trading it (`register`: statement and refutation are frozen at insert);
-  3. commit to a sample size before looking (the SYSTEM sets target_n and
-     max_n from research.DEFAULT_FORWARD_N; the LLM never does);
+  3. commit to the test before looking (the SYSTEM sets target_n, the first
+     look, and max_n, the horizon; the LLM never does);
   4. trade it small and on purpose (the `hypothesis` test lane, morning.py);
   5. review each trade honestly (`hypothesis_reviews`: did it express the
      idea? an annotation, never an exclusion);
-  6. judge at the committed sample, not before (`evaluate`, weekly, two
-     pre-registered looks at alpha/2, cohort BH, abandoned ideas at p = 1);
+  6. judge on a pre-registered schedule, not on a whim (`evaluate`, weekly:
+     the first look at target_n, then one look a week as tests accrue, all
+     spending ONE fixed error budget (agent/sequential.py); cohort BH;
+     abandoned ideas at p = 1). An idea is supported when the evidence shows
+     it, refuted when the evidence rules out a useful edge, and otherwise
+     keeps collecting -- a real idea is no longer killed by one unlucky week;
   7. remember what was tested (the notebook block shows judged ideas, and a
      dead idea cannot come back for GRAVEYARD_SESSIONS);
   8. graduate a survivor only through the existing forward test (a SUPPORTED
@@ -65,11 +69,17 @@ NOVEL_SETUP = "novel"
 from .research import DEFAULT_FORWARD_N as TARGET_N  # noqa: E402
 from .research import DEFAULT_MIN_QUARANTINE_SESSIONS as MIN_SESSIONS  # noqa: E402
 
-MAX_N = 2 * TARGET_N
+from . import sequential as _seq  # noqa: E402
+
+# The horizon: sessions-with-a-valid-test by which an idea's whole error budget
+# is spent (EDGE_ACCELERATION_SPEC_v1 Part 1). It replaced "a second look at
+# 2 x target_n" -- two looks at n = 8 and 16 judged a real +0.5R idea right
+# about one time in five, and refuted any idea whose first eight sessions
+# averaged <= 0, which a real +0.3R idea does about a third of the time.
+MAX_N = _seq.N_MAX
 EXPIRE_SESSIONS = 30
 GRAVEYARD_SESSIONS = 30
-ALPHA = 0.05
-LOOK_ALPHA = ALPHA / 2          # Bonferroni over the two pre-registered looks
+ALPHA = _seq.ALPHA              # one-sided, across every look an idea gets
 DUP_JACCARD = 0.8               # the lesson bank's near-duplicate bar
 
 OPEN, SUPPORTED, REFUTED, ABANDONED, EXPIRED = (
@@ -82,7 +92,8 @@ _DEFAULTS = {"enabled": False, "size_r": 0.25, "max_picks": 2, "max_new_per_day"
 _COLS = ("hyp_id", "created_date", "opened_at", "source", "from_lesson_id", "statement",
          "refutation", "origin", "belief", "direction", "setup_type", "predicate_json",
          "target_n", "max_n", "min_sessions", "state", "looks_done", "last_tagged_at",
-         "closed_at", "close_reason", "verdict_json", "cohort_counted", "rule_id", "note")
+         "closed_at", "close_reason", "verdict_json", "cohort_counted", "rule_id", "note",
+         "alpha_spent", "test_design")
 
 
 def _log(msg: str) -> None:
@@ -361,7 +372,7 @@ def _insert(con: Any, row: dict, created: date, opened: date, source: str,
          row["refutation"], row.get("origin"), row.get("belief"), row.get("direction"),
          row.get("setup_type"), json.dumps(row["predicate"]) if row.get("predicate") else None,
          TARGET_N, MAX_N, MIN_SESSIONS, OPEN, 0, None, None, None, None, None, None,
-         row.get("note") or None])
+         row.get("note") or None, 0.0, _seq.DESIGN])
     return True
 
 
@@ -461,9 +472,10 @@ def notebook_md(con: Any, d: date, cfg: Any) -> tuple[str, list[str]]:
         idle = _sessions_between(last or r["opened_at"], d)
         stall = (f" UNTESTED for {idle} sessions; it expires at {EXPIRE_SESSIONS}."
                  if idle >= MIN_SESSIONS else "")
-        look = ("judged at {0}; positive but not yet significant then, so judged again at {1}"
-                .format(r["target_n"], r["max_n"]) if (r.get("looks_done") or 0) >= 1
-                else f"judged at {r['target_n']} (again at {r['max_n']} only if positive but not yet significant)")
+        looks = int(r.get("looks_done") or 0)
+        look = (f"looked at {looks} time(s), not yet shown either way, so it keeps collecting"
+                if looks else
+                f"first judged at {r['target_n']}, then each week as tests accrue")
         belief = f"belief {r['belief']}/5, " if r.get("belief") else ""
         lines += [
             f"- `{r['hyp_id']}`: {r['statement']}",
@@ -541,10 +553,14 @@ def analyst_prompt_text(cfg: Any) -> dict[str, str]:
             " approves counts for the idea at its approved size.\n"
             "- One observation per idea per session: several tagged names on one tape are one"
             " observation, not several. Spread an idea across days, not across tickers.\n"
-            f"- The system judges each idea after {TARGET_N} sessions with a valid test, and"
-            f" again at {MAX_N} only if it is positive but not yet significant, with every idea"
-            " judged that week corrected together. You never see a running average before"
-            " then, on purpose: peeking is how noise becomes a belief.\n"
+            f"- The system first judges each idea after {TARGET_N} sessions with a valid test,"
+            " then again each week as tests accrue, spending one fixed error budget across"
+            " those looks, with every idea judged that week corrected together. An idea is"
+            " supported when the evidence shows it, refuted when the evidence rules out an"
+            " edge worth trading, and otherwise keeps collecting: one unlucky week does not"
+            " kill a real idea, and one lucky week does not crown a false one. You never see a"
+            " running average before the verdict, on purpose: peeking is how noise becomes a"
+            " belief.\n"
             "- A hypothesis never raises conviction, never sizes a trade and never ranks a"
             " candidate. An idea that survives becomes a quarantined rule and must pass a"
             " forward test like any other. A refuted idea cannot be re-proposed for"
@@ -768,21 +784,43 @@ def _register_rule(con: Any, h: dict, stats: dict, q: float | None, d: date) -> 
     return rid
 
 
-def evaluate(con: Any, d: date, apply: bool = True) -> dict:
-    """Judge every OPEN idea whose look is due; expire the neglected ones.
+def _horizon(h: dict) -> int:
+    """The spending horizon an idea is judged over. An idea registered before
+    the sequential design (max_n = 16, no look taken yet) is judged over the
+    current horizon: changing the schedule before the first look is
+    data-independent, so it moves no goalpost."""
+    return max(int(h.get("max_n") or 0), MAX_N)
 
-    Looks: at target_n and at max_n sessions-with-a-valid-test, each only
-    after min_sessions market sessions open, each at alpha/2. Every look due
-    this run, plus every ABANDONED/EXPIRED idea not yet counted, is one BH
-    family at alpha/2 (an abandoned idea at p = 1): dropping a loser can
-    never shrink the family a survivor is judged in.
+
+def _look(h: dict, st: dict) -> dict:
+    """This run's look at one idea (agent/sequential.py). Every idea claims
+    the same thing -- trading it, as tagged, makes money -- so the test is
+    always one-sided, positive."""
+    return _seq.look(st["n"], st["mean_r"], st["std_r"], 1, h.get("alpha_spent"),
+                     n_max=_horizon(h))
+
+
+def evaluate(con: Any, d: date, apply: bool = True) -> dict:
+    """Judge every OPEN idea that is due a look; expire the neglected ones.
+
+    An idea is first looked at once it has target_n sessions with a valid
+    test and has been open min_sessions market sessions; after that, at every
+    weekly run that has a new session for it. Each look spends its share of
+    one one-sided budget (agent/sequential.py). Every look taken this run,
+    plus every ABANDONED/EXPIRED idea not yet counted, is one BH family (an
+    abandoned idea at p = 1): dropping a loser can never shrink the family a
+    survivor is judged in.
+
+      SUPPORTED  significant after cohort BH
+      REFUTED    the evidence rules out a +MIN_USEFUL_R edge (futility), or
+                 the horizon is reached without the idea being shown
+      OPEN       anything else: it keeps collecting
     """
-    from .stats import benjamini_hochberg
     rows = all_hypotheses(con)
     sample = samples(con)
-    res = {"supported": [], "refuted": [], "extended": [], "expired": [], "waiting": [],
+    res = {"supported": [], "refuted": [], "continuing": [], "expired": [], "waiting": [],
            "cohort": 0, "counted_closed": 0}
-    due: list[tuple[dict, int, dict]] = []
+    due: list[tuple[dict, dict, dict]] = []
     for h in rows:
         if h["state"] != OPEN:
             continue
@@ -798,45 +836,56 @@ def evaluate(con: Any, d: date, apply: bool = True) -> dict:
             h["state"], h["cohort_counted"] = EXPIRED, False
             continue
         n = s["n"]
-        looks = int(h.get("looks_done") or 0)
-        look = None
-        if _sessions_between(h["opened_at"], d) >= int(h.get("min_sessions") or MIN_SESSIONS):
-            if looks == 0 and n >= int(h["target_n"]):
-                look = 2 if n >= int(h["max_n"]) else 1
-            elif looks == 1 and n >= int(h["max_n"]):
-                look = 2
-        stats = _stats(s["units"])
-        if look is None or stats["p"] is None:
-            h["_why"] = (f"{n}/{h['target_n'] if looks == 0 else h['max_n']} sessions"
-                         if look is None else "sample not testable (zero variance)")
+        if (_sessions_between(h["opened_at"], d) < int(h.get("min_sessions") or MIN_SESSIONS)
+                or n < int(h["target_n"])):
+            h["_why"] = f"{n}/{h['target_n']} sessions before the first look"
             res["waiting"].append(h)
             continue
-        due.append((h, look, stats))
+        stats = _stats(s["units"])
+        lk = _look(h, stats)
+        if lk["status"] != "looked":
+            h["_why"] = ("no new session since the last look"
+                         if lk["status"] == "no_new_information"
+                         else "sample not testable (zero variance)")
+            res["waiting"].append(h)
+            continue
+        due.append((h, lk, stats))
 
     closed = [h for h in rows if h["state"] in (ABANDONED, EXPIRED) and not h.get("cohort_counted")]
     if not due:
         return res
-    pvals = [st["p"] for _, _, st in due] + [1.0] * len(closed)
-    rejected, qvals = benjamini_hochberg(pvals, q=LOOK_ALPHA)
+    pvals = [lk["p_adj"] for _, lk, _ in due] + [1.0] * len(closed)
+    rejected, qvals = _seq.cohort(pvals)
     res["cohort"], res["counted_closed"] = len(pvals), len(closed)
-    for (h, look, st), rej, qv in zip(due, rejected, qvals):
+    for (h, lk, st), rej, qv in zip(due, rejected, qvals):
         verdict = dict(h.get("verdict") or {})
-        entry = {**st, "q": qv, "look": look, "cohort": len(pvals), "date": d.isoformat(),
-                 "not_expressed": _not_expressed(con, h["hyp_id"])}
+        look_no = int(h.get("looks_done") or 0) + 1
+        entry = {**st, "q": qv, "look": look_no, "cohort": len(pvals), "date": d.isoformat(),
+                 "not_expressed": _not_expressed(con, h["hyp_id"]),
+                 "p_one_sided": lk.get("p"), "alpha_look": lk.get("alpha_look"),
+                 "alpha_spent": lk.get("spent"), "upper": lk.get("upper"),
+                 "n_max": lk.get("n_max"), "design": _seq.DESIGN}
         h["_stats"] = entry
-        if st["mean_r"] is not None and st["mean_r"] <= 0:
-            state, reason = REFUTED, f"mean R not positive at n={st['n']}"
-        elif rej:
-            state, reason = SUPPORTED, f"positive and significant at n={st['n']} after cohort BH"
-        elif look == 1:
-            verdict["look1"] = entry
-            res["extended"].append(h)
-            if apply:
-                con.execute("UPDATE trader_hypotheses SET looks_done = 1, verdict_json = ? "
-                            "WHERE hyp_id = ?", [json.dumps(verdict, default=str), h["hyp_id"]])
-            continue
+        if rej:
+            state, reason = SUPPORTED, (f"positive and significant at n={st['n']} after cohort "
+                                        f"BH (look {look_no})")
+        elif lk["futile"]:
+            state, reason = REFUTED, (f"the evidence rules out a +{_seq.MIN_USEFUL_R:.2f}R edge "
+                                      f"at n={st['n']} ({int(_seq.FUTILITY_CONF * 100)}% upper "
+                                      f"bound {lk['upper']:+.2f}R)")
+        elif lk["final"]:
+            state, reason = REFUTED, (f"not shown at n={st['n']}: the whole budget is spent "
+                                      f"(positive or not, never significant)")
         else:
-            state, reason = REFUTED, f"not shown at n={st['n']} (positive but not significant)"
+            verdict[f"look{look_no}"] = entry
+            res["continuing"].append(h)
+            if apply:
+                con.execute(
+                    """UPDATE trader_hypotheses SET looks_done = ?, alpha_spent = ?,
+                              test_design = ?, verdict_json = ? WHERE hyp_id = ?""",
+                    [look_no, lk["spent"], _seq.DESIGN, json.dumps(verdict, default=str),
+                     h["hyp_id"]])
+            continue
         verdict["final"] = entry
         rule_id = None
         if apply:
@@ -844,10 +893,11 @@ def evaluate(con: Any, d: date, apply: bool = True) -> dict:
                 rule_id = _safe_rule(con, h, st, qv, d)
             con.execute(
                 """UPDATE trader_hypotheses SET state = ?, closed_at = ?, close_reason = ?,
-                          looks_done = ?, verdict_json = ?, cohort_counted = TRUE, rule_id = ?
+                          looks_done = ?, alpha_spent = ?, test_design = ?, verdict_json = ?,
+                          cohort_counted = TRUE, rule_id = ?
                    WHERE hyp_id = ? AND state = ?""",
-                [state, d, reason, look, json.dumps(verdict, default=str), rule_id,
-                 h["hyp_id"], OPEN])
+                [state, d, reason, look_no, lk["spent"], _seq.DESIGN,
+                 json.dumps(verdict, default=str), rule_id, h["hyp_id"], OPEN])
         h.update({"state": state, "close_reason": reason, "rule_id": rule_id})
         res["supported" if state == SUPPORTED else "refuted"].append(h)
     if apply:
@@ -893,14 +943,16 @@ def weekly_md(res: dict, con: Any) -> str:
     lines = ["## TRADER HYPOTHESES (the desk's own ideas, tested at minimum size; "
              "verdicts applied by the system)", ""]
     for label, key in (("SUPPORTED", "supported"), ("REFUTED", "refuted"),
-                       ("EXTENDED to the second look", "extended"), ("EXPIRED", "expired")):
+                       ("STILL COLLECTING (looked at, not yet shown either way)", "continuing"),
+                       ("EXPIRED", "expired")):
         if res.get(key):
             lines.append(f"**{label} ({len(res[key])}):**")
             lines += [_verdict_line(h) for h in res[key]]
             lines.append("")
     if res.get("cohort"):
-        lines.append(f"Judged as one family of {res['cohort']} at alpha {LOOK_ALPHA} per look "
-                     f"({res['counted_closed']} abandoned/expired idea(s) counted at p = 1).")
+        lines.append(f"Judged as one family of {res['cohort']} (Benjamini-Hochberg at one-sided "
+                     f"{ALPHA}; each look spends only its share of the idea's budget; "
+                     f"{res['counted_closed']} abandoned/expired idea(s) counted at p = 1).")
     lines.append(f"Open: {len(open_rows)}" + ("; " + ", ".join(
         f"{r['hyp_id']} {(sample.get(r['hyp_id']) or {}).get('n', 0)}/{r['target_n']}"
         for r in open_rows) if open_rows else ""))

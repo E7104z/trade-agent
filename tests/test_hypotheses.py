@@ -102,7 +102,7 @@ def test_a_hypothesis_needs_a_refutation_and_a_real_claim():
 def test_the_system_sets_the_bar_not_the_llm(con):
     hid = _open(con, target_n=3, max_n=4)
     row = next(r for r in hyp.all_hypotheses(con) if r["hyp_id"] == hid)
-    assert (row["target_n"], row["max_n"], row["min_sessions"]) == (8, 16, 10)
+    assert (row["target_n"], row["max_n"], row["min_sessions"]) == (8, 96, 10)
 
 
 def test_a_reworded_twin_resolves_to_the_open_idea(con):
@@ -278,32 +278,32 @@ def _units(con, hid, values, start=date(2026, 9, 2)):
 
 
 def _fix_p(monkeypatch, by_hid):
-    real = hyp._stats
+    """Pin chosen ideas' looks to a p_adj (the look's one-sided p scaled to the
+    whole budget); every other idea gets its real look."""
+    real = hyp._look
 
-    def fake(units):
-        st = real(units)
-        for hid, p in by_hid.items():
-            if units and units == fake.units.get(hid):
-                st["p"] = p
-        return st
-    fake.units = {}
-    monkeypatch.setattr(hyp, "_stats", fake)
-    return fake
+    def fake(h, st):
+        lk = real(h, st)
+        if h["hyp_id"] in by_hid and lk["status"] == "looked":
+            lk = {**lk, "p_adj": by_hid[h["hyp_id"]], "futile": False, "final": False}
+        return lk
+    monkeypatch.setattr(hyp, "_look", fake)
 
 
 def test_bh_over_the_cohort_with_abandoned_ideas_at_p_one(con, monkeypatch):
     good = _open(con)
     gone = _open(con, statement="sympathy longs on a second-tier name fade by noon reliably")
     _units(con, good, [0.5, 0.6, 0.4, 0.7, 0.5, 0.6, 0.5, 0.4])
-    fake = _fix_p(monkeypatch, {good: 0.02})
-    fake.units[good] = hyp.samples(con)[good]["units"]
+    _fix_p(monkeypatch, {good: 0.02})
     con.execute("UPDATE trader_hypotheses SET state='ABANDONED', closed_at=?, cohort_counted=FALSE "
                 "WHERE hyp_id=?", [date(2026, 9, 20), gone])
     res = hyp.evaluate(con, MON)
-    # m = 2, p = (0.02, 1.0): the rank-1 BH bound is 0.025 * 1/2 = 0.0125
-    assert res["cohort"] == 2 and not res["supported"] and [h["hyp_id"] for h in res["extended"]] == [good]
+    # m = 2, p_adj = (0.02, 1.0): the rank-1 BH bound is 0.025 * 1/2 = 0.0125
+    assert res["cohort"] == 2 and not res["supported"]
+    assert [h["hyp_id"] for h in res["continuing"]] == [good]
     rows = {r["hyp_id"]: r for r in hyp.all_hypotheses(con)}
     assert rows[good]["state"] == "OPEN" and rows[good]["looks_done"] == 1
+    assert rows[good]["alpha_spent"] > 0 and rows[good]["test_design"] == "spend-v1"
     assert rows[gone]["cohort_counted"] is True
 
 
@@ -311,8 +311,7 @@ def test_alone_a_strong_idea_is_supported_and_quarantined_as_a_rule(con, monkeyp
     pred = {"lane": "morning", "conditions": [{"dimension": "setup_type", "level": "gap_fade"}]}
     good = _open(con, predicate=pred)
     _units(con, good, [0.5, 0.6, 0.4, 0.7, 0.5, 0.6, 0.5, 0.4])
-    fake = _fix_p(monkeypatch, {good: 0.02})
-    fake.units[good] = hyp.samples(con)[good]["units"]
+    _fix_p(monkeypatch, {good: 0.02})
     res = hyp.evaluate(con, MON)
     assert [h["hyp_id"] for h in res["supported"]] == [good]
     row = next(r for r in hyp.all_hypotheses(con) if r["hyp_id"] == good)
@@ -323,16 +322,28 @@ def test_alone_a_strong_idea_is_supported_and_quarantined_as_a_rule(con, monkeyp
     assert "SUPPORTED idea is NOT edge" in hyp.weekly_md(res, con)
 
 
-def test_at_look_one_a_marginal_idea_waits_and_a_loser_is_refuted(con, monkeypatch):
+def test_a_marginal_idea_keeps_collecting_and_a_ruled_out_loser_is_refuted(con, monkeypatch):
     marginal = _open(con)
     loser = _open(con, statement="sympathy longs on a second-tier name fade by noon reliably")
     _units(con, marginal, [0.5, 0.6, 0.4, 0.7, 0.5, 0.6, 0.5, 0.4])
+    # mean -0.21R, std 0.51: the 80% upper bound (~-0.05R) rules out +0.10R
     _units(con, loser, [-0.5, -0.6, 0.4, -0.7, -0.5, 0.6, -0.5, -0.4])
-    fake = _fix_p(monkeypatch, {marginal: 0.04})
-    fake.units[marginal] = hyp.samples(con)[marginal]["units"]
+    _fix_p(monkeypatch, {marginal: 0.04})
     res = hyp.evaluate(con, MON)
-    assert [h["hyp_id"] for h in res["extended"]] == [marginal]
+    assert [h["hyp_id"] for h in res["continuing"]] == [marginal]
     assert [h["hyp_id"] for h in res["refuted"]] == [loser]
+    assert "rules out" in res["refuted"][0]["close_reason"]
+
+
+def test_one_unlucky_week_no_longer_refutes_a_real_idea(con):
+    # The old first look refuted any idea whose first eight sessions averaged
+    # <= 0. These average -0.03R with a wide spread: they say almost nothing,
+    # so the idea keeps collecting.
+    hid = _open(con)
+    _units(con, hid, [1.5, -1.0, -1.0, 2.0, -1.0, -1.0, 1.8, -1.5])
+    res = hyp.evaluate(con, MON)
+    assert [h["hyp_id"] for h in res["continuing"]] == [hid]
+    assert not res["refuted"]
 
 
 def test_neglected_ideas_expire_and_young_ones_wait(con):

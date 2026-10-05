@@ -426,6 +426,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v30.STATEMENTS
 from . import migrations_v31  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v31.STATEMENTS
 
+# --- v32 the forward test spends one budget across looks (EDGE_ACCELERATION) -
+from . import migrations_v32  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v32.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the

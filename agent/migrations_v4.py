@@ -39,9 +39,10 @@ def research_schema() -> list[str]:
     applies every migration in order. Defined as a function so STATEMENTS,
     and therefore the schema fingerprint, is untouched.
     """
-    from . import migrations_v17, migrations_v20
+    from . import migrations_v17, migrations_v20, migrations_v32
     return (list(STATEMENTS) + list(migrations_v17.RESEARCH_STATEMENTS)
-            + list(migrations_v20.RESEARCH_STATEMENTS))
+            + list(migrations_v20.RESEARCH_STATEMENTS)
+            + list(migrations_v32.RESEARCH_STATEMENTS))
 
 STATEMENTS: list[str] = [
 

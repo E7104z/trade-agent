@@ -264,38 +264,63 @@ def test_counterfactual_sources_are_recorded_but_not_counted(con):
 
 # ------------------------------------------------------------------ Phase 4
 
-def _state(rid, p, n=8, mean=0.5, disc=0.5, days=30):
+def _state(rid, n=12, mean=0.5, disc=0.5):
     return {"rule_id": rid, "state": "QUARANTINED", "statement": rid,
             "quarantined_at": "2026-07-01", "forward_n": n, "forward_n_required": 8,
-            "forward_p": p, "forward_mean_r": mean, "discovery_effect": disc}
+            "forward_p": None, "forward_mean_r": mean, "forward_std_r": 1.0,
+            "discovery_effect": disc, "alpha_spent": 0.0}
 
 
-def _decisions(monkeypatch, states, on=date(2026, 8, 30)):
+def _decisions(monkeypatch, states, p_adj, on=date(2026, 8, 30), futile=(), final=()):
+    """Run graduation with each rule's look pinned to a chosen p_adj (the
+    look's one-sided p scaled to the whole budget), so the cohort arithmetic
+    is exact."""
+    from agent import sequential
     monkeypatch.setattr(research, "rule_states", lambda con: [dict(s) for s in states])
+
+    def _look(n, mean, std, direction, spent_before, n_max=sequential.N_MAX):
+        rid = next(s["rule_id"] for s in states if s["forward_mean_r"] == mean and s["forward_n"] == n)
+        return {"status": "looked", "design": sequential.DESIGN, "n": n, "n_max": n_max,
+                "info": 0.5, "spent_before": 0.0, "direction": direction,
+                "alpha_look": 0.01, "spent": 0.01, "p": p_adj[rid] * 0.4,
+                "p_adj": p_adj[rid], "upper": 0.5, "futile": rid in futile,
+                "reversed": False, "final": rid in final}
+    monkeypatch.setattr(sequential, "look", _look)
     res = research.eligible_for_production(None, on, apply=False)
-    return ({r["rule_id"] for r in res["graduated"]}, {r["rule_id"] for r in res["failed"]})
+    return ({r["rule_id"] for r in res["graduated"]}, {r["rule_id"] for r in res["failed"]},
+            {r["rule_id"] for r in res["waiting"]})
 
 
 def test_cohort_bh_two_rules(monkeypatch):
-    # m=2, alpha=0.05: rank-1 bound 0.025... p=0.04 fails it, rank-2 bound 0.05:
-    # BH rejects all ranks <= the largest k with p_(k) <= k/m*alpha. p_(2)=0.30
-    # > 0.05 and p_(1)=0.04 > 0.025, so NEITHER graduates at alpha=0.05.
-    grad, fail = _decisions(monkeypatch, [_state("A", 0.04), _state("B", 0.30)])
-    assert grad == set() and fail == {"A", "B"}
-    # A lone rule at p=0.04 is exactly the old per-rule test.
-    grad, _ = _decisions(monkeypatch, [_state("A", 0.04)])
+    # m=2 at the whole one-sided budget 0.025: rank-1 bound 0.0125, rank-2
+    # bound 0.025. p_adj=(0.02, 0.30): 0.02 > 0.0125 and 0.30 > 0.025, so
+    # NEITHER graduates -- and neither is retired: not shown yet is WAITING.
+    states = [_state("A", mean=0.5), _state("B", mean=0.6)]
+    grad, fail, wait = _decisions(monkeypatch, states, {"A": 0.02, "B": 0.30})
+    assert grad == set() and fail == set() and wait == {"A", "B"}
+    # A lone rule at p_adj=0.02 <= 0.025 is exactly the per-look test.
+    grad, _, _ = _decisions(monkeypatch, [_state("A", mean=0.5)], {"A": 0.02})
     assert grad == {"A"}
 
 
 def test_cohort_bh_rejects_what_uncorrected_alpha_would_pass(monkeypatch):
-    grad, fail = _decisions(monkeypatch, [_state("A", 0.04), _state("B", 0.60), _state("C", 0.70)])
-    assert grad == set(), "0.04 < 0.05 uncorrected, but not under BH with m=3"
-    assert fail == {"A", "B", "C"}
+    states = [_state("A", mean=0.5), _state("B", mean=0.6), _state("C", mean=0.7)]
+    grad, _, wait = _decisions(monkeypatch, states, {"A": 0.02, "B": 0.6, "C": 0.7})
+    assert grad == set(), "0.02 < 0.025 alone, but not under BH with m=3"
+    assert wait == {"A", "B", "C"}
 
 
 def test_cohort_bh_still_graduates_a_strong_rule(monkeypatch):
-    grad, _ = _decisions(monkeypatch, [_state("A", 0.001), _state("B", 0.60)])
+    states = [_state("A", mean=0.5), _state("B", mean=0.6)]
+    grad, _, _ = _decisions(monkeypatch, states, {"A": 0.0005, "B": 0.60})
     assert grad == {"A"}
+
+
+def test_futile_and_spent_rules_retire_and_the_rest_keep_collecting(monkeypatch):
+    states = [_state("F", mean=0.5), _state("S", mean=0.6), _state("W", mean=0.7)]
+    grad, fail, wait = _decisions(monkeypatch, states, {"F": 0.5, "S": 0.4, "W": 0.3},
+                                  futile={"F"}, final={"S"})
+    assert grad == set() and fail == {"F", "S"} and wait == {"W"}
 
 
 def test_market_sessions_skip_weekends_and_holidays():

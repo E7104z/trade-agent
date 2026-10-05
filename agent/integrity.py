@@ -298,6 +298,11 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
     # (research.restart_runner_forward_clocks; idempotent).
     _safe("integrity", "runner forward-clock restart",
           lambda: research.restart_runner_forward_clocks(con), [])
+    # Rules the old one-look test retired for want of significance get one
+    # fresh forward test under the sequential design (EDGE_ACCELERATION_SPEC_v1
+    # Part 1). Idempotent; the evening loop runs it too.
+    _safe("integrity", "reopen underpowered retirements",
+          lambda: research.reopen_underpowered_retirements(con, session_date), [])
 
     # A construction arm or exit policy that beat the plan in THIS batch is
     # quarantined by the system (RUNNER_TRADE_CONSTRUCTION_v1): the family is

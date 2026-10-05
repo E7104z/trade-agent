@@ -75,6 +75,7 @@ __all__ = [
     "advance_quarantine",
     "rule_states",
     "eligible_for_production",
+    "reopen_underpowered_retirements",
     "check_playbook_provenance",
     "provenance_md",
 ]
@@ -261,7 +262,8 @@ def advance_quarantine(con: Any, rule_id: str, session_date: date) -> str:
     con.execute(
         """UPDATE research_rules
            SET state = 'QUARANTINED', quarantined_at = ?,
-               forward_n = 0, forward_sum_r = 0.0, forward_sumsq_r = 0.0
+               forward_n = 0, forward_sum_r = 0.0, forward_sumsq_r = 0.0,
+               alpha_spent = 0.0, looks_done = 0
            WHERE rule_id = ?""",
         [session_date, rule_id],
     )
@@ -358,14 +360,16 @@ def rule_states(con: Any) -> list[dict[str, Any]]:
                   discovered_at, discovery_n, discovery_effect, discovery_q,
                   quarantined_at, validated_at, retired_at, forward_n_required,
                   forward_n, forward_sum_r, forward_sumsq_r, note,
-                  predicate_json, lane, decay_count, last_observed_at
+                  predicate_json, lane, decay_count, last_observed_at,
+                  alpha_spent, looks_done, last_look_at, test_design
            FROM research_rules ORDER BY discovered_at DESC, rule_id"""
     ).fetchall()
     out: list[dict[str, Any]] = []
     for r in rows:
         (rid, stmt, dims, ndim, state, source, disc_at, disc_n, disc_eff, disc_q,
          q_at, val_at, ret_at, fwd_req, fwd_n, fwd_sum, fwd_sumsq, note,
-         pred_json, lane, decay_count, last_obs) = r
+         pred_json, lane, decay_count, last_obs,
+         alpha_spent, looks_done, last_look, test_design) = r
         fwd_n = int(fwd_n or 0)
         mean = (fwd_sum / fwd_n) if fwd_n else None
         std = None
@@ -399,6 +403,10 @@ def rule_states(con: Any) -> list[dict[str, Any]]:
             "lane": lane,
             "decay_count": int(decay_count or 0),
             "last_observed_at": str(last_obs) if last_obs else None,
+            "alpha_spent": float(alpha_spent or 0.0),
+            "looks_done": int(looks_done or 0),
+            "last_look_at": str(last_look) if last_look else None,
+            "test_design": test_design,
         })
     return out
 
@@ -406,28 +414,38 @@ def rule_states(con: Any) -> list[dict[str, Any]]:
 def eligible_for_production(
     con: Any,
     session_date: date,
-    alpha: float = 0.05,
+    alpha: float | None = None,
     min_quarantine_sessions: int = DEFAULT_MIN_QUARANTINE_SESSIONS,
     apply: bool = True,
 ) -> dict[str, list[dict]]:
-    """Decide which quarantined rules graduate, fail, or keep waiting.
+    """Decide which quarantined rules graduate, fail, or keep collecting.
 
-    Graduation requires ALL of:
-      - forward_n >= forward_n_required          (enough forward evidence)
-      - at least `min_quarantine_sessions` days elapsed since quarantine
-      - forward p < alpha                        (the effect is still there)
-      - forward effect has the SAME SIGN as discovery (a rule discovered as a
-        winner that forward-tests as a significant LOSER is falsified, not
-        validated -- an easy and expensive sign error to make)
+    A rule is LOOKED AT once it has forward_n >= forward_n_required and has sat
+    `min_quarantine_sessions` days in quarantine. Each look spends part of one
+    fixed error budget (agent/sequential.py, EDGE_ACCELERATION_SPEC_v1 Part 1):
 
-    A rule that reaches its forward-n target without significance is RETIRED,
-    not left waiting. Rules must be able to fail; a quarantine you can only
-    graduate from is a delay, not a test.
+      VALIDATED  its one-sided forward p, in the direction it was discovered,
+                 passes this look's share of the budget after cohort FDR
+      RETIRED    the forward evidence rules out a useful edge (futility), or
+                 the effect reversed sign, or the whole budget is spent
+                 (n >= sequential.N_MAX) without the rule being shown
+      WAITING    anything else: the rule keeps collecting forward evidence
 
-    `apply=False` evaluates without writing -- used by tests and by the weekly
-    loop's dry-run path.
+    Rules must still be able to fail -- futility and the horizon retire them --
+    but a rule is no longer retired merely because eight trades could not
+    prove a realistic edge. That one-look test retired ~90% of real +0.3R
+    edges for good.
+
+    Cohort FDR (FORWARD_VALIDATION_SPEC_v1 Phase 4) is unchanged in spirit:
+    every rule looked at in the SAME run is one family, BH at the full budget
+    over each look's p scaled to that budget. With one rule it is exactly
+    p <= this look's alpha; with more it only gets stricter.
+
+    `alpha` is accepted for backward compatibility and ignored: the budget is
+    sequential.ALPHA, a constant no caller can move. `apply=False` evaluates
+    without writing.
     """
-    from .stats import benjamini_hochberg
+    from . import sequential as seq
 
     graduated: list[dict] = []
     failed: list[dict] = []
@@ -448,70 +466,138 @@ def eligible_for_production(
         r["_elapsed"] = elapsed
         candidates.append(r)
 
-    # Cohort FDR (FORWARD_VALIDATION_SPEC_v1 Phase 4). Every rule that reaches
-    # its forward target in the SAME run is one look; K of them tested at a
-    # per-rule alpha is the multiple-comparison artifact the weekly batch
-    # exists to stop, moved one stage later. BH at level `alpha` over the
-    # ready cohort: with one rule it is exactly the per-rule test it replaces,
-    # with more it only gets stricter.
-    ready = [r for r in candidates
-             if r["forward_n"] >= r["forward_n_required"]
-             and r["_elapsed"] is not None and r["_elapsed"] >= min_quarantine_sessions
-             and r["forward_p"] is not None]
-    rejected, qvals = benjamini_hochberg([r["forward_p"] for r in ready], q=alpha)
-    cohort = {r["rule_id"]: (rej, qv) for r, rej, qv in zip(ready, rejected, qvals)}
+    looks: dict[str, dict] = {}
+    for r in candidates:
+        if not (r["forward_n"] >= r["forward_n_required"]
+                and r["_elapsed"] is not None and r["_elapsed"] >= min_quarantine_sessions):
+            continue
+        direction = -1 if (r.get("discovery_effect") or 0) < 0 else 1
+        looks[r["rule_id"]] = seq.look(
+            r["forward_n"], r.get("forward_mean_r"), r.get("forward_std_r"),
+            direction, r.get("alpha_spent"))
+    tested = [rid for rid, lk in looks.items() if lk["status"] == "looked"]
+    rejected, qvals = seq.cohort([looks[rid]["p_adj"] for rid in tested])
+    cohort = {rid: (rej, qv) for rid, rej, qv in zip(tested, rejected, qvals)}
 
     for r in candidates:
         elapsed = r.pop("_elapsed")
-        target_met = r["forward_n"] >= r["forward_n_required"]
-        time_met = elapsed is not None and elapsed >= min_quarantine_sessions
-        p = r["forward_p"]
-        sig, r["forward_q"] = cohort.get(r["rule_id"], (False, None))
-        disc_sign = 0
-        if r["discovery_effect"] is not None:
-            disc_sign = 1 if r["discovery_effect"] > 0 else -1
-        fwd_sign = 0
-        if r["forward_mean_r"] is not None:
-            fwd_sign = 1 if r["forward_mean_r"] > 0 else -1
-        sign_ok = (disc_sign == 0) or (fwd_sign == disc_sign)
-
-        if target_met and time_met and sig and sign_ok:
-            r["verdict"] = "VALIDATED"
-            graduated.append(r)
-            if apply:
-                con.execute(
-                    "UPDATE research_rules SET state='VALIDATED', validated_at=? WHERE rule_id=?",
-                    [session_date, r["rule_id"]],
-                )
-        elif target_met and time_met and p is None:
-            # UNTESTABLE is not the same as FAILED. A degenerate forward sample
-            # (zero observed variance, or n<2) means the test could not be run,
-            # not that the rule was falsified. Retiring here would be an
-            # unrecoverable false negative, since the playbook's graveyard rule
-            # forbids re-proposing a retired rule without post-retirement
-            # evidence. Hold it in quarantine and say so.
+        rid = r["rule_id"]
+        lk = looks.get(rid)
+        r["look"] = lk
+        if lk is None:
+            need_n = max(0, r["forward_n_required"] - r["forward_n"])
+            need_d = max(0, min_quarantine_sessions - (elapsed or 0))
+            r["verdict"] = f"WAITING — needs {need_n} more obs, {need_d} more days"
+            waiting.append(r)
+            continue
+        if lk["status"] == "untestable":
+            # UNTESTABLE is not FAILED. A degenerate forward sample (zero
+            # observed variance, or n<2) means the test could not be run; it
+            # spends nothing and the rule keeps collecting.
             r["verdict"] = ("WAITING — forward sample not testable "
                             "(zero variance or n<2); collecting more observations")
             waiting.append(r)
-        elif target_met and time_met:
-            reason = ("forward effect reversed sign" if not sign_ok
-                      else f"forward evidence not significant after cohort FDR "
-                           f"(p={p}, q={r['forward_q']}, cohort of {len(ready)})")
+            continue
+        if lk["status"] == "no_new_information":
+            r["verdict"] = (f"WAITING — no new forward evidence since the last look "
+                            f"(n={r['forward_n']})")
+            waiting.append(r)
+            continue
+
+        sig, r["forward_q"] = cohort.get(rid, (False, None))
+        if sig:
+            r["verdict"] = (f"VALIDATED — {seq.describe(lk)}; significant after cohort FDR "
+                            f"(cohort of {len(tested)})")
+            graduated.append(r)
+            if apply:
+                con.execute(
+                    """UPDATE research_rules SET state='VALIDATED', validated_at=?,
+                       alpha_spent=?, looks_done=COALESCE(looks_done,0)+1,
+                       last_look_at=?, test_design=? WHERE rule_id=?""",
+                    [session_date, lk["spent"], session_date, seq.DESIGN, rid])
+            continue
+
+        reason = None
+        if lk["reversed"]:
+            reason = (f"forward effect reversed sign (mean {r.get('forward_mean_r'):+.3f}R "
+                      f"against a discovery of {r.get('discovery_effect')}, n={lk['n']})")
+        elif lk["futile"]:
+            reason = (f"futile: the forward evidence rules out an edge of "
+                      f"+{seq.MIN_USEFUL_R:.2f}R ({int(seq.FUTILITY_CONF * 100)}% upper bound "
+                      f"{lk['upper']:+.3f}R at n={lk['n']})")
+        elif lk["final"]:
+            reason = (f"not shown: forward evidence not significant with the whole budget "
+                      f"spent (n={lk['n']}, p={lk['p']:.4g}, q={r['forward_q']}, cohort of "
+                      f"{len(tested)})")
+        if reason:
             r["verdict"] = f"RETIRED — {reason}"
             failed.append(r)
             if apply:
                 con.execute(
                     """UPDATE research_rules SET state='RETIRED', retired_at=?,
+                       alpha_spent=?, looks_done=COALESCE(looks_done,0)+1,
+                       last_look_at=?, test_design=?,
                        note = COALESCE(note,'') || ' | ' || ? WHERE rule_id=?""",
-                    [session_date, reason[:300], r["rule_id"]],
-                )
-        else:
-            need_n = max(0, r["forward_n_required"] - r["forward_n"])
-            need_d = max(0, min_quarantine_sessions - (elapsed or 0))
-            r["verdict"] = f"WAITING — needs {need_n} more obs, {need_d} more days"
-            waiting.append(r)
+                    [session_date, lk["spent"], session_date, seq.DESIGN, reason[:300], rid])
+            continue
+
+        r["verdict"] = f"WAITING — {seq.describe(lk)}; not yet shown, collecting"
+        waiting.append(r)
+        if apply:
+            con.execute(
+                """UPDATE research_rules SET alpha_spent=?, looks_done=COALESCE(looks_done,0)+1,
+                   last_look_at=?, test_design=? WHERE rule_id=?""",
+                [lk["spent"], session_date, seq.DESIGN, rid])
 
     return {"graduated": graduated, "failed": failed, "waiting": waiting}
+
+
+# The phrase the one-look test wrote when it retired a rule for want of
+# significance at its forward target. Those rules were judged by a test with
+# ~10% power against a +0.3R edge; they are re-quarantined once, on fresh
+# evidence only (reopen_underpowered_retirements).
+_UNDERPOWERED_RETIREMENT = "forward evidence not significant after cohort FDR"
+
+
+def reopen_underpowered_retirements(con: Any, session_date: date) -> list[str]:
+    """Give every rule the old single look retired for want of significance
+    one fresh forward test under the sequential design.
+
+    Fresh means fresh: the forward clock restarts at `session_date`, the
+    running sums are zeroed and only observations dated after today can count
+    (record_rule_observation's guard), so nothing already seen is counted
+    again. Rules retired for a REVERSED sign or as repeatedly stale stay
+    retired -- those were findings, not want of power. Idempotent: a reopened
+    rule is stamped with the new design and never matches again.
+    """
+    from . import sequential as seq
+    try:
+        rows = con.execute(
+            """SELECT rule_id, forward_n FROM research_rules
+               WHERE state = 'RETIRED' AND test_design IS NULL
+                 AND predicate_json IS NOT NULL AND note LIKE ?""",
+            [f"%{_UNDERPOWERED_RETIREMENT}%"]).fetchall()
+    except Exception:
+        return []
+    reopened = []
+    for rid, fwd_n in rows:
+        note = (f" | reopened {session_date}: retired at forward n={int(fwd_n or 0)} by the "
+                f"one-look test (~10% power against a +0.3R edge); fresh forward clock under "
+                f"{seq.DESIGN}, nothing seen before today counts")
+        con.execute(
+            """UPDATE research_rules
+               SET state = 'QUARANTINED', quarantined_at = ?, retired_at = NULL,
+                   forward_n = 0, forward_sum_r = 0.0, forward_sumsq_r = 0.0,
+                   last_observed_at = NULL, alpha_spent = 0.0, looks_done = 0,
+                   last_look_at = NULL, test_design = ?, note = COALESCE(note, '') || ?
+               WHERE rule_id = ?""",
+            [session_date, seq.DESIGN, note, rid])
+        reopened.append(rid)
+    if reopened:
+        from .util import log
+        log("research", f"reopened {len(reopened)} rule(s) the one-look test retired "
+                        f"underpowered: {', '.join(reopened)}")
+    return reopened
 
 
 # --------------------------------------------------------------------------
@@ -875,7 +961,8 @@ def restart_runner_forward_clocks(con: Any, anchor: date | None = None) -> list[
             """UPDATE research_rules
                SET state = 'QUARANTINED', quarantined_at = ?, validated_at = NULL,
                    forward_n = 0, forward_sum_r = 0.0, forward_sumsq_r = 0.0,
-                   last_observed_at = NULL, note = COALESCE(note, '') || ?
+                   last_observed_at = NULL, alpha_spent = 0.0, looks_done = 0,
+                   note = COALESCE(note, '') || ?
                WHERE rule_id = ?""",
             [restart_at, note, rid])
         restarted.append(rid)
@@ -896,6 +983,7 @@ def observe_session(con: Any, d: date) -> dict:
     source_key, so a retried evening changes nothing.
     """
     restart_runner_forward_clocks(con)
+    reopen_underpowered_retirements(con, d)
     rules = con.execute(
         """SELECT rule_id, lane, predicate_json FROM research_rules
            WHERE state IN ('QUARANTINED', 'VALIDATED') AND predicate_json IS NOT NULL"""
@@ -1106,6 +1194,7 @@ def apply_decay(con: Any, session_date: date, alpha: float = 0.05,
                     """UPDATE research_rules
                        SET state='QUARANTINED', quarantined_at=?, validated_at=NULL,
                            forward_n=0, forward_sum_r=0.0, forward_sumsq_r=0.0,
+                           alpha_spent=0.0, looks_done=0,
                            decay_count = COALESCE(decay_count, 0) + 1,
                            note = COALESCE(note,'') || ?
                        WHERE rule_id=?""",

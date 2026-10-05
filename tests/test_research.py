@@ -204,13 +204,45 @@ def test_rule_with_strong_consistent_forward_evidence_graduates(con):
     assert {s["rule_id"]: s for s in rule_states(con)}[rid]["state"] == "VALIDATED"
 
 
-def test_rule_that_reaches_target_without_significance_is_retired_not_left_waiting(con):
+def test_a_noisy_rule_at_its_first_look_keeps_collecting_instead_of_retiring(con):
+    # n=10 of +/-2R: mean 0, std 2.1. The one-look test retired this for good;
+    # ten trades cannot rule a +0.10R edge in or out, so the rule waits and
+    # the look's share of the budget is recorded as spent.
     rid = _quarantined(con, "noisy rule", date(2026, 6, 1), effect=0.8)
     for i in range(10):
         record_rule_observation(con, rid, date(2026, 7, 1), 2.0 if i % 2 else -2.0)
     res = eligible_for_production(con, date(2026, 8, 30))
+    assert [r["rule_id"] for r in res["waiting"]] == [rid]
+    assert "not yet shown" in res["waiting"][0]["verdict"]
+    st = {s["rule_id"]: s for s in rule_states(con)}[rid]
+    assert st["state"] == "QUARANTINED" and st["looks_done"] == 1
+    from agent import sequential
+    assert st["alpha_spent"] == pytest.approx(sequential.spent_at(10))
+    # No new evidence: the next run spends nothing and says so.
+    res = eligible_for_production(con, date(2026, 9, 6))
+    assert "no new forward evidence" in res["waiting"][0]["verdict"]
+
+
+def test_a_rule_whose_evidence_rules_out_a_useful_edge_retires_as_futile(con):
+    # Mean 0 with a tight spread: the 80% upper bound (~+0.09R) is below the
+    # +0.10R an edge has to clear to be worth trading.
+    rid = _quarantined(con, "flat rule", date(2026, 6, 1), effect=0.8)
+    for i in range(10):
+        record_rule_observation(con, rid, date(2026, 7, 1), 0.3 if i % 2 else -0.3)
+    res = eligible_for_production(con, date(2026, 8, 30))
     assert [r["rule_id"] for r in res["failed"]] == [rid]
+    assert "futile" in res["failed"][0]["verdict"]
     assert {s["rule_id"]: s for s in rule_states(con)}[rid]["state"] == "RETIRED"
+
+
+def test_a_rule_not_shown_when_the_budget_is_spent_retires(con):
+    from agent import sequential
+    rid = _quarantined(con, "never shown", date(2026, 6, 1), effect=0.8)
+    for i in range(sequential.N_MAX):
+        record_rule_observation(con, rid, date(2026, 7, 1), 2.0 if i % 2 else -2.0)
+    res = eligible_for_production(con, date(2026, 8, 30))
+    assert [r["rule_id"] for r in res["failed"]] == [rid]
+    assert "not shown" in res["failed"][0]["verdict"]
 
 
 def test_sign_reversal_is_falsification_not_validation(con):
