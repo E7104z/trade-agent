@@ -199,6 +199,20 @@ def check_morning_budget(con: Any, cfg: Any, d: date) -> dict:
                         key=lambda kv: kv[1], default=(None, None))
             slowest[str(rd)] = f"{stage[0]} {stage[1]}s" if stage[0] else ""
     missing = [str(x) for x in days if x not in seen and x < d]
+    # A morning killed at the budget AFTER saving its plan leaves a runs row
+    # but never releases its lock (2026-10-05); a bounded arm-B wait records
+    # the abandonment instead.
+    abandoned = []
+    for rd, _status, stages in rows:
+        try:
+            if (json.loads(stages or "{}") or {}).get("arm_b") == "abandoned_at_budget":
+                abandoned.append(str(rd))
+        except (TypeError, ValueError):
+            continue
+    stuck = [str(_as_date(r[0])) for r in _q(
+        con, """SELECT trading_date FROM run_locks WHERE run_type = 'morning'
+                AND status = 'in_progress' AND trading_date >= ? AND trading_date < ?""",
+        [days[0] if days else d, d])]
     vals = sorted(totals.values())
     med = vals[len(vals) // 2] if vals else None
     worst = max(totals.items(), key=lambda kv: kv[1]) if totals else None
@@ -209,11 +223,20 @@ def check_morning_budget(con: Any, cfg: Any, d: date) -> dict:
     if missing:
         status = "warn"
         notes.append(f"no morning run recorded on {', '.join(missing)} (a 300s kill logs nothing)")
+    if stuck:
+        status = "warn"
+        notes.append(f"morning killed at the 300s budget after saving its plan on "
+                     f"{', '.join(sorted(set(stuck)))} (its lock was never released)")
+    if abandoned:
+        status = "warn"
+        notes.append(f"paired arm B abandoned at the budget on {', '.join(abandoned)} "
+                     "(no paired comparison those sessions)")
     head = "; ".join(notes) if notes else (
         f"median {med:.0f}s, max {worst[1]:.0f}s of 300s over {len(vals)} run(s)" if worst
         else "no timed morning run in the window")
     return _res(status, head, median_s=med, max_s=worst[1] if worst else None,
-                runs=len(vals), missing_sessions=missing, slowest=slowest)
+                runs=len(vals), missing_sessions=missing, slowest=slowest,
+                killed_sessions=stuck, arm_b_abandoned=abandoned)
 
 
 def check_hypotheses(con: Any, cfg: Any, d: date) -> dict:
@@ -233,20 +256,36 @@ def check_hypotheses(con: Any, cfg: Any, d: date) -> dict:
                            AND hypothesis_id IS NOT NULL""", list(days))
     since_on = _one(con, "SELECT COUNT(*) FROM daily_plans WHERE plan_date >= ?", [date(2026, 10, 5)])
     total = sum(int(v) for v in states.values())
+    # What the analyst actually wrote, so "not using the notebook" is told
+    # apart from "writing ideas the register refuses".
+    proposed = cand_tagged = 0
+    for (aj,) in _q(con, f"SELECT analyst_json FROM daily_plans WHERE plan_date IN ({marks})",
+                    list(days)):
+        try:
+            a = json.loads(aj or "{}") or {}
+        except (TypeError, ValueError):
+            continue
+        proposed += len(a.get("new_hypotheses") or [])
+        cand_tagged += sum(1 for c in a.get("candidates") or [] if c.get("hypothesis_id"))
+    rejected = _one(con, "SELECT COUNT(*) FROM trader_hypotheses WHERE state = 'REJECTED'")
     if early:
         return _res("bad", f"{early} pick(s) tagged to an idea BEFORE the idea opened: a tag "
                            "that could see its outcome", early_tags=early)
     status = "ok"
     head = (f"{total} idea(s) ({', '.join(f'{k} {v}' for k, v in sorted(states.items()))}; "
             f"by {', '.join(f'{k} {v}' for k, v in sorted(sources.items()))}); last 5 sessions: "
+            f"the analyst wrote {proposed} idea(s) and tagged {cand_tagged} candidate(s); "
             f"{tagged} tagged pick(s), {lane} lane pick(s); every tag post-dates its idea")
-    if since_on >= 3 and not total:
+    if since_on >= 3 and not (total - rejected):
         status = "warn"
-        head = (f"lane on for {since_on} sessions and no idea has been written down: the analyst "
-                "and grader are not using the notebook")
+        head = (f"lane on for {since_on} sessions and no idea is in the notebook: "
+                + (f"the analyst wrote {proposed} and the register refused them ({rejected} "
+                   "REJECTED)" if proposed or rejected else
+                   "the analyst and grader are not writing ideas down"))
     return _res(status, head, states={str(k): int(v) for k, v in states.items()},
                 sources={str(k): int(v) for k, v in sources.items()}, lane_picks_5=lane,
-                tagged_picks_5=tagged, early_tags=early)
+                tagged_picks_5=tagged, early_tags=early, analyst_proposed_5=proposed,
+                candidates_tagged_5=cand_tagged, rejected=rejected)
 
 
 def check_lessons(con: Any, cfg: Any, d: date) -> dict:

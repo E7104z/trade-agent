@@ -144,3 +144,39 @@ def test_findings_reach_the_health_panel(con):
     h = health.loop_health(con, _cfg(), now=datetime(2026, 10, 9, 20, 0, tzinfo=ET))
     stage = next(s for s in h["stages"] if s["key"] == "selfcheck")
     assert stage["status"] == "bad" and "Data collected today" in stage["detail"]
+
+
+def test_a_morning_killed_at_the_budget_and_an_abandoned_arm_b_are_flagged(con):
+    day = date(2026, 10, 5)
+    con.execute(
+        """INSERT INTO runs (loop, run_date, started_at, finished_at, status, stages)
+           VALUES ('morning', ?, ?, ?, 'ok', ?)""",
+        [day, datetime(2026, 10, 5, 7, 11), datetime(2026, 10, 5, 7, 15), json.dumps(
+            {"timings_s": {"total": 240.0, "analyst": 120.0}, "arm_b": "abandoned_at_budget"})])
+    con.execute("""INSERT INTO run_locks (trading_date, run_type, status, request_id)
+                   VALUES (?, 'morning', 'in_progress', 'r1')""", [day])
+    r = _by_key(selfcheck.run(con, _cfg(), date(2026, 10, 6)))["morning_budget"]
+    assert r["status"] == "warn"
+    assert "killed at the 300s budget after saving its plan on 2026-10-05" in r["headline"]
+    assert "arm B abandoned at the budget on 2026-10-05" in r["headline"]
+
+
+def test_the_notebook_check_tells_not_writing_from_refused(con):
+    from datetime import timedelta
+    from agent.util import is_market_day
+    d, n = D, 0
+    while n < 3:
+        if is_market_day(d):
+            ledger.save_daily_plan(con, d, {"picks": [], "no_trade": False},
+                                   {"candidates": [], "new_hypotheses": []}, "chop")
+            n += 1
+        d -= timedelta(days=1)
+    r = _by_key(selfcheck.run(con, _cfg(), D))["hypotheses"]
+    assert r["status"] == "warn" and "not writing ideas down" in r["headline"]
+    con.execute("UPDATE daily_plans SET analyst_json = ? WHERE plan_date = ?",
+                [json.dumps({"candidates": [], "new_hypotheses": [{"statement": "x"}]}), D])
+    con.execute("""INSERT INTO trader_hypotheses (hyp_id, created_date, opened_at, source,
+                   statement, refutation, target_n, max_n, min_sessions, state, looks_done)
+                   VALUES ('H-r', ?, ?, 'analyst', 'x', '', 8, 96, 10, 'REJECTED', 0)""", [D, D])
+    r = _by_key(selfcheck.run(con, _cfg(), D))["hypotheses"]
+    assert "the analyst wrote 1 and the register refused them (1 REJECTED)" in r["headline"]

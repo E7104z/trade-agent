@@ -115,3 +115,16 @@ The forward-only guard, n ≥ 8 before any look, the ten-day quarantine floor, c
 - **Deploy:** migrations v32–v34 are additive. The first request after the deploy runs them, so warm the schema before the 10:45 UTC morning cron (`scripts\intraday_cron.ps1 -Once`, or load the logged-in dashboard). The nightly cron is a light first request too.
 - **Backfill:** fills over ~3–5 nights. `run.py gapfield` (or the evening email's self-check line) shows progress.
 - **Weekly runs:** the first one after the deploy registers the system's batch survivors and takes the first sequential looks. Expect "STILL WAITING — look at n=…" lines where the old test would have retired rules.
+
+---
+
+## Addendum 2026-10-05 — read against the first persona + hypothesis-lane morning
+
+The 10/05 morning ran on 50d6416 (this spec not yet deployed). Its email was correct in form: a floor pick and three coverage picks, every limit/breakout live at 09:45, and the persona's voice. Reading it against the code turned up three defects, fixed here:
+
+1. **The morning ran into the 300 s kill.** Vercel logged `Task timed out after 300 seconds` for the 11:11 UTC invocation. The plan was saved, the runs row was written and the email was sent before the kill. The kill came at the unbounded `paired_thread.join()` on arm B, which carries the same, now longer, persona and hypothesis prompts. Arm B's comparison for the session and the run-lock release were lost.
+   - The join is now bounded by what is left of the budget (`_join_arm_b`, 20 s margin). An abandoned arm B is recorded as `stages.arm_b = abandoned_at_budget`.
+   - The self-check flags a session whose morning lock was never released (a kill after the plan was saved), and a session whose arm B was abandoned.
+2. **A mislabeled trade was tested under the wrong label.** NVDA was proposed as `breakout` while its own thesis said "labeling as breakout is a stretch". Coverage then traded it into the breakout cell. The analyst prompt already forbade relabeling, but nothing enforced it.
+   - New kill-check `setup_fit` (risk prompt v15, checklist 2d). It is blocking in code for every lane that trades a rejected candidate (coverage, daily floor, hypothesis tests), whatever a lane's `blocking_kills` config says (`_ALWAYS_BLOCKING_KILLS`).
+3. **The hypothesis lane did nothing on day one:** no idea was written and no pick was tagged. One session is not evidence. The notebook self-check now counts what the analyst wrote (`new_hypotheses`, tagged candidates) beside what was registered or REJECTED. After three sessions it can tell "not writing ideas down" from "writing ideas the register refuses".

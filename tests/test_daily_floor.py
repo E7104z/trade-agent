@@ -66,6 +66,12 @@ def test_softest_kill_first_then_conviction_then_rr():
     assert order == ["CONV", "RRHI", "RRLO", "REGM", "GRND"]
 
 
+def test_a_mislabeled_candidate_is_never_the_floor_pick():
+    cands = {"candidates": [_cand("MISL", conviction=5, target=13.0), _cand("REGM")]}
+    plan = _empty_plan(("MISL", "setup_fit"), ("REGM", "regime_fit"))
+    assert [p["ticker"] for p in _floor_candidates(cands, plan, _cfg())] == ["REGM"]
+
+
 def test_candidates_are_minimum_sized_capped_and_labeled():
     cands = {"candidates": [_cand("AAA", conviction=5, probe_for="Q1")]}
     [pick] = _floor_candidates(cands, _empty_plan(("AAA", "rr")), _cfg())
@@ -230,3 +236,21 @@ def test_email_labels_the_floor_pick():
     html = morning_email_html(date(2026, 9, 30), {"no_trade": False, "picks": [pick]}, "")
     assert "Daily floor pick" in html and "[daily floor]" in html
     assert "AAA thesis" in html, "a floor pick carries the analyst's thesis, not a blank cell"
+
+
+def test_arm_b_is_waited_for_only_as_long_as_the_budget_allows():
+    import threading
+    import time
+    from agent.loops.morning import ARM_B_ABANDONED, _join_arm_b
+    stop = threading.Event()
+    slow = threading.Thread(target=lambda: stop.wait(5), daemon=True)
+    slow.start()
+    t0 = time.monotonic()
+    # 0.5s of budget left after the margin: the join gives up, arm A closes
+    assert _join_arm_b(slow, time.monotonic() - 299.5 + 20, budget_s=300, margin_s=20) \
+        == ARM_B_ABANDONED
+    assert time.monotonic() - t0 < 2.5
+    stop.set()
+    fast = threading.Thread(target=lambda: None)
+    fast.start()
+    assert _join_arm_b(fast, time.monotonic()) == "complete"

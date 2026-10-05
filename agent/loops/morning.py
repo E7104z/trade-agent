@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import json
 import threading
+import time as _time
 from collections import Counter
 from datetime import date
 
@@ -655,7 +656,17 @@ _KILL_CHECK_ENUM = {"staleness", "chase", "entry_type", "grounding", "crowding",
                     "conviction",
                     # TRADER_HYPOTHESIS_SPEC_v1: the trade does not test the idea
                     # it is tagged with. Named only when the hypothesis lane is on.
-                    "hypothesis_fit"}
+                    "hypothesis_fit",
+                    # The trade is not the setup it is labeled as (2026-10-05:
+                    # NVDA "breakout" whose own thesis called the label a
+                    # stretch, traded as breakout by coverage).
+                    "setup_fit"}
+
+# A kill that keeps a candidate off the tape in EVERY lane that trades a
+# rejected candidate (coverage, daily floor, hypothesis tests), whatever a
+# lane's blocking_kills config says: a mislabeled trade would be recorded
+# under a setup it is not, and per-setup records are what the desk mines.
+_ALWAYS_BLOCKING_KILLS = frozenset({"setup_fit"})
 
 
 def _build_rejections(candidates: dict, plan: dict,
@@ -913,7 +924,7 @@ _FLOOR_KILL_RANK = {
     "regime_fit": 1, "crowding": 1, "correlation": 1, "stop_quality": 1,
     "chase": 1, "staleness": 1, "hypothesis_fit": 1,
     "event_risk": 2,
-    "grounding": 3, "entry_type": 3,
+    "grounding": 3, "entry_type": 3, "setup_fit": 3,
 }
 
 # Lanes that put a candidate the risk manager rejected on the tape anyway, at
@@ -974,7 +985,7 @@ def _ranked_rejects(candidates: dict, plan: dict, lane: str, size: float,
         if rr < min_rr:
             continue
         kill = str((rejected_rows.get(ticker) or {}).get("primary_kill_check") or "").strip().lower()
-        if kill in blocked:
+        if kill in blocked or kill in _ALWAYS_BLOCKING_KILLS:
             continue
         conv = c.get("conviction")
         conv = int(conv) if isinstance(conv, (int, float)) else 3
@@ -996,8 +1007,9 @@ def _ranked_rejects(candidates: dict, plan: dict, lane: str, size: float,
 
 def _floor_candidates(candidates: dict, plan: dict, cfg: Config) -> list[dict]:
     """Fallback picks for a plan that review, validation and coverage left
-    empty, best first (see _ranked_rejects). Every kill-check is eligible:
-    the validator is what keeps a broken order off the tape."""
+    empty, best first (see _ranked_rejects). Every kill-check is eligible
+    except a mislabel (_ALWAYS_BLOCKING_KILLS): the validator is what keeps a
+    broken order off the tape."""
     floor = cfg.get("daily_floor", {}) or {}
     if not floor.get("enabled"):
         return []
@@ -1346,6 +1358,27 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
         return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
     finally:
         con2.close()
+
+
+FUNCTION_BUDGET_S = 300          # Vercel's hard limit for this invocation
+ARM_B_JOIN_MARGIN_S = 20         # left for the lock release and the response
+ARM_B_ABANDONED = "abandoned_at_budget"
+
+
+def _join_arm_b(thread: threading.Thread, t_start: float,
+                budget_s: float = FUNCTION_BUDGET_S,
+                margin_s: float = ARM_B_JOIN_MARGIN_S) -> str:
+    """Wait for arm B only as long as the function budget allows. Returns
+    'complete' or ARM_B_ABANDONED. An abandoned arm B costs that session its
+    paired comparison and nothing else: arm A's plan is already stored."""
+    remaining = max(1.0, budget_s - margin_s - (_time.monotonic() - t_start))
+    thread.join(timeout=remaining)
+    if thread.is_alive():
+        log("morning", f"WARN arm B still running {round(_time.monotonic() - t_start)}s into the "
+                       f"{int(budget_s)}s budget: abandoned so arm A closes cleanly (no paired "
+                       "comparison for this session)")
+        return ARM_B_ABANDONED
+    return "complete"
 
 
 def _place_premarket_orders(con, cfg: Config, d: date, plan: dict,
@@ -1719,11 +1752,18 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # is fully done.
         if paired_thread is not None:
             log("morning", "Waiting for paired challenger arm B (background)...")
-            paired_thread.join()
+            # Bounded by what is left of the function budget. Unbounded, a slow
+            # arm B held the whole invocation until Vercel killed it at 300s
+            # (2026-10-05): arm A's plan was already saved and emailed, but the
+            # run lock was never released and nothing recorded why.
+            stages["arm_b"] = _join_arm_b(paired_thread, t_start)
             _mark("arm_b_join")
             stages["timings_s"]["total"] = round(_time.monotonic() - t_start, 1)
             ledger.record_run_stages(con, "morning", d, stages)
-            arm_b = paired_box.get("arm_b") or {"ok": False, "reason": "background thread produced no result"}
+            arm_b = paired_box.get("arm_b") or {
+                "ok": False, "reason": ("abandoned at the function budget"
+                                        if stages["arm_b"] == ARM_B_ABANDONED
+                                        else "background thread produced no result")}
             if arm_b.get("ok"):
                 log("morning", f"Arm B ({arm_b['context_mode']}): {arm_b['picks']} pick(s), "
                                f"no_trade={arm_b['no_trade']}, ~${arm_b['cost_usd']:.3f}")

@@ -133,7 +133,7 @@ def test_missing_persona_file_with_flag_on_degrades_to_no_persona(tmp_path, monk
 
 # Bumped by TRADER_HYPOTHESIS_SPEC_v1 (hypothesis placeholders; the lane-off
 # render differs from the previous fixtures only by these version lines).
-PROMPT_VERSIONS = {"morning_analyst": "13", "morning_risk": "14", "evening_grader": "8",
+PROMPT_VERSIONS = {"morning_analyst": "13", "morning_risk": "15", "evening_grader": "8",
                    "weekly_miner": "17", "runner_selector": "3"}
 
 # The paragraph each persona block must directly follow (its prompt's role

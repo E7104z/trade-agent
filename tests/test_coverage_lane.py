@@ -91,6 +91,9 @@ def test_a_setup_the_desk_already_holds_is_not_doubled():
     ("grounding", False), ("entry_type", False), ("event_risk", False),
     ("rr", True), ("conviction", True), ("regime_fit", True), ("staleness", True),
     ("chase", True), ("crowding", True), ("correlation", True), ("stop_quality", True),
+    # 2026-10-05: a mislabel stays off whatever blocking_kills says, so a
+    # momentum trade can never be recorded as a breakout.
+    ("setup_fit", False),
 ])
 def test_only_a_broken_order_stays_off_the_tape(kill, admitted):
     plan = _plan(AAA=kill)
