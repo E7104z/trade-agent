@@ -1030,7 +1030,13 @@ def main() -> None:
         if args.check:
             ok, msg = rehearsal.verify_head()
             print(("OK: " if ok else "NOT REHEARSED: ") + msg)
-            sys.exit(0 if ok else 1)
+            if not ok:
+                sys.exit(1)
+            clash = rehearsal.cron_conflict()
+            if clash:
+                print(f"NOT NOW: {clash}; deploy outside 30 minutes before to 60 minutes after it")
+                sys.exit(2)
+            sys.exit(0)
         loops = ("morning", "evening") if args.loop == "both" else (args.loop,)
         s = rehearsal.rehearse(loops, evening_date=parse_date(args.date) if args.date else None,
                                paired=not args.no_paired)

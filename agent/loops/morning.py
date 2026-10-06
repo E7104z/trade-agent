@@ -1337,6 +1337,20 @@ def _hypothesis_plan(con, d: date, candidates: dict, cfg: Config) -> dict | None
         return None
 
 
+def _bounded_call(llm_call, t_start: float):
+    """Arm B's model calls: one attempt each, and never longer than what is
+    left of this invocation's budget. Unbounded, arm B's risk call ran past
+    280s with nothing logged in the 2026-10-06 rehearsal (and held the
+    10/05 production run until Vercel killed it); a call that cannot finish
+    in time is cut off and named, and arm A is never waiting on it."""
+    def call(**kw):
+        left = FUNCTION_BUDGET_S - ARM_B_JOIN_MARGIN_S - (_time.monotonic() - t_start) - 5
+        if left < 20:
+            raise TimeoutError(f"only {left:.0f}s of the budget left for arm B's {kw.get('mock_name')}")
+        return llm_call(**kw, timeout=left, attempts=1)
+    return call
+
+
 def _arm_b_analyst_half(cfg: Config, d: date, analyst_system: str, bundle_md: str,
                         reg_md: str, mem: dict, model: str, llm_call) -> dict:
     """The paired challenger arm's analyst call, on a background thread beside
@@ -1667,7 +1681,8 @@ def _analyst_half(cfg: Config, con, d: date, started, clock: _Clock) -> dict | N
     if not cfg.mock and paired_mod.should_run_paired(cfg, d):
         def _bg() -> None:
             arm_b_box["first"] = _arm_b_analyst_half(cfg, d, analyst_system, bundle_md,
-                                                     reg_md, mem, model, llm.call)
+                                                     reg_md, mem, model,
+                                                     _bounded_call(llm.call, clock.t_start))
         arm_b_thread = threading.Thread(target=_bg, daemon=True)
         arm_b_thread.start()
         log("morning", "Paired challenger arm B (analyst) started in background...")
@@ -1868,7 +1883,7 @@ def _risk_half(cfg: Config, con, d: date, payload: dict, request_id: str | None,
                 arm_b_box["arm_b"] = _arm_b_risk_half(
                     cfg, d, first, payload["risk_system"], payload["bundle_md"], bundle,
                     payload["reg_md"], mem["playbook_version"], payload["regime_tag"],
-                    model, llm.call)
+                    model, _bounded_call(llm.call, clock.t_start))
             arm_b_thread = threading.Thread(target=_bg, daemon=True)
             arm_b_thread.start()
             if hosted:

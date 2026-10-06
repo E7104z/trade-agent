@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import date, datetime
 from typing import Any, Callable
 
@@ -271,8 +272,11 @@ def challenger_analyst(cfg: Any, plan_date: date, *, analyst_system: str, bundle
             f"{arm_memory}\n\n"
             "Produce your candidate list now, following the output contract exactly."
         )
+        t0 = time.monotonic()
+        _log("paired", "arm B: analyst call...")
         analyst = llm_call(system=analyst_system, user=user_block, model=model,
                            mock_name="morning_analyst", thinking=True, web_search=True)
+        _log("paired", f"arm B: analyst returned in {time.monotonic() - t0:.0f}s")
         return {"ok": True, "candidates": getattr(analyst, "parsed", None) or {},
                 "arm_memory": arm_memory, "context_mode": context_mode,
                 "cost_usd": float((getattr(analyst, "usage", {}) or {}).get("cost_usd", 0.0) or 0.0)}
@@ -301,6 +305,8 @@ def challenger_risk(con: Any, cfg: Any, plan_date: date, first: dict, *, risk_sy
         # (the same reason `validate` and `llm_call` are injected). Omitting it
         # would hold arm B to a weaker pipeline than arm A -- a handicap, not a
         # comparison.
+        t0 = time.monotonic()
+        _log("paired", "arm B: pricing its candidates...")
         quotes_md = quotes_md_for(candidates) if quotes_md_for is not None else ""
 
         risk_user = (
@@ -312,14 +318,17 @@ def challenger_risk(con: Any, cfg: Any, plan_date: date, first: dict, *, risk_sy
             f"{arm_memory}\n\n"
             "Run every candidate through the kill checklist and produce the final plan now."
         )
+        _log("paired", f"arm B: risk manager call (+{time.monotonic() - t0:.0f}s)...")
         risk = llm_call(system=risk_system, user=risk_user, model=model,
                         mock_name="morning_risk", thinking=True, web_search=False)
         plan = getattr(risk, "parsed", None) or {}
+        _log("paired", f"arm B: risk manager returned (+{time.monotonic() - t0:.0f}s); validating...")
 
         if validate is not None:
             # Arm B goes through the SAME mechanical validator as arm A. An arm
             # held to weaker standards is not a comparison, it is a handicap.
             plan, _warnings = validate(plan)
+        _log("paired", f"arm B: validated (+{time.monotonic() - t0:.0f}s); recording")
 
         cost = float(first.get("cost_usd") or 0.0) + float(
             (getattr(risk, "usage", {}) or {}).get("cost_usd", 0.0) or 0.0)

@@ -133,6 +133,37 @@ def test_deploying_needs_a_passing_rehearsal_of_the_same_runtime_files(tmp_path,
     assert "uncommitted" in rehearsal.verify_head()[1]
 
 
+@pytest.mark.parametrize("utc, clash", [
+    ((2026, 10, 6, 10, 20), "/cron/morning"),            # 25 min before the 10:45 schedule
+    ((2026, 10, 6, 11, 40), "/cron/morning"),            # inside Hobby's late-firing hour
+    ((2026, 10, 6, 12, 30), "/cron/morning-continue"),
+    ((2026, 10, 6, 17, 30), None),                       # 13:30 ET: a quiet window
+    ((2026, 10, 10, 10, 50), None),                      # Saturday: no morning cron
+    ((2026, 10, 10, 14, 10), "/cron/weekly"),
+    ((2026, 10, 7, 3, 20), "/cron/nightly"),
+])
+def test_a_deploy_never_lands_on_a_cron(utc, clash):
+    from datetime import datetime
+    got = rehearsal.cron_conflict(datetime(*utc))
+    assert (got is None) if clash is None else got.startswith(clash + " ")
+
+
+def test_arm_b_calls_are_one_attempt_inside_the_budget(monkeypatch):
+    import time as _t
+    from agent.loops import morning
+    seen = {}
+
+    def _call(**kw):
+        seen.update(kw)
+        return "ok"
+    bounded = morning._bounded_call(_call, _t.monotonic() - 100)
+    assert bounded(mock_name="morning_risk") == "ok"
+    assert seen["attempts"] == 1 and 170 <= seen["timeout"] <= 176
+    late = morning._bounded_call(_call, _t.monotonic() - 270)
+    with pytest.raises(TimeoutError):
+        late(mock_name="morning_risk")
+
+
 def test_a_rehearsal_cannot_reach_production_email_or_the_broker(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", "postgres://prod")
     with rehearsal._isolated(tmp_path / "x.duckdb"):

@@ -11,9 +11,10 @@
 #
 # Steps: rehearsal check -> full test suite (never against production) ->
 # git push -> vercel --prod (retried) -> one intraday tick to load any new
-# schema before the next cron. -SkipWarm skips the last step.
+# schema before the next cron. -SkipWarm skips the last step. It also refuses
+# from 30 minutes before a scheduled cron to 60 after it (-Force overrides).
 # =============================================================================
-param([switch]$SkipWarm)
+param([switch]$SkipWarm, [switch]$Force)
 
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
@@ -26,7 +27,10 @@ $py = ".venv\Scripts\python.exe"
 
 Write-Host "== 1/5 rehearsal" -ForegroundColor Cyan
 & $py run.py rehearse --check
-if ($LASTEXITCODE -ne 0) { throw "Not deployed: no passing rehearsal covers this commit." }
+if ($LASTEXITCODE -eq 2 -and -not $Force) {
+    throw "Not deployed: a cron is due (see above). Run again outside that window, or pass -Force."
+}
+if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) { throw "Not deployed: no passing rehearsal covers this commit." }
 
 Write-Host "== 2/5 test suite" -ForegroundColor Cyan
 & $py -m pytest -q -p no:cacheprovider

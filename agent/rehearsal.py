@@ -220,9 +220,17 @@ def _morning(cfg: Config, d: date) -> dict:
         cost = _cost(con, ("morning",), d)
     finally:
         con.close()
+    # Arm A's own work in each half, apart from the bounded wait for arm B:
+    # the plan depends on the first, the paired comparison on the second.
+    t = (stages.get("timings_s") or {})
+    arm_a = {"analyst half": sum(float(t.get(k) or 0) for k in ("bundle", "regime", "analyst", "quotes")),
+             "risk half": sum(float(t.get(k) or 0) for k in ("risk", "validate", "persist", "deliver"))}
+    for name, s in arm_a.items():
+        if s >= PASS_S:
+            problems.append(f"arm A's {name} took {s:.0f}s (pass < {PASS_S}s of the {BUDGET_S}s budget)")
     for name, s in (("analyst half", analyst_s), ("risk half", risk_s)):
-        if s is not None and s >= PASS_S:
-            problems.append(f"{name} took {s:.0f}s of its {BUDGET_S}s budget (pass < {PASS_S}s)")
+        if s is not None and s >= BUDGET_S - 5:
+            problems.append(f"the {name} invocation ran {s:.0f}s, into the {BUDGET_S}s limit")
     if plan is None:
         problems.append("no plan was saved")
     if cp.get("stage") != "complete":
@@ -234,6 +242,7 @@ def _morning(cfg: Config, d: date) -> dict:
     return {
         "session": str(d), "analyst_half_s": round(analyst_s, 1),
         "risk_half_s": None if risk_s is None else round(risk_s, 1),
+        "arm_a_s": {k: round(v, 1) for k, v in arm_a.items()},
         "picks": [f"{p['ticker']} {p['direction']} {p.get('setup_type')} "
                   f"{p.get('entry_type')} @{p.get('entry_price')} "
                   f"[{p.get('exploration_lane') or 'approved'}]" for p in picks],
@@ -296,6 +305,55 @@ def _evening(cfg: Config, d: date) -> dict:
     }
 
 
+def _preflight(cfg: Config) -> str | None:
+    """One tiny model call before minutes of rehearsal: an exhausted credit
+    balance or a bad key fails here, named, instead of halfway through."""
+    try:
+        from .llm import LLMClient
+        LLMClient(cfg).call(system="Reply with OK.", user="OK?", model="claude-haiku-4-5-20251001",
+                            mock_name="preflight", expect_json=False, max_tokens=5,
+                            attempts=1, timeout=30, archive=False)
+        return None
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        return f"the Anthropic API refused a one-token call: {e}"[:500]
+
+
+def cron_conflict(now_utc: datetime | None = None, lead_min: int = 30,
+                  late_min: int = 60) -> str | None:
+    """The scheduled cron (vercel.json) a deploy now would land on, if any:
+    from `lead_min` before its schedule until `late_min` after it (Hobby
+    fires up to ~59 minutes late). A deploy that lands on a cron makes that
+    run pay the schema migration, or swaps code under it."""
+    from datetime import timedelta, timezone
+    now = now_utc or datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        crons = json.loads((ROOT / "vercel.json").read_text(encoding="utf-8")).get("crons") or []
+    except (OSError, ValueError):
+        return None
+
+    def dow_ok(field: str, day: datetime) -> bool:
+        cron_dow = (day.weekday() + 1) % 7            # cron: 0 = Sunday
+        if field == "*":
+            return True
+        for part in field.split(","):
+            lo, _, hi = part.partition("-")
+            if int(lo) <= cron_dow <= int(hi or lo):
+                return True
+        return False
+
+    for c in crons:
+        try:
+            minute, hour, _dom, _mon, dow = c["schedule"].split()
+            for day_offset in (-1, 0, 1):
+                day = now + timedelta(days=day_offset)
+                at = day.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+                if dow_ok(dow, at) and at - timedelta(minutes=lead_min) <= now <= at + timedelta(minutes=late_min):
+                    return f"{c['path']} is scheduled at {at:%H:%M} UTC ({c['schedule']})"
+        except (KeyError, ValueError):
+            continue
+    return None
+
+
 def _default_evening_date(con) -> date | None:
     rows = _q(con, f"""SELECT plan_date FROM picks
                       WHERE COALESCE(setup_type, '') <> '{ledger.RUNNER_SETUP}' AND plan_date < ?
@@ -323,6 +381,11 @@ def rehearse(loops: tuple[str, ...] = ("morning", "evening"), evening_date: date
     summary: dict[str, Any] = {"commit": sha, "dirty": dirty, "started_at": stamp,
                                "workdir": str(work), "loops": {}}
     tee = _Tee(sys.stdout)
+    refused = _preflight(cfg)
+    if refused:
+        for loop in loops:
+            summary["loops"][loop] = {"problems": [refused]}
+        loops = ()
     with _isolated(db), contextlib.redirect_stdout(tee):
         if "morning" in loops:
             d = today_et()

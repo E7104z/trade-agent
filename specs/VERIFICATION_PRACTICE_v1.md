@@ -36,6 +36,26 @@
 
 `scripts/deploy.ps1` ships only if a passing rehearsal covers HEAD's runtime files (`agent/`, `api/`, `prompts/`, `config.json`, `vercel.json`, `requirements.txt`). It then runs the suite with production unreachable, pushes, runs `vercel --prod` (retried), and warms the schema with one intraday tick. A docs-only commit needs no new rehearsal.
 
+### The first rehearsal (2026-10-06 08:00 ET, f0cf673): FAIL. Nothing was deployed.
+
+**Morning:**
+- The analyst half took 197s: bundle and memory 70s, analyst call 98s, arm B's analyst 27s after that. The old single invocation took 291s.
+- Arm A's risk half saved a 4-pick plan in 114s.
+- **Arm B's risk call never returned.** Nothing was logged and no response was archived. The bounded wait abandoned it at 280s.
+- This is the same silent hang that held the 10/05 production run until Vercel killed it. It exists in production today.
+
+**Fixes for arm B:**
+- Every arm-B step now logs with timings.
+- Each arm-B model call is one attempt, with a timeout no longer than what is left of the budget (`morning._bounded_call`).
+- The rehearsal reports arm A's own time apart from the wait for arm B.
+
+**Evening:**
+- The grader call was refused with "Your credit balance is too low to access the Anthropic API". The account ran dry during the rehearsal, after about $1.73 of its calls.
+
+**Fixes for the rehearsal and deploy:**
+- The rehearsal now makes one tiny preflight call and stops at once, naming the refusal.
+- `run.py rehearse --check` refuses from 30 minutes before a scheduled cron to 60 after it (Hobby fires up to ~59 minutes late). `deploy.ps1 -Force` overrides.
+
 ## Part 2: audit the grader before anything is saved (`agent/review_audit.py`)
 
 The grounding layer checks that a quoted number exists in the input. It does not check that the sentence around the number agrees with the rest of the input. The audit runs after the grader and before grades, lessons or ideas are stored. Each check names the 10/05 claim that prompted it:
