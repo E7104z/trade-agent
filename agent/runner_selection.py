@@ -445,7 +445,8 @@ def run_selection(cfg: Config, *, con, session_date: date,
 
     def _finish(reason: str, **extra) -> dict:
         ledger.upsert_runner_session(con, {
-            "session_date": session_date, "selection_skipped_reason": reason})
+            "session_date": session_date, "selection_skipped_reason": reason,
+            "selection_completed_at": now_et().replace(tzinfo=None)})
         return {"selection_skipped_reason": reason, **extra}
 
     # -- 1. nothing to choose from --------------------------------------
@@ -524,6 +525,8 @@ def run_selection(cfg: Config, *, con, session_date: date,
     if dropped:
         result["industry_cap_dropped"] = [d["ticker"] for d in dropped]
         result.update(_finish(_cap_note(dropped, industry_cap)))
+    else:
+        ledger.complete_runner_selection(con, session_date)
     return result
 
 

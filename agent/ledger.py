@@ -20,6 +20,7 @@ from typing import Any
 
 from .config import DB_PATH, ensure_dirs
 from .providers import INDEX_ETFS, SCAN_UNIVERSE
+from .grading import SCRATCH_R
 from .util import now_et
 
 _SCHEMA = """
@@ -438,6 +439,10 @@ _MIGRATIONS = _MIGRATIONS + migrations_v33.STATEMENTS
 from . import migrations_v34  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v34.STATEMENTS
 
+# --- v35 the morning in two invocations; a recoverable runner selection -----
+from . import migrations_v35  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v35.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -579,6 +584,85 @@ def finish_run_lock(con: Any, trading_date: date, run_type: str,
            WHERE trading_date = ? AND run_type = ? AND request_id = ?""",
         [status, trading_date, run_type, request_id],
     )
+
+
+def run_lock(con: Any, trading_date: date, run_type: str) -> dict | None:
+    row = con.execute(
+        "SELECT status, request_id FROM run_locks WHERE trading_date = ? AND run_type = ?",
+        [trading_date, run_type]).fetchone()
+    return {"status": row[0], "request_id": row[1]} if row else None
+
+
+# ---- the morning in two invocations (schema v35) ---------------------------
+# The analyst half writes one checkpoint row and hands off; the risk-manager
+# half claims it. A claim older than CHECKPOINT_RECLAIM_MINUTES belongs to a
+# half that is no longer alive (each invocation is capped at 300s), so the
+# safety-net cron may take it over.
+CHECKPOINT_RECLAIM_MINUTES = 10
+CHECKPOINT_RETENTION_DAYS = 30
+_CHECKPOINT_FIELDS = ("stage", "dispatch", "arm_b_status", "note")
+
+
+def save_morning_checkpoint(con: Any, trading_date: date, request_id: str,
+                            payload: dict) -> None:
+    con.execute("DELETE FROM morning_checkpoints WHERE trading_date = ?", [trading_date])
+    con.execute(
+        """INSERT INTO morning_checkpoints
+               (trading_date, request_id, stage, payload_json, created_at, attempts)
+           VALUES (?, ?, 'analyst_done', ?, current_timestamp, 0)""",
+        [trading_date, request_id, json.dumps(payload, default=str)])
+    con.execute("DELETE FROM morning_checkpoints WHERE trading_date < ?",
+                [trading_date - timedelta(days=CHECKPOINT_RETENTION_DAYS)])
+
+
+def claim_morning_checkpoint(con: Any, trading_date: date,
+                             request_id: str | None = None) -> dict | None:
+    """Atomically take the risk-manager half of a session's morning: a
+    checkpoint nobody has claimed, or one whose claimant died. `request_id`,
+    when given, must match (a dispatched call names the run it continues).
+    None when there is nothing to take."""
+    params: list = [trading_date]
+    rid = ""
+    if request_id:
+        rid = "AND request_id = ?"
+        params.append(request_id)
+    row = con.execute(
+        f"""UPDATE morning_checkpoints
+               SET stage = 'risk_running', claimed_at = current_timestamp,
+                   attempts = COALESCE(attempts, 0) + 1
+           WHERE trading_date = ? {rid}
+             AND (stage = 'analyst_done'
+                  OR (stage = 'risk_running' AND claimed_at < current_timestamp
+                      - INTERVAL '{CHECKPOINT_RECLAIM_MINUTES} minutes'))
+           RETURNING request_id, payload_json, attempts""", params).fetchone()
+    if not row:
+        return None
+    return {"request_id": row[0], "payload": json.loads(row[1] or "{}"),
+            "attempts": int(row[2] or 1)}
+
+
+def set_morning_checkpoint(con: Any, trading_date: date, **fields: Any) -> None:
+    """Update the checkpoint's status fields. A terminal stage stamps
+    completed_at and drops the payload, which nothing reads once the session
+    is finished."""
+    sets = {k: v for k, v in fields.items() if k in _CHECKPOINT_FIELDS}
+    if not sets:
+        return
+    clause = ", ".join(f"{k} = ?" for k in sets)
+    if sets.get("stage") in ("complete", "failed", "superseded"):
+        clause += ", completed_at = current_timestamp, payload_json = NULL"
+    con.execute(f"UPDATE morning_checkpoints SET {clause} WHERE trading_date = ?",
+                [str(v)[:2000] if v is not None else None for v in sets.values()]
+                + [trading_date])
+
+
+def morning_checkpoint(con: Any, trading_date: date) -> dict | None:
+    """The checkpoint's status, without the payload."""
+    cols = ("trading_date", "request_id", "stage", "created_at", "claimed_at",
+            "completed_at", "attempts", "dispatch", "arm_b_status", "note")
+    row = con.execute(f"SELECT {', '.join(cols)} FROM morning_checkpoints WHERE trading_date = ?",
+                      [trading_date]).fetchone()
+    return dict(zip(cols, row)) if row else None
 
 
 def append_plan_run(con: Any, trading_date: date, run_type: str,
@@ -1289,7 +1373,7 @@ def _stats_rows(con: duckdb.DuckDBPyConnection, dim_expr: str,
         f"""SELECT {dim_expr} AS dim,
                    COUNT(*) AS n,
                    SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END) AS triggered,
-                   SUM(CASE WHEN o.triggered AND COALESCE(o.r_planned, o.r_multiple) > 0
+                   SUM(CASE WHEN o.triggered AND COALESCE(o.r_planned, o.r_multiple) > {SCRATCH_R}
                             THEN 1 ELSE 0 END) AS wins,
                    ROUND(CAST(AVG(CASE WHEN o.triggered
                                        THEN COALESCE(o.r_planned, o.r_multiple) END)
@@ -1436,23 +1520,24 @@ def current_streak(con: duckdb.DuckDBPyConnection, lane: str | None = None,
            WHERE o.triggered AND {_REALIZED_R} IS NOT NULL{lane_clause(lane)}{extra}
            ORDER BY p.plan_date DESC, p.pick_id DESC LIMIT 30"""
     ).fetchall()
-    if not rows:
+    # A scratch (|R| <= SCRATCH_R) neither extends nor breaks a streak: a
+    # +0.01R exit is not the win that ends a run of losers, nor a loss.
+    signs = [1 if r > SCRATCH_R else -1 for (r,) in rows if abs(r) > SCRATCH_R]
+    if not signs:
         return {"kind": "none", "length": 0}
-    sign = 1 if rows[0][0] > 0 else -1
     length = 0
-    for (r,) in rows:
-        if (r > 0 and sign == 1) or (r <= 0 and sign == -1):
-            length += 1
-        else:
+    for sign in signs:
+        if sign != signs[0]:
             break
-    return {"kind": "winning" if sign == 1 else "losing", "length": length}
+        length += 1
+    return {"kind": "winning" if signs[0] == 1 else "losing", "length": length}
 
 
 def overall_stats(con: duckdb.DuckDBPyConnection, lane: str | None = None) -> dict:
     row = con.execute(
         f"""SELECT COUNT(*),
                   SUM(CASE WHEN o.triggered THEN 1 ELSE 0 END),
-                  SUM(CASE WHEN o.triggered AND {_REALIZED_R} > 0 THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN o.triggered AND {_REALIZED_R} > {SCRATCH_R} THEN 1 ELSE 0 END),
                   AVG(CASE WHEN o.triggered THEN {_REALIZED_R} END),
                   SUM(CASE WHEN o.triggered THEN {_REALIZED_R} * COALESCE(p.size_r,1) ELSE 0 END)
            FROM picks p JOIN outcomes o ON p.pick_id = o.pick_id
@@ -2030,7 +2115,7 @@ def add_calibration_row(con: duckdb.DuckDBPyConnection, session_date: date, tick
         "INSERT INTO calibration (session_date, ticker, stated_conviction, realized_r, win) "
         "VALUES (?,?,?,?,?)",
         [session_date, ticker, conviction, realized_r,
-         (realized_r > 0) if realized_r is not None else None],
+         (realized_r > SCRATCH_R) if realized_r is not None else None],
     )
 
 
@@ -2063,8 +2148,10 @@ def calibration_aggregate(con: duckdb.DuckDBPyConnection,
     """Realized WR/avgR per stated conviction -- MORNING lane only."""
     runner_only = _RUNNER_ONLY_ROW.format(d="c.session_date", t="c.ticker")
     rows = con.execute(
+        # Wins read off realized_r against the scratch band, not the stored
+        # `win` flag, so rows written before the band are counted the same way.
         f"""SELECT stated_conviction, COUNT(*),
-                  SUM(CASE WHEN win THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN realized_r > {SCRATCH_R} THEN 1 ELSE 0 END),
                   ROUND(CAST(AVG(realized_r) AS NUMERIC), 3)
            FROM calibration c WHERE realized_r IS NOT NULL AND NOT ({runner_only})
            GROUP BY stated_conviction ORDER BY stated_conviction DESC"""
@@ -2421,6 +2508,7 @@ _RUNNER_SESSION_FIELDS = [
     "rejected_too_few_bars", "gates_unavailable", "provider_degraded",
     "selection_made", "selection_skipped_reason", "scan_version",
     "live_orders_note", "universe_stats", "rejected_liquidity", "rejected_instrument",
+    "selection_completed_at",
 ]
 
 
@@ -2484,13 +2572,80 @@ def claim_runner_selection(con: duckdb.DuckDBPyConnection, d: date,
     # at this moment is graded from (runner_scan.honest_entry_time). Naive ET
     # wall-clock, the same convention as first_pass_et / scan_pass_et.
     decided = (at or now_et()).replace(tzinfo=None)
+    # A claim can also be TAKEN OVER when the request that made it died before
+    # finishing: no completion stamp (v35), no recorded reason, no broker note
+    # and not one candidate marked selected, SELECTION_RECLAIM_MINUTES after
+    # the claim. The selection request runs on a 300s function budget, after a
+    # scan of the whole universe; before this, a kill between the claim and
+    # the result left the session with 0 picks and nothing saying why (10/05:
+    # 533 candidates, 0 selected, no reason). Any trace of a result -- a pick
+    # marked, a reason, a broker note -- keeps the claim, so a finished
+    # selection is never made twice.
     row = con.execute(
-        """UPDATE runner_sessions SET selection_made = TRUE, selection_at = ?
-           WHERE session_date = ? AND (selection_made IS NULL OR selection_made = FALSE)
+        f"""UPDATE runner_sessions
+               SET selection_made = TRUE, selection_at = ?, selection_completed_at = NULL
+           WHERE session_date = ?
+             AND (selection_made IS NULL OR selection_made = FALSE
+                  OR (selection_completed_at IS NULL
+                      AND selection_skipped_reason IS NULL
+                      AND live_orders_note IS NULL
+                      AND selection_at < ?
+                      AND NOT EXISTS (SELECT 1 FROM runner_candidate_outcomes o
+                                      WHERE o.session_date = runner_sessions.session_date
+                                        AND o.selected)))
            RETURNING session_date""",
-        [decided, d],
+        [decided, d, decided - timedelta(minutes=SELECTION_RECLAIM_MINUTES)],
     ).fetchone()
     return bool(row)
+
+
+# A selection claimed this long ago with no trace of a result belongs to a
+# request that is no longer alive (each invocation is capped at 300s).
+SELECTION_RECLAIM_MINUTES = 10
+
+
+def runner_selection_note(con: Any, d: date) -> dict:
+    """What happened to the session's one runner selection, from what is
+    stored: {"state", "selected", "text"}. state is one of
+      decided     the selection finished (text: its recorded reason, if any)
+      unfinished  claimed, then nothing: no pick, no reason, no completion --
+                  the claiming request died between the claim and the result
+      not_run     never claimed (no tick reached the decision with budget)
+      no_session  no scan recorded for the session
+    """
+    try:
+        row = con.execute(
+            """SELECT selection_made, selection_skipped_reason, selection_at,
+                      selection_completed_at, live_orders_note
+               FROM runner_sessions WHERE session_date = ?""", [d]).fetchone()
+    except Exception:  # noqa: BLE001 -- pre-v35 database
+        row = None
+    if not row:
+        return {"state": "no_session", "selected": 0, "text": "no runner scan recorded"}
+    made, reason, at, completed, orders = row
+    n_sel = int((con.execute(
+        "SELECT COUNT(*) FROM runner_candidate_outcomes WHERE session_date = ? AND selected",
+        [d]).fetchone() or (0,))[0] or 0)
+    at_txt = f" at {at:%H:%M} ET" if hasattr(at, "strftime") else ""
+    # Any trace of a result means the selection ran to its end.
+    if reason or completed or orders or n_sel:
+        text = f"selected {n_sel}" + (f" ({reason})" if reason else "") \
+            + (f"; broker: {orders}" if orders else "")
+        return {"state": "decided", "selected": n_sel, "text": text}
+    if not made:
+        return {"state": "not_run", "selected": 0,
+                "text": "selection never ran: no tick reached the decision time with "
+                        "enough of its budget left"}
+    return {"state": "unfinished", "selected": 0,
+            "text": f"selection claimed{at_txt} and never finished: no pick, no reason, no "
+                    f"completion stamp, so the claiming request died before its result "
+                    f"(most likely the 300s function limit) and no later tick took it over"}
+
+
+def complete_runner_selection(con: Any, d: date) -> None:
+    """Stamp the session's selection as finished, whatever it decided."""
+    upsert_runner_session(con, {"session_date": d,
+                                "selection_completed_at": now_et().replace(tzinfo=None)})
 
 
 def runner_candidate_outcomes_since(con: duckdb.DuckDBPyConnection,

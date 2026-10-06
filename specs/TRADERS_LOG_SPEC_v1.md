@@ -101,6 +101,7 @@ Exception-guarded: on any error, return what was built plus `errors`; the caller
 ### 2.1 `render(raw_text, facts) -> (rendered, violations)`
 
 - Find every `{{slot_name}}` in `raw_text`. Unknown slot name = violation. Each valid slot is replaced with `value` plus, for `scope == "one_session"`, the suffix ` (one session)` appended by the renderer (not the model). `cumulative` and `count` get no suffix; `computed_verdict` is wrapped in quotes.
+  - *Amended 2026-10-05 (MORNING_BUDGET_SPEC_v1 Part 6):* inside `## What happened` the scope is stated once, on the rendered heading ("What happened (one session, not evidence)"), and its values carry no suffix. A one-session value cited in any other section keeps ` (one session)`. The facts-only list does the same per group.
 - After removing slot tokens, **any digit character in the remaining text is a violation**. (This catches `13 sessions`, `3/20`, `1R`, `0.5`, years, times. Everything numeric must come through a slot. Spelled-out small words like "one" and "two" are permitted.)
 - The final non-empty line must start with `Tomorrow:` and its remainder must contain either `no change` or exactly one slot reference to a `menu_item_ids` entry, and no free-form hypothesis text beyond a single short clause. (Violation otherwise.)
 - Sections must appear in the required order with the required headings (§3.2). Missing/extra headings = violation.

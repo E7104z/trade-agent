@@ -149,32 +149,53 @@ def check_lanes(con: Any, cfg: Any, d: date) -> dict:
         by_lane[str(lane)] += int(n)
         per_day[_as_date(pd)] += int(n)
     planned = [_as_date(r[0]) for r in _q(con, f"SELECT plan_date FROM daily_plans WHERE plan_date IN ({marks})", list(days))]
+    # A probe-tagged candidate can reach the tape as an approval or as
+    # coverage, which collects the same observation under another label; only
+    # one that reached it by no lane at all is a probe lost.
+    lane_of_pick: dict = {}
+    for pd, t, lane in _q(con, f"""SELECT plan_date, ticker, COALESCE(exploration_lane, 'approved')
+                                   FROM picks WHERE plan_date IN ({marks})
+                                     AND COALESCE(setup_type, '') <> '{RUNNER}'""", list(days)):
+        lane_of_pick[(_as_date(pd), str(t).upper())] = str(lane)
     tagged = 0
-    for (aj,) in _q(con, f"SELECT analyst_json FROM daily_plans WHERE plan_date IN ({marks})", list(days)):
+    probes_traded: Counter = Counter()
+    for pd, aj in _q(con, f"SELECT plan_date, analyst_json FROM daily_plans WHERE plan_date IN ({marks})", list(days)):
         try:
-            tagged += sum(1 for c in (json.loads(aj or "{}") or {}).get("candidates") or []
-                          if c.get("probe_for"))
+            for c in (json.loads(aj or "{}") or {}).get("candidates") or []:
+                if not c.get("probe_for"):
+                    continue
+                tagged += 1
+                lane = lane_of_pick.get((_as_date(pd), str(c.get("ticker", "")).upper()))
+                if lane:
+                    probes_traded[lane] += 1
         except (TypeError, ValueError, AttributeError):
             continue
     cap = int(_cfg(cfg, "live_paper").get("max_picks_per_day", 4) or 4)
     clipped = {str(k): v for k, v in per_day.items() if v > cap}
     notes, status = [], "ok"
+    n_probe_traded = sum(probes_traded.values())
     if _cfg(cfg, "exploration_lane").get("backlog_probe") and len(planned) >= 5 \
-            and not by_lane.get("backlog_probe"):
+            and not by_lane.get("backlog_probe") and not n_probe_traded:
         status = "warn"
         notes.append(
             f"backlog_probe has not fired in {len(planned)} sessions: "
             + ("the analyst tagged no candidate `probe_for`" if not tagged else
-               f"the analyst tagged {tagged} candidate(s) `probe_for`, but none was killed on "
-               "rr/conviction alone with R:R >= the lane's floor"))
+               f"the analyst tagged {tagged} candidate(s) `probe_for` and none reached the tape "
+               "(each killed on a broken order or below the lane's R:R floor)"))
     if clipped:
         status = "warn"
         notes.append(f"broker cap {cap} clipped the plan on {len(clipped)} day(s) "
                      f"(max {max(clipped.values())} picks); the sim still grades them all")
     lane_txt = ", ".join(f"{k} {v}" for k, v in sorted(by_lane.items(), key=lambda kv: -kv[1]))
-    head = "; ".join(notes) if notes else f"last {len(planned)} sessions: {lane_txt or 'no picks'}"
+    if n_probe_traded:
+        probe_txt = (f"; probes tagged {tagged}, traded {n_probe_traded} ("
+                     + ", ".join(f"{k} {v}" for k, v in sorted(probes_traded.items())) + ")")
+    else:
+        probe_txt = f"; probes tagged {tagged}, none traded" if tagged else ""
+    head = "; ".join(notes) if notes else \
+        f"last {len(planned)} sessions: {lane_txt or 'no picks'}{probe_txt}"
     return _res(status, head, sessions=len(planned), by_lane=dict(by_lane),
-                probe_tagged_candidates=tagged, broker_cap=cap,
+                probe_tagged_candidates=tagged, probes_traded=dict(probes_traded), broker_cap=cap,
                 max_picks_in_a_day=max(per_day.values()) if per_day else 0, clipped_days=clipped)
 
 
@@ -213,6 +234,18 @@ def check_morning_budget(con: Any, cfg: Any, d: date) -> dict:
         con, """SELECT trading_date FROM run_locks WHERE run_type = 'morning'
                 AND status = 'in_progress' AND trading_date >= ? AND trading_date < ?""",
         [days[0] if days else d, d])]
+    # The two-invocation morning (schema v35) says which half died.
+    halves: dict[str, list[str]] = {}
+    for td, stage, arm_b in _q(
+            con, """SELECT trading_date, stage, arm_b_status FROM morning_checkpoints
+                    WHERE trading_date >= ? AND trading_date <= ?""", [days[0] if days else d, d]):
+        why = {"analyst_done": "risk half never started (hand-off and safety-net cron both missed)",
+               "risk_running": "risk half died mid-run",
+               "failed": "risk half failed"}.get(str(stage))
+        if why:
+            halves.setdefault(why, []).append(str(_as_date(td)))
+        if str(arm_b or "") == "running":
+            abandoned.append(f"{_as_date(td)} (killed mid-run)")
     vals = sorted(totals.values())
     med = vals[len(vals) // 2] if vals else None
     worst = max(totals.items(), key=lambda kv: kv[1]) if totals else None
@@ -225,8 +258,11 @@ def check_morning_budget(con: Any, cfg: Any, d: date) -> dict:
         notes.append(f"no morning run recorded on {', '.join(missing)} (a 300s kill logs nothing)")
     if stuck:
         status = "warn"
-        notes.append(f"morning killed at the 300s budget after saving its plan on "
-                     f"{', '.join(sorted(set(stuck)))} (its lock was never released)")
+        notes.append(f"morning run lock never released on {', '.join(sorted(set(stuck)))} "
+                     "(a run killed at the 300s limit)")
+    for why, dates in sorted(halves.items()):
+        status = "warn"
+        notes.append(f"{why} on {', '.join(sorted(dates))}")
     if abandoned:
         status = "warn"
         notes.append(f"paired arm B abandoned at the budget on {', '.join(abandoned)} "
@@ -236,7 +272,26 @@ def check_morning_budget(con: Any, cfg: Any, d: date) -> dict:
         else "no timed morning run in the window")
     return _res(status, head, median_s=med, max_s=worst[1] if worst else None,
                 runs=len(vals), missing_sessions=missing, slowest=slowest,
-                killed_sessions=stuck, arm_b_abandoned=abandoned)
+                killed_sessions=stuck, arm_b_abandoned=abandoned, halves=halves)
+
+
+def check_runner_selection(con: Any, cfg: Any, d: date) -> dict:
+    """Did the runner lane make its one selection today? A claim whose
+    request died left 10/05 with 533 candidates, 0 picks and no reason."""
+    rcfg = _cfg(cfg, "runner")
+    if not (rcfg.get("enabled") and rcfg.get("selection_enabled")):
+        return _res("info", "runner selection off")
+    from .ledger import runner_selection_note
+    n_cand = _one(con, "SELECT COUNT(*) FROM runner_candidates WHERE session_date = ?", [d])
+    try:
+        note = runner_selection_note(con, d)
+    except Exception as e:  # noqa: BLE001
+        return _res("warn", f"selection state unreadable ({type(e).__name__})")
+    if n_cand and note["state"] in ("unfinished", "not_run"):
+        status = "warn"
+    else:
+        status = "ok" if note["state"] == "decided" else "info"
+    return _res(status, f"{n_cand} candidate(s): {note['text']}", candidates=n_cand, **note)
 
 
 def check_hypotheses(con: Any, cfg: Any, d: date) -> dict:
@@ -398,6 +453,7 @@ def check_gapfield(con: Any, cfg: Any, d: date) -> dict:
 CHECKS: tuple[tuple[str, str, Callable[[Any, Any, date], dict]], ...] = (
     ("plumbing", "Data collected today", check_plumbing),
     ("lanes", "Lanes and broker cap", check_lanes),
+    ("runner_selection", "Runner selection", check_runner_selection),
     ("morning_budget", "Morning time budget", check_morning_budget),
     ("hypotheses", "Hypothesis notebook", check_hypotheses),
     ("lessons", "Lessons steering untested", check_lessons),

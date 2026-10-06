@@ -4,6 +4,10 @@ MORNING LOOP (6:45 AM ET)
   pull market data -> compute regime -> load memory -> two-stage Claude call
   (analyst generates candidates, risk manager kills the weak ones) ->
   validate plan -> log picks to ledger -> deliver (email + dashboard).
+
+Run as two halves with a function budget each (specs/MORNING_BUDGET_SPEC_v1.md):
+the analyst half (run) ends at the candidate quotes and hands the risk half to
+a fresh invocation (resume), which a safety-net cron also calls.
 """
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ import json
 import threading
 import time as _time
 from collections import Counter
-from datetime import date
+from datetime import date, datetime
 
 from .. import hypotheses, ledger
 from ..config import REPORTS_DIR, Config
@@ -480,6 +484,35 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                 f"rather than let it fill as a disguised market order")
             continue
 
+        # TRIGGER-ALREADY-CROSSED / TARGET-ALREADY-REACHED GATE (2026-10-05).
+        # The plan is written ~07:10 ET; a breakout goes live at the 09:45
+        # entry window. A trigger less than breakout_min_trigger_r of planned
+        # risk beyond the last price is crossed by an ordinary opening wiggle
+        # before the window opens, and then fills wherever price is at 09:45:
+        # CWH, trigger 4.90 against a 4.91 open, filled at 4.60, 0.86R through
+        # its own trigger -- a market order wearing a breakout's levels. And an
+        # open or breakout entry whose target the last price has already
+        # reached has no reward left to capture (CHRW opened 3.1% beyond its
+        # target). Both are dropped here, for every lane; the simulator's
+        # invalid_fill gate stays the backstop for what moves after the plan.
+        risk_ps = abs(entry - stop)
+        sign = 1 if p["direction"] == "long" else -1
+        if entry_type == "breakout":
+            room_r = sign * (entry - ref) / risk_ps
+            min_trigger_r = float(cfg.get("breakout_min_trigger_r", 0.25))
+            if room_r < min_trigger_r:
+                warnings.append(
+                    f"{t}: breakout trigger {entry} is {room_r:+.2f}R from last price {ref} "
+                    f"(needs >= {min_trigger_r}R beyond it) — dropped: it would be crossed "
+                    f"before the {cfg.get('morning_entry_not_before', MORNING_ENTRY_NOT_BEFORE)} "
+                    f"window and fill wherever price is then, not at the trigger")
+                continue
+        if entry_type in ("open", "breakout") and sign * (target - ref) <= 0:
+            warnings.append(
+                f"{t}: target {target} is already reached at last price {ref} — dropped: "
+                f"an {entry_type} entry fills at or past the target, with no reward left")
+            continue
+
         # NOISE-STOP / WIDE-STOP / FANTASY-TARGET GATE (fails OPEN on missing ATR —
         # see module docstring's "null asymmetry" note: ATR is not always
         # fetchable for a real tradable name, and dropping a real trade on
@@ -781,11 +814,19 @@ def _no_trade_category(plan: dict, rejections: list[dict]) -> str | None:
     return "all_failed_validator"
 
 
-# Kill-checks a backlog probe may be rescued from. Both are judgments about
-# how good the trade is, not about whether it is a valid trade: every
-# validity check (staleness, grounding, event risk, chase, entry type, stop
-# quality, correlation, crowding, regime fit) stays binding.
-_PROBE_KILL_CHECKS = {"rr", "conviction"}
+# Kill-checks that keep a backlog probe off the tape: a broken order (the
+# coverage lane's blocking_kills), a mislabel, or a trade that does not test
+# the idea it is tagged with. Until 2026-10-05 a probe could be rescued only
+# from `rr` or `conviction`, while the coverage lane (live since 9/29) traded
+# every other kill at the same size -- so a probe was held to a stricter bar
+# than an untagged candidate, never fired as a probe in 9 sessions, and was
+# dropped outright when coverage had already filled its setup. A probe aims at
+# a CELL, not a setup; that is exactly the trade coverage cannot add.
+def _probe_blocking_kills(cfg: Config) -> frozenset:
+    lane = cfg.get("coverage_lane", {}) or {}
+    blocking = lane.get("blocking_kills", ("grounding", "entry_type", "event_risk"))
+    return (frozenset(str(k).lower() for k in blocking)
+            | _ALWAYS_BLOCKING_KILLS | frozenset({"hypothesis_fit"}))
 
 
 def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config,
@@ -801,10 +842,11 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config,
                         rejection reasons remain binding.
       backlog_probe     (EVIDENCE_BACKLOG_SPEC_v1) a candidate the analyst
                         tagged `probe_for` one of the top backlog items, that
-                        the risk manager killed on `rr` or `conviction` only
-                        (the structured primary_kill_check is required), and
-                        whose planned R:R still clears `min_rr`. It buys an
-                        observation the desk is short of.
+                        the risk manager killed on any check but a broken
+                        order (_probe_blocking_kills; the structured
+                        primary_kill_check is required), and whose planned
+                        R:R still clears `min_rr`. It buys an observation the
+                        desk is short of.
 
     By default exploration only runs on an otherwise empty plan;
     `allow_with_picks` lets it run beside regular picks.
@@ -834,6 +876,7 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config,
     low_rr = float(lane.get("min_rr", 1.8))
     high_rr = float(lane.get("max_rr", 2.0))
     probe_ids = set(backlog_ids or []) if lane.get("backlog_probe") else set()
+    probe_blocked = _probe_blocking_kills(cfg)
     already = {str(p.get("ticker", "")).upper() for p in plan.get("picks") or []}
     admitted: list[dict] = []
     for candidate in candidates.get("candidates", []) or []:
@@ -865,7 +908,8 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config,
         rr = abs(float(target) - float(entry)) / risk
 
         tag = None
-        if is_probe and kill_check in _PROBE_KILL_CHECKS and rr >= low_rr:
+        if is_probe and kill_check is not None and kill_check not in probe_blocked \
+                and rr >= low_rr:
             tag = "backlog_probe"
         elif low_rr <= rr < high_rr:
             # Checked AFTER the R:R band so the log line can report the rr
@@ -1293,18 +1337,32 @@ def _hypothesis_plan(con, d: date, candidates: dict, cfg: Config) -> dict | None
         return None
 
 
-def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: str,
-                      bundle_md: str, bundle: dict, reg_md: str, mem: dict,
-                      regime_tag: str, model: str, llm_call) -> dict:
-    """Run the paired challenger arm on its own DB connection and MarketData
-    instance so it can execute concurrently with arm A on a background thread
-    (see run()) instead of stacking two full analyst+risk-manager LLM round
-    trips back to back. Sharing arm A's `con`/`md` across threads would race
-    on the DB connection and the Alpaca/yfinance client state underneath it;
-    a fresh connection/instance sidesteps that entirely. `bundle` itself is
-    read-only after morning_bundle() returns, so it's safe to share as-is.
+def _arm_b_analyst_half(cfg: Config, d: date, analyst_system: str, bundle_md: str,
+                        reg_md: str, mem: dict, model: str, llm_call) -> dict:
+    """The paired challenger arm's analyst call, on a background thread beside
+    arm A's (see _analyst_half). Its result is JSON-safe: the risk-manager
+    half may run in another invocation. Never raises."""
+    from . import paired as paired_mod
+    try:
+        return paired_mod.challenger_analyst(
+            cfg, d, analyst_system=analyst_system, bundle_md=bundle_md,
+            regime_md_text=reg_md, memory_text=mem["text"], llm_call=llm_call, model=model)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
-    Never raises — mirrors run_challenger_arm's own never-fail contract, since
+
+def _arm_b_risk_half(cfg: Config, d: date, first: dict, risk_system: str,
+                     bundle_md: str, bundle: dict, reg_md: str, playbook_version: str,
+                     regime_tag: str, model: str, llm_call) -> dict:
+    """Run the paired challenger arm's risk-manager half on its own DB
+    connection and MarketData instance so it can execute concurrently with
+    arm A's on a background thread (see _risk_half) instead of stacking the
+    LLM round trips back to back. Sharing arm A's `con`/`md` across threads
+    would race on the DB connection and the Alpaca/yfinance client state
+    underneath it; a fresh connection/instance sidesteps that entirely.
+    `bundle` is read-only, so it's safe to share as-is.
+
+    Never raises — mirrors challenger_risk's own never-fail contract, since
     a challenger-arm crash must not take down arm A (which owns this thread).
     """
     from . import paired as paired_mod
@@ -1347,11 +1405,10 @@ def _run_paired_arm_b(cfg: Config, d: date, analyst_system: str, risk_system: st
                                         hyp=_hypothesis_plan(con2, d, armb_cands, cfg))
             return p, warnings
 
-        return paired_mod.run_challenger_arm(
-            con2, cfg, d,
-            analyst_system=analyst_system, risk_system=risk_system,
-            bundle_md=bundle_md, regime_md_text=reg_md, memory_text=mem["text"],
-            playbook_version=mem["playbook_version"], llm_call=llm_call,
+        return paired_mod.challenger_risk(
+            con2, cfg, d, first, risk_system=risk_system,
+            bundle_md=bundle_md, regime_md_text=reg_md,
+            playbook_version=playbook_version, llm_call=llm_call,
             validate=_validate_arm_b, quotes_md_for=_quotes_md_arm_b,
             regime_tag=regime_tag, model=model)
     except Exception as e:  # noqa: BLE001
@@ -1423,7 +1480,57 @@ def _place_premarket_orders(con, cfg: Config, d: date, plan: dict,
     return out
 
 
+# ---------------------------------------------------------------------------
+# The run: two halves, each with a function budget of its own
+# (specs/MORNING_BUDGET_SPEC_v1.md)
+#
+# The analyst call and the risk-manager call each took ~130s (Opus with
+# thinking). With the data bundle, one invocation reached 291s of its 300s
+# budget on 2026-10-05, and Vercel killed the run after it had saved its plan
+# on 9/28, 9/30, 10/01, 10/02 and 10/05 -- the lock never released, the paired
+# arm lost, nothing recorded. Bounding the arm-B wait (7f8099d) could not help:
+# arm A alone was at the limit, and every new prompt section adds to it.
+#
+# So the morning is two halves. The ANALYST HALF (data, regime, memory, the
+# analyst call, candidate quotes) writes a checkpoint and hands the RISK HALF
+# (risk manager, validation, lanes, persistence, orders, email) to a fresh
+# invocation of this deployment (agent/dispatch.py). Locally, and under mock,
+# both halves run here, one after the other, through the same JSON payload.
+# The paired arm B is split at the same seam and runs beside each half.
+# ---------------------------------------------------------------------------
+
+# The risk half runs in THIS invocation after a failed hand-off only when at
+# least this much of the budget is left (it took ~130-190s on record).
+RISK_HALF_INLINE_MIN_LEFT_S = 200
+PAYLOAD_VERSION = 1
+
+
+class _Clock:
+    """Stage timings (DATA_CONTINUITY_SPEC_v1 Phase 4) for one invocation,
+    each also written as a heartbeat the instant the stage finishes: a run
+    killed at the budget never reaches record_run_stages, but its heartbeat
+    says where it died."""
+
+    def __init__(self, con, d: date, timings: dict, beat: bool, t_start: float | None = None):
+        self.con, self.d, self.timings, self.beat = con, d, timings, beat
+        self.t_start = _time.monotonic() if t_start is None else t_start
+        self._last = self.t_start
+
+    def elapsed(self) -> float:
+        return _time.monotonic() - self.t_start
+
+    def mark(self, name: str) -> None:
+        now = _time.monotonic()
+        self.timings[name] = round(now - self._last, 1)
+        self._last = now
+        if self.beat:
+            ledger.beat(self.con, "morning_run",
+                        f"{self.d.isoformat()} reached '{name}' at +{round(now - self.t_start, 1)}s")
+
+
 def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
+    """The session's morning: the analyst half, then the risk half -- in this
+    process locally and under mock, in a fresh invocation when hosted."""
     d = run_date or today_et()
     started = now_et().replace(tzinfo=None)
     con = ledger.connect()
@@ -1445,121 +1552,127 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             con.close()
             return
 
-    paired_thread: threading.Thread | None = None
-    # Stage timings (DATA_CONTINUITY_SPEC_v1 Phase 4). The morning run is the
-    # closest to the 300s budget of any loop -- it timed out on 2026-08-28 and
-    # 2026-09-24 -- and a killed function logs nothing, so the only warning is
-    # the timings of the runs that DO finish creeping toward the limit.
-    import time as _time
-    t_start = _time.monotonic()
-    t_last = [t_start]
-    stages: dict = {"timings_s": {}}
+    clock = _Clock(con, d, {}, beat=bool(lock))
     if lock:
         ledger.beat(con, "morning_run", f"{d.isoformat()} started (data bundle fetch)")
+    try:
+        payload = _analyst_half(cfg, con, d, started, clock)
+        if payload is not None:
+            _hand_off(cfg, con, d, payload, lock, clock)
+    except _RiskHalfFailed:
+        raise                     # already recorded by _risk_half
+    except Exception as e:
+        _record_failure(con, cfg, d, started, lock["request_id"] if lock else None, e,
+                        {"timings_s": clock.timings})
+        raise
+    finally:
+        con.close()
 
-    def _mark(name: str) -> None:
-        now = _time.monotonic()
-        elapsed = round(now - t_last[0], 1)
-        stages["timings_s"][name] = elapsed
-        t_last[0] = now
-        # stages["timings_s"] itself is only ever persisted to `runs` AFTER the
-        # plan is saved (record_run_stages, well below) -- so a 300s-timeout
-        # kill during the analyst/risk LLM calls (the two stages actually
-        # close to that budget) has historically left zero trace of where it
-        # died (2026-08-28, 2026-09-24, 2026-09-25 all show an empty `runs`
-        # row for the date). A heartbeat survives a kill because it is written
-        # the instant each stage finishes, not batched for later -- same
-        # best-effort, never-fails-the-job pattern as the intraday monitor's.
-        ledger.beat(con, "morning_run", f"{d.isoformat()} reached '{name}' at +{round(now - t_start, 1)}s")
+
+class _RiskHalfFailed(RuntimeError):
+    """Raised past run() once _risk_half has recorded its own failure."""
+
+
+def _record_failure(con, cfg: Config, d: date, started, request_id: str | None,
+                    e: Exception, stages: dict | None = None) -> None:
+    # str(e) alone loses the stack, and a bare "error" status cannot tell a
+    # provider outage from a defect in this code -- both were true of the
+    # 2026-09-22 failures. See agent/failures.py.
+    if request_id:
+        ledger.finish_run_lock(con, d, "morning", request_id, "failed")
+    ledger.log_run(con, "morning", d, started, classify_failure(e), error=format_failure(e),
+                   stages=stages)
+    log("morning", f"ERROR: {e}")
+    from ..failures import alert_provider_outage
+    alert_provider_outage(con, cfg, "morning", d, e)
+
+
+def _analyst_half(cfg: Config, con, d: date, started, clock: _Clock) -> dict | None:
+    """Data, regime, memory, the analyst call (with arm B's beside it) and the
+    candidate quotes. Returns the JSON-safe payload the risk half needs, or
+    None for a dry run."""
+    # 1. data
+    log("morning", "Pulling market data bundle...")
+    md = MarketData(cfg)
+    bundle = md.morning_bundle(d)
+    bundle_md = render_bundle_md(bundle)
+    clock.mark("bundle")
+    auth_error = getattr(md, "alpaca_auth_error", None)
+    if auth_error and not cfg.mock:
+        from ..failures import alert_alpaca_auth
+        alert_alpaca_auth(con, cfg, "morning", auth_error.get("path", "?"))
+
+    # 2. regime
+    log("morning", "Computing market regime...")
+    reg = compute_regime(cfg, d)
+    ledger.save_regime(con, reg)
+    reg_md = regime_md(reg)
+    clock.mark("regime")
+
+    # 3. memory
+    mem = build_morning_memory(con, cfg)
+
+    # 4. build prompts
+    persona_stamp = persona_version(cfg)
+    analyst_system = load_prompt("morning_analyst", {
+        **_coverage_prompt_text(cfg), **hypotheses.analyst_prompt_text(cfg),
+        "PERSONA": persona_block(cfg, "analyst")})
+    user_block = (
+        f"# TODAY: {d.isoformat()} ({d.strftime('%A')})\n\n"
+        f"## MARKET DATA\n\n{bundle_md}\n\n"
+        f"## REGIME READ (computed)\n\n{reg_md}\n\n"
+        f"{mem['text']}\n\n"
+        "Produce your candidate list now, following the output contract exactly."
+    )
+
+    if cfg.dry_run:
+        path = REPORTS_DIR / f"{d.isoformat()}_morning_prompt.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(analyst_system + "\n\n---\n\n" + user_block, encoding="utf-8")
+        log("morning", f"DRY RUN — prompt written to {path}, no API call made")
+        ledger.log_run(con, "morning", d, started, "dry_run")
+        return None
+
+    # 4b. Deterministic collection BEFORE any LLM call (DATA_CONTINUITY_SPEC
+    # _v1 Phase 1). The gap-scan population needs no model: it is the input
+    # to the long/short population monkeys the evening grades. Snapshotted
+    # here, an LLM outage no longer costs that day's population. The call
+    # at the end of the run re-snapshots with the final picks
+    # (snapshot_universe is DELETE-then-INSERT per plan_date), which only
+    # sets was_picked.
+    if not cfg.mock:
+        from .. import integrity
+        integrity.on_morning(con, cfg, d, bundle, {"picks": []})
+
+    # 5. stage 1: analyst
+    llm = LLMClient(cfg)
+    model = cfg.models["morning"]
+    risk_system = load_prompt("morning_risk", {
+        "MAX_PICKS": str(cfg.get("max_picks", 4)),
+        "MIN_SIZE_R": str(cfg.get("min_size_r", 0.25)),
+        "MAX_SIZE_R": str(cfg.get("max_size_r", 1.5)),
+        "MAX_TOTAL_RISK_R": str(cfg.get("max_total_open_risk_r", 3.0)),
+        "FLOOR_SIZE_R": str((cfg.get("daily_floor", {}) or {}).get(
+            "size_r", cfg.get("min_size_r", 0.25))),
+        **_coverage_prompt_text(cfg),
+        **hypotheses.risk_prompt_text(cfg),
+        "PERSONA": persona_block(cfg, "risk"),
+    })
+
+    # Arm B's analyst runs on a background thread beside arm A's, so the
+    # half's critical path is one analyst call, not two.
+    from . import paired as paired_mod
+    arm_b_box: dict = {}
+    arm_b_thread: threading.Thread | None = None
+    if not cfg.mock and paired_mod.should_run_paired(cfg, d):
+        def _bg() -> None:
+            arm_b_box["first"] = _arm_b_analyst_half(cfg, d, analyst_system, bundle_md,
+                                                     reg_md, mem, model, llm.call)
+        arm_b_thread = threading.Thread(target=_bg, daemon=True)
+        arm_b_thread.start()
+        log("morning", "Paired challenger arm B (analyst) started in background...")
 
     try:
-        # 1. data
-        log("morning", "Pulling market data bundle...")
-        md = MarketData(cfg)
-        bundle = md.morning_bundle(d)
-        bundle_md = render_bundle_md(bundle)
-        _mark("bundle")
-        auth_error = getattr(md, "alpaca_auth_error", None)
-        if auth_error and not cfg.mock:
-            from ..failures import alert_alpaca_auth
-            alert_alpaca_auth(con, cfg, "morning", auth_error.get("path", "?"))
-
-        # 2. regime
-        log("morning", "Computing market regime...")
-        reg = compute_regime(cfg, d)
-        ledger.save_regime(con, reg)
-        reg_md = regime_md(reg)
-        _mark("regime")
-
-        # 3. memory
-        mem = build_morning_memory(con, cfg)
-
-        # 4. build prompts
-        persona_stamp = persona_version(cfg)
-        analyst_system = load_prompt("morning_analyst", {
-            **_coverage_prompt_text(cfg), **hypotheses.analyst_prompt_text(cfg),
-            "PERSONA": persona_block(cfg, "analyst")})
-        user_block = (
-            f"# TODAY: {d.isoformat()} ({d.strftime('%A')})\n\n"
-            f"## MARKET DATA\n\n{bundle_md}\n\n"
-            f"## REGIME READ (computed)\n\n{reg_md}\n\n"
-            f"{mem['text']}\n\n"
-            "Produce your candidate list now, following the output contract exactly."
-        )
-
-        if cfg.dry_run:
-            path = REPORTS_DIR / f"{d.isoformat()}_morning_prompt.md"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(analyst_system + "\n\n---\n\n" + user_block, encoding="utf-8")
-            log("morning", f"DRY RUN — prompt written to {path}, no API call made")
-            ledger.log_run(con, "morning", d, started, "dry_run")
-            return
-
-        # 4b. Deterministic collection BEFORE any LLM call (DATA_CONTINUITY_SPEC
-        # _v1 Phase 1). The gap-scan population needs no model: it is the input
-        # to the long/short population monkeys the evening grades. Snapshotted
-        # here, an LLM outage no longer costs that day's population. The call
-        # at the end of the run re-snapshots with the final picks
-        # (snapshot_universe is DELETE-then-INSERT per plan_date), which only
-        # sets was_picked.
-        if not cfg.mock:
-            from .. import integrity
-            integrity.on_morning(con, cfg, d, bundle, {"picks": []})
-
-        # 5. stage 1: analyst
-        llm = LLMClient(cfg)
-        model = cfg.models["morning"]
-
-        # risk_system doesn't depend on the analyst's output, so it's built
-        # here (rather than after stage 1, where it used to live) so arm B
-        # -- a full independent analyst+risk round trip -- can be kicked off
-        # on a background thread right now and run concurrently with arm A's
-        # two LLM calls below, instead of stacking after them. That's the
-        # difference between ~1x and ~2x the per-call wall time in a
-        # synchronous serverless request with a hard 300s budget.
-        risk_system = load_prompt("morning_risk", {
-            "MAX_PICKS": str(cfg.get("max_picks", 4)),
-            "MIN_SIZE_R": str(cfg.get("min_size_r", 0.25)),
-            "MAX_SIZE_R": str(cfg.get("max_size_r", 1.5)),
-            "MAX_TOTAL_RISK_R": str(cfg.get("max_total_open_risk_r", 3.0)),
-            "FLOOR_SIZE_R": str((cfg.get("daily_floor", {}) or {}).get(
-                "size_r", cfg.get("min_size_r", 0.25))),
-            **_coverage_prompt_text(cfg),
-            **hypotheses.risk_prompt_text(cfg),
-            "PERSONA": persona_block(cfg, "risk"),
-        })
-
-        from . import paired as paired_mod
-        paired_box: dict = {}
-        if not cfg.mock and paired_mod.should_run_paired(cfg, d):
-            def _bg() -> None:
-                paired_box["arm_b"] = _run_paired_arm_b(
-                    cfg, d, analyst_system, risk_system, bundle_md, bundle, reg_md,
-                    mem, reg.get("tag", ""), model, llm.call)
-            paired_thread = threading.Thread(target=_bg, daemon=True)
-            paired_thread.start()
-            log("morning", "Paired challenger arm B started in background...")
-
         log("morning", f"Stage 1/2 — analyst call ({model})...")
         analyst = llm.call(
             system=analyst_system, user=user_block, model=model,
@@ -1568,7 +1681,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         candidates = analyst.parsed or {}
         n_cand = len(candidates.get("candidates", []))
         log("morning", f"Analyst produced {n_cand} candidates")
-        _mark("analyst")
+        clock.mark("analyst")
 
         # Between stage 1 and stage 2: price every candidate the bundle never
         # quoted, while the risk manager can still act on it. See
@@ -1577,11 +1690,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # offered nothing."
         cand_quotes = _grounded_candidate_prices(md, candidates, bundle, d)
         quotes_md = _live_quotes_md(cand_quotes)
-
         corr_md = "" if cfg.offline else _correlation_matrix_md(
             [c.get("ticker", "") for c in candidates.get("candidates", [])])
-
-        # 6. stage 2: risk manager
         risk_user = (
             f"# TODAY: {d.isoformat()}\n\n"
             f"## THE ANALYST'S CANDIDATES\n\n```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
@@ -1592,13 +1702,187 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             f"{mem['text']}\n\n"
             "Run every candidate through the kill checklist and produce the final plan now."
         )
+        clock.mark("quotes")
+    finally:
+        arm_b_status = None
+        if arm_b_thread is not None:
+            log("morning", "Waiting for paired challenger arm B's analyst (background)...")
+            arm_b_status = _join_arm_b(arm_b_thread, clock.t_start)
+            clock.mark("arm_b_analyst_join")
+
+    arm_b = None
+    if arm_b_thread is not None:
+        arm_b = arm_b_box.get("first") or {
+            "ok": False, "reason": ("analyst abandoned at the function budget"
+                                    if arm_b_status == ARM_B_ABANDONED
+                                    else "background thread produced no result")}
+        if not arm_b.get("ok"):
+            log("morning", f"Arm B skipped/failed: {arm_b.get('reason')}")
+
+    return {
+        "version": PAYLOAD_VERSION,
+        "started": started.isoformat(),
+        "model": model,
+        "persona_stamp": persona_stamp,
+        "risk_system": risk_system,
+        "risk_user": risk_user,
+        "candidates": candidates,
+        "analyst_usage": analyst.usage or {},
+        "cand_quotes": cand_quotes,
+        "bundle": bundle,
+        "bundle_md": bundle_md,
+        # _bundle_health reads the analyst half's MarketData (feed downgrade,
+        # credentials), which the risk half's fresh instance cannot see.
+        "bundle_health": _bundle_health(md, bundle),
+        "regime_tag": reg.get("tag", ""),
+        "reg_md": reg_md,
+        "mem": {"text": mem["text"], "playbook_version": mem["playbook_version"],
+                "backlog_ids": mem.get("backlog_ids") or []},
+        "arm_b": arm_b,
+        "arm_b_analyst_join": arm_b_status,
+        "analyst_half_timings": dict(clock.timings),
+        "analyst_half_s": round(clock.elapsed(), 1),
+    }
+
+
+def _hand_off(cfg: Config, con, d: date, payload: dict, lock: dict | None,
+              clock: _Clock) -> None:
+    """Start the risk half. Hosted, in a fresh invocation (its own 300s);
+    otherwise here, through a JSON round trip so the in-process path carries
+    exactly what a checkpoint would."""
+    from .. import dispatch
+    rid = lock["request_id"] if lock else None
+    if cfg.mock or not rid or not dispatch.available(cfg):
+        _risk_half(cfg, con, d, json.loads(json.dumps(payload, default=str)), rid,
+                   clock.t_start, how="in process")
+        return
+
+    ledger.save_morning_checkpoint(con, d, rid, payload)
+    sent = dispatch.fire("/cron/morning-continue", {"d": d.isoformat(), "rid": rid}, cfg=cfg)
+    ledger.set_morning_checkpoint(
+        con, d, dispatch=("http" if sent["ok"] else "FAILED") + f" at +{clock.elapsed():.0f}s: "
+                         + sent["how"])
+    if sent["ok"]:
+        log("morning", f"Analyst half done in {clock.elapsed():.0f}s; the risk half runs in a "
+                       f"fresh invocation ({sent['how']})")
+        ledger.beat(con, "morning_run", f"{d.isoformat()} analyst half done, risk half dispatched")
+        return
+    left = FUNCTION_BUDGET_S - clock.elapsed()
+    log("morning", f"WARN hand-off to a fresh invocation failed ({sent['how']}); {left:.0f}s "
+                   "of this invocation's budget left")
+    if left >= RISK_HALF_INLINE_MIN_LEFT_S:
+        claim = ledger.claim_morning_checkpoint(con, d, rid)
+        if claim:
+            _risk_half(cfg, con, d, claim["payload"], rid, clock.t_start,
+                       how="in process after a failed hand-off")
+        return
+    log("morning", "The risk half is left to the safety-net cron (/cron/morning-continue), "
+                   "which resumes the saved checkpoint before the open")
+
+
+def resume(cfg: Config, run_date: date | None = None, request_id: str | None = None) -> dict:
+    """The risk half in an invocation of its own: dispatched by the analyst
+    half (with its request_id), or by the safety-net cron (without). Takes
+    the session's checkpoint if nobody holds it, or if its holder died.
+
+    The cron also covers a morning whose analyst half never finished: with no
+    plan and no live checkpoint, it runs the whole morning again, and the run
+    lock decides whether that is allowed (a fresh in-progress lock is not)."""
+    d = run_date or today_et()
+    con = ledger.connect()
+    t_start = _time.monotonic()
+    try:
+        claim = ledger.claim_morning_checkpoint(con, d, request_id)
+        if not claim:
+            cp = ledger.morning_checkpoint(con, d)
+            plan = ledger.plan_for_date(con, d)
+            if request_id is None and plan is None and is_market_day(d) \
+                    and (cp is None or cp.get("stage") in ("failed", "superseded")):
+                log("morning", f"Safety net: no plan for {d} and no live checkpoint "
+                               f"({cp.get('stage') if cp else 'none'}) — running the morning again")
+                con.close()
+                con = None
+                run(cfg, run_date=d)
+                return {"resumed": "full_rerun"}
+            why = f"checkpoint is '{cp['stage']}'" if cp else "no checkpoint"
+            log("morning", f"Nothing to resume for {d}: {why}"
+                           + (", plan already saved" if plan else ""))
+            return {"resumed": False, "reason": why}
+
+        rid = claim["request_id"]
+        lock = ledger.run_lock(con, d, "morning")
+        if not lock or lock["request_id"] != rid or lock["status"] != "in_progress":
+            ledger.set_morning_checkpoint(con, d, stage="superseded",
+                                          note=f"run lock no longer held by this run: {lock}")
+            log("morning", f"Checkpoint for {d} superseded (run lock: {lock}) — not resumed")
+            return {"resumed": False, "reason": "superseded"}
+        if ledger.plan_for_date(con, d):
+            # The earlier risk half died AFTER saving the plan. Running it
+            # again would write the picks and send the orders twice.
+            ledger.set_morning_checkpoint(
+                con, d, stage="complete",
+                note="the plan was already saved by a risk half that died; not re-run")
+            ledger.finish_run_lock(con, d, "morning", rid, "complete")
+            log("morning", f"Plan for {d} already saved by a killed risk half — closed, not re-run")
+            return {"resumed": False, "reason": "plan already saved"}
+        how = "dispatched" if request_id else "safety-net cron"
+        if claim["attempts"] > 1:
+            how += f" (attempt {claim['attempts']}, the previous holder died)"
+        _risk_half(cfg, con, d, claim["payload"], rid, t_start, how=how)
+        return {"resumed": True, "how": how}
+    finally:
+        if con is not None:
+            con.close()
+
+
+def _risk_half(cfg: Config, con, d: date, payload: dict, request_id: str | None,
+               t_start: float, how: str) -> None:
+    """The risk manager (with arm B's beside it), validation, the test lanes,
+    persistence, orders and the email. Records its own failure (lock, runs
+    row, checkpoint, alert) and raises _RiskHalfFailed."""
+    started = datetime.fromisoformat(payload["started"])
+    clock = _Clock(con, d, {}, beat=bool(request_id), t_start=t_start)
+    hosted = bool(request_id) and how != "in process"
+    stages: dict = {"timings_s": {**(payload.get("analyst_half_timings") or {})},
+                    "risk_half": how}
+    if payload.get("arm_b_analyst_join"):
+        stages["arm_b"] = payload["arm_b_analyst_join"]
+    arm_b_thread: threading.Thread | None = None
+    try:
+        if payload.get("version") != PAYLOAD_VERSION:
+            raise RuntimeError(f"morning checkpoint payload version {payload.get('version')!r} "
+                               f"is not {PAYLOAD_VERSION}; written by different code")
+        md = MarketData(cfg)
+        bundle = payload["bundle"]
+        candidates = payload["candidates"] or {}
+        cand_quotes = {str(k): float(v) for k, v in (payload.get("cand_quotes") or {}).items()}
+        mem = payload["mem"]
+        model = payload["model"]
+        n_cand = len(candidates.get("candidates", []))
+        llm = LLMClient(cfg)
+
+        arm_b_box: dict = {}
+        first = payload.get("arm_b") or {}
+        if first.get("ok"):
+            def _bg() -> None:
+                arm_b_box["arm_b"] = _arm_b_risk_half(
+                    cfg, d, first, payload["risk_system"], payload["bundle_md"], bundle,
+                    payload["reg_md"], mem["playbook_version"], payload["regime_tag"],
+                    model, llm.call)
+            arm_b_thread = threading.Thread(target=_bg, daemon=True)
+            arm_b_thread.start()
+            if hosted:
+                ledger.set_morning_checkpoint(con, d, arm_b_status="running")
+            log("morning", "Paired challenger arm B (risk manager) started in background...")
+
+        # 6. stage 2: risk manager
         log("morning", f"Stage 2/2 — risk manager call ({model})...")
         risk = llm.call(
-            system=risk_system, user=risk_user, model=model,
+            system=payload["risk_system"], user=payload["risk_user"], model=model,
             mock_name="morning_risk", thinking=True, web_search=False,
         )
         plan = risk.parsed or {}
-        _mark("risk")
+        clock.mark("risk")
         plan["analyst_candidate_count"] = n_cand
         plan["risk_rejection_count"] = len(plan.get("rejected", []) or [])
         _normalize_floor_picks(plan, cfg)
@@ -1606,7 +1890,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         plan["validator_proposed_count"] = len(plan.get("picks", []) or [])
 
         # 7. validate + persist (ref prices cover every proposed ticker — live-fetched if needed)
-        session_health = {**_bundle_health(md, bundle),
+        session_health = {**(payload.get("bundle_health") or {}),
                           **_candidate_grounding_health(candidates, bundle, cand_quotes)}
         # Lane-scoped: the streak clamp and drawdown breaker are this lane's
         # discipline and read this lane's record only (see ledger.lane_clause
@@ -1632,13 +1916,15 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                                     streak, drawdown, hyp=hyp_plan)
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
-        plan["regime_tag"] = reg.get("tag", "")
+        plan["regime_tag"] = payload["regime_tag"]
         plan["prompt_version"] = f"analyst_v{prompt_version('morning_analyst')}/risk_v{prompt_version('morning_risk')}"
         plan["playbook_version"] = mem["playbook_version"]
         # v29: the persona is a treatment; the plan, its picks and the run say
         # whether it was in the prompts (None -> NULL when off).
+        persona_stamp = payload.get("persona_stamp")
         plan["persona_version"] = persona_stamp
-        usage = merge_usage(analyst.usage, risk.usage)
+        usage = merge_usage(payload.get("analyst_usage") or {}, risk.usage)
+        clock.mark("validate")
 
         if cfg.mock:
             # Mock mode exists to exercise prompts/parsing/validation for free --
@@ -1674,8 +1960,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                 log("morning", f"WARN hypothesis notebook commit failed; plan unaffected: {e}")
                 for p in plan.get("picks") or []:
                     p.pop("hypothesis_id", None)
-        pick_ids = ledger.save_daily_plan(con, d, plan, candidates, reg.get("tag", ""))
-        ledger.append_plan_run(con, d, "morning", lock["request_id"], plan)
+        pick_ids = ledger.save_daily_plan(con, d, plan, candidates, payload["regime_tag"])
+        ledger.append_plan_run(con, d, "morning", request_id, plan)
         n_rej = ledger.save_rejections(con, d, rejections)
         # A degraded session is one the pipeline could not EVALUATE, as opposed
         # to one it evaluated and declined. Both are stored — the degraded rate
@@ -1691,7 +1977,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         ledger.log_run(con, "morning", d, started,
                        "degraded" if health.get("degraded") else "ok", model, usage,
                        persona_version=persona_stamp)
-        _mark("persist")
+        clock.mark("persist")
 
         # Before today's orders: close anything a missed end-of-day flatten
         # left open from a previous session (queued for the open when this runs
@@ -1726,7 +2012,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                        f"(~${usage['cost_usd']:.3f}, {usage['web_searches']} web searches)")
 
         send_email(cfg, f"Trade Agent — Morning Plan {d.isoformat()}",
-                   morning_email_html(d, plan, reg_md))
+                   morning_email_html(d, plan, payload["reg_md"]))
         render_dashboard(con, cfg, d)
         log("morning", f"Done. {len(pick_ids)} picks logged, {n_rej} rejections logged to shadow ledger.")
 
@@ -1739,28 +2025,24 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             population.mark_picked(con, d, [p.get("ticker") for p in plan.get("picks", []) or []])
         except Exception as e:  # noqa: BLE001
             log("morning", f"WARN could not mark picked names in the population: {e}")
-        stages["timings_s"]["total"] = round(_time.monotonic() - t_start, 1)
-        ledger.record_run_stages(con, "morning", d, stages)
+        clock.mark("deliver")
+        _record_stages(con, d, stages, clock, payload, hosted)
 
         # v4: paired challenger arm B — same bundle/regime/memory arm A saw,
         # context_mode ablated per config (default: aggregate_only, the ungated
         # last-20-trades channel). Arm B never trades and is never written to
         # picks; graded later by the SAME simulator in evening.py. Never runs
         # under mock (no real plan A was persisted to pair against) or dry-run.
-        # It was started on a background thread back in step 5 (concurrently
-        # with arm A's own analyst+risk calls) — join it here now that arm A
-        # is fully done.
-        if paired_thread is not None:
+        if arm_b_thread is not None:
             log("morning", "Waiting for paired challenger arm B (background)...")
-            # Bounded by what is left of the function budget. Unbounded, a slow
-            # arm B held the whole invocation until Vercel killed it at 300s
-            # (2026-10-05): arm A's plan was already saved and emailed, but the
-            # run lock was never released and nothing recorded why.
-            stages["arm_b"] = _join_arm_b(paired_thread, t_start)
-            _mark("arm_b_join")
-            stages["timings_s"]["total"] = round(_time.monotonic() - t_start, 1)
-            ledger.record_run_stages(con, "morning", d, stages)
-            arm_b = paired_box.get("arm_b") or {
+            # Bounded by what is left of this invocation's budget. Unbounded,
+            # a slow arm B held the whole invocation until Vercel killed it at
+            # 300s (2026-10-05): the plan was saved and emailed, but the run
+            # lock was never released and nothing recorded why.
+            stages["arm_b"] = _join_arm_b(arm_b_thread, clock.t_start)
+            arm_b_thread = None
+            clock.mark("arm_b_join")
+            arm_b = arm_b_box.get("arm_b") or {
                 "ok": False, "reason": ("abandoned at the function budget"
                                         if stages["arm_b"] == ARM_B_ABANDONED
                                         else "background thread produced no result")}
@@ -1769,25 +2051,46 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                                f"no_trade={arm_b['no_trade']}, ~${arm_b['cost_usd']:.3f}")
             else:
                 log("morning", f"Arm B skipped/failed: {arm_b.get('reason')}")
-        ledger.finish_run_lock(con, d, "morning", lock["request_id"], "complete")
+            if hosted:
+                ledger.set_morning_checkpoint(
+                    con, d, arm_b_status=("complete" if arm_b.get("ok") else
+                                          stages["arm_b"] if stages["arm_b"] == ARM_B_ABANDONED
+                                          else "failed"))
+            _record_stages(con, d, stages, clock, payload, hosted)
+        if request_id:
+            ledger.finish_run_lock(con, d, "morning", request_id, "complete")
+        if hosted:
+            ledger.set_morning_checkpoint(con, d, stage="complete")
 
     except Exception as e:
-        # str(e) alone loses the stack, and a bare "error" status cannot tell a
-        # provider outage from a defect in this code -- both were true of the
-        # 2026-09-22 failures. See agent/failures.py.
-        status = classify_failure(e)
-        detail = format_failure(e)
-        if lock:
-            ledger.finish_run_lock(con, d, "morning", lock["request_id"], "failed")
-        ledger.log_run(con, "morning", d, started, status, error=detail)
-        log("morning", f"ERROR: {e}")
-        from ..failures import alert_provider_outage
-        alert_provider_outage(con, cfg, "morning", d, e)
-        # arm A failed before reaching its own join point above — still wait
-        # (briefly) for the background arm B thread so it isn't left running
-        # against a connection this function is about to close out from under it.
-        if paired_thread is not None:
-            paired_thread.join(timeout=120)
-        raise
-    finally:
-        con.close()
+        stages["timings_s"].update(clock.timings)
+        _record_failure(con, cfg, d, started, request_id, e, stages)
+        if hosted:
+            try:
+                ledger.set_morning_checkpoint(con, d, stage="failed",
+                                              note=f"{type(e).__name__}: {e}")
+            except Exception:  # noqa: BLE001
+                pass
+        # The risk half failed before reaching its own join point above --
+        # still wait (briefly) for the background arm B thread so it isn't
+        # left running against a connection about to be closed under it.
+        if arm_b_thread is not None:
+            arm_b_thread.join(timeout=max(1.0, FUNCTION_BUDGET_S - ARM_B_JOIN_MARGIN_S
+                                          - clock.elapsed()))
+        raise _RiskHalfFailed(f"{type(e).__name__}: {e}") from e
+
+
+def _record_stages(con, d: date, stages: dict, clock: _Clock, payload: dict,
+                   hosted: bool) -> None:
+    """runs.stages for the session. `total` is the slowest INVOCATION -- the
+    number the 300s budget applies to -- and `invocations` names both halves
+    when they ran apart."""
+    stages["timings_s"].update(clock.timings)
+    risk_s = round(clock.elapsed(), 1)
+    if hosted:
+        analyst_s = float(payload.get("analyst_half_s") or 0.0)
+        stages["invocations"] = {"analyst_half": analyst_s, "risk_half": risk_s}
+        stages["timings_s"]["total"] = max(analyst_s, risk_s)
+    else:
+        stages["timings_s"]["total"] = risk_s
+    ledger.record_run_stages(con, "morning", d, stages)

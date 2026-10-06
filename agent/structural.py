@@ -36,6 +36,7 @@ import math
 from typing import Any
 
 from .clusters import unit_count, unit_values
+from .grading import SCRATCH_R
 from .stats import Comparison, fisher_exact_2x2
 
 __all__ = ["PAIR_SPEC_VERSION", "PAIR_SPEC", "PAIR_SEP", "lane_rows", "pair_comparisons",
@@ -170,14 +171,15 @@ def winrate_comparisons(rows_by_lane: dict[str, list[dict]]) -> list[Comparison]
                     continue
                 cells.setdefault(lev, []).append(r)
             for lev, cell in sorted(cells.items()):
-                # A "win" is an observation with realized R > 0: a row in the
-                # morning lane, a (session, industry) unit's mean in the runner
-                # lane. The rest of the lane is counted the same way.
+                # A "win" is an observation with realized R above the scratch
+                # band (grading.SCRATCH_R): a row in the morning lane, a
+                # (session, industry) unit's mean in the runner lane. The rest
+                # of the lane is counted the same way.
                 inside = _values(cell, lane)
                 rest = _values([r for r, l in zip(rows, labels) if l != lev], lane)
-                w, n = sum(1 for v in inside if v > 0), len(inside)
+                w, n = sum(1 for v in inside if v > SCRATCH_R), len(inside)
                 a, b = w, n - w
-                c_ = sum(1 for v in rest if v > 0)
+                c_ = sum(1 for v in rest if v > SCRATCH_R)
                 d_ = len(rest) - c_
                 comps.append(Comparison(
                     dimension=f"winrate:{dim}", level=lev, n=n, mean_r=None, std_r=None,

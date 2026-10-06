@@ -17,6 +17,10 @@
       "schedule": "45 10 * * 1-5"
     },
     {
+      "path": "/cron/morning-continue",
+      "schedule": "15 12 * * 1-5"
+    },
+    {
       "path": "/cron/evening",
       "schedule": "30 20 * * 1-5"
     },

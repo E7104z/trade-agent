@@ -226,11 +226,36 @@ def run_challenger_arm(
 
     Returns a summary dict. NEVER raises: any failure is logged and reported as
     {"ok": False, ...} so the morning loop's production path is untouched.
-    """
-    paired = (cfg.get("paired", {}) or {}) if hasattr(cfg, "get") else {}
-    context_mode = str(paired.get("arm_b_context_mode", "full"))
-    arm_b_playbook = paired.get("arm_b_playbook_version")
 
+    The two halves are also callable apart (challenger_analyst, then
+    challenger_risk), which is how the hosted morning runs them: each half
+    beside arm A's matching call, in an invocation of its own.
+    """
+    first = challenger_analyst(cfg, plan_date, analyst_system=analyst_system,
+                               bundle_md=bundle_md, regime_md_text=regime_md_text,
+                               memory_text=memory_text, llm_call=llm_call, model=model)
+    if not first.get("ok"):
+        return first
+    return challenger_risk(con, cfg, plan_date, first, risk_system=risk_system,
+                           bundle_md=bundle_md, regime_md_text=regime_md_text,
+                           playbook_version=playbook_version, llm_call=llm_call,
+                           validate=validate, quotes_md_for=quotes_md_for,
+                           regime_tag=regime_tag, model=model)
+
+
+def _arm_settings(cfg: Any) -> tuple[str, Any]:
+    paired = (cfg.get("paired", {}) or {}) if hasattr(cfg, "get") else {}
+    return str(paired.get("arm_b_context_mode", "full")), paired.get("arm_b_playbook_version")
+
+
+def challenger_analyst(cfg: Any, plan_date: date, *, analyst_system: str, bundle_md: str,
+                       regime_md_text: str, memory_text: str,
+                       llm_call: Callable[..., Any], model: str = "") -> dict[str, Any]:
+    """Arm B's first half: the ablated memory and the analyst call. Returns
+    {"ok": True, "candidates", "arm_memory", "context_mode", "cost_usd"}, a
+    JSON-safe dict the second half can be handed in another invocation.
+    NEVER raises."""
+    context_mode, _ = _arm_settings(cfg)
     try:
         arm_memory = apply_context_mode(memory_text, context_mode)
         ablated = arm_memory != memory_text
@@ -248,7 +273,28 @@ def run_challenger_arm(
         )
         analyst = llm_call(system=analyst_system, user=user_block, model=model,
                            mock_name="morning_analyst", thinking=True, web_search=True)
-        candidates = getattr(analyst, "parsed", None) or {}
+        return {"ok": True, "candidates": getattr(analyst, "parsed", None) or {},
+                "arm_memory": arm_memory, "context_mode": context_mode,
+                "cost_usd": float((getattr(analyst, "usage", {}) or {}).get("cost_usd", 0.0) or 0.0)}
+    except Exception as e:
+        _log("paired", f"WARN challenger arm failed ({type(e).__name__}: {e}) — "
+                       "production arm A is unaffected")
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+
+
+def challenger_risk(con: Any, cfg: Any, plan_date: date, first: dict, *, risk_system: str,
+                    bundle_md: str, regime_md_text: str, playbook_version: str,
+                    llm_call: Callable[..., Any],
+                    validate: Callable[[dict], tuple[dict, list[str]]] | None = None,
+                    quotes_md_for: Callable[[dict], str] | None = None,
+                    regime_tag: str = "", model: str = "") -> dict[str, Any]:
+    """Arm B's second half, from challenger_analyst's result: the quote
+    top-up, the risk manager, the same validator arm A gets, and the record.
+    NEVER raises."""
+    context_mode, arm_b_playbook = _arm_settings(cfg)
+    try:
+        candidates = first.get("candidates") or {}
+        arm_memory = first.get("arm_memory") or ""
 
         # Same post-analyst quote top-up arm A gets, injected rather than
         # imported so this module stays free of MarketData/provider knowledge
@@ -275,9 +321,8 @@ def run_challenger_arm(
             # held to weaker standards is not a comparison, it is a handicap.
             plan, _warnings = validate(plan)
 
-        cost = 0.0
-        for r in (analyst, risk):
-            cost += float((getattr(r, "usage", {}) or {}).get("cost_usd", 0.0) or 0.0)
+        cost = float(first.get("cost_usd") or 0.0) + float(
+            (getattr(risk, "usage", {}) or {}).get("cost_usd", 0.0) or 0.0)
 
         n = record_arm(
             con, plan_date, "B", plan, candidates,

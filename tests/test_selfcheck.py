@@ -157,7 +157,7 @@ def test_a_morning_killed_at_the_budget_and_an_abandoned_arm_b_are_flagged(con):
                    VALUES (?, 'morning', 'in_progress', 'r1')""", [day])
     r = _by_key(selfcheck.run(con, _cfg(), date(2026, 10, 6)))["morning_budget"]
     assert r["status"] == "warn"
-    assert "killed at the 300s budget after saving its plan on 2026-10-05" in r["headline"]
+    assert "morning run lock never released on 2026-10-05" in r["headline"]
     assert "arm B abandoned at the budget on 2026-10-05" in r["headline"]
 
 

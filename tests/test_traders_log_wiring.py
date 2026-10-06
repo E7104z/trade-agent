@@ -46,8 +46,9 @@ def test_email_with_an_ok_log_and_the_contrast_block(con):
     seed_session(con)
     row = tl.generate(con, _cfg(), D, llm_client=_Stub(CLEAN))
     html = evening_email_html(D, REVIEW, SUMMARY, traders_log=row, day_contrast=tl.day_contrast(con, D))
-    assert "<h3>Trader's log</h3>" in html and "<h4 style=\"margin:14px 0 4px\">What happened</h4>" in html
-    assert "Morning picks taken: 5 (one session)." in html
+    assert "<h3>Trader's log</h3>" in html
+    assert "<h4 style=\"margin:14px 0 4px\">What happened (one session, not evidence)</h4>" in html
+    assert "Morning picks taken: 5." in html
     assert "facts-only" not in html
     assert "<h3>Today's winners and losers (descriptive)</h3>" in html
     assert html.index("Trader's log") > html.index(SUMMARY.splitlines()[0])

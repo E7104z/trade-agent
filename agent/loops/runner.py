@@ -25,6 +25,18 @@ from ..util import ET, is_market_day, log, market_close_et, now_et
 
 __all__ = ["tick"]
 
+# The hosted invocation's hard limit (vercel.json maxDuration), and what the
+# selection call plus its live orders need of it.
+FUNCTION_BUDGET_S = 300
+SELECTION_RESERVE_S = 90
+
+
+def _budget_too_spent(spent_s: float) -> bool:
+    """True when a hosted tick has too little budget left to start the
+    selection. Local runs have no budget to protect."""
+    import os
+    return bool(os.environ.get("VERCEL")) and spent_s > FUNCTION_BUDGET_S - SELECTION_RESERVE_S
+
 
 def _parse_clock(value, default: dtime) -> dtime:
     """"HH:MM" -> time. A malformed value falls back rather than raising -
@@ -98,7 +110,16 @@ def tick(cfg: Config, *, at: datetime | None = None, md: MarketData | None = Non
         # decision time. Guarded inside by a one-per-session database claim.
         if rcfg.get("selection_enabled"):
             decision_t = _parse_clock(rcfg.get("decision_time_et", "10:30"), dtime(10, 30))
-            if now_t >= decision_t:
+            spent = time.monotonic() - started
+            if now_t >= decision_t and _budget_too_spent(spent):
+                # Claiming now would bet the session's one selection on the
+                # seconds left of this invocation: a kill between the claim
+                # and the result left 10/05 with 533 candidates, 0 picks and
+                # no reason. The next tick (five minutes) starts fresh.
+                log("runner", f"selection deferred: this tick's scan used {spent:.0f}s of the "
+                              f"{FUNCTION_BUDGET_S}s budget (needs {SELECTION_RESERVE_S}s)")
+                result["selection"] = {"deferred": f"scan used {spent:.0f}s of {FUNCTION_BUDGET_S}s"}
+            elif now_t >= decision_t:
                 try:
                     from .. import runner_selection
                     result["selection"] = runner_selection.run_selection(

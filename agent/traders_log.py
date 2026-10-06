@@ -38,6 +38,7 @@ import time
 from datetime import date, datetime
 from typing import Any
 
+from .grading import SCRATCH_R, outcome_class
 from .util import log
 
 __all__ = [
@@ -136,13 +137,17 @@ def _day_facts(con: Any, d: date, s: _Slots) -> bool:
     graded = [p for p in picks if p["pick_id"] in outs]
     measured = [(p, outs[p["pick_id"]]["r_planned"]) for p in valid
                 if outs[p["pick_id"]]["r_planned"] is not None]
-    wins = sum(1 for _, r in measured if r > 0)
-    losses = sum(1 for _, r in measured if r < 0)
+    classes = [outcome_class(r) for _, r in measured]
+    wins, losses, scratches = (classes.count("win"), classes.count("loss"),
+                               classes.count("scratch"))
+    band = f"{SCRATCH_R:.2f}R"
     s.add("day.graded", len(graded), "one_session", "outcomes", "picks with a graded outcome")
     s.add("day.triggered", len(valid), "one_session", src,
           "fill-valid trades that triggered (invalid fills and execution anomalies excluded)")
-    s.add("day.wins", wins, "one_session", src, "fill-valid trades with planned R above zero")
-    s.add("day.losses", losses, "one_session", src, "fill-valid trades with planned R below zero")
+    s.add("day.wins", wins, "one_session", src, f"fill-valid trades with planned R above +{band}")
+    s.add("day.losses", losses, "one_session", src, f"fill-valid trades with planned R below -{band}")
+    s.add("day.scratches", scratches, "one_session", src,
+          f"fill-valid trades within +/-{band} of zero: scratches, neither a win nor a loss")
     s.add("day.net_r", _r(sum(r for _, r in measured)) if measured else "n/a", "one_session", src,
           "sum of planned R per fill-valid trade (unweighted by size)")
     if len(measured) < len(valid):
@@ -211,16 +216,32 @@ def _stand_down_reason(con: Any, d: date, plan: dict | None) -> str:
 
 
 def _shadow_facts(con: Any, d: date, s: _Slots) -> bool:
-    rows = _q(con, """SELECT COUNT(*), SUM(forgone_r) FROM rejections
+    rows = _q(con, """SELECT COUNT(*), COUNT(forgone_r), SUM(forgone_r) FROM rejections
                       WHERE plan_date = ? AND graded_at IS NOT NULL""", [d])
-    n, net = rows[0] if rows else (0, None)
+    n, priced, net = rows[0] if rows else (0, 0, None)
     if not n:
         return False
     s.add("shadow.scored", int(n), "one_session", "rejections (shadow ledger)",
           "rejected candidates scored by the shadow ledger")
+    # Unmeasurable rows (no bars, invalid fill) carry no forgone R. Saying
+    # "7 scored, -0.14R" when the R covers 6 made two honest counts disagree.
+    s.add("shadow.priced", int(priced or 0), "one_session", "rejections.forgone_r IS NOT NULL",
+          "of those, rejections with a measurable forgone R (the rest had no usable bars)")
     s.add("shadow.forgone_r", _r(net or 0.0), "one_session", "rejections.forgone_r",
-          "net forgone R of the rejections (positive = the filters cost the desk)")
+          "net forgone R over the priced rejections (positive = the filters cost the desk)")
+    if priced:
+        s.add("shadow.forgone_per_rejection", _r((net or 0.0) / int(priced)), "one_session",
+              "rejections.forgone_r / priced", "forgone R per priced rejection")
     return True
+
+
+# The four runner exit policies the log reports, by the name a reader knows.
+_EXIT_NAMES = {
+    "plan": "plan exits (the selected plan's own stop and 2R target)",
+    "arm_a_floor": "arm A, stop floor (stop no tighter than 1 ATR)",
+    "arm_b_dashboard": "arm B, dashboard rules (half at 1R, 9 EMA trail)",
+    "arm_c_floor_dashboard": "arm C, floor + dashboard (arm A's stop, arm B's management)",
+}
 
 
 def _runner_facts(con: Any, d: date, s: _Slots) -> bool:
@@ -239,6 +260,11 @@ def _runner_facts(con: Any, d: date, s: _Slots) -> bool:
     m = re.search(r"industry cap \S+ dropped (\d+)", note or "")
     s.add("runner.industry_cap_drops", int(m.group(1)) if m else 0, "one_session",
           "runner_sessions.selection_skipped_reason", "selections dropped by the per-industry cap")
+    # Why the count of selected is what it is. "0 of 533 selected" with no
+    # reason (10/05) read as a decision; it was a claim whose request died.
+    s.add("runner.selection", ledger.runner_selection_note(con, d)["text"], "one_session",
+          "runner_sessions via ledger.runner_selection_note",
+          "what happened to the session's one runner selection")
     # The exit replays for this one session, summarized exactly as
     # `run.py runner-exits` summarizes them (runner_exits.policy_summary).
     try:
@@ -246,13 +272,15 @@ def _runner_facts(con: Any, d: date, s: _Slots) -> bool:
         rows = [r for r in ledger.runner_exit_replays_since(con, d)
                 if r.get("session_date") == d and r.get("policy_version") == runner_exits.POLICY_VERSION
                 and r.get("r_planned") is not None]
-        wanted = ("plan", "arm_a_floor", "arm_b_dashboard", "arm_c_floor_dashboard")
         for summ in runner_exits.policy_summary(rows):
-            if summ["policy"] not in wanted or not summ["n"]:
+            if summ["policy"] not in _EXIT_NAMES or not summ["n"]:
                 continue
             win = "n/a" if summ["win_rate"] is None else f"{100 * summ['win_rate']:.0f}%"
+            # The value names its policy: the reader sees the value, not the
+            # slot, and four unnamed lines (10/05) had to be decoded by count.
             s.add(f"runner.exit.{summ['policy']}",
-                  f"{_r(summ['mean_r'])} per trade over {summ['n']} replayed trades, {win} closed positive",
+                  f"{_EXIT_NAMES[summ['policy']]}: {_r(summ['mean_r'])} per trade over "
+                  f"{summ['n']} replayed trades, {win} closed positive",
                   "one_session", "runner_exit_replays via runner_exits.policy_summary",
                   f"runner exit replay, policy {summ['policy']} (each in its own risk unit)")
     except Exception as e:  # noqa: BLE001 -- one family must not cost the others
@@ -360,7 +388,10 @@ def render_facts_only(facts: dict) -> str:
         out += ["", title + ":"]
         for x in rows:
             val = f'"{x["value"]}"' if x["scope"] == "computed_verdict" else x["value"]
-            out.append(f"- {x['label']}: {val} ({SCOPE_LABEL[x['scope']]})")
+            # The group title already names a one-session group's scope.
+            scope = "" if x["scope"] == "one_session" and "one session" in title \
+                else f" ({SCOPE_LABEL[x['scope']]})"
+            out.append(f"- {x['label']}: {val}{scope}")
     if len(out) == 1:
         out.append("(no facts for this session)")
     return "\n".join(out)
@@ -370,9 +401,16 @@ def render_facts_only(facts: dict) -> str:
 # Rendering and validation
 # =============================================================================
 
-def _substitute(slot: dict) -> str:
+# The "What happened" section is about one session by definition, so its
+# heading carries that scope once. A one-session value cited anywhere else
+# still carries its own suffix. (It used to be appended to every value, which
+# on a full day put "(one session)" after nearly every number of the entry.)
+H_HAPPENED_RENDERED = f"{H_HAPPENED} (one session, not evidence)"
+
+
+def _substitute(slot: dict, scoped: bool = False) -> str:
     if slot["scope"] == "one_session":
-        return f"{slot['value']} (one session)"
+        return slot["value"] if scoped else f"{slot['value']} (one session)"
     if slot["scope"] == "computed_verdict":
         return f'"{slot["value"]}"'
     return slot["value"]
@@ -452,7 +490,15 @@ def render(raw_text: str, facts: dict, max_chars: int = 3000) -> tuple[str, list
 
     if v:
         return "", v
-    rendered = _TOKEN.sub(lambda m: _substitute(slots[m.group(1)]), text)
+    out, section = [], None
+    for line in lines:
+        if line.strip().startswith("#"):
+            section = line.strip()
+            if section == H_HAPPENED:
+                line = line.replace(H_HAPPENED, H_HAPPENED_RENDERED, 1)
+        scoped = section == H_HAPPENED
+        out.append(_TOKEN.sub(lambda m: _substitute(slots[m.group(1)], scoped), line))
+    rendered = "\n".join(out)
     if len(rendered) > max_chars:
         return "", [f"rendered log is {len(rendered)} characters; the cap is {max_chars}"]
     return rendered, []
@@ -645,11 +691,11 @@ def _counts_table(rows: list[dict], lane: str, dims: list[str]) -> list[str]:
         for r in rows:
             lvl = buckets.label(lane, dim, r)
             c = cells.setdefault(lvl, [0, 0, 0])
-            rp = r.get("r_planned")
-            c[0 if rp is not None and rp > 0 else 1 if rp is not None and rp < 0 else 2] += 1
+            cls = outcome_class(r.get("r_planned"))
+            c[0 if cls == "win" else 1 if cls == "loss" else 2] += 1
         for lvl, (w, l, other) in sorted(cells.items()):
             out.append(f"  {dim}={lvl}: winners {w}, losers {l}"
-                       + (f", flat or unmeasured {other}" if other else ""))
+                       + (f", scratch or unmeasured {other}" if other else ""))
     return out
 
 

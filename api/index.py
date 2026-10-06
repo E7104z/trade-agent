@@ -699,6 +699,16 @@ def _execute_loop(loop_name: str, cfg, force: bool) -> dict:
             if loop_name == "morning":
                 from agent.loops import morning
                 morning.run(cfg, force=force)
+            elif loop_name == "morning-continue":
+                # The morning's risk half, in an invocation of its own
+                # (specs/MORNING_BUDGET_SPEC_v1.md): dispatched by the analyst
+                # half with its request id, or by the safety-net cron.
+                from agent.loops import morning
+                from datetime import date as _date
+                d_arg = request.args.get("d")
+                result = morning.resume(cfg, run_date=_date.fromisoformat(d_arg) if d_arg else None,
+                                        request_id=request.args.get("rid") or None)
+                print(json.dumps(result, indent=2, default=str))
             elif loop_name == "nightly":
                 # EDGE_ACCELERATION_SPEC_v1 Part 4: no LLM, no orders -- the gap
                 # field's forward session and its history backfill, on a
@@ -785,10 +795,16 @@ def run_loop(loop_name: str):
 # claimed once per session in the database.
 # nightly: "0 3" UTC lands 23:00-23:59 ET in summer, 22:00-22:59 in winter --
 # after the evening cron in every season, long before the morning's.
+# morning-continue: the morning's risk half. The analyst half dispatches it
+# with `rid` (its own request id) seconds after finishing; the "15 12" cron
+# (08:15-09:14 ET in summer, 07:15-08:14 in winter) is the safety net that
+# resumes a checkpoint the dispatch never reached, before the open.
 _CRON_WINDOWS = {"morning": (5, 10), "evening": (15, 19), "runner": (9, 12),
-                 "runner-late": (9, 12), "weekly": (6, 14), "nightly": (21, 23)}
+                 "runner-late": (9, 12), "weekly": (6, 14), "nightly": (21, 23),
+                 "morning-continue": (5, 10)}
 _CRON_LOOP = {"morning": "morning", "evening": "evening", "runner": "runner",
-              "runner-late": "runner", "weekly": "weekly", "nightly": "nightly"}
+              "runner-late": "runner", "weekly": "weekly", "nightly": "nightly",
+              "morning-continue": "morning-continue"}
 
 
 @app.route("/cron/<loop_name>", methods=["GET"])
@@ -802,7 +818,10 @@ def cron_loop(loop_name: str):
     from agent.util import now_et
     now = now_et()
     lo, hi = _CRON_WINDOWS[loop_name]
-    if not (lo <= now.hour <= hi):
+    # A hand-off names the run it continues: it is not a schedule firing, and
+    # a morning started by hand in the afternoon must still get its risk half.
+    dispatched = loop_name == "morning-continue" and bool(request.args.get("rid"))
+    if not dispatched and not (lo <= now.hour <= hi):
         return json_response({
             "loop": loop_name, "skipped": True,
             "reason": f"current ET hour {now.hour} outside expected window {lo}-{hi} "

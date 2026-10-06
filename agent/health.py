@@ -296,14 +296,25 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
             " | ".join(sc["flagged"])[:1500]))
 
     # --- wedged locks -----------------------------------------------------
+    # Only a lock a later attempt can still take over is worth a warning: the
+    # one for the session each loop would run now. A past session's lock left
+    # 'in_progress' belongs to a run that died and that nothing will ever
+    # retry; listing every one of them (eight, on 2026-10-05) told the owner
+    # "the next attempt takes it over automatically" about dates no attempt
+    # will touch. Their history is the self-check's "Morning time budget".
     from .ledger import STALE_LOCK_MINUTES
+    today = now.date()
+    session = today if is_market_day(today) else prev_market_day(today)
+    current = {"morning": today, "evening": today, "weekly": session}
     stale = _q(con, f"""SELECT trading_date, run_type FROM run_locks
-                        WHERE status = 'in_progress'
+                        WHERE status = 'in_progress' AND trading_date >= ?
                           AND started_at < current_timestamp - INTERVAL '{STALE_LOCK_MINUTES} minutes'
-                        ORDER BY trading_date DESC LIMIT 10""")
+                        ORDER BY trading_date DESC LIMIT 10""", [session])
     for td, rt in stale:
-        warnings.append(f"{rt} lock for {td} is stuck 'in_progress' (its run died without "
-                        f"releasing it). The next attempt takes it over automatically.")
+        if _as_date(td) != current.get(str(rt)):
+            continue
+        warnings.append(f"today's {rt} lock ({td}) is stuck 'in_progress': its run died without "
+                        f"releasing it. The next attempt takes it over automatically.")
 
     # --- live paper orders nobody is managing ---------------------------
     if ((cfg.get("live_paper", {}) or {}) if cfg else {}).get("enabled"):

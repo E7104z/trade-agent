@@ -74,7 +74,8 @@ def test_clean_draft_is_stored_ok_with_its_cost(con):
     assert call["user"].count("{{verdict.calibration_q3}}") == 1
     (status, rendered, raw), = _rows(con)
     assert status == "ok" and raw == CLEAN
-    assert "Morning picks taken: 5 (one session)." in rendered
+    assert "Morning picks taken: 5." in rendered
+    assert "## What happened (one session, not evidence)" in rendered
     run = con.execute("SELECT loop, status, cost_usd, input_tokens FROM runs").fetchall()
     assert run == [("traders_log", "ok", 0.006, 1000)]
 

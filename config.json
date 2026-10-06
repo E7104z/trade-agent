@@ -61,6 +61,7 @@
   "drawdown_window": 10,
   "drawdown_pause_r": -4.0,
   "timezone": "America/New_York",
+  "public_base_url": "https://iwilltrade.com",
   "email_enabled": true,
   "data": {
     "alpaca_feed": "sip",

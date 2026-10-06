@@ -454,8 +454,8 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
     the rejections table), which behaves the same as a pick with no time_stop.
     """
     rejections = ledger.ungraded_rejections(con, d)
-    summary = {"scored": 0, "net_forgone_r": 0.0, "gap_fade_notes": [],
-               "rr_band_notes": []}
+    summary = {"scored": 0, "priced": 0, "triggered": 0, "net_forgone_r": 0.0,
+               "gap_fade_notes": [], "rr_band_notes": []}
     for r in rejections:
         try:
             bars = md.minute_bars(r["ticker"], d)
@@ -474,6 +474,9 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
                                       sim_version=sim.get("sim_version"))
         summary["scored"] += 1
         summary["net_forgone_r"] += forgone or 0.0
+        if forgone is not None:
+            summary["priced"] += 1
+            summary["triggered"] += 1 if sim.get("triggered") else 0
         log("evening", f"  shadow {r['ticker']} ({r['reason'][:40]}): {eod_outcome}"
                        + (f" {forgone:+.2f}R" if forgone is not None else ""))
         if r.get("setup_type") == "gap_fade":
@@ -490,6 +493,24 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
                 (r["ticker"], round(float(rr), 3), eod_outcome, forgone))
     summary["net_forgone_r"] = round(summary["net_forgone_r"], 2)
     return summary
+
+
+def _shadow_md(shadow: dict) -> str:
+    """The grader's one line on the shadow ledger. Counts what the net
+    covers, and says plainly what one session of it can and cannot show:
+    on 2026-10-05 the grader read -0.14R over six priced rejections (0.02R a
+    rejection) as "confirms filters are working"."""
+    scored, priced = int(shadow.get("scored") or 0), int(shadow.get("priced") or 0)
+    net = float(shadow.get("net_forgone_r") or 0.0)
+    if not scored:
+        return "No rejected candidates were scored today."
+    per = f", {net / priced:+.2f}R per priced rejection" if priced else ""
+    return (f"{scored} rejected candidates scored, {priced} priced "
+            f"({shadow.get('triggered', 0)} of them would have triggered; "
+            f"{scored - priced} unmeasurable); net forgone {net:+.2f}R over the priced"
+            f"{per} (positive = the filters cost the desk). One session of forgone R is "
+            "a single noisy draw over a handful of names: it neither confirms nor refutes "
+            "the filters. Only the weekly miner's cumulative shadow read can.")
 
 
 def _rr_band_note(ticker: str, rr: float, eod_outcome: str,
@@ -1224,8 +1245,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                 log("evening", f"WARN hypothesis block unavailable: {e}")
         system = load_prompt("evening_grader", {"PERSONA": persona_block(cfg, "grader"),
                                                 **hypotheses.grader_prompt_text(cfg)})
-        shadow_md = (f"{shadow['scored']} rejected candidates scored; net forgone "
-                     f"{shadow['net_forgone_r']:+.2f}R today (positive = filters cost us)")
+        shadow_md = _shadow_md(shadow)
         user = (
             f"# GRADING DATE: {d.isoformat()}\n\n"
             f"## THE MORNING PLAN\n\n"

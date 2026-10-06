@@ -52,12 +52,21 @@ def test_a_well_formed_log_renders_byte_stable():
     a, va = tl.render(draft(), FACTS)
     b, vb = tl.render(draft(), FACTS)
     assert va == vb == [] and a == b
-    assert "Net +0.40R (one session)." in a                 # renderer adds the label
+    # The section heading carries the one-session scope once; values inside it
+    # carry none (it used to follow nearly every number of the entry).
+    assert "## What happened (one session, not evidence)" in a
+    assert "Net +0.40R." in a and "Net +0.40R (one session)" not in a
     assert "So far conviction 3: n 9, 56% winners." in a    # cumulative: no suffix
-    assert "(one session) (one session)" not in a
     assert '"Calibration verdict (computed, Q3): not yet computable."' in a
     assert "Q3 (question): 5/8" in a and a.endswith("Tomorrow: Q3 — take the cleanest real setup that feeds it.")
     assert "{{" not in a
+
+
+def test_a_one_session_value_outside_what_happened_keeps_its_own_label():
+    a, v = tl.render(draft(cant="I still owe {{deficit.Q3}}; today netted {{day.net_r}}."), FACTS)
+    assert v == []
+    assert "today netted +0.40R (one session)." in a
+    assert a.count("(one session)") == 1
 
 
 def test_no_change_is_a_valid_tomorrow():

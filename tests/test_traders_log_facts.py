@@ -83,9 +83,14 @@ def test_shadow_runner_and_exit_replays(con):
     assert _v(f, "shadow.scored") == "2" and _v(f, "shadow.forgone_r") == "-0.20R"
     assert _v(f, "runner.candidates") == "3" and _v(f, "runner.selected") == "1"
     assert _v(f, "runner.industry_cap_drops") == "1"
-    assert _v(f, "runner.exit.plan") == "+0.50R per trade over 2 replayed trades, 50% closed positive"
-    assert _v(f, "runner.exit.arm_a_floor").startswith("+0.25R per trade over 2")
+    assert _v(f, "runner.exit.plan") == ("plan exits (the selected plan's own stop and 2R target): "
+                                         "+0.50R per trade over 2 replayed trades, 50% closed positive")
+    assert _v(f, "runner.exit.arm_a_floor").startswith(
+        "arm A, stop floor (stop no tighter than 1 ATR): +0.25R per trade over 2")
     assert "runner.exit.arm_b_dashboard" not in f["slots"]      # no replays, no slot
+    # Every shadow row in the seed is priced, and the selection is explained.
+    assert _v(f, "shadow.priced") == "2" and _v(f, "shadow.forgone_per_rejection") == "-0.10R"
+    assert _v(f, "runner.selection").startswith("selected 1")
 
 
 def test_deficits_and_menu_are_the_morning_list(con):
@@ -164,7 +169,9 @@ def test_render_facts_only_is_deterministic_and_labeled(con):
     a, b = tl.render_facts_only(f), tl.render_facts_only(json.loads(json.dumps(f)))
     assert a == b
     assert a.startswith("FACTS ONLY (no narrative)")
-    assert "(one session)" in a and "(count)" in a and "(cumulative)" in a
+    # A one-session group names its scope in its title, not on every line.
+    assert "What happened (one session, not evidence):" in a and "(one session)" not in a
+    assert "(count)" in a and "(cumulative)" in a
     assert '"Calibration verdict (computed, Q3)' in a and "(computed verdict)" in a
     assert tl.render_facts_only({"slots": {}}) == "FACTS ONLY (no narrative)\n(no facts for this session)"
 

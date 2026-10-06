@@ -133,8 +133,13 @@ def test_a_probe_killed_on_rr_or_conviction_is_admitted_at_minimum_size():
 
 
 @pytest.mark.parametrize("kill, target, ids, admitted", [
-    ("staleness", 12.4, ["P1"], False),   # a validity defect stays binding
+    ("staleness", 12.4, ["P1"], True),    # on coverage's terms: only a broken order binds
+    ("regime_fit", 12.4, ["P1"], True),
     ("grounding", 12.4, ["P1"], False),
+    ("entry_type", 12.4, ["P1"], False),
+    ("event_risk", 12.4, ["P1"], False),
+    ("setup_fit", 12.4, ["P1"], False),    # a mislabel never reaches the tape
+    ("hypothesis_fit", 12.4, ["P1"], False),
     ("rr", 11.5, ["P1"], False),           # R:R 1.5 < min_rr 1.8
     ("rr", 12.4, ["OTHER"], False),        # not a top backlog item
     ("rr", 12.4, ["P1"], True),

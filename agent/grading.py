@@ -150,6 +150,29 @@ CURRENT_SIM_VERSION = 7
 # imports it from here.
 EOD_FLATTEN_MINUTES = 5
 
+# A taken trade's result inside +/-SCRATCH_R is a SCRATCH: neither a win nor a
+# loss. The simulator charges slippage_bps (5) a side; on a typical morning
+# stop ~2% from entry, that round trip alone is 10 bps / 2% = 0.05R, so a
+# result inside the band is flat at the desk's own cost of trading. ALEC on
+# 2026-10-05 exited at +0.01R -- $0.0028 a share on a $2 stock, inside the
+# spread -- and was counted a winner in every cell it touched. Only what is
+# CALLED a win or a loss changes: mean R, the sequential tests and the FDR
+# batch read R itself and are untouched. (The shadow ledger keeps its own,
+# wider +/-0.2R band for "meaningful forgone R"; see classify_shadow.)
+SCRATCH_R = 0.05
+
+
+def outcome_class(r: float | None) -> str | None:
+    """'win', 'loss' or 'scratch' for a realized R; None when unmeasured."""
+    if r is None:
+        return None
+    if r > SCRATCH_R:
+        return "win"
+    if r < -SCRATCH_R:
+        return "loss"
+    return "scratch"
+
+
 # The least reward, in planned R, a runner fill must leave below the target.
 # It is the execution_anomaly line (fill_vs_plan_r > 0.5) read from the other
 # side: a fill that has used up more than 1.5 of the plan's 2R has stopped
@@ -1078,6 +1101,32 @@ def realized_r(o: dict) -> float | None:
     return v
 
 
+# Why a minimum-size test pick is on the tape. The grader is told, per pick,
+# that the SYSTEM placed it to sample a setup; on 2026-10-05 NVDA (coverage)
+# got a C and "shouldn't have been taken" for being exactly what the lane is for.
+_TEST_LANE_NOTES = {
+    "coverage": "coverage: the risk manager rejected it and the desk traded it at minimum "
+                "size by design, so every setup the analyst found gets tested",
+    "daily_floor": "daily floor: the desk trades every session, and this minimum-size pick "
+                   "was placed by design so the day is not empty",
+    "hypothesis": "hypothesis test: a minimum-size trade placed by design to test an idea "
+                  "the desk wrote down",
+    "rr_below_control": "R:R control: a minimum-size trade placed by design to measure the "
+                        "R:R threshold",
+    "backlog_probe": "backlog probe: a minimum-size trade placed by design to collect "
+                     "evidence the desk is short of",
+}
+
+
+def _volume_share(part: float | None, whole: float | None) -> str | None:
+    """Share of the day's volume done by a checkpoint: RVOL@T / RVOL@close.
+    Both are cumulative volume over the same ADV20, so the ratio is the
+    stock's own intraday volume curve -- no outside volume profile needed."""
+    if part is None or not whole or whole <= 0:
+        return None
+    return f"{min(part / whole, 1.0):.0%}"
+
+
 def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
     """Render computed outcomes for the evening grader prompt."""
     by_id = {o["pick_id"]: o for o in outcomes}
@@ -1088,12 +1137,19 @@ def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
         lines.append(f"- Plan: entry {p['entry_type']} @ {p['entry_price']}, stop {p['stop_price']}, "
                      f"target {p['target_price']}, size {p['size_r']}R, conviction {p['conviction']}, "
                      f"time_stop: {p['time_stop']}")
+        lane_note = _TEST_LANE_NOTES.get(str(p.get("exploration_lane") or ""))
+        if lane_note:
+            lines.append(f"- Lane: {lane_note}. Being taken is the system's decision, not the "
+                         f"desk's: grade its construction and what the tape did, never that it "
+                         f"was traded.")
         lines.append(f"- Thesis: {p['thesis']}")
         lines.append(f"- Invalidation: {p['invalidation']}")
         if o.get("triggered"):
             times = f" [{o['fill_time']} -> {o['exit_time']}]" if o.get("fill_time") and o.get("exit_time") else ""
+            scratch = (f" — a SCRATCH (inside +/-{SCRATCH_R:.2f}R: neither a win nor a loss, "
+                       f"its sign is noise)" if outcome_class(realized_r(o)) == "scratch" else "")
             lines.append(f"- OUTCOME: filled @ {o['entry_fill']}, exit @ {o['exit_price']} "
-                         f"({o['exit_reason']}), R = {realized_r(o):+.2f} (planned-risk R), "
+                         f"({o['exit_reason']}), R = {realized_r(o):+.2f} (planned-risk R){scratch}, "
                          f"MFE {o['mfe_r']:+.2f}R, MAE {o['mae_r']:+.2f}R{times}")
             if o.get("execution_anomaly"):
                 lines.append(
@@ -1105,8 +1161,15 @@ def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
                 bits = [f"filled {o['vwap_side_at_fill']} VWAP ({o['fill_vs_vwap_pct']:+.1f}%)",
                         f"session {(o.get('pct_time_above_vwap') or 0) * 100:.0f}% time above VWAP",
                         f"{o.get('vwap_crosses', 0)} VWAP cross(es)"]
-                if o.get("rvol_at_1000") is not None:
-                    bits.append(f"RVOL@10:00 {o['rvol_at_1000']:.2f}x ADV20")
+                # RVOL@T is CUMULATIVE session volume to T over the FULL-day
+                # ADV20, so 0.16x at 10:00 can be an ordinary pace. The share
+                # of the day's volume done by each checkpoint is what reads
+                # pace (NVDA 10/05: 0.16x at 10:00, 0.90x at close = 18%).
+                for key, label in (("rvol_at_1000", "10:00"), ("rvol_at_1200", "12:00")):
+                    if o.get(key) is not None:
+                        share = _volume_share(o[key], o.get("rvol_close"))
+                        bits.append(f"RVOL@{label} {o[key]:.2f}x ADV20"
+                                    + (f" ({share} of the day's volume by {label})" if share else ""))
                 if o.get("rvol_close") is not None:
                     bits.append(f"RVOL@close {o['rvol_close']:.2f}x ADV20")
                 if o.get("ema9_5m_loss_et"):

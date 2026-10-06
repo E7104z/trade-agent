@@ -79,6 +79,14 @@ from . import sequential as _seq  # noqa: E402
 MAX_N = _seq.N_MAX
 EXPIRE_SESSIONS = 30
 GRAVEYARD_SESSIONS = 30
+
+# An idea is judged on sessions it was tested in, at one per session, so it
+# must be tradeable often. Each number in a statement is, in practice, one
+# more condition a trade must meet ("gap >40%", "RVOL 2.49x at 10:00", "5%
+# above VWAP"): H-de095870 (2026-10-05) stacked five and was unlikely ever to
+# reach its first look. A clock time counts once.
+MAX_STATEMENT_NUMBERS = 3
+_NUMBER = re.compile(r"\d{1,2}:\d{2}|\d+(?:\.\d+)?")
 ALPHA = _seq.ALPHA              # one-sided, across every look an idea gets
 DUP_JACCARD = 0.8               # the lesson bank's near-duplicate bar
 
@@ -190,6 +198,11 @@ def clean_proposal(raw: Any) -> tuple[dict | None, str]:
         return None, "statement missing or too short to be a repeatable trade idea"
     if len(refutation) < 10:
         return None, "no refutation: a hypothesis must say what would prove it wrong"
+    n_cond = len(set(_NUMBER.findall(statement)))
+    if n_cond > MAX_STATEMENT_NUMBERS:
+        return None, (f"names {n_cond} numeric conditions: an idea that needs that many things "
+                      f"at once fits too few trades to reach a verdict (state its core "
+                      f"condition, {MAX_STATEMENT_NUMBERS} numbers at most)")
     direction = str(raw.get("direction") or "").strip().lower()
     direction = direction if direction in ("long", "short") else None
     setup = str(raw.get("setup_type") or "").strip().lower()[:40] or None
@@ -545,6 +558,11 @@ def analyst_prompt_text(cfg: Any) -> dict[str, str]:
             " half hour makes money on a risk-off tape\"), not a mood (\"the market feels"
             " heavy\"). Say where it came from in `origin`, and how strongly you believe it in"
             " `belief` (1-5): the desk tracks whether your strong hunches beat your weak ones.\n"
+            "- Keep an idea testable: one core condition, two at most, beyond its setup. An"
+            " idea is judged only on sessions it was traded, and every extra condition is fewer"
+            " trades that fit it; the register refuses a statement with more than"
+            f" {MAX_STATEMENT_NUMBERS} numbers in it. An idea your notebook shows UNTESTED for"
+            " many sessions is too narrow: abandon it, or restate its core as a new idea.\n"
             f"- Beyond the one candidate per setup, you may bring up to {lane['max_picks']} extra"
             " candidates that exist only to test a hypothesis. They may repeat a setup.\n"
             f"- A tagged candidate the risk manager rejects still trades at {lane['size_r']}R as a"
@@ -621,7 +639,11 @@ def grader_prompt_text(cfg: Any) -> dict[str, str]:
             f"You may also start up to {lane['max_new_per_day']} new idea(s) in `hypotheses`."
             " This is where a single ordinary event goes: it is not a lesson, but it can be an"
             " idea worth testing. Write a repeatable trade claim with a refutation, and copy"
-            " every number from your input (numbers are checked). Or nominate an existing lesson"
+            " every number from your input (numbers are checked). Keep it testable: one core"
+            " condition, two at most (the register refuses a statement with more than"
+            f" {MAX_STATEMENT_NUMBERS} numbers), and a mechanism the computed numbers agree with:"
+            " an idea built on a misread number tests the wrong thing for weeks. Or nominate an"
+            " existing lesson"
             " for a deliberate test with `from_lesson_id` and a refutation, because an untested"
             " lesson should not steer the desk forever. Do not re-propose an idea already open"
             " in your input. New ideas are tested from the next session on."),
