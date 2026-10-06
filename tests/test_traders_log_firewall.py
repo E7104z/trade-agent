@@ -30,6 +30,10 @@ ALLOWLIST = {
     "api/index.py": lambda l: '"traders_log": "session_date"' in l or l.lstrip().startswith("#"),
     "agent/webui.py": lambda l: '<option value="traders_log">' in l,
     "agent/loops/evening.py": None,      # the hook; confined to its block below
+    # The pre-deploy rehearsal report (VERIFICATION_PRACTICE_v1): it shows the
+    # owner the rendered log of a scratch session and clears that row before
+    # re-grading; nothing it reads reaches a prompt or the ledger's learning.
+    "agent/rehearsal.py": None,
 }
 
 

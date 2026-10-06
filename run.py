@@ -980,6 +980,15 @@ def main() -> None:
     p_hyp.add_argument("--show", type=str, default=None,
                        help="one idea (H-...): its pre-registration, verdict and tagged trades")
 
+    p_reh = sub.add_parser(
+        "rehearse", help="run the changed loops on real data in a scratch ledger before deploying "
+                         "(real model calls, ~$2-3; no email, no orders, never production)")
+    p_reh.add_argument("--loop", choices=("morning", "evening", "both"), default="both")
+    p_reh.add_argument("--date", type=str, default=None,
+                       help="past session to grade in the evening rehearsal (default: latest with picks)")
+    p_reh.add_argument("--no-paired", action="store_true", help="skip the paired arm B (halves the cost)")
+    p_reh.add_argument("--check", action="store_true",
+                       help="only say whether a passing rehearsal covers HEAD (exit 1 if not)")
     p_research = sub.add_parser("research", help="research integrity report (selection ablation + population baseline, zero API cost)")
     p_research.add_argument("--full", action="store_true", help="also render the full weekly research block (FDR looks, quarantine, paired arms)")
 
@@ -1016,6 +1025,19 @@ def main() -> None:
         cmd_regate_runner(cfg, args)
     elif args.cmd == "research":
         cmd_research(cfg, args)
+    elif args.cmd == "rehearse":
+        from agent import rehearsal
+        if args.check:
+            ok, msg = rehearsal.verify_head()
+            print(("OK: " if ok else "NOT REHEARSED: ") + msg)
+            sys.exit(0 if ok else 1)
+        loops = ("morning", "evening") if args.loop == "both" else (args.loop,)
+        s = rehearsal.rehearse(loops, evening_date=parse_date(args.date) if args.date else None,
+                               paired=not args.no_paired)
+        print(f"\nREHEARSAL {'PASS' if s['passed'] else 'FAIL'}: {s['workdir']}\\report.md")
+        for loop, r in s["loops"].items():
+            print(f"  {loop}: {r['verdict']}" + "".join(f"\n    - {p}" for p in r.get("problems") or []))
+        sys.exit(0 if s["passed"] else 1)
     elif args.cmd == "morning":
         from agent.loops import morning
         morning.run(cfg, run_date, force=args.force)

@@ -1305,6 +1305,22 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             ledger.log_run(con, "evening", d, started, "mock", model, result.usage)
             return
 
+        # VERIFICATION_PRACTICE_v1: the grader's claims checked against the
+        # computed numbers BEFORE any of it is stored. A lesson or idea the
+        # numbers contradict is dropped; a pick review or the plan notes keep
+        # the grader's words with an [AUDIT: ...] note beside them.
+        from .. import review_audit
+        audit = review_audit.audit(review, picks, outcomes)
+        review = audit["review"]
+        stages["audit"] = {
+            "findings": len(audit["findings"]),
+            "dropped_lessons": audit["dropped_lessons"],
+            "dropped_ideas": audit["dropped_ideas"],
+            "items": [{k: str(v)[:300] for k, v in f.items()} for f in audit["findings"][:20]]}
+        for f in audit["findings"]:
+            log("evening", f"AUDIT [{f['check']}] {f['where']} {f.get('ticker') or ''}: "
+                           f"{f['why'][:200]} ({f['action']})")
+
         # 3. persist grades + lessons
         n_graded = ledger.apply_grades(con, review.get("pick_reviews", []), picks)
 
@@ -1441,11 +1457,13 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                     key=lambda s: {"bad": 3, "warn": 2, "info": 1}.get(s, 0), default="ok")
             except Exception as e:  # noqa: BLE001
                 log("evening", f"WARN self-check failed; the evening is unaffected: {e}")
+        audit_txt = review_audit.text(audit)
         send_email(cfg, f"Trade Agent — Evening Review {d.isoformat()}",
                    evening_email_html(d, review, out_md + (
                        f"\n\nCOMPUTED TAPE\n{tape_md}" if tape_md else "") + (
                        f"\n\n{digest_txt}" if digest_txt else "") + (
                        f"\n\n{hyp_txt}" if hyp_txt else "") + (
+                       f"\n\n{audit_txt}" if audit_txt else "") + (
                        f"\n\n{check_txt}" if check_txt else ""), **email_log))
         render_dashboard(con, cfg, d)
         ledger.finish_run_lock(con, d, "evening", lock["request_id"], "complete")

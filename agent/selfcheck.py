@@ -294,6 +294,27 @@ def check_runner_selection(con: Any, cfg: Any, d: date) -> dict:
     return _res(status, f"{n_cand} candidate(s): {note['text']}", candidates=n_cand, **note)
 
 
+def check_grader_audit(con: Any, cfg: Any, d: date) -> dict:
+    """What the evening audit (agent/review_audit.py) caught in today's grader
+    output: claims the computed numbers contradict, before they were saved."""
+    rows = _q(con, """SELECT stages FROM runs WHERE loop = 'evening' AND run_date = ?
+                      AND stages IS NOT NULL ORDER BY run_id DESC LIMIT 1""", [d])
+    try:
+        audit = (json.loads(rows[0][0] or "{}") or {}).get("audit") if rows else None
+    except (TypeError, ValueError):
+        audit = None
+    if audit is None:
+        return _res("info", "no audited evening review for this session")
+    n = int(audit.get("findings") or 0)
+    if not n:
+        return _res("ok", "every checked claim agreed with the computed numbers", **audit)
+    kinds = Counter(str(i.get("check")) for i in audit.get("items") or [])
+    return _res("warn", f"{n} grader claim(s) contradicted the numbers "
+                        f"({', '.join(f'{k} {v}' for k, v in sorted(kinds.items()))}); "
+                        f"{audit.get('dropped_lessons', 0)} lesson(s) and "
+                        f"{audit.get('dropped_ideas', 0)} idea(s) dropped before saving", **audit)
+
+
 def check_hypotheses(con: Any, cfg: Any, d: date) -> dict:
     """The notebook's integrity property (every tag written before its idea's
     outcome can exist) and whether the lane is being used at all."""
@@ -454,6 +475,7 @@ CHECKS: tuple[tuple[str, str, Callable[[Any, Any, date], dict]], ...] = (
     ("plumbing", "Data collected today", check_plumbing),
     ("lanes", "Lanes and broker cap", check_lanes),
     ("runner_selection", "Runner selection", check_runner_selection),
+    ("grader_audit", "Grader audit", check_grader_audit),
     ("morning_budget", "Morning time budget", check_morning_budget),
     ("hypotheses", "Hypothesis notebook", check_hypotheses),
     ("lessons", "Lessons steering untested", check_lessons),
