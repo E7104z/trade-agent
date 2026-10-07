@@ -63,6 +63,11 @@
 
   It warns when fewer than half of 8 or more orders fill.
 
+- **Premarket data survives a bad symbol (`agent/providers.py`).** The rehearsal at 00:06 ET on 10/07 showed Alpaca refusing the whole premarket-bars batch with a 400, because rights and warrants from the movers list (NMCO.RT, BCAT.RT, …W) were in it.
+  - When that happens, every name loses its premarket VWAP, volume and high/low: the levels entries anchor on and level grounding checks against.
+  - A refused batch is now retried once with the common-stock symbols only.
+  - The earlier rehearsals at real morning hours did not hit it.
+
 ## Kept as designed
 
 - **Coverage admits R:R from 1.0;** the 2.0 bar is for the risk manager's approvals. The lane exists to test a setup at minimum size.
