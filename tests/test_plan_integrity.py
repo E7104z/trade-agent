@@ -8,8 +8,12 @@ built from that day's real levels:
   * Three theses named the premarket low and priced it from memory, 0.41-0.49
     ATR below the computed value; none filled. Such entries move onto the
     computed level.
-  * PTC disowned its own label and traded anyway; GOOG and NVDA went on as
-    one bet.
+  * PTC disowned its own label and traded anyway.
+  * A real duplicate (two share classes, an ETF and its top holding) could go
+    on twice. The review's "GOOG and NVDA are one AI bet" did not hold up:
+    their prior 20-day correlation was +0.06. And the plain 20-day number
+    called CEG and HTZ one bet (+0.81) on the strength of a single shared
+    gap day; the rule now needs the link to survive leaving any day out.
 """
 from __future__ import annotations
 
@@ -158,6 +162,22 @@ def test_the_shadow_ledger_says_what_happened_to_each_candidate():
 def test_a_trade_that_disowns_its_label_never_reaches_a_test_lane(cand, row, ok):
     plan = {"picks": [], "rejected": [{"ticker": cand["ticker"], **row}]}
     assert bool(_ranked_rejects({"candidates": [cand]}, plan, "coverage", 0.25, 1.0)) is ok
+
+
+def test_one_shared_news_day_is_not_one_bet():
+    from agent.loops.morning import _one_risk_unit
+    # 19 unrelated small days, then both names gap ~+12-15% on the same day:
+    # the CEG/HTZ shape of 10/06 (+0.81 with the day, +0.49 without it).
+    a = [0.004, -0.006, 0.002, -0.003, 0.005, -0.002, 0.001, 0.003, -0.004, 0.002,
+         -0.001, 0.006, -0.005, 0.002, 0.000, -0.003, 0.004, -0.002, 0.001, 0.12]
+    b = [-0.003, 0.002, 0.005, 0.004, -0.006, 0.001, -0.004, 0.002, 0.003, -0.005,
+         0.006, -0.002, 0.001, -0.003, 0.004, 0.002, -0.001, 0.005, -0.004, 0.15]
+    from agent.loops.morning import _pearson
+    assert _pearson(a, b) > 0.7                     # the plain number says one bet
+    assert _one_risk_unit(a, b) is None             # it rests on one day
+    # Two share classes of one company move together every day.
+    c = [x * 1.01 + 0.0002 for x in a[:-1]] + [0.119]
+    assert _one_risk_unit(a, c) > 0.9
 
 
 def test_correlated_picks_pointing_the_same_way_are_one_bet():

@@ -25,7 +25,12 @@
    - Its thesis: "NOT a momentum trade — it's M&A arbitrage, which is outside my setup taxonomy".
    - The risk manager's reason: "Wrong time horizon".
    - `setup_fit` blocked a test lane only when it was the *primary* kill.
-4. **GOOG and NVDA, both AI-infrastructure longs, went on as two picks.** Coverage ignored correlation.
+4. **Correlation.** The review called GOOG and NVDA one AI bet; their prior 20-day correlation was
+   +0.06, so by the numbers they were not. But coverage ignored correlation entirely, so a real
+   duplicate (two share classes, an ETF and its top holding) could go on twice. And the plain
+   20-day correlation the risk manager has been shown for kill-check 17 is fragile on this desk:
+   in the rehearsal of the first build it called CEG and HTZ one bet (+0.81), on the strength of
+   one shared gap day (+12.3% and +15.1% on 10/06); without that day it was +0.49.
 5. **The dashboard showed no lane,** so a test pick appeared both "taken" and "killed".
 
 ## The fixes (`agent/loops/morning.py` unless noted)
@@ -41,7 +46,12 @@
   - A `setup_fit` kill blocks every test lane wherever it appears in `kill_checks`.
   - So does a thesis or kill reason that disowns the label: "outside my setup taxonomy", "label is a stretch", "wrong horizon", "not intraday", "doesn't fit the setup".
   - The probe lane follows the same rules.
-- **One bet.** A test-lane candidate that would double a pick already on is skipped and logged ("the same bet as GOOG (20d corr +0.82)"). Doubling means |20d corr| above `CORR_PAIR` (0.7, the risk manager's kill-check 17 line) in the same direction. One correlation pass covers both arms' candidates and travels in the checkpoint.
+- **One bet.** A test-lane candidate that would double a pick already on is skipped and logged ("the same bet as XLE (20d corr +0.84)").
+  - Doubling means one risk unit: |20d corr| above `CORR_PAIR` (0.7, the risk manager's kill-check 17 line) **with every single day left out**, and pointing the same way.
+  - A link that rests on one day is a shared news day, not a shared bet. On real data, GOOG/GOOGL (+0.99) and XLE/XOM (+0.84, +0.77 at worst) pass; CEG/HTZ (+0.81, +0.49 without 10/06) does not.
+  - A pair is measured only when both series cover the same days; unmeasured is never a pair.
+  - The risk manager's kill-check 17 list uses the same rule, so it no longer lists unrelated names as one risk unit.
+  - One correlation pass covers both arms' candidates and travels in the checkpoint.
 - **Dashboard (`agent/webui.py`).**
   - Each plan row carries its lane.
   - A note explains test picks.
@@ -62,6 +72,7 @@
 
 - **T1 (fills vs the analyst's price).** A corrected long limit buys higher than the analyst wrote. It is the level the analyst said it wanted, and it is reachable: on 10/06 it would have turned two non-fills into trades. "Entries and fills" measures whether corrected entries fill and how they do; if they lose more than they add, the tolerance is the knob.
 - **T2 (coverage of setups vs concentration).** A setup whose only candidate is the same bet as a pick already on goes untested that day. Its observation would have been a duplicate.
+- **T3 (risk manager input).** Kill-check 17's pair list now shows only robust pairs. It used to show any |corr| > 0.7, which on gap days included names linked only by one shared day.
 
 ## Acceptance (read by the system)
 

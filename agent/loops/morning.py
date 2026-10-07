@@ -745,29 +745,75 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
 # Two names whose 20-day daily returns correlate beyond this are one risk unit
 # (the risk manager's kill-check 17). The test lanes use the same line.
 CORR_PAIR = 0.7
+CORR_DAYS = 20
+
+
+def _pearson(a: list[float], b: list[float]) -> float | None:
+    n = len(a)
+    if n < 3:
+        return None
+    ma, mb = sum(a) / n, sum(b) / n
+    va = sum((x - ma) ** 2 for x in a)
+    vb = sum((y - mb) ** 2 for y in b)
+    if va <= 0 or vb <= 0:
+        return None
+    return sum((x - ma) * (y - mb) for x, y in zip(a, b)) / (va * vb) ** 0.5
+
+
+def _one_risk_unit(a: list[float], b: list[float]) -> float | None:
+    """The correlation of two return series when it makes them ONE risk unit,
+    else None: |corr| above CORR_PAIR with EVERY single day left out, same
+    sign throughout. A relationship that rests on one day is a shared news
+    day, not a shared bet: on 2026-10-06 CEG (+12.3%, a nuclear deal) and HTZ
+    (+15.1%) printed a 20-day correlation of +0.81 that fell to +0.49
+    without that day. The morning trades gappers, whose latest day is an
+    outlier by construction, so the plain number flagged unrelated names."""
+    full = _pearson(a, b)
+    if full is None or abs(full) <= CORR_PAIR:
+        return None
+    for i in range(len(a)):
+        v = _pearson(a[:i] + a[i + 1:], b[:i] + b[i + 1:])
+        if v is None or (v > 0) != (full > 0) or abs(v) <= CORR_PAIR:
+            return None
+    return full
 
 
 def _correlations(tickers: list[str]) -> dict:
-    """Each name's beta to SPY and every pair with |corr| > CORR_PAIR, from
-    20d daily returns: {"betas": {t: b}, "pairs": [[a, b, corr]]}, plus
-    "failed": True when the fetch or the arithmetic failed. Never raises."""
+    """Each name's beta to SPY and every pair that is one risk unit
+    (_one_risk_unit), from CORR_DAYS daily returns: {"betas": {t: b},
+    "pairs": [[a, b, corr]]}, plus "failed": True when the fetch or the
+    arithmetic failed. A pair is measured only when both series cover the
+    same days -- the closes carry no dates, so unequal lengths mean a gap in
+    one of them, and returns paired by position would be from different
+    days. An unmeasured pair is never a pair. Never raises."""
     uniq = list(dict.fromkeys(t.upper() for t in tickers if t))
     if len(uniq) < 2:
         return {"betas": {}, "pairs": []}
     try:
         closes = yf_history_closes(uniq + ["SPY"], days=40)
+
+        def rets(t: str) -> list[float]:
+            xs = closes.get(t) or []
+            if len(xs) < CORR_DAYS + 1:
+                return []
+            return [xs[i] / xs[i - 1] - 1 for i in range(len(xs) - CORR_DAYS, len(xs))]
+
         spy = closes.get("SPY") or []
         betas = {}
         for t in uniq:
-            bc = beta_corr(spy, closes.get(t) or [], n=20)
-            if bc:
-                betas[t] = bc[0]
+            if len(closes.get(t) or []) == len(spy):
+                bc = beta_corr(spy, closes.get(t) or [], n=CORR_DAYS)
+                if bc:
+                    betas[t] = bc[0]
         pairs = []
         for i, a in enumerate(uniq):
             for b in uniq[i + 1:]:
-                bc = beta_corr(closes.get(a) or [], closes.get(b) or [], n=20)
-                if bc and abs(bc[1]) > CORR_PAIR:
-                    pairs.append([a, b, round(float(bc[1]), 2)])
+                if len(closes.get(a) or []) != len(closes.get(b) or []):
+                    continue
+                ra, rb = rets(a), rets(b)
+                v = _one_risk_unit(ra, rb) if ra and rb else None
+                if v is not None:
+                    pairs.append([a, b, round(float(v), 2)])
         return {"betas": betas, "pairs": pairs}
     except Exception as e:
         log("morning", f"WARN correlation matrix failed ({e}) — kill-check 17 section omitted")
@@ -795,8 +841,8 @@ def _correlation_matrix_md(tickers: list[str], corr: dict | None = None) -> str:
     lines = ["## CORRELATION / BETA (candidates, 20d daily returns — computed, not a vibe)\n"]
     if betas:
         lines.append("- Beta to SPY: " + ", ".join(f"{t} {b:+.2f}" for t, b in betas.items()))
-    lines.append(f"- Pairs with |corr| > {CORR_PAIR} (share ONE risk unit, kill-check 17): "
-                 + (", ".join(pairs) if pairs else "none"))
+    lines.append(f"- Pairs with |corr| > {CORR_PAIR} that hold with any single day left out "
+                 f"(share ONE risk unit, kill-check 17): " + (", ".join(pairs) if pairs else "none"))
     return "\n".join(lines)
 
 
@@ -1239,9 +1285,12 @@ def _all_kills(rejected_row: dict) -> set[str]:
 
 
 def _same_bet(pick: dict, held: list[dict], pairs: list | None) -> str | None:
-    """The held pick that `pick` would double -- |20d corr| above CORR_PAIR,
-    pointing the same way (positive correlation, same direction; negative,
-    opposite) -- or None. 10/06: GOOG and NVDA, one AI-infrastructure long."""
+    """The held pick that `pick` would double -- one risk unit by
+    _correlations (e.g. two share classes, or an ETF and its largest
+    holding: GOOG/GOOGL +0.99, XLE/XOM +0.84), pointing the same way
+    (positive correlation, same direction; negative, opposite) -- or None.
+    A shared theme alone is not one bet: GOOG and NVDA, both called "AI
+    infrastructure" on 10/06, correlated +0.06 over the prior 20 days."""
     if not pairs:
         return None
     t = str(pick.get("ticker", "")).upper()
