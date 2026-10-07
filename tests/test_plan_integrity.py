@@ -89,6 +89,52 @@ def test_a_thesis_naming_no_level_and_a_stop_clause_are_left_alone():
     assert _fix(stop_only)[0] is None
 
 
+@pytest.mark.parametrize("thesis", [
+    "Entry limit at $270.10 near the premarket low; stop below.",       # decimal is not a clause end
+    "Entry on pullback to the pre‑market low area.",                # non-breaking hyphen
+    "Entry on a pullback to the low of the premarket range.",
+    "Buy the dip toward the PM low ~$270, target 295.",
+    "**Entry:** limit at the premarket low (~$270)\n**Stop:** $258",
+])
+def test_the_entry_level_is_found_however_the_thesis_words_it(thesis):
+    fix, p = _fix(dict(CEG, thesis=thesis))
+    assert fix and fix["computed"] == 275.25 and p["entry_price"] == 275.25
+
+
+@pytest.mark.parametrize("thesis", [
+    "Entry on pullback near $270, stop under the premarket low.",       # level named for the stop
+    "Stop below premarket low, entry at $270 pullback.",
+    "Entry at 270 pullback; invalidates under overnight low.",
+    "Entry near 270. Stop $274.50 under PML.",
+])
+def test_a_level_named_for_the_stop_never_moves_the_entry(thesis):
+    assert _fix(dict(CEG, thesis=thesis))[0] is None
+
+
+def test_a_bad_print_far_from_the_price_is_not_a_level():
+    p = json.loads(json.dumps(CEG))
+    assert _level_fix(p, "limit", 286.10, {"pm_low": 150.0}, 10.81, 0.25) is None
+
+
+def test_levels_are_topped_up_for_a_ticker_the_bundle_never_enriched():
+    class MD:
+        def level_top_up(self, syms):
+            return {s: {"pm_low": 275.25, "pdl": 270.0} for s in syms}
+    bundle = {"premarket_gappers": [{"symbol": "GOOG", "pm_low": 344.16}]}
+    plan = {"picks": [{"ticker": "CEG"}, {"ticker": "GOOG"}]}
+    lv = morning._grounded_levels(MD(), plan, bundle)
+    assert lv["GOOG"] == {"pm_low": 344.16} and lv["CEG"]["pm_low"] == 275.25
+
+
+def test_a_failed_top_up_leaves_the_bundles_levels():
+    class MD:
+        def level_top_up(self, syms):
+            raise RuntimeError("boom")
+    bundle = {"premarket_gappers": [{"symbol": "GOOG", "pm_low": 344.16}]}
+    lv = morning._grounded_levels(MD(), {"picks": [{"ticker": "CEG"}]}, bundle)
+    assert lv == {"GOOG": {"pm_low": 344.16}}
+
+
 def test_only_a_level_on_the_side_the_order_waits_on_can_anchor_it():
     # RPM: a breakdown SHORT whose entry clause names levels ABOVE the price.
     rpm = _pick("RPM", 91.5, 96.0, 86.5, "Entry on failed bounce toward VWAP/overnight high area; "
@@ -265,3 +311,25 @@ def test_the_self_check_counts_fills_fixes_and_drops():
     assert "1 of 2 limit/breakout orders filled (50%)" in r["headline"]
     assert "1 entry moved onto the computed level their thesis named (1 filled)" in r["headline"]
     assert "discipline 1" in r["headline"]
+
+
+def test_level_top_up_computes_the_same_levels_the_bundle_does(monkeypatch):
+    from datetime import datetime
+    from agent import providers
+    from agent.providers import ET, MarketData
+    md = object.__new__(MarketData)
+    bars = [{"t": datetime(2026, 10, 7, 5, i, tzinfo=ET), "o": 10, "h": h, "l": lo, "c": 10, "v": 100}
+            for i, (h, lo) in enumerate([(11.0, 10.0), (10.5, 9.5)])]
+
+    class A:
+        def multi_bars(self, syms, tf, start, end):
+            return {"AAA": bars, "BBB": []}
+    md.alpaca = A()
+    md.daily_context = lambda syms: {"AAA": {"daily_levels": {"pdh": 12.0, "pdl": 9.0}}}
+    monkeypatch.setattr(providers, "now_et", lambda: datetime(2026, 10, 7, 7, 0, tzinfo=ET))
+    out = md.level_top_up(["AAA", "BBB"])
+    assert out["AAA"]["pm_high"] == 11.0 and out["AAA"]["pm_low"] == 9.5
+    assert out["AAA"]["pdl"] == 9.0 and "pm_vwap" in out["AAA"]
+    assert out["BBB"] == {}
+    monkeypatch.setattr(providers, "now_et", lambda: datetime(2026, 10, 7, 3, 0, tzinfo=ET))
+    assert "pm_low" not in md.level_top_up(["AAA"])["AAA"]

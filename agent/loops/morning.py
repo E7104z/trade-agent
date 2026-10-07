@@ -197,11 +197,12 @@ def _bundle_field(bundle: dict, field: str) -> dict:
 # ~$236-238" at 239.42. All three sat 0.41-0.49 ATR below the level they
 # named and none filled; at the named levels GOOG and NVDA would have. It is
 # the stale-price defect again (CWH, XLE, INSM, DKS), one level down.
+_PM = r"(?:pre[- ]?market|extended[- ]hours?|\bpm|overnight)"
 _LEVEL_WORDS = (
     ("pm_low", "premarket low",
-     re.compile(r"(?:pre-?market|\bpm|overnight)\s+lows?\b|\bPML\b", re.I)),
+     re.compile(rf"{_PM}[- ]+lows?\b|\blows? of (?:the )?{_PM}|\bPML\b", re.I)),
     ("pm_high", "premarket high",
-     re.compile(r"(?:pre-?market|\bpm|overnight)\s+highs?\b|\bPMH\b", re.I)),
+     re.compile(rf"{_PM}[- ]+highs?\b|\bhighs? of (?:the )?{_PM}|\bPMH\b", re.I)),
     ("pdl", "prior-day low",
      re.compile(r"(?:prior|previous|yesterday'?s?)(?:[- ]?day'?s?)?\s+lows?\b|\bPDL\b", re.I)),
     ("pdh", "prior-day high",
@@ -214,7 +215,28 @@ _ENTRY_CLAUSE = re.compile(
     r"\bentry\b|\bentries\b|pull ?back (?:to|into|toward)|\bbuy(?:ing)? (?:at|the|near|into|on)"
     r"|\blimit (?:at|near|on)|\bshort(?:ing)? (?:at|into|near|the)|\bfade (?:at|into|the)"
     r"|\bretest\b|\btrigger(?:s|ed)? (?:at|on|above|below)", re.I)
-_NOT_ENTRY = re.compile(r"^\s*(?:stop|target|invalidat|exit)", re.I)
+# A word that makes the level a stop / target / exit, not the entry.
+_MAX_LEVEL_ATR = 5.0
+_NOT_ENTRY = re.compile(r"\b(?:stops?|targets?|invalidat\w*|exits?|bail\w*|risk)\b", re.I)
+# Clause boundaries: a full stop inside a number ("$240.10") is not one.
+_CLAUSE_SPLIT = re.compile(r"(?<!\d)\.|\.(?!\d)|[;\n!?]")
+_DASHES = str.maketrans({c: "-" for c in "‐‑‒–—―−"} | {" ": " "})
+
+
+def _names_entry_level(clauses: list[str], rx: re.Pattern) -> bool:
+    """True when some entry clause names the level as the ENTRY: the nearest
+    word before the level that says what it is for is an entry word, not a
+    stop/target one. "Entry near 270, stop under the premarket low" names the
+    level for the stop; "premarket low retest" and "buy the dip to the PML"
+    name it for the entry."""
+    for c in clauses:
+        for m in rx.finditer(c):
+            before = c[:m.start()]
+            e = max((x.start() for x in _ENTRY_CLAUSE.finditer(before)), default=-1)
+            s = max((x.start() for x in _NOT_ENTRY.finditer(before)), default=-1)
+            if s < 0 or e > s:
+                return True
+    return False
 
 
 def _level_map(bundle: dict) -> dict[str, dict]:
@@ -240,8 +262,8 @@ def _level_fix(p: dict, entry_type: str, ref: float, levels: dict, atr14: float 
     ep = p.get("entry_plan") if isinstance(p.get("entry_plan"), dict) else {}
     text = " ".join(str(x) for x in (p.get("thesis"), p.get("thesis_final"),
                                      ep.get("rationale"), ep.get("note")) if x)
-    clauses = [c for c in re.split(r"[.;\n]", text)
-               if _ENTRY_CLAUSE.search(c) and not _NOT_ENTRY.search(c)]
+    clauses = [c for c in _CLAUSE_SPLIT.split(text.translate(_DASHES))
+               if _ENTRY_CLAUSE.search(c)]
     if not clauses:
         return None
     entry = float(p["entry_price"])
@@ -249,7 +271,11 @@ def _level_fix(p: dict, entry_type: str, ref: float, levels: dict, atr14: float 
     named = []
     for key, label, rx in _LEVEL_WORDS:
         v = levels.get(key)
-        if v is None or not any(rx.search(c) for c in clauses):
+        if v is None or not _names_entry_level(clauses, rx):
+            continue
+        # A level more than _MAX_LEVEL_ATR from the last price is a bad print
+        # (an odd-lot trade in a thin premarket), not a level to trade.
+        if abs(v - ref) > _MAX_LEVEL_ATR * float(atr14):
             continue
         if (v <= ref) if below else (v >= ref):
             named.append((abs(v - entry), key, label, v))
@@ -307,6 +333,23 @@ def _grounded_atr(md: MarketData, plan: dict, bundle: dict) -> dict[str, float]:
     except Exception as e:
         log("morning", f"WARN ATR fetch failed for noise-stop gate ({e}) — gate skipped (fails open) for affected tickers")
     return atr_map
+
+
+def _grounded_levels(md: MarketData, plan: dict, bundle: dict) -> dict[str, dict]:
+    """Computed levels per proposed ticker: the bundle's, topped up by one
+    batched fetch for any ticker the bundle never enriched (same shape as
+    _grounded_atr). Fails open to the bundle's levels."""
+    levels = _level_map(bundle)
+    proposed = [str(p.get("ticker", "")).upper().strip() for p in (plan.get("picks") or [])]
+    missing = [t for t in dict.fromkeys(proposed) if t and "pm_low" not in levels.get(t, {})]
+    if not missing:
+        return levels
+    try:
+        for t, lv in md.level_top_up(missing).items():
+            levels.setdefault(t, {}).update({k: v for k, v in lv.items() if k not in levels.get(t, {})})
+    except Exception as e:
+        log("morning", f"WARN level top-up failed ({e}) — levels for {missing} not grounded")
+    return levels
 
 
 def _grounded_earnings(md: MarketData, plan: dict, bundle: dict) -> dict[str, int]:
@@ -1340,7 +1383,7 @@ def _trial_validator(cfg: Config, md: MarketData, bundle: dict, candidates: dict
             maps["refs"] = {**_reference_prices(bundle), **cand_quotes}
             maps["atr"] = _grounded_atr(md, everyone, bundle)
             maps["earnings"] = _grounded_earnings(md, everyone, bundle)
-            maps["levels"] = _level_map(bundle)
+            maps["levels"] = _grounded_levels(md, everyone, bundle)
         return _validate_plan(trial, cfg, streak, drawdown, ref_prices=maps["refs"],
                               atr_map=maps["atr"], earnings_map=maps["earnings"],
                               level_map=maps["levels"])
@@ -1685,7 +1728,7 @@ def _arm_b_risk_half(cfg: Config, d: date, first: dict, risk_system: str,
                 ref_prices=_grounded_ref_prices(md2, p, bundle, d, seed=armb_quotes),
                 atr_map=_grounded_atr(md2, p, bundle),
                 earnings_map=_grounded_earnings(md2, p, bundle),
-                level_map=_level_map(bundle),
+                level_map=_grounded_levels(md2, p, bundle),
                 session_health={**_bundle_health(md2, bundle), **armb_health})
             warnings += _run_test_lanes(p, armb_cands, cfg, md2, bundle, armb_quotes,
                                         streak, drawdown,
@@ -2207,7 +2250,7 @@ def _risk_half(cfg: Config, con, d: date, payload: dict, request_id: str | None,
             ref_prices=_grounded_ref_prices(md, plan, bundle, d, seed=cand_quotes),
             atr_map=_grounded_atr(md, plan, bundle),
             earnings_map=_grounded_earnings(md, plan, bundle),
-            level_map=_level_map(bundle),
+            level_map=_grounded_levels(md, plan, bundle),
             session_health=session_health)
         plan["validator_drop_count"] = max(
             0, plan["validator_proposed_count"] - len(plan.get("picks", []) or []))

@@ -1507,6 +1507,47 @@ class MarketData:
             q["short_asof"] = f.get("short_asof")
             q["earnings_days_away"] = earn.get(sym)
 
+    def level_top_up(self, symbols: list[str]) -> dict[str, dict]:
+        """Premarket high/low/VWAP and prior-day high/low for tickers the
+        morning bundle never enriched (an analyst's web-search find): the same
+        numbers _enrich_indicators computes, from the same bars, so a thesis
+        naming "the premarket low" on such a ticker is held to the computed
+        level too. Absent keys are unknown, never guessed; a failed fetch
+        returns what it has."""
+        out: dict[str, dict] = {}
+        if not symbols or not self.alpaca:
+            return out
+        try:
+            ctx = self.daily_context(symbols)
+        except Exception as e:
+            log("data", f"WARN level top-up daily_context failed: {e}")
+            ctx = {}
+        for s in symbols:
+            lv = (ctx.get(s) or {}).get("daily_levels") or {}
+            out[s] = {k: float(lv[k]) for k in ("pdh", "pdl") if lv.get(k) is not None}
+        now = now_et()
+        start = datetime.combine(now.date(), dtime(4, 0), tzinfo=ET)
+        if now <= start:
+            return out
+        try:
+            pm_bars = self.alpaca.multi_bars(symbols, "1Min", start, now)
+        except Exception as e:
+            log("data", f"WARN level top-up premarket bars failed: {e}")
+            return out
+        for s in symbols:
+            bars = pm_bars.get(s) or []
+            if not bars:
+                continue
+            pml = ind.premarket_levels(bars)
+            for k in ("pm_high", "pm_low"):
+                if pml.get(k) is not None:
+                    out[s][k] = float(pml[k])
+            try:
+                out[s]["pm_vwap"] = float(vwap_series(bars)[-1])
+            except Exception:
+                pass
+        return out
+
     # ---- grading data ----------------------------------------------------
     def minute_bars(self, symbol: str, d: date) -> list[dict]:
         if self.cfg.offline:
