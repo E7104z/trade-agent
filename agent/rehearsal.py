@@ -283,7 +283,8 @@ def _evening(cfg: Config, d: date) -> dict:
         status = (_q(con, """SELECT status FROM runs WHERE loop = 'evening' AND run_date = ?
                              ORDER BY run_id DESC LIMIT 1""", [d]) or [(None,)])[0][0]
         grades = [f"{t}: {g}" for t, g in _q(
-            con, "SELECT ticker, grade FROM picks WHERE plan_date = ? ORDER BY pick_id", [d])]
+            con, """SELECT p.ticker, o.grade FROM picks p JOIN outcomes o ON o.pick_id = p.pick_id
+                    WHERE p.plan_date = ? ORDER BY p.pick_id""", [d])]
         log_row = _q(con, "SELECT status, rendered_text FROM traders_log WHERE session_date = ?", [d])
         checks = [f"[{s.upper()}] {k}: {h}" for k, s, h in _q(
             con, "SELECT check_key, status, headline FROM self_checks WHERE session_date = ?", [d])]
