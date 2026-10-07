@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import threading
 import time as _time
 from collections import Counter
@@ -188,6 +189,88 @@ def _bundle_field(bundle: dict, field: str) -> dict:
     return out
 
 
+# LEVEL GROUNDING -------------------------------------------------------------
+# The computed levels a thesis may name as its entry, and the words that name
+# them. On 2026-10-06 three theses named the premarket low and priced it from
+# memory: CEG "premarket low area ($268-270)" with the computed low at 275.25,
+# GOOG "overnight low area ~$340" at 344.16, NVDA "premarket low/VWAP area
+# ~$236-238" at 239.42. All three sat 0.41-0.49 ATR below the level they
+# named and none filled; at the named levels GOOG and NVDA would have. It is
+# the stale-price defect again (CWH, XLE, INSM, DKS), one level down.
+_LEVEL_WORDS = (
+    ("pm_low", "premarket low",
+     re.compile(r"(?:pre-?market|\bpm|overnight)\s+lows?\b|\bPML\b", re.I)),
+    ("pm_high", "premarket high",
+     re.compile(r"(?:pre-?market|\bpm|overnight)\s+highs?\b|\bPMH\b", re.I)),
+    ("pdl", "prior-day low",
+     re.compile(r"(?:prior|previous|yesterday'?s?)(?:[- ]?day'?s?)?\s+lows?\b|\bPDL\b", re.I)),
+    ("pdh", "prior-day high",
+     re.compile(r"(?:prior|previous|yesterday'?s?)(?:[- ]?day'?s?)?\s+highs?\b|\bPDH\b", re.I)),
+    ("pm_vwap", "premarket VWAP", re.compile(r"(?:pre-?market|\bpm)\s*vwap|\bpmvwap\b", re.I)),
+)
+# A clause about the ENTRY -- not "stop below the overnight low", which names
+# the same level for a different purpose.
+_ENTRY_CLAUSE = re.compile(
+    r"\bentry\b|\bentries\b|pull ?back (?:to|into|toward)|\bbuy(?:ing)? (?:at|the|near|into|on)"
+    r"|\blimit (?:at|near|on)|\bshort(?:ing)? (?:at|into|near|the)|\bfade (?:at|into|the)"
+    r"|\bretest\b|\btrigger(?:s|ed)? (?:at|on|above|below)", re.I)
+_NOT_ENTRY = re.compile(r"^\s*(?:stop|target|invalidat|exit)", re.I)
+
+
+def _level_map(bundle: dict) -> dict[str, dict]:
+    """Computed premarket / prior-day levels per ticker, from the bundle."""
+    out: dict[str, dict] = {}
+    for key, _label, _rx in _LEVEL_WORDS:
+        for t, v in _bundle_field(bundle, key).items():
+            if isinstance(v, (int, float)):
+                out.setdefault(t, {})[key] = float(v)
+    return out
+
+
+def _level_fix(p: dict, entry_type: str, ref: float, levels: dict, atr14: float | None,
+               tol_atr: float) -> dict | None:
+    """Move a limit/breakout onto the computed level its thesis names as the
+    entry, when it sits more than tol_atr ATR from it; stop and target move
+    by the same amount, so the trade's risk and reward are unchanged. Only a
+    level on the side of the price the order waits on can be its anchor (a
+    long limit's below the price, a long breakout's above). Returns what was
+    changed (also stored as p["level_fix"]), or None."""
+    if entry_type not in ("limit", "breakout") or not levels or not atr14 or not ref:
+        return None
+    ep = p.get("entry_plan") if isinstance(p.get("entry_plan"), dict) else {}
+    text = " ".join(str(x) for x in (p.get("thesis"), p.get("thesis_final"),
+                                     ep.get("rationale"), ep.get("note")) if x)
+    clauses = [c for c in re.split(r"[.;\n]", text)
+               if _ENTRY_CLAUSE.search(c) and not _NOT_ENTRY.search(c)]
+    if not clauses:
+        return None
+    entry = float(p["entry_price"])
+    below = (entry_type == "limit") == (p.get("direction") == "long")
+    named = []
+    for key, label, rx in _LEVEL_WORDS:
+        v = levels.get(key)
+        if v is None or not any(rx.search(c) for c in clauses):
+            continue
+        if (v <= ref) if below else (v >= ref):
+            named.append((abs(v - entry), key, label, v))
+    if not named:
+        return None
+    _, key, label, v = min(named)
+    off = abs(v - entry) / float(atr14)
+    if off <= tol_atr:
+        return None
+    digits = 2 if ref >= 1 else 4
+    shift = round(v - entry, digits)
+    for k in ("entry_price", "stop_price", "target_price"):
+        p[k] = round(float(p[k]) + shift, digits)
+    if ep:
+        ep["price"] = p["entry_price"]
+    fix = {"named": label, "level": key, "computed": round(v, digits), "was": entry,
+           "shift": shift, "off_atr": round(off, 2)}
+    p["level_fix"] = fix
+    return fix
+
+
 def _bundle_health(md: MarketData, bundle: dict) -> dict:
     """Session-level data facts _validate_plan cannot see for itself: how much
     the bundle actually covered, and whether the quote feed had to be
@@ -316,8 +399,21 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                    ref_prices: dict[str, float] | None = None,
                    atr_map: dict[str, float] | None = None,
                    earnings_map: dict[str, int] | None = None,
-                   session_health: dict | None = None) -> tuple[dict, list[str]]:
+                   session_health: dict | None = None,
+                   level_map: dict[str, dict] | None = None) -> tuple[dict, list[str]]:
     """Hard-validate and normalize the risk manager's plan. Returns (plan, warnings).
+
+    Every pick the validator removes is also recorded in plan["validator_drops"]
+    as {ticker, kind, reason}: kind "discipline" (the streak / drawdown
+    conviction bar), "trim" (over max_picks) or "validity" (everything else).
+    On 2026-10-06 CEG, the risk manager's one approval, vanished between the
+    plan and the tape with nothing saying why.
+
+    LEVEL GROUNDING (level_map: computed premarket / prior-day levels per
+    ticker): a limit or breakout whose thesis names a computed level as its
+    entry ("pullback to the premarket low") but sits more than anchor_tol_atr
+    ATR from that level's computed value is moved onto it, stop and target
+    shifted by the same amount. See _level_fix.
 
     The playbook's losing-streak rule (>=3 losers: cap 0.5R, demand conviction >= 4)
     is enforced MECHANICALLY here — the prompt asks the risk manager to apply it,
@@ -412,6 +508,12 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
 
     valid: list[dict] = []
     seen: set[str] = set()
+    drops: list[dict] = []
+
+    def _drop(ticker: str, kind: str, msg: str) -> None:
+        warnings.append(msg)
+        drops.append({"ticker": ticker, "kind": kind, "reason": msg[:300]})
+
     for p in picks:
         t = str(p.get("ticker", "")).upper().strip()
         if not t or t in seen:
@@ -433,38 +535,50 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                    f"supply, not a company catalyst; a thesis on it is a thesis about "
                    f"its underlying wearing a costume")
             if leveraged_gate_mode == "enforce":
-                warnings.append(msg + " — dropped")
+                _drop(t, "validity", msg + " — dropped")
                 continue
             warnings.append(f"[LEVERAGED GATE warn-only, would drop if enforced] {msg}")
 
         entry, stop, target = p.get("entry_price"), p.get("stop_price"), p.get("target_price")
         if not all(isinstance(x, (int, float)) for x in (entry, stop, target)):
-            warnings.append(f"{t}: missing numeric entry/stop/target — dropped")
+            _drop(t, "validity", f"{t}: missing numeric entry/stop/target — dropped")
             continue
         if p["direction"] == "long" and not (stop < entry < target):
-            warnings.append(f"{t}: long levels inconsistent (need stop<entry<target) — dropped")
+            _drop(t, "validity", f"{t}: long levels inconsistent (need stop<entry<target) — dropped")
             continue
         if p["direction"] == "short" and not (target < entry < stop):
-            warnings.append(f"{t}: short levels inconsistent (need target<entry<stop) — dropped")
+            _drop(t, "validity", f"{t}: short levels inconsistent (need target<entry<stop) — dropped")
             continue
 
         ref = (ref_prices or {}).get(t)
         if not ref:
             gate_counts["grounding"] += 1
-            warnings.append(
+            _drop(
+                t, "validity",
                 f"{t}: entry {entry} could not be verified against any live quote (no bundle "
                 f"reference and the pre-validation snapshot fetch returned nothing) — dropped; "
                 f"an unverifiable price fails closed, not open")
             continue
+        entry_type = str((p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open").lower()
+        # LEVEL GROUNDING runs first, so every gate below judges the levels
+        # the desk will actually trade.
+        fix = _level_fix(p, entry_type, ref, (level_map or {}).get(t) or {},
+                         (atr_map or {}).get(t), float(cfg.get("anchor_tol_atr", 0.25)))
+        if fix:
+            warnings.append(
+                f"{t}: entry {fix['was']} corrected to {fix['computed']}, the {fix['named']} its "
+                f"thesis names ({fix['off_atr']:.2f} ATR off); stop and target moved by "
+                f"{fix['shift']:+.2f} with it")
+            entry, stop, target = p["entry_price"], p["stop_price"], p["target_price"]
         max_dist = float(cfg.get("max_entry_ref_distance_pct", 15.0))
         dist_pct = abs(entry - ref) / ref * 100
         if dist_pct > max_dist:
-            warnings.append(
+            _drop(
+                t, "validity",
                 f"{t}: entry {entry} is {dist_pct:.0f}% away from last price {ref} "
                 f"(max {max_dist:.0f}%) — dropped as ungrounded; the level was priced off "
                 f"something other than the actual market")
             continue
-        entry_type = str((p.get("entry_plan") or {}).get("type") or p.get("entry_type") or "open").lower()
         tol = 1.01  # 1% buffer for reference-price staleness, not a chase threshold
         mistyped_as = None
         if entry_type == "limit":
@@ -478,7 +592,8 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
             elif p["direction"] == "short" and entry > ref * tol:
                 mistyped_as = "limit"
         if mistyped_as:
-            warnings.append(
+            _drop(
+                t, "validity",
                 f"{t}: entry_type={entry_type} but entry {entry} is on the wrong side of "
                 f"last price {ref} for a {p['direction']} (reads as {mistyped_as}) — dropped "
                 f"rather than let it fill as a disguised market order")
@@ -501,14 +616,16 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
             room_r = sign * (entry - ref) / risk_ps
             min_trigger_r = float(cfg.get("breakout_min_trigger_r", 0.25))
             if room_r < min_trigger_r:
-                warnings.append(
+                _drop(
+                    t, "validity",
                     f"{t}: breakout trigger {entry} is {room_r:+.2f}R from last price {ref} "
                     f"(needs >= {min_trigger_r}R beyond it) — dropped: it would be crossed "
                     f"before the {cfg.get('morning_entry_not_before', MORNING_ENTRY_NOT_BEFORE)} "
                     f"window and fill wherever price is then, not at the trigger")
                 continue
         if entry_type in ("open", "breakout") and sign * (target - ref) <= 0:
-            warnings.append(
+            _drop(
+                t, "validity",
                 f"{t}: target {target} is already reached at last price {ref} — dropped: "
                 f"an {entry_type} entry fills at or past the target, with no reward left")
             continue
@@ -525,7 +642,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                 msg = (f"{t}: stop is {stop_dist_atr:.2f} ATR from entry (min {min_stop_atr}) — "
                        f"inside daily noise, the thesis cannot be tested at this distance")
                 if atr_gate_mode == "enforce":
-                    warnings.append(msg + " — dropped")
+                    _drop(t, "validity", msg + " — dropped")
                     continue
                 warnings.append(f"[ATR GATE warn-only, would drop if enforced] {msg}")
             elif stop_dist_atr > warn_stop_atr:
@@ -550,7 +667,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                 msg = (f"{t}: earnings today (not a declared earnings play) — a report can gap "
                        f"through the stop; the stop is fiction against a binary event")
                 if earnings_gate_mode == "enforce":
-                    warnings.append(msg + " — dropped")
+                    _drop(t, "validity", msg + " — dropped")
                     continue
                 warnings.append(f"[EARNINGS GATE warn-only, would drop if enforced] {msg}")
         else:
@@ -573,16 +690,16 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
         floor = p.get("exploration_lane") in _TEST_LANES
         if losing_streak:
             if p["conviction"] < 4 and not floor:
-                warnings.append(f"{t}: dropped — losing streak >= 3 demands conviction >= 4 "
-                                f"(had {p['conviction']})")
+                _drop(t, "discipline", f"{t}: dropped — losing streak >= 3 demands conviction >= 4 "
+                                       f"(had {p['conviction']})")
                 continue
             if p["size_r"] > 0.5:
                 warnings.append(f"{t}: size clamped {p['size_r']} -> 0.5R (losing-streak rule)")
                 p["size_r"] = 0.5
         if dd_mode:
             if p["conviction"] < 4 and not floor:
-                warnings.append(f"{t}: dropped — capital preservation mode demands conviction >= 4 "
-                                f"(had {p['conviction']})")
+                _drop(t, "discipline", f"{t}: dropped — capital preservation mode demands "
+                                       f"conviction >= 4 (had {p['conviction']})")
                 continue
             if p["size_r"] > min_r:
                 warnings.append(f"{t}: size clamped {p['size_r']} -> {min_r}R (capital preservation mode)")
@@ -592,6 +709,10 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     if len(valid) > max_picks:
         valid.sort(key=lambda x: -x["conviction"])
         warnings.append(f"trimmed picks {len(valid)} -> {max_picks} (kept highest conviction)")
+        for p in valid[max_picks:]:
+            drops.append({"ticker": p["ticker"], "kind": "trim",
+                          "reason": f"{p['ticker']}: trimmed (over max_picks {max_picks}, "
+                                    f"conviction {p['conviction']})"})
         valid = valid[:max_picks]
 
     total = sum(p["size_r"] for p in valid)
@@ -611,6 +732,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
             (p.get("entry_plan") or {}).get("type") or p.get("entry_type"), window)
 
     plan["picks"] = valid
+    plan["validator_drops"] = drops
     plan["total_risk_r"] = round(sum(p["size_r"] for p in valid), 2)
     if not valid and not plan.get("no_trade"):
         plan["no_trade"] = True
@@ -620,17 +742,18 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     return plan, warnings
 
 
-def _correlation_matrix_md(tickers: list[str]) -> str:
-    """Pairwise 20d-return correlation + each name's beta to SPY, for the
-    risk manager's kill-check 17 (thematic exposure -> arithmetic, not just
-    narrative). Rendered only when >= 2 distinct candidates. Best-effort: any
-    fetch/compute failure just omits the section — this never blocks the run,
-    and its absence reads to the risk manager as "not computed," not as a
-    certified absence of correlation (it still owns kill-check 12 either way).
-    """
+# Two names whose 20-day daily returns correlate beyond this are one risk unit
+# (the risk manager's kill-check 17). The test lanes use the same line.
+CORR_PAIR = 0.7
+
+
+def _correlations(tickers: list[str]) -> dict:
+    """Each name's beta to SPY and every pair with |corr| > CORR_PAIR, from
+    20d daily returns: {"betas": {t: b}, "pairs": [[a, b, corr]]}, plus
+    "failed": True when the fetch or the arithmetic failed. Never raises."""
     uniq = list(dict.fromkeys(t.upper() for t in tickers if t))
     if len(uniq) < 2:
-        return ""
+        return {"betas": {}, "pairs": []}
     try:
         closes = yf_history_closes(uniq + ["SPY"], days=40)
         spy = closes.get("SPY") or []
@@ -643,19 +766,38 @@ def _correlation_matrix_md(tickers: list[str]) -> str:
         for i, a in enumerate(uniq):
             for b in uniq[i + 1:]:
                 bc = beta_corr(closes.get(a) or [], closes.get(b) or [], n=20)
-                if bc and abs(bc[1]) > 0.7:
-                    pairs.append(f"{a}/{b} corr {bc[1]:+.2f}")
-        if not betas and not pairs:
-            return ""
-        lines = ["## CORRELATION / BETA (candidates, 20d daily returns — computed, not a vibe)\n"]
-        if betas:
-            lines.append("- Beta to SPY: " + ", ".join(f"{t} {b:+.2f}" for t, b in betas.items()))
-        lines.append("- Pairs with |corr| > 0.7 (share ONE risk unit, kill-check 17): "
-                     + (", ".join(pairs) if pairs else "none"))
-        return "\n".join(lines)
+                if bc and abs(bc[1]) > CORR_PAIR:
+                    pairs.append([a, b, round(float(bc[1]), 2)])
+        return {"betas": betas, "pairs": pairs}
     except Exception as e:
         log("morning", f"WARN correlation matrix failed ({e}) — kill-check 17 section omitted")
+        return {"betas": {}, "pairs": [], "failed": True}
+
+
+def _correlation_matrix_md(tickers: list[str], corr: dict | None = None) -> str:
+    """Pairwise 20d-return correlation + each name's beta to SPY, for the
+    risk manager's kill-check 17 (thematic exposure -> arithmetic, not just
+    narrative). Rendered only when >= 2 distinct candidates. Best-effort: any
+    fetch/compute failure just omits the section — this never blocks the run,
+    and its absence reads to the risk manager as "not computed," not as a
+    certified absence of correlation (it still owns kill-check 12 either way).
+    `corr` is a _correlations result computed over these tickers or more.
+    """
+    uniq = list(dict.fromkeys(t.upper() for t in tickers if t))
+    if len(uniq) < 2:
         return ""
+    c = corr if corr is not None else _correlations(uniq)
+    betas = {t: b for t, b in (c.get("betas") or {}).items() if t in uniq}
+    pairs = [f"{a}/{b} corr {v:+.2f}" for a, b, v in c.get("pairs") or []
+             if a in uniq and b in uniq]
+    if c.get("failed") or (not betas and not pairs):
+        return ""
+    lines = ["## CORRELATION / BETA (candidates, 20d daily returns — computed, not a vibe)\n"]
+    if betas:
+        lines.append("- Beta to SPY: " + ", ".join(f"{t} {b:+.2f}" for t, b in betas.items()))
+    lines.append(f"- Pairs with |corr| > {CORR_PAIR} (share ONE risk unit, kill-check 17): "
+                 + (", ".join(pairs) if pairs else "none"))
+    return "\n".join(lines)
 
 
 def _attach_overlay_context(plan: dict, bundle: dict) -> None:
@@ -720,6 +862,9 @@ def _build_rejections(candidates: dict, plan: dict,
     # session is still graded (a counterfactual is still a counterfactual), it
     # just must not be counted as a REASON — see ledger.shadow_summary.
     degraded = bool((plan.get("data_health") or {}).get("degraded"))
+    # Why an approval left the plan, when the validator removed it: "not
+    # selected by risk manager" said the opposite of what happened to CEG.
+    dropped = {str(x.get("ticker", "")).upper(): x for x in plan.get("validator_drops") or []}
     out = []
     for c in candidates.get("candidates", []) or []:
         t = str(c.get("ticker", "")).upper()
@@ -764,14 +909,18 @@ def _build_rejections(candidates: dict, plan: dict,
             "ticker": t,
             "direction": c.get("direction"),
             "setup_type": c.get("setup_type"),
-            "reason": reason or "not selected by risk manager (no explicit reason)",
+            "reason": reason or (
+                f"approved by the risk manager, then dropped by the validator: {dropped[t]['reason']}"
+                if t in dropped else
+                "the risk manager neither approved nor rejected it (absent from its output)"),
             "entry_type": entry_plan.get("type", "open"),
             "entry_price": entry,
             "stop_price": stop,
             "target_price": target,
             "conviction": c.get("conviction"),
             "thesis": c.get("thesis"),
-            "source_stage": "risk_rejected" if reason else "validator_or_unselected",
+            "source_stage": ("risk_rejected" if reason else
+                             "validator_dropped" if t in dropped else "risk_unaddressed"),
             "rejection_category": rejection_category,
             "primary_kill_check": kill_check,
             "kill_checks": kill_checks,
@@ -894,6 +1043,10 @@ def _add_exploration_pick(candidates: dict, plan: dict, cfg: Config,
         is_probe = bool(probe_for) and probe_for in probe_ids
         if not rejected_row:
             continue
+        # A mislabel never reaches the tape, whichever kill the risk manager
+        # named first, and neither does a trade that disowns its own label.
+        if _all_kills(rejected_row) & _ALWAYS_BLOCKING_KILLS or _disowns_label(candidate, rejected_row):
+            continue
         if kill_check is None and "r:r" not in reason.lower() and not is_probe:
             continue
         entry_plan = candidate.get("entry_plan") or {}
@@ -1011,6 +1164,12 @@ def _ranked_rejects(candidates: dict, plan: dict, lane: str, size: float,
     """
     rejected_rows = {str(r.get("ticker", "")).upper(): r for r in plan.get("rejected", []) or []}
     seen = {str(p.get("ticker", "")).upper() for p in plan.get("picks") or []}
+    # An approval the validator removed only for discipline (the streak /
+    # drawdown conviction bar) or count goes first in its setup: on 10/06 the
+    # risk manager approved CEG and coverage filled its setup with GOOG, the
+    # weakest version of the same idea, at the same size.
+    approved_dropped = {str(x.get("ticker", "")).upper() for x in plan.get("validator_drops") or []
+                        if x.get("kind") in ("discipline", "trim")}
     ranked: list[tuple[tuple, dict]] = []
     for i, c in enumerate(candidates.get("candidates", []) or []):
         ticker = str(c.get("ticker", "")).upper().strip()
@@ -1028,8 +1187,9 @@ def _ranked_rejects(candidates: dict, plan: dict, lane: str, size: float,
         rr = abs(float(target) - float(entry)) / risk
         if rr < min_rr:
             continue
-        kill = str((rejected_rows.get(ticker) or {}).get("primary_kill_check") or "").strip().lower()
-        if kill in blocked or kill in _ALWAYS_BLOCKING_KILLS:
+        row = rejected_rows.get(ticker) or {}
+        kill = str(row.get("primary_kill_check") or "").strip().lower()
+        if kill in blocked or _all_kills(row) & _ALWAYS_BLOCKING_KILLS or _disowns_label(c, row):
             continue
         conv = c.get("conviction")
         conv = int(conv) if isinstance(conv, (int, float)) else 3
@@ -1044,9 +1204,58 @@ def _ranked_rejects(candidates: dict, plan: dict, lane: str, size: float,
             "exploration_rr": round(rr, 4),
         }
         pick.pop("probe_for", None)
-        ranked.append(((_FLOOR_KILL_RANK.get(kill, 1), -conv, -rr, i), pick))
+        rank = -1 if ticker in approved_dropped else _FLOOR_KILL_RANK.get(kill, 1)
+        ranked.append(((rank, -conv, -rr, i), pick))
     ranked.sort(key=lambda row: row[0])
     return [pick for _, pick in ranked]
+
+
+# A candidate whose own thesis, or the risk manager's reason, says it is not
+# the setup it is labeled. PTC on 2026-10-06: "This is NOT a momentum trade —
+# it's M&A arbitrage, which is outside my setup taxonomy", killed for "Wrong
+# time horizon for this desk", and traded by coverage as event_driven anyway,
+# because the risk manager's PRIMARY kill was another check.
+_DISOWNED = re.compile(
+    r"outside (?:of )?(?:my|the|our|this desk'?s) (?:setup )?taxonomy"
+    r"|(?:setup |the )?label (?:is|was) a stretch"
+    r"|wrong (?:time )?horizon"
+    r"|\bnot (?:an? )?intraday(?: trade| setup| play)?\b(?!-)"
+    r"|(?:doesn'?t|does not) fit (?:the|any|my|our) (?:setup|taxonomy)", re.I)
+
+
+def _disowns_label(candidate: dict, rejected_row: dict) -> bool:
+    text = " ".join(str(x) for x in (candidate.get("thesis"), candidate.get("thesis_final"),
+                                     (rejected_row or {}).get("reason")) if x)
+    return bool(_DISOWNED.search(text))
+
+
+def _all_kills(rejected_row: dict) -> set[str]:
+    """Every kill-check the risk manager named for a candidate, primary first."""
+    row = rejected_row or {}
+    kills = {str(row.get("primary_kill_check") or "").strip().lower()}
+    if isinstance(row.get("kill_checks"), list):
+        kills |= {str(k or "").strip().lower() for k in row["kill_checks"]}
+    return kills - {""}
+
+
+def _same_bet(pick: dict, held: list[dict], pairs: list | None) -> str | None:
+    """The held pick that `pick` would double -- |20d corr| above CORR_PAIR,
+    pointing the same way (positive correlation, same direction; negative,
+    opposite) -- or None. 10/06: GOOG and NVDA, one AI-infrastructure long."""
+    if not pairs:
+        return None
+    t = str(pick.get("ticker", "")).upper()
+    corr = {}
+    for a, b, v in pairs:
+        if a == t:
+            corr[b] = v
+        elif b == t:
+            corr[a] = v
+    for q in held:
+        v = corr.get(str(q.get("ticker", "")).upper())
+        if v is not None and (v > 0) == (q.get("direction") == pick.get("direction")):
+            return f"{q['ticker']} (20d corr {v:+.2f})"
+    return None
 
 
 def _floor_candidates(candidates: dict, plan: dict, cfg: Config) -> list[dict]:
@@ -1082,8 +1291,10 @@ def _trial_validator(cfg: Config, md: MarketData, bundle: dict, candidates: dict
             maps["refs"] = {**_reference_prices(bundle), **cand_quotes}
             maps["atr"] = _grounded_atr(md, everyone, bundle)
             maps["earnings"] = _grounded_earnings(md, everyone, bundle)
+            maps["levels"] = _level_map(bundle)
         return _validate_plan(trial, cfg, streak, drawdown, ref_prices=maps["refs"],
-                              atr_map=maps["atr"], earnings_map=maps["earnings"])
+                              atr_map=maps["atr"], earnings_map=maps["earnings"],
+                              level_map=maps["levels"])
 
     return validate_one
 
@@ -1098,7 +1309,8 @@ def _admit(plan: dict, picks: list[dict]) -> None:
     plan.pop("no_trade_reason", None)
 
 
-def _run_coverage(plan: dict, candidates: dict, cfg: Config, validate_one) -> list[str]:
+def _run_coverage(plan: dict, candidates: dict, cfg: Config, validate_one,
+                  corr_pairs: list | None = None) -> list[str]:
     """Every setup the analyst found gets traded today.
 
     For each setup_type the plan does not already hold, the best-ranked
@@ -1109,7 +1321,9 @@ def _run_coverage(plan: dict, candidates: dict, cfg: Config, validate_one) -> li
     mistyped entry, an unlabeled earnings report today) stays off the tape,
     and every candidate must still pass validate_one. Coverage picks sit
     outside max_picks and max_total_open_risk_r, which size the desk's own
-    approvals; the lane has its own cap. Returns log lines.
+    approvals; the lane has its own cap. A candidate that would double a
+    pick already on (|20d corr| > CORR_PAIR, same way) is skipped: two names
+    on one theme are one bet, and one observation of it. Returns log lines.
     """
     lane = cfg.get("coverage_lane", {}) or {}
     if not lane.get("enabled"):
@@ -1131,6 +1345,10 @@ def _run_coverage(plan: dict, candidates: dict, cfg: Config, validate_one) -> li
         if len(admitted) >= max_picks:
             break
         if setup_of(pick) in covered:
+            continue
+        twin = _same_bet(pick, (plan.get("picks") or []) + admitted, corr_pairs)
+        if twin:
+            notes.append(f"coverage {pick['ticker']}: skipped — the same bet as {twin}")
             continue
         trial, warnings = validate_one({"no_trade": False, "picks": [pick]})
         notes += [f"coverage {pick['ticker']}: {w}" for w in warnings]
@@ -1233,7 +1451,7 @@ def _stamp_hypotheses(plan: dict, by_ticker: dict[str, str]) -> None:
 
 
 def _run_hypothesis_lane(plan: dict, candidates: dict, cfg: Config, validate_one,
-                         hyp: dict | None) -> list[str]:
+                         hyp: dict | None, corr_pairs: list | None = None) -> list[str]:
     """The trader tests its own written-down ideas (TRADER_HYPOTHESIS_SPEC_v1).
 
     1. Stamp: a pick already in the plan (an approval, a coverage or
@@ -1288,6 +1506,10 @@ def _run_hypothesis_lane(plan: dict, candidates: dict, cfg: Config, validate_one
         hid = by_ticker[pick["ticker"]]
         if hid in used:
             continue
+        twin = _same_bet(pick, (plan.get("picks") or []) + admitted, corr_pairs)
+        if twin:
+            notes.append(f"hypothesis {pick['ticker']}: skipped — the same bet as {twin}")
+            continue
         pick["hypothesis_id"] = hid
         trial, warnings = validate_one({"no_trade": False, "picks": [pick]})
         notes += [f"hypothesis {pick['ticker']}: {w}" for w in warnings]
@@ -1305,15 +1527,15 @@ def _run_hypothesis_lane(plan: dict, candidates: dict, cfg: Config, validate_one
 def _run_test_lanes(plan: dict, candidates: dict, cfg: Config, md: MarketData,
                     bundle: dict, cand_quotes: dict[str, float],
                     streak: dict | None, drawdown: dict | None,
-                    hyp: dict | None = None) -> list[str]:
+                    hyp: dict | None = None, corr_pairs: list | None = None) -> list[str]:
     """After validation: coverage (every setup found gets traded), then the
     trader's own hypothesis tests, then the daily floor (the day is never
     empty). Both arms call this, so the paired comparison is not confounded
     by one arm having the lanes and the other not. Coverage runs first so its
     selection is exactly what it was before the hypothesis lane existed."""
     validate_one = _trial_validator(cfg, md, bundle, candidates, cand_quotes, streak, drawdown)
-    notes = _run_coverage(plan, candidates, cfg, validate_one)
-    notes += _run_hypothesis_lane(plan, candidates, cfg, validate_one, hyp)
+    notes = _run_coverage(plan, candidates, cfg, validate_one, corr_pairs)
+    notes += _run_hypothesis_lane(plan, candidates, cfg, validate_one, hyp, corr_pairs)
     if not plan.get("picks"):
         notes += _apply_daily_floor(plan, _floor_candidates(candidates, plan, cfg), validate_one)
         if hypotheses.enabled(cfg) and hyp:
@@ -1367,7 +1589,8 @@ def _arm_b_analyst_half(cfg: Config, d: date, analyst_system: str, bundle_md: st
 
 def _arm_b_risk_half(cfg: Config, d: date, first: dict, risk_system: str,
                      bundle_md: str, bundle: dict, reg_md: str, playbook_version: str,
-                     regime_tag: str, model: str, llm_call) -> dict:
+                     regime_tag: str, model: str, llm_call,
+                     corr_pairs: list | None = None) -> dict:
     """Run the paired challenger arm's risk-manager half on its own DB
     connection and MarketData instance so it can execute concurrently with
     arm A's on a background thread (see _risk_half) instead of stacking the
@@ -1413,10 +1636,12 @@ def _arm_b_risk_half(cfg: Config, d: date, first: dict, risk_system: str,
                 ref_prices=_grounded_ref_prices(md2, p, bundle, d, seed=armb_quotes),
                 atr_map=_grounded_atr(md2, p, bundle),
                 earnings_map=_grounded_earnings(md2, p, bundle),
+                level_map=_level_map(bundle),
                 session_health={**_bundle_health(md2, bundle), **armb_health})
             warnings += _run_test_lanes(p, armb_cands, cfg, md2, bundle, armb_quotes,
                                         streak, drawdown,
-                                        hyp=_hypothesis_plan(con2, d, armb_cands, cfg))
+                                        hyp=_hypothesis_plan(con2, d, armb_cands, cfg),
+                                        corr_pairs=corr_pairs)
             return p, warnings
 
         return paired_mod.challenger_risk(
@@ -1705,18 +1930,6 @@ def _analyst_half(cfg: Config, con, d: date, started, clock: _Clock) -> dict | N
         # offered nothing."
         cand_quotes = _grounded_candidate_prices(md, candidates, bundle, d)
         quotes_md = _live_quotes_md(cand_quotes)
-        corr_md = "" if cfg.offline else _correlation_matrix_md(
-            [c.get("ticker", "") for c in candidates.get("candidates", [])])
-        risk_user = (
-            f"# TODAY: {d.isoformat()}\n\n"
-            f"## THE ANALYST'S CANDIDATES\n\n```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
-            f"## MARKET DATA\n\n{bundle_md}\n\n"
-            + (f"{quotes_md}\n" if quotes_md else "")
-            + (f"{corr_md}\n\n" if corr_md else "")
-            + f"## REGIME READ\n\n{reg_md}\n\n"
-            f"{mem['text']}\n\n"
-            "Run every candidate through the kill checklist and produce the final plan now."
-        )
         clock.mark("quotes")
     finally:
         arm_b_status = None
@@ -1733,6 +1946,29 @@ def _analyst_half(cfg: Config, con, d: date, started, clock: _Clock) -> dict | N
                                     else "background thread produced no result")}
         if not arm_b.get("ok"):
             log("morning", f"Arm B skipped/failed: {arm_b.get('reason')}")
+
+    # One correlation pass over both arms' candidates: the risk manager sees
+    # arm A's pairs (kill-check 17), and each arm's test lanes use the pairs
+    # to keep correlated minimum-size picks from becoming one larger bet.
+    tickers = [c.get("ticker", "") for c in candidates.get("candidates", [])]
+    if arm_b and arm_b.get("ok"):
+        tickers_b = [c.get("ticker", "") for c in
+                     (arm_b.get("candidates") or {}).get("candidates", []) or []]
+    else:
+        tickers_b = []
+    corr = {"betas": {}, "pairs": []} if cfg.offline else _correlations(tickers + tickers_b)
+    corr_md = "" if cfg.offline else _correlation_matrix_md(tickers, corr)
+    risk_user = (
+        f"# TODAY: {d.isoformat()}\n\n"
+        f"## THE ANALYST'S CANDIDATES\n\n```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
+        f"## MARKET DATA\n\n{bundle_md}\n\n"
+        + (f"{quotes_md}\n" if quotes_md else "")
+        + (f"{corr_md}\n\n" if corr_md else "")
+        + f"## REGIME READ\n\n{reg_md}\n\n"
+        f"{mem['text']}\n\n"
+        "Run every candidate through the kill checklist and produce the final plan now."
+    )
+    clock.mark("correlation")
 
     return {
         "version": PAYLOAD_VERSION,
@@ -1755,6 +1991,7 @@ def _analyst_half(cfg: Config, con, d: date, started, clock: _Clock) -> dict | N
                 "backlog_ids": mem.get("backlog_ids") or []},
         "arm_b": arm_b,
         "arm_b_analyst_join": arm_b_status,
+        "corr_pairs": corr.get("pairs") or [],
         "analyst_half_timings": dict(clock.timings),
         "analyst_half_s": round(clock.elapsed(), 1),
     }
@@ -1883,7 +2120,8 @@ def _risk_half(cfg: Config, con, d: date, payload: dict, request_id: str | None,
                 arm_b_box["arm_b"] = _arm_b_risk_half(
                     cfg, d, first, payload["risk_system"], payload["bundle_md"], bundle,
                     payload["reg_md"], mem["playbook_version"], payload["regime_tag"],
-                    model, _bounded_call(llm.call, clock.t_start))
+                    model, _bounded_call(llm.call, clock.t_start),
+                    corr_pairs=payload.get("corr_pairs") or [])
             arm_b_thread = threading.Thread(target=_bg, daemon=True)
             arm_b_thread.start()
             if hosted:
@@ -1920,6 +2158,7 @@ def _risk_half(cfg: Config, con, d: date, payload: dict, request_id: str | None,
             ref_prices=_grounded_ref_prices(md, plan, bundle, d, seed=cand_quotes),
             atr_map=_grounded_atr(md, plan, bundle),
             earnings_map=_grounded_earnings(md, plan, bundle),
+            level_map=_level_map(bundle),
             session_health=session_health)
         plan["validator_drop_count"] = max(
             0, plan["validator_proposed_count"] - len(plan.get("picks", []) or []))
@@ -1928,7 +2167,11 @@ def _risk_half(cfg: Config, con, d: date, payload: dict, request_id: str | None,
         # under mock) before the plan is saved.
         hyp_plan = _hypothesis_plan(con, d, candidates, cfg)
         warnings += _run_test_lanes(plan, candidates, cfg, md, bundle, cand_quotes,
-                                    streak, drawdown, hyp=hyp_plan)
+                                    streak, drawdown, hyp=hyp_plan,
+                                    corr_pairs=payload.get("corr_pairs") or [])
+        # Every validator and lane line, stored with the plan: on 10/06 the
+        # reason CEG vanished was logged once and lost with Vercel's logs.
+        plan["validation_warnings"] = [str(w)[:300] for w in warnings][:80]
         for w in warnings:
             log("morning", f"VALIDATE: {w}")
         plan["regime_tag"] = payload["regime_tag"]

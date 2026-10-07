@@ -233,6 +233,10 @@ def test_locally_both_halves_run_in_one_process_without_a_checkpoint(env):
     assert env["calls"] == ["morning_analyst", "morning_risk"]
     assert _n(root, "SELECT COUNT(*) FROM picks") == 1
     assert _n(root, "SELECT COUNT(*) FROM morning_checkpoints") == 0
+    # What the validator did is stored with the plan, not only logged.
+    import json
+    plan = json.loads(_n(root, "SELECT plan_json FROM daily_plans"))
+    assert plan["validator_drops"] == [] and isinstance(plan["validation_warnings"], list)
     assert ledger.run_lock(root, D, "morning")["status"] == "complete"
 
 

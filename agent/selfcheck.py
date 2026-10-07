@@ -275,6 +275,46 @@ def check_morning_budget(con: Any, cfg: Any, d: date) -> dict:
                 killed_sessions=stuck, arm_b_abandoned=abandoned, halves=halves)
 
 
+def check_entries(con: Any, cfg: Any, d: date) -> dict:
+    """Do the morning's orders fill, and what did the validator change? On
+    10/06 not one of the plan's limits was reached: the day produced no
+    trade and no observation. Counts the limit/breakout fill rate over the
+    lookback, the entries moved onto the computed level their thesis named
+    (and how those filled), and approvals the validator dropped, by kind."""
+    days = _sessions(d, LOOKBACK_SESSIONS)
+    marks = ",".join("?" for _ in days)
+    rows = _q(con, f"""SELECT p.plan_date, p.ticker, o.triggered FROM picks p
+                       JOIN outcomes o ON o.pick_id = p.pick_id
+                       WHERE p.plan_date IN ({marks}) AND p.entry_type IN ('limit', 'breakout')
+                         AND COALESCE(p.setup_type, '') <> '{RUNNER}'""", list(days))
+    filled = {(_as_date(pd), str(t).upper()): bool(tr) for pd, t, tr in rows}
+    n, n_fill = len(filled), sum(filled.values())
+    fixes = fix_fill = 0
+    drops: Counter = Counter()
+    for pd, pj in _q(con, f"SELECT plan_date, plan_json FROM daily_plans WHERE plan_date IN ({marks})",
+                     list(days)):
+        try:
+            plan = json.loads(pj or "{}") or {}
+        except (TypeError, ValueError):
+            continue
+        for p in plan.get("picks") or []:
+            if p.get("level_fix"):
+                fixes += 1
+                fix_fill += int(filled.get((_as_date(pd), str(p.get("ticker", "")).upper()), False))
+        for x in plan.get("validator_drops") or []:
+            drops[str(x.get("kind"))] += 1
+    rate = f"{100 * n_fill / n:.0f}%" if n else "n/a"
+    head = (f"last {len(days)} sessions: {n_fill} of {n} limit/breakout orders filled ({rate}); "
+            f"{fixes} entr{'y' if fixes == 1 else 'ies'} moved onto the computed level their thesis "
+            f"named ({fix_fill} filled); approvals dropped by the validator: "
+            + (", ".join(f"{k} {v}" for k, v in sorted(drops.items())) or "none"))
+    status = "warn" if n >= 8 and n_fill * 2 < n else "ok"
+    if status == "warn":
+        head = "fewer than half the orders filled — " + head
+    return _res(status, head, orders=n, filled=n_fill, level_fixes=fixes,
+                level_fixes_filled=fix_fill, validator_drops=dict(drops))
+
+
 def check_runner_selection(con: Any, cfg: Any, d: date) -> dict:
     """Did the runner lane make its one selection today? A claim whose
     request died left 10/05 with 533 candidates, 0 picks and no reason."""
@@ -474,6 +514,7 @@ def check_gapfield(con: Any, cfg: Any, d: date) -> dict:
 CHECKS: tuple[tuple[str, str, Callable[[Any, Any, date], dict]], ...] = (
     ("plumbing", "Data collected today", check_plumbing),
     ("lanes", "Lanes and broker cap", check_lanes),
+    ("entries", "Entries and fills", check_entries),
     ("runner_selection", "Runner selection", check_runner_selection),
     ("grader_audit", "Grader audit", check_grader_audit),
     ("morning_budget", "Morning time budget", check_morning_budget),

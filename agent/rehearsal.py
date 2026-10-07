@@ -223,7 +223,8 @@ def _morning(cfg: Config, d: date) -> dict:
     # Arm A's own work in each half, apart from the bounded wait for arm B:
     # the plan depends on the first, the paired comparison on the second.
     t = (stages.get("timings_s") or {})
-    arm_a = {"analyst half": sum(float(t.get(k) or 0) for k in ("bundle", "regime", "analyst", "quotes")),
+    arm_a = {"analyst half": sum(float(t.get(k) or 0) for k in ("bundle", "regime", "analyst", "quotes",
+                                                                 "correlation")),
              "risk half": sum(float(t.get(k) or 0) for k in ("risk", "validate", "persist", "deliver"))}
     for name, s in arm_a.items():
         if s >= PASS_S:

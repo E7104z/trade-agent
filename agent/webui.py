@@ -614,25 +614,36 @@ function planHtml(){
   }
   const source = (state.picks_today && state.picks_today.length) ? state.picks_today : (plan.picks||[]);
   if(!source.length) return `<p>${esc(plan.market_stance||'')}</p><div class="empty">Plan has no picks yet.</div>`;
+  // The plan JSON carries what the picks table does not: a level the
+  // validator moved onto the computed one its thesis named.
+  const planPick = t => (plan.picks||[]).find(x => String(x.ticker).toUpperCase() === String(t).toUpperCase()) || {};
   const rows = source.map(p=>{
     const entryType = p.entry_type || (p.entry_plan && p.entry_plan.type) || 'open';
     const link = tickerLink(p.ticker, p.pick_id != null ? {date: state.today, lane:'morning', id: p.pick_id} : {date: state.today});
-    return `<tr><td>${link}</td><td>${esc(p.direction)}</td><td>${esc(p.setup_type||'')}</td>
-      <td>${esc(entryType)} @ ${px(p.entry_price)}${p.entry_not_before ? ` <span class="muted-note">(live ${esc(p.entry_not_before)} ET)</span>` : ''}</td><td>${px(p.stop_price)}</td>
+    const lane = p.exploration_lane ? ` <span class="pill neutral">${esc(String(p.exploration_lane).replace('_',' '))}</span>` : '';
+    const fix = planPick(p.ticker).level_fix;
+    const fixNote = fix ? ` <span class="muted-note">(moved from ${px(fix.was)} to the computed ${esc(fix.named)})</span>` : '';
+    return `<tr><td>${link}</td><td>${esc(p.direction)}</td><td>${esc(p.setup_type||'')}${lane}</td>
+      <td>${esc(entryType)} @ ${px(p.entry_price)}${p.entry_not_before ? ` <span class="muted-note">(live ${esc(p.entry_not_before)} ET)</span>` : ''}${fixNote}</td><td>${px(p.stop_price)}</td>
       <td>${px(p.target_price)}</td><td>${esc(p.size_r ?? '—')}R</td><td>${esc(p.conviction ?? '—')}</td>
       <td class="wrap">${esc(p.thesis_final||p.thesis||'')}</td></tr>`;
   }).join('');
-  return `<p>${esc(plan.market_stance||'')}</p>
+  const tests = source.filter(p => p.exploration_lane).length;
+  const testNote = tests ? `<p class="muted-note">${tests} of these ${tests === 1 ? 'is a test pick' : 'are test picks'} (marked by lane): the risk manager rejected ${tests === 1 ? 'it' : 'them'}, and the desk trades ${tests === 1 ? 'it' : 'them'} at minimum size to test the setup. The kill reason stays in the shadow ledger below.</p>` : '';
+  return `<p>${esc(plan.market_stance||'')}</p>${testNote}
     <div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th><th>Stop</th><th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function shadowHtml(){
   const rejections = state.rejections_today || [];
   if(!rejections.length) return '<div class="empty">Nothing rejected today — every candidate that survived analysis made the plan.</div>';
+  const traded = {};
+  (state.picks_today||[]).forEach(p => { traded[String(p.ticker).toUpperCase()] = p.exploration_lane || 'approved'; });
   const rows = rejections.map(r=>{
-    const outcome = r.eod_outcome
+    const lane = traded[String(r.ticker).toUpperCase()];
+    const outcome = (r.eod_outcome
       ? `${esc(r.eod_outcome)}${r.forgone_r!=null ? ' (' + fmtR(r.forgone_r) + 'R)' : ''}`
-      : 'ungraded';
+      : 'ungraded') + (lane ? ` <span class="pill neutral">traded anyway: ${esc(String(lane).replace('_',' '))}</span>` : '');
     return `<tr><td>${tickerLink(r.ticker, {date: state.today, lane:'shadow', id: r.rejection_id})}</td><td>${esc(r.direction||'')}</td><td>${esc(r.setup_type||'')}</td>
       <td>${esc(r.entry_type||'')} @ ${px(r.entry_price)}</td><td>${px(r.stop_price)}</td>
       <td>${px(r.target_price)}</td><td>${esc(r.conviction ?? '—')}</td>

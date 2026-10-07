@@ -62,6 +62,10 @@ def morning_email_html(plan_date: date, plan: dict, regime_md: str) -> str:
                 setup += f" (tests {p['hypothesis_id']})"
             live_at = (" (live " + str(p["entry_not_before"]) + " ET)"
                        if p.get("entry_not_before") else "")
+            fix = p.get("level_fix") or {}
+            if fix:
+                live_at += (f" <i>(moved from {fix.get('was')} to the computed {fix.get('named')}"
+                            f" its thesis names)</i>")
             rows.append(f"""
             <tr>
               <td>{p['ticker']}</td><td>{p['direction']}</td><td>{setup}</td>
