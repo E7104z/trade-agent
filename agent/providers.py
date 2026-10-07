@@ -1417,29 +1417,23 @@ class MarketData:
         except Exception as e:
             log("data", f"WARN daily_context fetch failed during enrichment: {e}")
             ctx = {}
-        start = datetime.combine(now_et().date(), dtime(4, 0), tzinfo=ET)
-        try:
-            pm_bars = self.alpaca.multi_bars(syms, "1Min", start, now_et())
-        except Exception as e:
-            # One malformed symbol -- a right or warrant off the movers list
-            # (NMCO.RT, BCAT.RT, ...W on 2026-10-07) -- makes Alpaca refuse
-            # the WHOLE batch with a 400, and every name loses its premarket
-            # VWAP, volume and high/low: the levels the morning's entries are
-            # anchored on and the validator's level grounding checks against.
-            # Retry once with the names that are common stock.
-            clean = [s for s in syms if is_common_stock_symbol(s)]
+        now = now_et()
+        start = datetime.combine(now.date(), dtime(4, 0), tzinfo=ET)
+        if now <= start:
+            # Before 04:00 ET there is no premarket session yet: the window
+            # would end before it starts, and Alpaca refuses that with a 400
+            # that used to read as "fetch failed". Only an off-hours run (a
+            # rehearsal after midnight) gets here; the morning cron runs
+            # hours later.
+            log("data", "premarket bars: no premarket session yet (before 04:00 ET); "
+                        "premarket fields left empty")
             pm_bars = {}
-            if clean and len(clean) < len(syms):
-                try:
-                    pm_bars = self.alpaca.multi_bars(clean, "1Min", start, now_et())
-                    log("data", f"premarket bars: batch refused ({str(e)[:120]}); retried without "
-                                f"{len(syms) - len(clean)} non-common symbol(s): "
-                                f"{len(pm_bars)} name(s) priced")
-                except Exception as e2:
-                    log("data", f"WARN premarket bars fetch failed during enrichment, also "
-                                f"without non-common symbols: {e2}")
-            else:
+        else:
+            try:
+                pm_bars = self.alpaca.multi_bars(syms, "1Min", start, now)
+            except Exception as e:
                 log("data", f"WARN premarket bars fetch failed during enrichment: {e}")
+                pm_bars = {}
 
         fund: dict[str, dict] = {}
         earn: dict[str, int | None] = {}

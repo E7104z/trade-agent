@@ -205,8 +205,13 @@ def test_coverage_skips_the_second_name_of_one_bet():
 
 # ------------------------------------------------------------ premarket data
 
-def test_one_malformed_symbol_no_longer_costs_every_name_its_premarket_levels():
+@pytest.mark.parametrize("hour, fetched", [(0, False), (3, False), (8, True)])
+def test_before_four_am_there_is_no_premarket_window_to_fetch(monkeypatch, hour, fetched):
+    # Before 04:00 ET the window would end before it starts; Alpaca refuses
+    # that with a 400 for any symbol (verified: CEG alone, 00:18 ET 10/07),
+    # which an after-midnight rehearsal logged as a failed fetch.
     from datetime import datetime
+    from agent import providers
     from agent.providers import MarketData
     from agent.util import ET
 
@@ -215,20 +220,20 @@ def test_one_malformed_symbol_no_longer_costs_every_name_its_premarket_levels():
             self.calls = []
 
         def multi_bars(self, syms, tf, start, end):
+            assert start < end
             self.calls.append(list(syms))
-            if any("." in s for s in syms):
-                raise RuntimeError("400 Client Error: Bad Request")
-            t = datetime(2026, 10, 7, 8, 0, tzinfo=ET)
+            t = datetime(2026, 10, 7, 7, 59, tzinfo=ET)
             return {s: [{"t": t, "o": 10.0, "h": 10.5, "l": 9.5, "c": 10.2, "v": 1000}] for s in syms}
 
+    monkeypatch.setattr(providers, "now_et", lambda: datetime(2026, 10, 7, hour, 18, tzinfo=ET))
     md = MarketData.__new__(MarketData)
     md.cfg = Config(raw={"data": {"indicator_enrich": True, "context_enrich": False}})
     md.alpaca = _Alpaca()
     md.daily_context = lambda syms: {}
-    quotes = [{"symbol": "CEG", "last": 10.2}, {"symbol": "NMCO.RT", "last": 0.1}]
+    quotes = [{"symbol": "CEG", "last": 10.2}]
     md._enrich_indicators(quotes)
-    assert md.alpaca.calls == [["CEG", "NMCO.RT"], ["CEG"]]
-    assert quotes[0].get("pm_vwap") is not None             # CEG kept its premarket data
+    assert bool(md.alpaca.calls) is fetched
+    assert (quotes[0].get("pm_vwap") is not None) is fetched
 
 
 # ---------------------------------------------------- surfaces and the check

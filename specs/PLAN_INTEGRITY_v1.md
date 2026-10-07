@@ -63,10 +63,11 @@
 
   It warns when fewer than half of 8 or more orders fill.
 
-- **Premarket data survives a bad symbol (`agent/providers.py`).** The rehearsal at 00:06 ET on 10/07 showed Alpaca refusing the whole premarket-bars batch with a 400, because rights and warrants from the movers list (NMCO.RT, BCAT.RT, …W) were in it.
-  - When that happens, every name loses its premarket VWAP, volume and high/low: the levels entries anchor on and level grounding checks against.
-  - A refused batch is now retried once with the common-stock symbols only.
-  - The earlier rehearsals at real morning hours did not hit it.
+- **No premarket fetch before 04:00 ET (`agent/providers.py`).** Rehearsals run after midnight logged "premarket bars fetch failed" (HTTP 400).
+  - I first blamed rights and warrants in the batch (NMCO.RT, …W) and shipped a retry without them (ecf2346).
+  - A direct test disproved that. Those symbols return bars fine. CEG alone gets the same 400 when the window starts at 04:00 today and ends at 00:18: the window ends before it starts.
+  - The retry is removed. Before 04:00 ET the fetch is skipped and logged as "no premarket session yet".
+  - Production's morning (~07:11 ET) never hit this.
 
 ## Kept as designed
 
