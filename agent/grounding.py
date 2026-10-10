@@ -161,12 +161,10 @@ def _regime_matches(lesson_regime: str | None, row_regime: str | None) -> bool:
     return bool(b) and (a.startswith(b) or b.startswith(a))
 
 
-def lesson_in_scope(lesson: dict, pick_rows: Iterable[dict],
-                    runner_rows: Iterable[dict] = ()) -> tuple[bool, str]:
+def lesson_in_scope(lesson: dict, pick_rows: Iterable[dict]) -> tuple[bool, str]:
     """Did any of today's fill-valid trades fall inside this lesson?
 
-    With a predicate: a row whose buckets match it (runner-lane predicates
-    against the runner field). Without one: a trade of the lesson's
+    With a predicate: a row whose buckets match it. Without one: a trade of the lesson's
     setup_type (and regime, when the lesson names one). A lesson with neither
     cannot be confirmed or contradicted by a single evening at all -- only the
     weekly miner, from ledger counts, can act on it.
@@ -181,8 +179,7 @@ def lesson_in_scope(lesson: dict, pick_rows: Iterable[dict],
             pred = None
     pred = validate_lesson_predicate(pred) if pred else None
     if pred:
-        rows = list(runner_rows) if pred["lane"] == "runner" else list(pick_rows)
-        return (any(matches(pred, r) for r in rows),
+        return (any(matches(pred, r) for r in pick_rows),
                 "no trade today fell in the lesson's predicate cell")
     setup = lesson.get("setup_type")
     if not setup:

@@ -91,7 +91,7 @@ FUTILITY_CONF = 0.80   # one-sided upper bound used to call a rule futile
 MIN_USEFUL_R = 0.10    # an edge below this is not worth trading after friction
 DESIGN = "spend-v1"    # stamped on every look, so a later design is never confused with this one
 
-FIELD_LANES = ("runner", "gapfield")
+FIELD_LANES = ("gapfield",)
 FIELD_N_MAX = 768
 FIELD_MIN_USEFUL_R = 0.05
 

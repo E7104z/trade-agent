@@ -68,7 +68,7 @@ def test_clean_draft_is_stored_ok_with_its_cost(con):
     call = stub.calls[0]
     assert call["attempts"] == 1 and call["timeout"] <= 45 and call["expect_json"] is False
     assert call["model"] == "claude-sonnet-4-5"
-    assert "{{day.net_r}} = -0.20R" in call["user"]
+    assert "{{day.net_r}} = +0.20R" in call["user"]
     # Slots and the menu only: no playbook text, no lessons, no trade tables.
     assert "# Trading Agent Playbook" not in call["user"] and "LESSON" not in call["user"]
     assert call["user"].count("{{verdict.calibration_q3}}") == 1

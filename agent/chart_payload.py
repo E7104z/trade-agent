@@ -3,11 +3,8 @@
 Pure(ish) server-side computation for the strategy-aware chart drawer. Every
 strategy number the drawer draws -- VWAP, premarket VWAP, the 9 EMA, levels,
 R, ATR bands -- is computed here in Python, with the SAME modules that
-produced the original ledger value (R-0):
-  - morning lane   -> agent.indicators (SMA-seeded EMA)
-  - runner lane    -> agent.runner_indicators (ri; the DTO-parity port)
-These two modules intentionally produce different EMAs from the same bars.
-Never substitute one for the other, and never use a browser-side EMA.
+produced the original ledger value (R-0): agent.indicators (SMA-seeded
+EMA). Never use a browser-side EMA.
 
 Read-only: this module issues no ledger writes and no schema migrations. The
 one exception (necessary, not incidental) is that the replay-vs-ledger guard
@@ -27,13 +24,11 @@ from typing import Any
 
 from . import indicators as ind
 from . import ledger
-from . import runner_indicators as ri
 from .config import Config
-from .grading import (CURRENT_SIM_VERSION, RUNNER_MIN_REWARD_R, classify_shadow,
+from .grading import (CURRENT_SIM_VERSION, classify_shadow,
                       realized_r, same_semantics, simulate_pick)
 from .grading_context import build_grading_context
 from .providers import MarketData
-from .runner_scan import DETECTION_BAR_MINUTES, earliest_entry_time, honest_entry_time
 from .util import ET, log, market_close_et, prev_market_day
 
 _REPLAY_TOL = 1e-6
@@ -153,7 +148,7 @@ def series_morning_vwap(bars_rth: list[dict], bars_pm: list[dict] | None) -> dic
 
 def series_morning_ema9(bars_5m: list[dict]) -> dict:
     """9 EMA on 5-minute closes via indicators.ema_series (SMA-seeded) --
-    matching the morning lane's own grading timeframe. Never runner_indicators."""
+    matching the morning lane's own grading timeframe."""
     out: dict = {}
     closes = [b["c"] for b in bars_5m]
     for b, v in zip(bars_5m, ind.ema_series(closes, 9)):
@@ -165,43 +160,19 @@ def series_morning_ema9(bars_5m: list[dict]) -> dict:
     return out
 
 
-def series_runner(bars_scan_basis: list[dict]) -> dict:
-    """{"vwap": {ts_ms: value}, "ema9": {ts_ms: value}}, computed bar-by-bar
-    with runner_indicators (ri) over the SAME bar source runner_scan.scan()
-    feeds it (native Alpaca 5Min, per Phase 0 §0.3) -- never agent.indicators."""
-    out: dict = {"vwap": {}, "ema9": {}}
-    for i, b in enumerate(bars_scan_basis):
-        ms = _ms(b.get("t"))
-        if ms is None:
-            continue
-        prefix = bars_scan_basis[: i + 1]
-        vw = ri.vwap(prefix)
-        if vw is not None:
-            out["vwap"][ms] = _round(vw)
-        e9 = ri.ema(prefix, 9)
-        if e9 is not None:
-            out["ema9"][ms] = _round(e9)
-    return out
-
-
 # ------------------------------------------------------------- resolve_contexts
 
 def resolve_contexts(con, ticker: str, d: date) -> list[dict]:
     """Every lane context that exists for `ticker` on `d`.
 
-    Runner items are listed in ticker order only (there is at most one per
-    ticker/date so this is trivially satisfied) -- nothing here ranks (R-1).
+    Items are listed in storage order -- nothing here ranks (R-1).
     """
     t = ticker.upper()
     out: list[dict] = []
     for p in ledger.picks_for_date(con, d):
-        if str(p.get("ticker", "")).upper() == t and p.get("setup_type") != "dto_runner":
+        if str(p.get("ticker", "")).upper() == t and p.get("setup_type") != ledger.RUNNER_SETUP:
             out.append({"lane": "morning", "id": p["pick_id"],
                        "label": f"{p.get('setup_type') or 'pick'} {p.get('direction') or ''}".strip()})
-    for c in ledger.runner_candidates_for_date(con, d):
-        if str(c.get("ticker", "")).upper() == t:
-            out.append({"lane": "runner", "id": f"{t}:{d.isoformat()}",
-                       "label": "runner candidate"})
     for r in ledger.rejections_for_date(con, d):
         if str(r.get("ticker", "")).upper() == t:
             out.append({"lane": "shadow", "id": r["rejection_id"],
@@ -246,21 +217,6 @@ def levels_morning(pick: dict, outcome: dict | None, cfg: Config) -> tuple[list[
     elif entry is not None and stop is not None:
         warnings.append("ATR band unavailable (stop_dist_atr null)")
     return levels, warnings
-
-
-def levels_runner(candidate: dict) -> list[dict]:
-    levels = []
-    det = candidate.get("detection_price")
-    stop = candidate.get("stop_price")
-    target = candidate.get("target_price")
-    if det is not None:
-        levels.append({"kind": "entry", "price": det, "style": "solid", "label": f"Detection {det:.2f}"})
-    if stop is not None:
-        levels.append({"kind": "stop", "price": stop, "style": "solid",
-                       "label": f"Stop (9 EMA) {stop:.2f}"})
-    if target is not None:
-        levels.append({"kind": "target", "price": target, "style": "solid", "label": f"Target {target:.2f}"})
-    return levels
 
 
 def levels_live(pick_ctx: dict, broker_levels: list[dict]) -> list[dict]:
@@ -322,24 +278,12 @@ def _replay_morning(md: MarketData, con, cfg: Config, pick: dict, d: date,
     slippage = float(cfg.get("slippage_bps", 0) or 0)
     flatten_at = cfg.get("flatten_at")
     min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
-    # The runner entry time and the runner fill rule apply to RUNNER picks only,
-    # exactly as grading.grade_day applies them: a morning pick on a name the
-    # runner also detected that day is still graded from the open.
-    runner_pick = pick.get("setup_type") == ledger.RUNNER_SETUP
-    entry_after = (gctx["entry_after_map"] or {}).get(t) if runner_pick else None
-    sim_bars = bars
-    if entry_after is not None and bars:
-        sim_bars = [b for b in bars if _naive(b["t"]) >= _naive(entry_after)]
-        if not sim_bars:
-            return {"triggered": False, "exit_reason": "no_data",
-                    "sim_version": CURRENT_SIM_VERSION}
-    return simulate_pick(pick, sim_bars, daily, slippage_bps=slippage, flatten_at=flatten_at,
+    return simulate_pick(pick, bars, daily, slippage_bps=slippage, flatten_at=flatten_at,
                          min_bar_volume=min_bar_volume, adv20=gctx["adv20_map"].get(t),
                          atr14=gctx["atr_map"].get(t), trend_snapshot=gctx["trend_map"].get(t),
                          fundamentals=gctx["fundamentals_map"].get(t),
                          prev_close=gctx["prev_close_map"].get(t),
-                         or_minutes=gctx["or_minutes"], session_date=d, session_bars=bars,
-                         min_reward_r=RUNNER_MIN_REWARD_R if runner_pick else 0.0)
+                         or_minutes=gctx["or_minutes"], session_date=d, session_bars=bars)
 
 
 def _replay_shadow(cfg: Config, rejection: dict, d: date, bars: list[dict]) -> dict:
@@ -354,36 +298,6 @@ def _replay_shadow(cfg: Config, rejection: dict, d: date, bars: list[dict]) -> d
                          min_bar_volume=min_bar_volume, session_date=d)
 
 
-def _replay_runner(md: MarketData, con, cfg: Config, candidate: dict, d: date,
-                   bars: list[dict]) -> tuple[dict, datetime | None]:
-    session = ledger.runner_session(con, d) or {}
-    fp = candidate.get("first_pass_et")
-    cutoff = honest_entry_time(fp, candidate.get("scan_pass_et"), session.get("selection_at")) if fp else None
-    entry_bars = bars
-    if cutoff is not None and bars:
-        entry_bars = [b for b in bars if _naive(b["t"]) >= _naive(cutoff)]
-    if not entry_bars:
-        return {"triggered": False, "exit_reason": "no_data", "sim_version": CURRENT_SIM_VERSION}, cutoff
-    ctx = {}
-    try:
-        ctx = md.daily_context([candidate["ticker"]])
-    except Exception as e:
-        log("chart", f"runner replay: daily_context failed for {candidate['ticker']}: {e}")
-    t = candidate["ticker"].upper()
-    atr14 = (ctx.get(t) or {}).get("atr14")
-    trend_snapshot = (ctx.get(t) or {}).get("trend_snapshot")
-    slippage = float(cfg.get("slippage_bps", 0) or 0)
-    flatten_at = cfg.get("flatten_at")
-    min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
-    shim = {"pick_id": 0, "direction": "long", "entry_type": "open",
-           "entry_price": candidate.get("detection_price"), "stop_price": candidate.get("stop_price"),
-           "target_price": candidate.get("target_price")}
-    sim = simulate_pick(shim, entry_bars, None, slippage_bps=slippage, flatten_at=flatten_at,
-                        min_bar_volume=min_bar_volume, atr14=atr14, trend_snapshot=trend_snapshot,
-                        session_date=d, min_reward_r=RUNNER_MIN_REWARD_R)
-    return sim, cutoff
-
-
 # ---------------------------------------------------------------------- guard
 
 def _replay_guard(name: str, stored: float | None, replayed: float | None,
@@ -394,9 +308,8 @@ def _replay_guard(name: str, stored: float | None, replayed: float | None,
     # flagging it put a red banner on every same-day chart.
     if not graded:
         return {"name": name, "ok": True, "detail": "not graded yet -- replay only"}
-    # A version bump that changed nothing for this lane (sim v6 is runner-only)
-    # is not a disagreement: grading.same_semantics knows which versions grade
-    # a lane identically.
+    # A version bump that changed nothing for this lane is not a disagreement:
+    # grading.same_semantics knows which versions grade a lane identically.
     if stored_sim_version is not None and not same_semantics(stored_sim_version, lane):
         return {"name": name, "ok": False,
                "detail": f"graded under sim v{stored_sim_version}, replayed under v{CURRENT_SIM_VERSION}"}
@@ -424,23 +337,6 @@ def _premarket_bars(md: MarketData, ticker: str, d: date) -> list[dict]:
         return got.get(ticker.upper()) or []
     except Exception as e:
         log("chart", f"premarket bars fetch failed for {ticker}: {e}")
-        return []
-
-
-def _runner_scan_bars(md: MarketData, ticker: str, d: date, end: datetime) -> list[dict]:
-    """Native Alpaca 5Min bars, session open through `end` -- the exact
-    source runner_scan.scan() feeds `ri` (Phase 0 §0.3), never 1Min
-    aggregated."""
-    if md.cfg.offline or not md.alpaca:
-        from .providers import synthetic_minute_bars
-        return aggregate(synthetic_minute_bars(ticker, d), 5)
-    from datetime import time as _t
-    start = datetime.combine(d, _t(9, 30), tzinfo=ET)
-    try:
-        got = md.alpaca.multi_bars([ticker], "5Min", start, end)
-        return got.get(ticker.upper()) or []
-    except Exception as e:
-        log("chart", f"runner scan-basis bars fetch failed for {ticker}: {e}")
         return []
 
 
@@ -501,8 +397,6 @@ def build(con, cfg: Config, ticker: str, d: date, lane: str | None, ctx_id: Any,
             _build_morning(con, cfg, md, out, t, d, ctx_id, bars, daily, tf, asof, warnings, guards)
         elif lane == "shadow":
             _build_shadow(con, cfg, md, out, t, d, ctx_id, bars, tf, asof, warnings, guards)
-        elif lane == "runner":
-            _build_runner(con, cfg, md, out, t, d, bars, tf, asof, warnings, guards)
         elif lane == "live":
             _build_live(con, cfg, md, out, t, d, ctx_id, bars, tf, warnings, guards)
         else:
@@ -597,7 +491,7 @@ def trade_summary(out: dict) -> dict:
 
     return {
         "direction": direction,
-        "entry_label": "Detection" if out.get("lane") == "runner" else "Entry",
+        "entry_label": "Entry",
         "entry": entry, "stop": stop, "target": target,
         "risk_per_share": round(risk, 4) if risk is not None else None,
         "risk_pct": risk_pct, "reward_r": reward_r,
@@ -650,9 +544,7 @@ def _build_morning(con, cfg, md, out, t, d, pick_id, bars, daily, tf, asof, warn
     stored_r = realized_r(outcome_row or {})
     stored_sim = (outcome_row or {}).get("sim_version")
     guards.append(_replay_guard("replay_vs_ledger", stored_r, realized_r(sim), stored_sim,
-                                graded=outcome_row is not None,
-                                lane=("runner" if pick.get("setup_type") == ledger.RUNNER_SETUP
-                                      else "morning")))
+                                graded=outcome_row is not None, lane="morning"))
     if not guards[-1]["ok"]:
         for m in markers:
             if m.get("source") == "replay":
@@ -732,75 +624,6 @@ def _build_shadow(con, cfg, md, out, t, d, rejection_id, bars, tf, asof, warning
     out["premarket_bars"] = to_kline(_apply_cutoff_bars(pm_bars, cutoff) if asof else pm_bars)
     if asof:
         _apply_asof(out, cutoff)
-
-
-def _build_runner(con, cfg, md, out, t, d, bars, tf, asof, warnings, guards):
-    candidate = next((c for c in ledger.runner_candidates_for_date(con, d)
-                      if str(c["ticker"]).upper() == t), None)
-    if candidate is None:
-        warnings.append(f"no runner candidate for {t}/{d}")
-        out["bars"] = to_kline(aggregate(bars, tf))
-        return
-
-    close_dt = datetime.combine(d, market_close_et(d), tzinfo=ET)
-    scan_bars = _runner_scan_bars(md, t, d, close_dt)
-    rseries = series_runner(scan_bars)
-    out["series"] = {
-        "vwap": {"basis": "runner_indicators.vwap (native 5Min, DTO parity)", "bar_minutes": 5,
-                 "points": rseries["vwap"]},
-        "ema9": {"basis": "runner_indicators.ema period=9 (native 5Min, DTO parity)", "bar_minutes": 5,
-                 "points": rseries["ema9"]},
-    }
-    out["levels"] = levels_runner(candidate)
-
-    windows = []
-    fp = candidate.get("first_pass_et")
-    if fp is not None:
-        windows.append({"kind": "detection_bar", "start": _ms(fp),
-                        "end": _ms(earliest_entry_time(fp))})
-
-    outcomes = {o["ticker"]: o for o in ledger.runner_outcomes_for_date(con, d)}
-    stored = outcomes.get(t)
-    sim, cutoff = _replay_runner(md, con, cfg, candidate, d, bars)
-    markers = []
-    if fp is not None:
-        markers.append({"kind": "detection", "timestamp": _ms(fp), "label": "Detected", "source": "ledger"})
-        markers.append({"kind": "detection_close", "timestamp": _ms(earliest_entry_time(fp)),
-                        "label": "Detection bar close", "source": "ledger"})
-    if cutoff is not None:
-        markers.append({"kind": "honest_entry", "timestamp": _ms(cutoff),
-                        "label": "Earliest honest fill", "source": "ledger"})
-        windows.append({"kind": "honest_entry", "at": _ms(cutoff)})
-    markers.extend(markers_from_replay(sim, "long"))
-    out["markers"] = markers
-    out["windows"] = windows
-
-    stored_r = realized_r(stored or {})
-    stored_sim = (stored or {}).get("sim_version")
-    guards.append(_replay_guard("replay_vs_ledger", stored_r, realized_r(sim), stored_sim,
-                                graded=stored is not None, lane="runner"))
-    if not guards[-1]["ok"]:
-        for m in out["markers"]:
-            if m.get("source") == "replay":
-                m["source"] = "replay — disagrees with ledger"
-
-    out["context"] = {
-        "setup_type": "dto_runner", "direction": "long",
-        "selection_rank": (stored or {}).get("selection_rank"),
-        "outcome": None if asof else ({
-            "triggered": (stored or {}).get("triggered"), "exit_reason": (stored or {}).get("exit_reason"),
-            "r_planned": (stored or {}).get("r_planned"),
-            "r_multiple": (stored or {}).get("r_multiple"),
-            "invalid_reason": (stored or {}).get("invalid_reason"),
-            "mfe_r": (stored or {}).get("mfe_r"),
-            "mae_r": (stored or {}).get("mae_r"), "sim_version": stored_sim,
-        } if stored else None),
-    }
-
-    display_cutoff = cutoff if asof else None
-    out["bars"] = to_kline(aggregate(_apply_cutoff_bars(bars, display_cutoff) if asof else bars, tf))
-    if asof:
-        _apply_asof(out, display_cutoff)
 
 
 def _build_live(con, cfg, md, out, t, d, order_id, bars, tf, warnings, guards):

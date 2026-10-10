@@ -54,7 +54,7 @@ def load_prompt(name: str, replacements: dict[str, str]) -> str:
 # version header, so it can add no number to any prompt or to the grader's
 # grounding corpus.
 
-PERSONA_ROLES = ("analyst", "risk", "grader", "miner", "selector")
+PERSONA_ROLES = ("analyst", "risk", "grader", "miner")
 
 # The placeholder plus the one blank line it sits on. Removed whole when the
 # persona is off; see load_prompt.

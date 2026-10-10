@@ -21,7 +21,7 @@ The proof-deficit slots (`deficit.*`), stated as debts you owe the scoreboard. C
 
 ## What happened
 
-Today, from the day slots (`day.*`, `pick.*`, `shadow.*`, `runner.*`), plus any `calibration.*` or `verdict.*` slot that matters. Every sentence about a result is backed by a slot. When you lean on a one-session slot, say "one session, not evidence". Invalid fills are not trades: you may cite their count, never narrate them. Verdict slots are the system's words; quote them, never soften or extend them.
+Today, from the day slots (`day.*`, `pick.*`, `shadow.*`), plus any `calibration.*` or `verdict.*` slot that matters. Every sentence about a result is backed by a slot. When you lean on a one-session slot, say "one session, not evidence". Invalid fills are not trades: you may cite their count, never narrate them. Verdict slots are the system's words; quote them, never soften or extend them.
 
 ## What I believe (not evidence, not acted on)
 

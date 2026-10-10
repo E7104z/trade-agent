@@ -61,14 +61,9 @@ __all__ = [
     "validate_predicate",
     "register_candidate",
     "register_batch_survivors",
-    "register_exit_policy_candidates",
-    "exit_rule_predicate",
-    "EXIT_LANE",
-    "EXIT_DIMENSION",
     "observe_session",
     "apply_decay",
     "morning_rows",
-    "runner_rows",
     "record_looks",
     "looks_summary",
     "register_rule",
@@ -272,24 +267,12 @@ def advance_quarantine(con: Any, rule_id: str, session_date: date) -> str:
 
 
 # Observation sources that count toward validation. `taken` = a fill-valid
-# trade the desk actually took (morning lane); `runner_field` = a runner
-# candidate priced by the same simulator (runner rules are statements about the
-# candidate population, selected or not); `runner_exit` = one session's mean
-# paired ΔR of an exit policy / construction arm against the plan, over that
-# session's triggered candidates (lane EXIT_LANE). Counterfactual streams --
+# trade the desk actually took (morning lane); `gapfield` = a unit of the gap
+# field's forward rows. Counterfactual streams --
 # `shadow` (rejected candidates) and `population` (mechanical monkeys) -- are
 # RECORDED as confirming/disconfirming evidence but never counted: the desk
 # did not take them, so they cannot validate a rule about what the desk takes.
-COUNTED_SOURCES = ("taken", "runner_field", "runner_exit", "gapfield")
-
-# Exit policies and construction arms (agent/runner_exits.py) are rules about
-# HOW a runner candidate is traded, not WHICH: their one dimension is the
-# policy, their unit is the session (a few hundred candidates on one tape are
-# one observation of "did this beat the plan today"), and their value is the
-# paired ΔR. RUNNER_EXIT_SPEC_v1 Phase 3 / RUNNER_TRADE_CONSTRUCTION_v1.
-EXIT_LANE = "runner_exit"
-EXIT_DIMENSION = "runner_exit_policy"
-
+COUNTED_SOURCES = ("taken", "gapfield")
 
 def record_rule_observation(
     con: Any, rule_id: str, session_date: date, r_multiple: float,
@@ -670,7 +653,7 @@ def validate_predicate(pred: Any, comparisons: Iterable[Any]) -> tuple[dict | No
     canon = canonical_predicate(pred)
     if canon is None:
         return None, "REJECTED_UNMATCHABLE", "no machine-readable predicate"
-    if canon["lane"] not in buckets.LANES + (EXIT_LANE,):
+    if canon["lane"] not in buckets.LANES:
         return None, "REJECTED_UNMATCHABLE", f"unknown lane {canon['lane']!r}"
     conds = canon["conditions"]
     if not conds:
@@ -681,8 +664,7 @@ def validate_predicate(pred: Any, comparisons: Iterable[Any]) -> tuple[dict | No
             f"more than {MAX_RULE_DIMENSIONS} at any realistic sample size")
     if len({c["dimension"] for c in conds}) != len(conds):
         return None, "REJECTED_UNMATCHABLE", "the same dimension appears twice"
-    lane_dims = ({EXIT_DIMENSION} if canon["lane"] == EXIT_LANE
-                 else set(buckets.dimensions(canon["lane"])))
+    lane_dims = set(buckets.dimensions(canon["lane"]))
     levels = emitted_levels(comparisons)
     for c in conds:
         if c["dimension"] not in lane_dims:
@@ -697,8 +679,8 @@ def validate_predicate(pred: Any, comparisons: Iterable[Any]) -> tuple[dict | No
 def realized_r(row: dict) -> float | None:
     """The realized R every mined statistic uses: planned-risk R (`r_planned`)
     where the row carries it, else the legacy `r_multiple`. Same measure as
-    ledger's COALESCE(r_planned, r_multiple) and runner_research._planned_r,
-    so discovery, pairs, and forward validation share one denominator."""
+    ledger's COALESCE(r_planned, r_multiple), so discovery, pairs, and forward
+    validation share one denominator."""
     v = row.get("r_planned")
     if v is None:
         v = row.get("r_multiple")
@@ -740,21 +722,6 @@ def morning_rows(con: Any, on: date | None = None) -> list[dict]:
         row.update(dict(zip(cols_o, r[len(cols_p):])))
         out.append(row)
     return out
-
-
-def runner_rows(con: Any, on: date | None = None) -> list[dict]:
-    """Triggered runner candidates under the CURRENT scan/sim version."""
-    from . import runner_research
-    if on is None:
-        return runner_research.current_candidate_rows(con)
-    from . import ledger
-    scan_v, sim_v = runner_research.current_versions()
-    rows = [r for r in ledger.runner_candidate_outcomes_since(con, on)
-            if r.get("session_date") == on and r.get("scan_version") == scan_v
-            and r.get("sim_version") == sim_v and r.get("triggered")
-            and realized_r(r) is not None
-            and r.get("exit_reason") != "invalid_fill"]
-    return runner_research._attach_regime(con, rows)
 
 
 def discovery_stats(pred: dict, comparisons: Iterable[Any], rows: list[dict]) -> dict:
@@ -852,7 +819,7 @@ def register_candidate(con: Any, candidate: dict, session_date: date,
 # LANE. A budget choice, not an edge claim: each quarantined rule is a forward
 # test, and the cohort correction at graduation gets stricter as the cohort
 # grows. Per lane so two years of gap-field history cannot crowd the morning
-# and runner survivors out of the forward test.
+# survivors out of the forward test.
 SYSTEM_MAX_NEW_PER_RUN = 12
 
 
@@ -866,8 +833,7 @@ def register_batch_survivors(con: Any, session_date: date, comparisons: Iterable
     if the miner happened to nominate it in prose that week -- so a real
     survivor could sit unvalidated forever on the strength of one LLM's
     attention. The system now does what it already did for exit policies:
-    every surviving 1-D cell and admitted 2-D pair of the morning and runner
-    lanes is registered through `register_candidate` (predicate validated
+    every surviving 1-D cell and admitted 2-D pair of the morning lane is registered through `register_candidate` (predicate validated
     against the cells emitted this run, discovery numbers from the batch)
     and quarantined today (the gap field's strategy x dimension cells too).
     Losers are registered too: a validated losing cell is an exclusion the
@@ -901,7 +867,7 @@ def register_batch_survivors(con: Any, session_date: date, comparisons: Iterable
         if per_lane.get(lane, 0) >= max_new:
             continue
         cell = " AND ".join(f"{d_}={lv}" for d_, lv in zip(dims, levels))
-        unit = "unit" if lane in ("runner", "gapfield") else "trade"
+        unit = "unit" if lane == "gapfield" else "trade"
         statement = (f"[system] {lane} cell {cell}: mean {c.mean_r:+.3f}R per {unit} over "
                      f"n={c.n}, a survivor of the {session_date} FDR batch (q={c.q_value})")
         pred = {"lane": lane, "conditions": [{"dimension": d_, "level": lv}
@@ -919,140 +885,35 @@ def register_batch_survivors(con: Any, session_date: date, comparisons: Iterable
     return out
 
 
-# The first session whose runner evidence is counted in (session, industry)
-# UNITS under scan_version 3 (specs/RUNNER_POOL_INTEGRITY_v1.md). Before it,
-# runner forward observations were recorded one per candidate row -- thirty
-# correlated banks on one morning were thirty observations -- and described a
-# pool that held ETFs and stale-bracket fills.
-RUNNER_UNIT_COUNTING_FROM = date(2026, 10, 2)
+# Lanes that no longer exist. The runner lane was removed on 2026-10-10 at
+# Jason's request; a rule about it can never gain another forward observation,
+# so it is retired rather than left QUARANTINED forever.
+REMOVED_LANES = ("runner", "runner_exit")
 
 
-def _is_runner_rule(lane: Any, dimensions: Any) -> bool:
-    if lane == EXIT_LANE:
-        return False   # session-unit evidence from the start; nothing to restart
-    if lane == "runner":
-        return True
-    return "runner_" in str(dimensions or "")
-
-
-def exit_rule_predicate(policy: str) -> dict:
-    return {"lane": EXIT_LANE,
-            "conditions": [{"dimension": EXIT_DIMENSION, "level": str(policy)}]}
-
-
-def register_exit_policy_candidates(con: Any, session_date: date,
-                                    comparisons: Iterable[Any]) -> list[dict]:
-    """Quarantine every exit policy / construction arm whose paired ΔR against
-    the plan survived THIS run's FDR batch with a positive sign.
-
-    The system does this itself, not the miner: the family is pre-registered
-    in code (agent/runner_exits.py), so "which arm is a candidate" is a
-    computed fact, and leaving it to a prose nomination would let a surviving
-    arm sit unvalidated -- or an unsurvived one be talked into quarantine.
-    A policy that tests significantly WORSE than the plan is not a candidate
-    for anything and is not registered. Idempotent: the rule id comes from the
-    predicate, so a policy already in the registry keeps its state and clock.
-    """
-    out: list[dict] = []
-    for c in comparisons or []:
-        if getattr(c, "dimension", None) != EXIT_DIMENSION or not getattr(c, "significant", False):
-            continue
-        if c.mean_r is None or c.mean_r <= 0:
-            continue
-        canon = canonical_predicate(exit_rule_predicate(c.level))
-        rid = rule_id_for_predicate(canon)
-        if con.execute("SELECT 1 FROM research_rules WHERE rule_id = ?", [rid]).fetchone():
-            continue
-        statement = (f"Runner exit policy `{c.level}` beats the plan exit: paired ΔR "
-                     f"{c.mean_r:+.3f}R per session over n={c.n} sessions (q={c.q_value}).")
-        con.execute(
-            """INSERT INTO research_rules
-               (rule_id, statement, dimensions, n_dimensions, state, source,
-                discovered_at, discovery_n, discovery_effect, discovery_q,
-                quarantined_at, validated_at, retired_at, forward_n_required,
-                forward_n, forward_sum_r, forward_sumsq_r, note, predicate_json, lane,
-                decay_count, last_observed_at)
-               VALUES (?,?,?,1,'DISCOVERED','system',?,?,?,?,NULL,NULL,NULL,?,0,0.0,0.0,?,?,?,0,NULL)""",
-            [rid, statement, json.dumps([EXIT_DIMENSION]), session_date, int(c.n or 0),
-             c.mean_r, c.q_value, DEFAULT_FORWARD_N,
-             "construction arm / exit policy, registered by the system from the weekly batch; "
-             "forward observations are per-session paired ΔR",
-             json.dumps(canon), EXIT_LANE])
-        state = advance_quarantine(con, rid, session_date)
-        out.append({"rule_id": rid, "policy": c.level, "state": state})
-    return out
-
-
-def _exit_session_deltas(con: Any, d: date) -> dict[str, float]:
-    """{policy: session d's mean paired ΔR vs the plan}, current versions only."""
-    from . import ledger, runner_exits
-    from .runner_research import current_versions
-    scan_v, sim_v = current_versions()
+def retire_removed_lane_rules(con: Any, session_date: date | None = None) -> list[str]:
+    """Retire every live rule that belongs to a removed lane, keeping its row,
+    its observations and its history. Idempotent: a RETIRED rule is skipped."""
+    marks = ",".join("?" for _ in REMOVED_LANES)
     try:
-        rows = [r for r in ledger.runner_exit_replays_since(con, d)
-                if r.get("session_date") == d and r.get("scan_version") == scan_v
-                and r.get("sim_version") == sim_v
-                and r.get("policy_version") == runner_exits.POLICY_VERSION
-                and r.get("r_planned") is not None]
-    except Exception:
-        return {}
-    by_cand: dict[str, dict[str, float]] = {}
-    for r in rows:
-        by_cand.setdefault(r["ticker"], {})[r["policy"]] = float(r["r_planned"])
-    deltas: dict[str, list[float]] = {}
-    for m in by_cand.values():
-        if runner_exits.REFERENCE not in m:
-            continue
-        for pol, v in m.items():
-            if pol != runner_exits.REFERENCE:
-                deltas.setdefault(pol, []).append(v - m[runner_exits.REFERENCE])
-    return {p: sum(v) / len(v) for p, v in deltas.items() if v}
-
-
-def restart_runner_forward_clocks(con: Any, anchor: date | None = None) -> list[str]:
-    """Restart the forward clock of every live runner rule quarantined before
-    `anchor`, so its forward evidence is all unit-counted, scan_version 3
-    evidence. Idempotent: a restarted rule's quarantined_at becomes the day
-    before `anchor`, which the test below no longer selects.
-
-    This can only DELAY validation -- it never lowers a bar. A VALIDATED
-    runner rule goes back to QUARANTINED: its validation was counted on rows
-    that were not independent, from a population that included funds. Its old
-    observations stay in research_observations as the record; they stop
-    counting because the running sums are zeroed.
-    """
-    from datetime import timedelta
-    anchor = anchor or RUNNER_UNIT_COUNTING_FROM
-    restart_at = anchor - timedelta(days=1)
-    rows = con.execute(
-        """SELECT rule_id, state, quarantined_at, lane, dimensions, forward_n
-           FROM research_rules WHERE state IN ('QUARANTINED', 'VALIDATED')"""
-    ).fetchall()
-    restarted: list[str] = []
-    for rid, state, q_at, lane, dims, fwd_n in rows:
-        if not _is_runner_rule(lane, dims):
-            continue
-        q = q_at.date() if hasattr(q_at, "date") and not isinstance(q_at, date) else q_at
-        if q is not None and q >= restart_at:
-            continue
-        note = (f" | forward clock restarted {anchor}: runner evidence is now counted in "
-                f"(session, industry) units under scan_version 3; {int(fwd_n or 0)} earlier "
-                f"row-level observation(s) no longer count"
-                + ("; was VALIDATED" if state == "VALIDATED" else ""))
+        rows = con.execute(
+            f"""SELECT rule_id FROM research_rules
+                WHERE lane IN ({marks}) AND state <> 'RETIRED'""", list(REMOVED_LANES)).fetchall()
+    except Exception:  # noqa: BLE001 -- a registry that cannot be read is not this function's failure
+        return []
+    ids = [r[0] for r in rows]
+    if not ids:
+        return []
+    at = session_date or date.today()
+    note = " | retired: the runner lane was removed, so this rule can gain no more forward evidence"
+    for rid in ids:
         con.execute(
             """UPDATE research_rules
-               SET state = 'QUARANTINED', quarantined_at = ?, validated_at = NULL,
-                   forward_n = 0, forward_sum_r = 0.0, forward_sumsq_r = 0.0,
-                   last_observed_at = NULL, alpha_spent = 0.0, looks_done = 0,
-                   note = COALESCE(note, '') || ?
-               WHERE rule_id = ?""",
-            [restart_at, note, rid])
-        restarted.append(rid)
-    if restarted:
-        from .util import log
-        log("research", f"restarted the forward clock of {len(restarted)} runner rule(s): "
-                        f"{', '.join(restarted)}")
-    return restarted
+               SET state = 'RETIRED', retired_at = ?, note = COALESCE(note, '') || ?
+               WHERE rule_id = ?""", [at, note, rid])
+    from .util import log
+    log("research", f"retired {len(ids)} rule(s) of the removed runner lane")
+    return ids
 
 
 def gapfield_rows(con: Any, d: date) -> list[dict]:
@@ -1066,11 +927,11 @@ def observe_session(con: Any, d: date, lanes: Iterable[str] | None = None) -> di
 
     For each QUARANTINED or VALIDATED rule with a predicate, every fill-valid
     row of its lane from `d` whose buckets match the predicate is one forward
-    observation -- one per (session, industry) unit for the runner lane.
+    observation -- one per (session, industry) unit for the gap-field lane.
     `record_rule_observation` keeps the forward-only guard and is idempotent on
     source_key, so a retried evening changes nothing.
     """
-    restart_runner_forward_clocks(con)
+    retire_removed_lane_rules(con, d)
     reopen_underpowered_retirements(con, d)
     rules = con.execute(
         """SELECT rule_id, lane, predicate_json FROM research_rules
@@ -1084,28 +945,15 @@ def observe_session(con: Any, d: date, lanes: Iterable[str] | None = None) -> di
         return out
     cache: dict[str, list[dict]] = {}
     counterfactual: list[tuple[str, str, dict]] | None = None
-    exit_deltas: dict[str, float] | None = None
     out["counterfactual"] = 0
     for rid, lane, pred_json in rules:
         try:
             pred = json.loads(pred_json)
         except (TypeError, ValueError):
             continue
-        if lane == EXIT_LANE:
-            # One observation per SESSION: that session's mean paired ΔR of
-            # the policy against the plan, on the same candidates and fills.
-            if exit_deltas is None:
-                exit_deltas = _exit_session_deltas(con, d)
-            policy = (pred.get("conditions") or [{}])[0].get("level")
-            if policy in exit_deltas and record_rule_observation(
-                    con, rid, d, exit_deltas[policy], f"runner_exit:{d}:{policy}",
-                    "runner_exit"):
-                out["recorded"] += 1
-            continue
         if lane not in cache:
             cache[lane] = (morning_rows(con, d) if lane == "morning"
-                           else gapfield_rows(con, d) if lane == "gapfield"
-                           else runner_rows(con, d))
+                           else gapfield_rows(con, d) if lane == "gapfield" else [])
         hits = [row for row in cache[lane] if matches(pred, row)]
         if lane == "morning":
             for row in hits:
@@ -1114,15 +962,13 @@ def observe_session(con: Any, d: date, lanes: Iterable[str] | None = None) -> di
                     out["recorded"] += 1
         else:
             # One observation per (session, industry) UNIT, valued at its rows'
-            # mean R (agent/clusters.py). Recorded per row, a runner rule could
+            # mean R (agent/clusters.py). Recorded per row, a rule could
             # collect its whole forward n on one session: thirty-odd regional
             # banks firing in one half hour are one event, not thirty.
             from .clusters import units
-            prefix, source = (("gapfield", "gapfield") if lane == "gapfield"
-                              else ("runner", "runner_field"))
             for (sess, cluster), vals in units(hits, realized_r).items():
-                key = f"{prefix}:{sess}:{cluster}"
-                if record_rule_observation(con, rid, d, sum(vals) / len(vals), key, source):
+                key = f"gapfield:{sess}:{cluster}"
+                if record_rule_observation(con, rid, d, sum(vals) / len(vals), key, "gapfield"):
                     out["recorded"] += 1
         # EVIDENCE_BACKLOG_SPEC_v1 Phase 5: the desk's counterfactual streams
         # -- rejected candidates (shadow ledger) and the gap population's

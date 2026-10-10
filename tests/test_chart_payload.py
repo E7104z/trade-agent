@@ -1,6 +1,6 @@
 """Tests for agent/chart_payload.py (specs/CHART_DRAWER_SPEC_v1.md §1.6).
 
-Conventions follow tests/test_dashboard_payload.py / tests/test_runner_view.py:
+Conventions follow tests/test_dashboard_payload.py:
 a real ledger on a temp DuckDB file so migrations actually run, rather than a
 mocked connection.
 """
@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from agent import chart_payload, indicators as ind, ledger, runner_indicators as ri
+from agent import chart_payload, indicators as ind, ledger
 from agent.config import Config, _DEFAULTS
 from agent.grading import CURRENT_SIM_VERSION
 from agent.util import ET
@@ -124,33 +124,10 @@ def test_aggregate_passthrough_for_tf_1():
     assert chart_payload.aggregate(bars, 1) == bars
 
 
-# --------------------------------------------------------------- runner parity
-
-def test_runner_series_matches_runner_indicators_at_detection_bar():
-    """The chart's Runner vwap/ema9 at the first_pass_et bar must equal what
-    runner_indicators itself computes over the identical prefix -- proving
-    Phase 0 §0.3 (native 5Min bars, never 1Min aggregated) was wired right."""
-    d = date(2026, 1, 5)
-    bars_5m = _bars(d, n=20, drift=0.3)  # 20 five-minute-labelled synthetic bars
-    series = chart_payload.series_runner(bars_5m)
-    idx = 10
-    ts_ms = chart_payload._ms(bars_5m[idx]["t"])
-    expected_vwap = ri.vwap(bars_5m[: idx + 1])
-    expected_ema9 = ri.ema(bars_5m[: idx + 1], 9)
-    assert series["vwap"][ts_ms] == round(expected_vwap, 4)
-    assert series["ema9"][ts_ms] == round(expected_ema9, 4)
-
-
-def test_morning_ema9_uses_indicators_module_not_runner_indicators():
+def test_morning_ema9_uses_indicators_module():
     """series_morning_ema9 must match indicators.ema_series (the morning
-    lane's own grading module) exactly -- R-0 for the morning lane. This also
-    guards against a future edit accidentally swapping in `ri` (runner_indicators):
-    the two modules are mathematically identical at seed="sma" (both are a
-    standard SMA-seeded EMA recursion), so the thing worth pinning is WHICH
-    module computed the series, not a forced numeric disagreement -- the
-    payload's own `basis` string names the module, and this test would catch
-    a future change to indicators.ema_series's rounding/seeding just as
-    readily as a wrong-module swap."""
+    lane's own grading module) exactly -- R-0 for the morning lane. A change to
+    indicators.ema_series's rounding or seeding would show up here."""
     d = date(2026, 1, 5)
     bars_5m = _bars(d, n=15, drift=0.15)
     closes = [b["c"] for b in bars_5m]
@@ -211,19 +188,6 @@ def _insert_rejection(con, d, ticker, **overrides):
         [d, ticker]).fetchone()[0]
 
 
-def _insert_runner_candidate(con, d, ticker, **overrides):
-    row = {"session_date": d, "ticker": ticker,
-          "first_pass_et": datetime.combine(d, dtime(10, 20)),
-          "detection_minutes": 50, "scan_pass_et": datetime.combine(d, dtime(10, 20)),
-          "detection_price": 100.0, "vwap": 99.0, "ema9": 98.5,
-          "stop_price": 98.5, "target_price": 103.0, "stop_dist": 1.5,
-          "scan_version": 1}
-    row.update(overrides)
-    cols = list(row)
-    con.execute(f"INSERT INTO runner_candidates ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
-               [row[c] for c in cols])
-
-
 def _insert_live_order(con, d, ticker, order_id, **overrides):
     row = {"live_order_id": order_id, "session_date": d, "ticker": ticker, "side": "buy",
           "qty": 10, "entry_order_type": "market"}
@@ -237,25 +201,14 @@ def test_resolve_contexts_returns_every_lane_present(con):
     d = date(2026, 1, 5)
     pick_id = _insert_pick(con, d, MOCK_TICKER)
     rej_id = _insert_rejection(con, d, MOCK_TICKER)
-    _insert_runner_candidate(con, d, MOCK_TICKER)
     _insert_live_order(con, d, MOCK_TICKER, "order-1")
     ctxs = chart_payload.resolve_contexts(con, MOCK_TICKER, d)
     lanes = {c["lane"] for c in ctxs}
-    assert lanes == {"morning", "shadow", "runner", "live"}
+    assert lanes == {"morning", "shadow", "live"}
     ids = {c["lane"]: c["id"] for c in ctxs}
     assert ids["morning"] == pick_id
     assert ids["shadow"] == rej_id
     assert ids["live"] == "order-1"
-
-
-def test_resolve_contexts_runner_items_in_ticker_order(con):
-    d = date(2026, 1, 5)
-    for t in ("ZWZY", "AAPL", "MSFT"):
-        _insert_runner_candidate(con, d, t)
-    # resolve_contexts is per-ticker; verify the underlying ledger call (which
-    # every runner-lane listing in the app uses) is alphabetical -- R-1.
-    rows = ledger.runner_candidates_for_date(con, d)
-    assert [r["ticker"] for r in rows] == sorted(r["ticker"] for r in rows)
 
 
 # -------------------------------------------------------------------- as-of
@@ -378,11 +331,6 @@ def test_trade_summary_live_prefers_broker_legs_and_reports_unrealized():
     assert s["direction"] == "long"
     assert s["result"] == {"label": "Unrealized", "r": 0.4}
     assert s["status"] == "Position open"
-
-
-def test_runner_summary_labels_entry_as_detection():
-    s = chart_payload.trade_summary(_summary_out(lane="runner"))
-    assert s["entry_label"] == "Detection"
 
 
 def test_build_attaches_summary_and_series_bar_minutes(con, cfg):

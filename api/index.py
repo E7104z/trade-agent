@@ -264,71 +264,6 @@ def _pick_bars(picks: list, d) -> dict:
     return out
 
 
-def _runner_payload(con, d) -> dict:
-    """Today's runner session for the dashboard, or a marker that it never ran.
-
-    Never raises: a failure in this lane must not take down the whole status
-    endpoint the rest of the desk depends on.
-    """
-    try:
-        from agent import runner_view
-        s = runner_view.session_summary(con, d)
-        picks = con.execute(
-            """SELECT pick_id, ticker, direction, conviction, size_r,
-                      entry_price, stop_price, target_price, thesis
-               FROM picks WHERE plan_date = ? AND setup_type = 'dto_runner'
-               ORDER BY pick_id""", [d]).fetchall()
-        return {
-            "ran": bool(s["session"] or s["rows"]),
-            "health": runner_view._health_line(s),
-            "universe": (s["session"] or {}).get("universe_size") or 0,
-            "n_candidates": s["n_candidates"],
-            "n_selected": s["n_selected"],
-            "n_orders": len(s["orders"]),
-            "degraded": bool((s["session"] or {}).get("provider_degraded")),
-            "skipped_reason": (s["session"] or {}).get("selection_skipped_reason"),
-            # The runner's actual selections, with the thesis the selector wrote
-            # — the "WHY THESE WERE PICKED" evidence that render_text shows but
-            # the dashboard never did. Flat fields only (no nested entry_plan).
-            "picks": [
-                {"ticker": p[1], "direction": p[2], "conviction": p[3],
-                 "size_r": p[4], "entry_price": p[5], "stop_price": p[6],
-                 "target_price": p[7], "thesis": p[8] or ""}
-                for p in picks
-            ],
-            # Rounded for transport only (display precision); the ledger keeps
-            # full precision. Hundreds of rows ride every status poll.
-            "rows": [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()}
-                     for r in sorted(s["rows"],
-                                     key=lambda x: (not x["selected"], x["rank"] or 99,
-                                                    x["ticker"]))],
-            # Same-day eyeball diagnostic, not a retuning signal -- one day's
-            # top N out of hundreds of candidates is noise as training data.
-            # Ranked by the move AFTER detection, (close - plan price) / ATR;
-            # change_pct (the move already made at detection) rides along as
-            # context only. The FDR-corrected, many-session comparison lives in
-            # agent/runner_research.selection_edge() and feeds the weekly
-            # miner, which is the only thing allowed to write a playbook rule.
-            "moves": [
-                {"ticker": r["ticker"], "post_move_atr": r["post_move_atr"],
-                 "change_pct": r["change_pct"], "r": r["r"],
-                 "exit_reason": r["exit_reason"], "invalid_reason": r["invalid_reason"],
-                 "selected": r["selected"], "rank": r["rank"]}
-                for r in runner_view.biggest_moves(s, 10)
-            ],
-            # Selected vs field in planned-risk R, with fills, industry units
-            # and invalid fills counted -- one session, not evidence.
-            "outcomes": runner_view.outcome_summary(s) if s["graded"] else None,
-            # Plan vs the construction arms, and continuation after entry --
-            # one session, descriptive (RUNNER_TRADE_CONSTRUCTION_v1).
-            "construction": runner_view.construction_summary(con, s) if s["graded"] else None,
-            "universe_note": runner_view.universe_line(s),
-        }
-    except Exception as e:
-        return {"ran": False, "health": f"runner view unavailable ({e})",
-                "rows": [], "n_candidates": 0, "n_selected": 0, "n_orders": 0}
-
-
 @app.route("/api/status")
 @login_required
 def api_status():
@@ -340,13 +275,8 @@ def api_status():
         overall = ledger.overall_stats(con)
         by_setup = ledger.stats_by(con, "setup_type")
         streak = ledger.current_streak(con)
-        # Each lane priced at its own $/R: the runner lane sizes at
-        # runner.dollars_per_r, and valuing its R at the morning rate
-        # overstated its P&L several-fold.
-        runner_dpr = (cfg.get("runner", {}) or {}).get("dollars_per_r")
         curve = ledger.equity_curve(con, cfg.get("account_size", 100000),
-                                    cfg.get("dollars_per_r", 500),
-                                    runner_dollars_per_r=runner_dpr)
+                                    cfg.get("dollars_per_r", 500), lane="morning")
         runs = ledger.recent_runs(con, 15)
         playbook_text, version = read_playbook(con)
         equity = curve[-1]["equity"] if curve else cfg.get("account_size", 100000)
@@ -381,10 +311,6 @@ def api_status():
             "drawdown_pause_r": float(cfg.get("drawdown_pause_r", -4.0)),
             # Is every stage of the learning loop actually completing?
             "loop_health": health.loop_health(con, cfg),
-            # Runner lane: the whole session, so the dashboard can show what was
-            # scanned, what was picked, and - critically - whether a thin
-            # candidate list was the market or a broken feed.
-            "runner": _runner_payload(con, d),
             "by_setup": by_setup,
             "streak": streak_str,
             "streak_detail": streak,
@@ -393,8 +319,7 @@ def api_status():
             # Conclusions & Changes: everything the weekly miner and evening
             # grader concluded, read back so a human can see the current best
             # edge, the active lessons, the shadow-ledger cost, the calibration
-            # and management verdicts, and the FDR-corrected runner selection
-            # edge — the same numbers that actually drive future playbooks.
+            # and management verdicts — the same numbers that actually drive future playbooks.
             "conclusions": dashboard_lib.conclusions_payload(con),
             # Arby parity: the static dashboard inlines these as boot data, so
             # the hosted mascot gets the identical contract (playbook_bullets
@@ -436,13 +361,11 @@ def api_paper():
     because the dashboard polls."""
     cfg = load_config()
     live = cfg.get("live_paper", {}) or {}
-    rcfg = cfg.get("runner", {}) or {}
     now = time.monotonic()
     cached = _PAPER_CACHE.get("data")
     if cached is not None and now - _PAPER_CACHE["at"] < _PAPER_TTL:
         return json_response(cached, compact=True)
     out: dict = {"enabled": bool(live.get("enabled")),
-                 "runner_orders_enabled": bool(rcfg.get("live_orders_enabled")),
                  "breakout_two_step": bool(live.get("breakout_two_step"))}
     if not out["enabled"]:
         return json_response(out, compact=True)
@@ -482,8 +405,6 @@ def api_paper():
         out["ledger_today"] = ledger.live_orders_for_date(con, d)
         for row in out["ledger_today"]:
             row.pop("raw_order_json", None)
-        sess = ledger.runner_session(con, d) or {}
-        out["runner_note"] = sess.get("live_orders_note")
         hb = ledger.last_beat(con, "intraday_check")
         out["heartbeat"] = hb
         if hb and hb.get("last_at"):
@@ -568,11 +489,6 @@ _QUERYABLE_TABLES = {
     "calibration": "session_date",
     "rule_confirmations": "session_date",
     "open_question_progress": "session_date",
-    "runner_candidates": "session_date",
-    "runner_candidate_outcomes": "session_date",
-    "runner_sessions": "session_date",
-    # RUNNER_EXIT_SPEC_v1: each triggered candidate under every exit policy.
-    "runner_exit_replays": "session_date",
     "live_orders": "session_date",
     # The integrity layer's own state (INTEGRITY_REPAIR_SPEC_v1 Phase 1).
     # Without these, whether a false survivor was recorded, or whether any
@@ -679,7 +595,7 @@ def api_table(name: str):
 
 # ------------------------------------------------------------------ run loops
 
-_VALID_LOOPS = {"morning", "evening", "weekly", "runner", "nightly"}
+_VALID_LOOPS = {"morning", "evening", "weekly", "nightly"}
 
 
 def _weekly_run_date():
@@ -719,16 +635,6 @@ def _execute_loop(loop_name: str, cfg, force: bool) -> dict:
             elif loop_name == "evening":
                 from agent.loops import evening
                 evening.run(cfg, force=force)
-            elif loop_name == "runner":
-                # Runs the scan SERVER-SIDE, so its evidence lands in the same
-                # Postgres the dashboard reads. Running it locally writes to a
-                # local DuckDB the hosted dashboard cannot see -- which is the
-                # entire reason the Runner card kept showing "no scan recorded"
-                # while the lane was in fact working fine on the local machine.
-                from agent.loops import runner as runner_loop
-                from agent.util import now_et
-                result = runner_loop.tick(cfg, at=now_et())
-                print(json.dumps(result, indent=2, default=str))
             else:
                 from agent.loops import weekly
                 weekly.run(cfg, run_date=_weekly_run_date())
@@ -767,7 +673,7 @@ def run_loop(loop_name: str):
 # Vercel Hobby restricts cron FREQUENCY (at most once per day per job), not the
 # NUMBER of jobs -- an earlier comment here claimed a hard max of two, which was
 # wrong and cost this project a working intraday trigger for days. Three
-# once-per-day crons deploy fine (morning / evening / runner, verified
+# once-per-day crons deploy fine (morning / evening, verified
 # 2026-09-18). A "*/5 13-20 * * 1-5" expression IS rejected, with the explicit
 # reason that it "would run more than once per day".
 #
@@ -786,25 +692,16 @@ def run_loop(loop_name: str):
 # enough to accept the one-hour EST/EDT drift (morning fires ~7:11 ET in
 # summer, ~6:11 in winter).
 #
-# runner: "30 14" lands ~11:18 ET in summer but ~10:18 ET in winter -- BEFORE
-# scan_start_et (10:20) and the 10:30 decision time, which would stand the
-# lane down every day from November to March. "runner-late" ("30 15") lands
-# 11:30-12:29 ET in summer and 10:30-11:29 in winter, so every season has at
-# least one tick inside the scan window and past the decision time. Two ticks
-# are safe by construction: candidates dedupe per session and selection is
-# claimed once per session in the database.
 # nightly: "0 3" UTC lands 23:00-23:59 ET in summer, 22:00-22:59 in winter --
 # after the evening cron in every season, long before the morning's.
 # morning-continue: the morning's risk half. The analyst half dispatches it
 # with `rid` (its own request id) seconds after finishing; the "15 12" cron
 # (08:15-09:14 ET in summer, 07:15-08:14 in winter) is the safety net that
 # resumes a checkpoint the dispatch never reached, before the open.
-_CRON_WINDOWS = {"morning": (5, 10), "evening": (15, 19), "runner": (9, 12),
-                 "runner-late": (9, 12), "weekly": (6, 14), "nightly": (21, 23),
-                 "morning-continue": (5, 10)}
-_CRON_LOOP = {"morning": "morning", "evening": "evening", "runner": "runner",
-              "runner-late": "runner", "weekly": "weekly", "nightly": "nightly",
-              "morning-continue": "morning-continue"}
+_CRON_WINDOWS = {"morning": (5, 10), "evening": (15, 19), "weekly": (6, 14),
+                 "nightly": (21, 23), "morning-continue": (5, 10)}
+_CRON_LOOP = {"morning": "morning", "evening": "evening", "weekly": "weekly",
+              "nightly": "nightly", "morning-continue": "morning-continue"}
 
 
 @app.route("/cron/<loop_name>", methods=["GET"])
@@ -853,13 +750,9 @@ def intraday_check():
     # the GitHub Actions cron discards the body.
     result = dict(monitor)
     result["monitor"] = monitor
-    # The runner lane runs second, inside try/except. This is required, not
-    # defensive habit: the runner lane must never be able to break the live
-    # position monitor, and a monitor that stops running is a real position
-    # left unwatched.
     from agent.util import is_market_day, log
     # Positions a missed end-of-day flatten left open overnight are closed on
-    # the first tick of the next session. Guarded like the runner: it must
+    # the first tick of the next session. Guarded: it must
     # never break the monitor that already ran above.
     if ((cfg.get("live_paper", {}) or {}).get("enabled") and is_market_day(today_et())):
         try:
@@ -873,7 +766,7 @@ def intraday_check():
             log("intraday", f"WARN carry cleanup failed; monitor unaffected: {e}")
             result["carry"] = {"error": str(e)}
         # Morning limit/breakout picks go live at their entry window (09:45 by
-        # default), not on the opening print. Guarded like the runner.
+        # default), not on the opening print. Guarded: it never breaks the monitor.
         try:
             from agent.live_monitor import place_deferred_orders
             from agent.util import now_et
@@ -885,13 +778,6 @@ def intraday_check():
         except Exception as e:
             log("intraday", f"WARN deferred order placement failed; monitor unaffected: {e}")
             result["deferred"] = {"error": str(e)}
-    if (cfg.get("runner", {}) or {}).get("enabled"):
-        try:
-            from agent.loops.runner import tick
-            result["runner"] = tick(cfg)
-        except Exception as e:
-            log("runner", f"WARN runner tick failed; monitor unaffected: {e}")
-            result["runner"] = {"error": str(e)}
     # A broker 401 is the credentials, not an order: every live position is
     # unmanaged until the key pair is fixed, so the owner hears about it once.
     try:
@@ -911,9 +797,7 @@ def intraday_check():
         con = ledger.connect()
         try:
             ledger.beat(con, "intraday_check", json.dumps(
-                {"monitor": {k: monitor.get(k) for k in ("skipped", "reason", "updated")},
-                 "runner": {k: (result.get("runner") or {}).get(k)
-                            for k in ("skipped", "candidates", "universe_size", "error")}},
+                {"monitor": {k: monitor.get(k) for k in ("skipped", "reason", "updated")}},
                 default=str))
         finally:
             con.close()
@@ -949,7 +833,7 @@ def api_chart():
     except Exception:
         return json_response({"error": "invalid date"}, 400)
     lane = request.args.get("lane") or None
-    if lane not in (None, "morning", "shadow", "runner", "live"):
+    if lane not in (None, "morning", "shadow", "live"):
         return json_response({"error": f"unknown lane {lane!r}"}, 400)
     raw_id = request.args.get("id")
     ctx_id: Any = None
@@ -957,7 +841,7 @@ def api_chart():
         try:
             ctx_id = int(raw_id)
         except ValueError:
-            ctx_id = raw_id  # runner id is "TICKER:DATE"; live id is a broker order id string
+            ctx_id = raw_id  # live id is a broker order id string
     try:
         tf = int(request.args.get("tf", 5))
     except ValueError:
@@ -983,46 +867,6 @@ def api_chart():
         con.close()
     _CHART_CACHE[cache_key] = (now, payload)
     return json_response(payload, compact=True)
-
-
-@app.route("/api/runner/candidates")
-@login_required
-def api_runner_candidates():
-    """Candidates for one session, alphabetical (spec R-1: detection must not
-    rank). Defaults to today."""
-    con = ledger.connect()
-    try:
-        d = parse_date(request.args["date"]) if request.args.get("date") else today_et()
-        rows = ledger.runner_candidates_for_date(con, d)
-        outcomes = {o["ticker"]: o for o in ledger.runner_outcomes_for_date(con, d)}
-        for r in rows:
-            r["outcome"] = outcomes.get(r["ticker"])
-        return json_response({"date": d.isoformat(), "count": len(rows),
-                              "session": ledger.runner_session(con, d),
-                              "candidates": rows})
-    finally:
-        con.close()
-
-
-@app.route("/api/runner/sessions")
-@login_required
-def api_runner_sessions():
-    """Per-session scan telemetry — the stand-down-vs-outage discriminator.
-
-    A zero-candidate day with universe_size 0 or provider_degraded true is a
-    pipeline failure; a zero-candidate day with a full universe and a high
-    rejected_conditions is a genuine stand-down. Vercel keeps logs about an
-    hour, so this table is the durable record.
-    """
-    con = ledger.connect()
-    try:
-        try:
-            limit = max(1, min(int(request.args.get("limit", 40)), 400))
-        except ValueError:
-            limit = 40
-        return json_response({"sessions": ledger.recent_runner_sessions(con, limit)})
-    finally:
-        con.close()
 
 
 # Local dev convenience: `python api/index.py` runs a normal Flask dev server.

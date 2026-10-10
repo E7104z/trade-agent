@@ -278,12 +278,57 @@ def _cached_industries(con: Any, symbols: Iterable[str]) -> dict[str, str]:
 # Fetching
 # --------------------------------------------------------------------------
 
+def instrument_classes(md, con, d, *, force: bool = False) -> dict | None:
+    """{"common": {SYM: registered name}, "other": {SYM: class}} for every
+    active, tradable asset, cached per session. None when the asset list is unavailable --
+    the caller then records the universe as unclassified rather than guessing.
+
+    Covers ALL tradable assets, not only a fractionable subset.
+    """
+    from . import instruments, ledger
+    if con is not None and not force:
+        cached = ledger.get_universe_cache(con, d, kind="classes")
+        if cached and isinstance(cached["payload"].get("common"), dict):
+            return cached["payload"]
+    alp = getattr(md, "alpaca", None)
+    if alp is None or not hasattr(alp, "asset_records"):
+        return None
+    try:
+        records = alp.asset_records()
+    except Exception as e:
+        _log(f"WARN asset list unavailable for instrument classes: {e}")
+        return None
+    if not records:
+        return None
+    common: dict[str, str] = {}
+    other: dict[str, str] = {}
+    for a in records:
+        sym = str(a.get("symbol") or "").upper()
+        if not sym:
+            continue
+        cls = instruments.classify(a.get("name"))
+        if cls == instruments.COMMON:
+            common[sym] = a.get("name") or ""
+        else:
+            other[sym] = cls
+    payload = {"common": common, "other": other}
+    if con is not None:
+        try:
+            ledger.save_universe_cache(
+                con, d, payload, kind="classes", n=len(common),
+                source=f"assets={len(records)} common={len(common)} other={len(other)}")
+        except Exception as e:
+            _log(f"WARN could not cache instrument classes: {e}")
+    _log(f"instrument classes built: {len(common)} common, {len(other)} other "
+                  f"of {len(records)} tradable assets")
+    return payload
+
+
 def universe(md: Any, con: Any, d: date) -> list[str]:
-    """Operating companies' common stock, by registered name (the runner's
-    instrument classes, cached per session), shape-filtered like the runner's
-    tradable list. Index ETFs and leveraged products are never in it."""
+    """Operating companies' common stock, by registered name (instrument
+    classes, cached per session), shape-filtered to plain tickers. Index ETFs
+    and leveraged products are never in it."""
     from .providers import EXCLUDED_PRODUCTS, INDEX_ETFS, is_common_stock_symbol
-    from .runner_universe import instrument_classes
     classes = instrument_classes(md, con, d) or {}
     common = classes.get("common") or {}
     out = []

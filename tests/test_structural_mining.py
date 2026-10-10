@@ -71,7 +71,7 @@ def test_pair_spec_never_declares_more_than_two_dimensions():
 
 def test_an_inadmissible_pair_is_listed_not_computed():
     rows = [_row("gap_go", "up", 1.0) for _ in range(20)]      # one setup level only
-    comps, status = structural.pair_comparisons({"morning": rows, "runner": []})
+    comps, status = structural.pair_comparisons({"morning": rows})
     st = {s["pair"]: s["admitted"] for s in status}
     assert st["regime_tag|setup_type"] is False
     assert not any(c.dimension == "regime_tag|setup_type" for c in comps)
@@ -81,7 +81,7 @@ def test_an_admissible_pair_emits_two_dimension_cells():
     rng = random.Random(3)
     rows = [_row(s, reg, rng.gauss(0, 1)) for s in ("gap_go", "breakout")
             for reg in ("up", "down") for _ in range(9)]
-    comps, _ = structural.pair_comparisons({"morning": rows, "runner": []})
+    comps, _ = structural.pair_comparisons({"morning": rows})
     cells = {c.level: c for c in comps if c.dimension == "regime_tag|setup_type"}
     assert set(cells) == {"down|breakout", "down|gap_go", "up|breakout", "up|gap_go"}
     assert all(c.n_dimensions == 2 and c.n == 9 for c in cells.values())
@@ -119,28 +119,6 @@ def test_a_finding_that_holds_everywhere_is_structural():
     res = structural.consistency(_survivor("setup_type", "gap_go", 0.7), {"morning": rows})
     assert res[0]["structural"] is True and res[0]["strata"] >= 2
     assert "STRUCTURAL" in structural.consistency_md(res)
-
-
-def test_a_shared_dimension_is_read_in_the_other_lane_too():
-    morning = [_row("gap_go", "up", 1.0, stop_dist_atr=0.7) for _ in range(10)]
-    # Nine runner rows in nine DIFFERENT industries: nine units.
-    runner = [{"stop_dist_atr": 0.7, "r_multiple": -1.0, "session_date": date(2026, 9, 1),
-               "ticker": f"T{i}", "industry": f"Industry {i}"} for i in range(9)]
-    res = structural.consistency(_survivor("stop_atr_bucket", "0.5-1", 1.0),
-                                 {"morning": morning, "runner": runner})
-    assert res[0]["detail"]["lane=runner"] == {"n": 9, "sign": "-"}
-    assert res[0]["structural"] is False
-
-
-def test_one_sessions_industry_is_one_runner_observation_not_nine():
-    """Nine banks on one morning are one event: as a stratum they are n=1, so
-    they can neither confirm nor contradict a finding (agent/clusters.py)."""
-    morning = [_row("gap_go", "up", 1.0, stop_dist_atr=0.7) for _ in range(10)]
-    runner = [{"stop_dist_atr": 0.7, "r_multiple": -1.0, "session_date": date(2026, 9, 1),
-               "ticker": f"B{i}", "industry": "Banks - Regional"} for i in range(9)]
-    res = structural.consistency(_survivor("stop_atr_bucket", "0.5-1", 1.0),
-                                 {"morning": morning, "runner": runner})
-    assert "lane=runner" not in res[0]["detail"]
 
 
 # ------------------------------------------------------------------ Phase 3

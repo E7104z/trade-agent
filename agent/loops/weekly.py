@@ -152,8 +152,8 @@ def _selection_edge_md(history: list[dict]) -> str:
     for r in history:
         n = r.get("n_triggered") or 0
         # A row computed by an older ablation method is WITHDRAWN, numbers and
-        # verdict both: method 1 compared triggered-only desk picks (runner
-        # picks included) against a pool padded with 0R non-triggers, which
+        # verdict both: method 1 compared triggered-only desk picks (legacy
+        # runner picks included) against a pool padded with 0R non-triggers, which
         # ranks any losing book near the bottom whatever its selection skill.
         # Printed beside method-2 rows it would read as a trend.
         if (r.get("method_version") or 1) < METHOD_VERSION:
@@ -228,9 +228,8 @@ def _counterfactuals_md(mem: dict) -> str:
                             f"p={sc.get('size_r_p'):.3f} (the test of that sign)")
     return (
         "## DETERMINISTIC COUNTERFACTUALS (computed by the system, not the LLM)\n\n"
-        "MORNING LANE ONLY. Runner picks share the ledger but are a different "
-        "strategy (EMA9 stop, fixed 2R target, fixed 0.25R size); they are measured "
-        "in the runner block and never pooled here.\n\n"
+        "MORNING LANE ONLY. Legacy rows of the retired runner lane share the "
+        "ledger but are never pooled here.\n\n"
         f"Every average below carries ITS OWN n. Readings are suppressed below "
         f"n={MIN_INTERPRETABLE_N}: a suppressed metric may be quoted as a number, "
         "but you may not call it positive or negative, may not contrast two "
@@ -730,8 +729,8 @@ def _fmt_r(v) -> str:
 def _calibration_section(cal: list[dict], evals: list[dict]) -> list[str]:
     by_c = {int(c["conviction"]): c for c in cal if c.get("conviction") is not None}
     lines = ["",
-             "> System-rendered from the calibration rows: MORNING lane only (runner-lane",
-             "> rows excluded), all sessions -- not the funnel's trailing window. WR/avgR",
+             "> System-rendered from the calibration rows: MORNING lane only (legacy",
+             "> runner rows excluded), all sessions -- not the funnel's trailing window. WR/avgR",
              "> are shown only at n >= 8; the verdict is Open Question 3's computed test,",
              "> not a reading of this table.",
              "",
@@ -761,143 +760,6 @@ def _selection_edge_section(history: list[dict]) -> list[str]:
              "> random draws of the same number from the same session's candidates. Morning",
              "> lane only. Rows from an older method are withdrawn, not compared."]
             + body + [""])
-
-
-def _runner_section(research_block: dict, states: list[dict]) -> list[str]:
-    from ..research import EXIT_LANE
-    from ..runner_research import DRIFT_ALL, MIN_CONTESTED_SESSIONS
-    from ..runner_selection import NO_RUNNER_RULES
-    # Exit-policy / construction-arm rules say HOW to trade a candidate, not
-    # WHICH; they are listed below, never as selection rules.
-    validated = [s for s in states if s.get("state") == "VALIDATED"
-                 and s.get("lane") != EXIT_LANE
-                 and (s.get("lane") == "runner" or "runner" in " ".join(s.get("dimensions") or []))]
-    lines = [""]
-    if validated:
-        lines.append("Validated runner rules (forward-tested after quarantine):")
-        lines.append("")
-        for s in validated:
-            lines.append(f"- [rule: {s['rule_id']}] {s['statement'][:200]} "
-                         f"(forward n={s['forward_n']})")
-    else:
-        lines.append(f"**{NO_RUNNER_RULES}**")
-    lines += ["",
-              "> System-rendered from the research layer. Measurements, not rules: nothing",
-              "> below tells the selector to prefer or avoid any candidate.",
-              ""]
-    setup = research_block.get("runner_setup_edge") or {}
-    if setup.get("n"):
-        p = setup.get("p_value")
-        reading = ("UNDERPOWERED" if setup.get("underpowered") else
-                   "not distinguishable from zero" if p is None or p >= 0.05 else
-                   ("negative expectancy as detected and simulated" if (setup.get("mean_r") or 0) < 0
-                    else "positive expectancy as detected and simulated"))
-        p_s = "n/a" if p is None else ("<0.001" if p < 0.001 else f"{p:.3f}")
-        lines.append(f"Setup edge (every triggered candidate, current scan/sim version, vs 0): "
-                     f"n={setup['n']} session x industry units "
-                     f"({setup.get('n_rows', setup['n'])} candidates), "
-                     f"mean R {_fmt_r(setup.get('mean_r'))}, p={p_s} -> {reading}.  ")
-    else:
-        lines.append("Setup edge: no triggered candidates under the current scan/sim version.  ")
-    sel = research_block.get("runner_selection_edge") or {}
-    lines.append(f"Selection edge (selected vs unselected, contested sessions only; n = "
-                 f"session x industry units): "
-                 f"{sel.get('n_selected', 0)} selected / {sel.get('n_unselected', 0)} unselected "
-                 f"across {sel.get('sessions_contested', 0)} session(s) -> "
-                 f"{sel.get('verdict', 'not computed')}.  ")
-    rnd = research_block.get("runner_random") or {}
-    if rnd.get("sessions"):
-        rverdict = (f"NO VERDICT (under {MIN_CONTESTED_SESSIONS} contested sessions)"
-                    if rnd["sessions"] < MIN_CONTESTED_SESSIONS else
-                    "beating random" if rnd["percentile"] >= 95 else
-                    "WORSE than random" if rnd["percentile"] <= 5 else
-                    "indistinguishable from random")
-        lines.append(f"Selector vs random draws from its own pool: {rverdict} "
-                     f"({rnd['sessions']} contested session(s)).  ")
-    comps = research_block.get("runner_comps") or []
-    survivors = [c for c in comps if c.significant]
-    degenerate = sorted({f"{c.dimension}={c.level}" for c in comps if c.test == "degenerate"})
-    lines.append("Dimension cells whose mean differs from 0 after FDR (in a losing lane a big "
-                 "cell can pass by being the lane; it is not a separating attribute): "
-                 + ("; ".join(f"{c.dimension}={c.level} n={c.n} mean {_fmt_r(c.mean_r)} "
-                              f"q={c.q_value:.3f}" for c in survivors[:8]) or "none") + ".  ")
-    if degenerate:
-        lines.append("Not tested (one cell holds >= 90% of its dimension, so it restates the "
-                     "lane mean): " + ", ".join(degenerate) + ".")
-
-    # Continuation after entry (drift in ATR, no stop/target): where price
-    # kept going up after the first enterable price. A map, not a rule.
-    drift = research_block.get("runner_drift_comps") or []
-    overall = next((c for c in drift if c.dimension == DRIFT_ALL), None)
-    if overall is not None and overall.n:
-        pos = [c for c in drift if c.significant and c.dimension != DRIFT_ALL
-               and (c.mean_r or 0) > 0]
-        q_s = "n/a" if overall.q_value is None else f"{overall.q_value:.3f}"
-        mean_s = (f"mean drift {_fmt_r(overall.mean_r).rstrip('R')} ATR"
-                  if overall.n >= _RUNNER_MIN_N else f"mean suppressed (n < {_RUNNER_MIN_N})")
-        lines.append(f"Continuation after entry (close vs first enterable price, ATR, every "
-                     f"candidate): n={overall.n} units, {mean_s}, q={q_s}. Buckets with "
-                     "significantly POSITIVE drift after FDR: "
-                     + ("; ".join(f"{c.dimension.split(':', 1)[1]}={c.level} n={c.n} "
-                                  f"{_fmt_r(c.mean_r).rstrip('R')} ATR" for c in pos[:6])
-                        or "none") + ".  ")
-    else:
-        lines.append("Continuation after entry: not measured yet under the current versions.  ")
-
-    # The construction arms (stop floor, dashboard rules, both) and the exit
-    # grid: paired ΔR vs the plan, and where each stands in forward validation.
-    exits = {c.level: c for c in research_block.get("runner_exit_comps") or []}
-    expect = {c.level: c for c in research_block.get("runner_expectancy_comps") or []}
-    arm_state = {(s.get("predicate") or {}).get("conditions", [{}])[0].get("level"): s
-                 for s in states if s.get("lane") == EXIT_LANE}
-
-    def _pays(name: str) -> bool:
-        e = expect.get(name)
-        return bool(e is not None and e.significant and (e.mean_r or 0) > 0)
-
-    from ..runner_exits import ARMS
-    bits = []
-    for name in ARMS:
-        c, st = exits.get(name), arm_state.get(name)
-        if c is None or not c.n:
-            bits.append(f"{name}: no replays yet")
-            continue
-        if c.n < _RUNNER_MIN_N:
-            # n<8 suppression: the selector reads this section the same day.
-            bits.append(f"{name}: {c.n} session(s), under n={_RUNNER_MIN_N}, ΔR suppressed")
-            continue
-        q_s = "n/a" if c.q_value is None else f"{c.q_value:.3f}"
-        e = expect.get(name)
-        e_s = ("" if e is None or e.mean_r is None else
-               f", own mean {_fmt_r(e.mean_r)}/session"
-               f"{' (positive after FDR)' if _pays(name) else ' (not a positive expectancy)'}")
-        status = (f"{st['state']} (forward n={st['forward_n']}/{st['forward_n_required']})"
-                  if st else ("candidate" if c.significant and (c.mean_r or 0) > 0
-                              else "not a candidate"))
-        bits.append(f"{name}: ΔR {_fmt_r(c.mean_r)}/session over {c.n} session(s), "
-                    f"q={q_s}{e_s}, {status}")
-    lines.append("Construction arms vs the plan (paired, same candidates, R in each arm's "
-                 "own risk unit; a wider stop holds fewer shares, so beating the plan can be "
-                 "a smaller loss, not an edge): " + "; ".join(bits) + ".  ")
-    from ..runner_research import lane_verdict
-    lines.append(lane_verdict(int(research_block.get("runner_drift_sessions") or 0),
-                              drift, list(exits.values()), list(expect.values())) + "  ")
-    validated = [lvl for lvl, s in arm_state.items() if s.get("state") == "VALIDATED"]
-    live_ok = [lvl for lvl in validated if _pays(lvl)]
-    not_paying = [lvl for lvl in validated if not _pays(lvl)]
-    msg = "Live runner orders keep the plan bracket (9 EMA stop, 2R target). "
-    if live_ok:
-        msg += ("Forward-VALIDATED, with positive expectancy of its own, awaiting Jason's "
-                "approval for live management: " + ", ".join(map(str, live_ok)) + ". ")
-    if not_paying:
-        msg += ("Forward-validated as better than the plan but NOT making money on its own, "
-                "so not a live candidate: " + ", ".join(map(str, not_paying)) + ". ")
-    if not validated:
-        msg += ("No arm or exit policy has validated on forward sessions, so none may "
-                "change a live order.")
-    lines.append(msg.rstrip())
-    lines.append("")
-    return lines
 
 
 def _shadow_section(sh: dict, pt: dict) -> list[str]:
@@ -970,7 +832,6 @@ def _system_sections(mem: dict, research_block: dict, evals: list[dict],
     return {
         "calibration": _calibration_section(mem.get("calibration") or [], evals),
         "selection edge": _selection_edge_section(se_history),
-        "runner lane": _runner_section(research_block, list(research_block.get("states") or [])),
         "shadow ledger": _shadow_section(sh, pt),
         "participation funnel": _participation_section(pt, sh),
         "open questions": question_eval.playbook_md(evals),
@@ -1119,75 +980,6 @@ def _check_sizing_banner(playbook_md: str) -> list[str]:
     if count > 1:
         violations.append(
             f"Sizing Policy banner appears {count} times; it must appear exactly once")
-    return violations
-
-
-# A row of the runner candidate-dimension table:
-# | runner_tc_bucket | 75-85 | 4 | 0.812 | 0.4400 |
-_RUNNER_ROW = re.compile(
-    r"^[|]\s*(runner_[a-z0-9_]+)\s*[|]\s*([^|]+?)\s*[|]\s*(\d+)\s*[|]\s*([^|]+?)\s*[|]")
-
-_RUNNER_MIN_N = 8
-
-
-def _check_runner_section(playbook_md: str) -> list[str]:
-    """The Runner Lane section: present, and honest at low n.
-
-    This section is checked apart from the rest of the document because it has
-    a consumer the rest does not. The intraday selector reads ONLY this
-    section and acts on it the same morning, hours before the outcome exists
-    -- so a sentence written here becomes an order before anything can
-    contradict it. Everywhere else in the playbook an unearned claim costs a
-    week; here it costs a day's trades.
-
-    Extraction deliberately calls the selector's own
-    `runner_playbook_section` rather than re-implementing it. A checker with
-    its own parser could pass a section the selector never finds, which is
-    precisely the failure being closed: the research layer computed a full
-    runner block every week and the selector read the placeholder anyway,
-    because nothing connected the two.
-
-    Three failures, all observed shapes:
-
-      MISSING       no runner heading at all -- the selector silently falls
-                    back to "no validated rules" and the week's runner
-                    research reaches nobody.
-      SMALL-N MEAN  a per-bucket mean R quoted over a handful of candidates.
-                    Same floor the Calibration and Selection Edge tables
-                    already enforce; this table was simply shaped differently
-                    from anything the existing scanners could see.
-      CONTRADICTION the section declares it has no validated rules while
-                    carrying a [rule: Rxxx] tag. One of the two is wrong, and
-                    the selector cannot tell which.
-    """
-    from ..runner_selection import NO_RUNNER_RULES, runner_playbook_section
-
-    section = runner_playbook_section(playbook_md or "")
-    if section == NO_RUNNER_RULES:
-        return ["playbook has no Runner Lane section; the intraday selector "
-                "will read the no-validated-rules placeholder and this week's "
-                "runner research reaches nothing"]
-
-    violations = []
-    empty = {"", "-", "—", "--", "n/a", "na", "suppressed",
-             "insufficient data", "not computable"}
-    for line in section.splitlines():
-        m = _RUNNER_ROW.match(line.strip())
-        if not m:
-            continue
-        n = int(m.group(3))
-        mean_r = m.group(4).strip().lower()
-        if n < _RUNNER_MIN_N and mean_r not in empty:
-            violations.append(
-                f"runner dimension {m.group(1)}/{m.group(2).strip()} shows "
-                f"mean R={m.group(4).strip()} at n={n} (floor is "
-                f"n={_RUNNER_MIN_N}): {line.strip()[:160]}")
-
-    flat = " ".join(section.split()).lower()
-    if "no validated runner rules" in flat and "[rule: r" in flat:
-        violations.append(
-            "Runner Lane declares it has no validated rules while carrying a "
-            "[rule: Rxxx] tag -- the selector cannot tell which claim to act on")
     return violations
 
 
@@ -1355,9 +1147,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
         user = (
             f"# WEEKLY REVIEW — {d.isoformat()}\n\n"
             f"## OVERALL RECORD\n\n{json.dumps(overall, indent=2)}\n\n"
-            "By lane (the morning premarket lane and the intraday runner lane "
-            "are different strategies with different sizing -- never pool them "
-            "into one claim):\n\n"
+            "By lane (never pool lanes into one claim):\n\n"
             f"{json.dumps(mem.get('overall_by_lane') or {}, indent=2)}\n\n"
             f"{_fmt_stats(mem['by_setup'], 'setup_type')}\n\n"
             f"{_fmt_stats(mem['by_regime'], 'regime_tag')}\n\n"
@@ -1455,8 +1245,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             comps = list(getattr(research_block.get("search"), "comparisons", None) or [])
             rows_by_lane = {}
             try:
-                rows_by_lane = {"morning": research.morning_rows(con),
-                                "runner": research.runner_rows(con)}
+                rows_by_lane = {"morning": research.morning_rows(con)}
             except Exception as e:
                 log("weekly", f"WARN could not load rows for 2-D discovery stats: {e}")
             for c in candidates:
@@ -1479,8 +1268,7 @@ def run(cfg: Config, run_date: date | None = None) -> None:
             # the offending line/row/section is repaired deterministically
             # (withheld text kept in playbook_violations), the result is
             # re-checked, and only a document with zero blocking violations is
-            # written. The Runner Lane -- read by the intraday selector the
-            # same day -- falls back to an explicit no-rules statement.
+            # written.
             stale_rules = [r for r in mem.get("rule_staleness", []) or []
                            if (r.get("sessions_since") or 0) >= STALE_SESSIONS]
             computed = None

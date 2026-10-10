@@ -71,7 +71,7 @@ def _on_or_after(d: Any, since: Any) -> bool:
 def collect(con: Any, sessions: int | None = 10, since: Any = None) -> dict[str, dict]:
     """{group label: readings} for the most recent `sessions` sessions of each
     group (None = all), on or after `since` when given. Morning sessions are
-    daily_plans rows; runner sessions are runner_sessions rows. Never raises."""
+    daily_plans rows. Never raises."""
     groups: dict[str, dict] = {}
 
     # --- morning lane: one session per daily_plans row ---------------------
@@ -153,28 +153,6 @@ def collect(con: Any, sessions: int | None = 10, since: Any = None) -> dict[str,
                   else f"genuine ({category or 'no category stored'})"] += 1
         g["stand_down_reasons"] = dict(stand)
 
-    # --- runner lane: one session per runner_sessions row ------------------
-    stamps = dict(_q(con, f"""SELECT plan_date, MAX(persona_version) FROM picks
-                             WHERE setup_type = '{_RUNNER}' GROUP BY plan_date"""))
-    cands = dict(_q(con, "SELECT session_date, COUNT(*) FROM runner_candidates GROUP BY session_date"))
-    chosen = dict(_q(con, """SELECT session_date, COUNT(*) FROM runner_candidate_outcomes
-                             WHERE selected GROUP BY session_date"""))
-    notes = dict(_q(con, "SELECT session_date, selection_skipped_reason FROM runner_sessions"))
-    runner_by_group: dict[str, list] = {}
-    for d in set(cands) | set(notes):
-        if _on_or_after(d, since):
-            runner_by_group.setdefault(_label(stamps.get(d)), []).append(d)
-    for label, dates in runner_by_group.items():
-        keep = _recent(dates, sessions)
-        g = groups.setdefault(label, {})
-        g["runner_sessions"] = len(keep)
-        g["runner_candidates"] = sum(int(cands.get(d) or 0) for d in keep)
-        g["runner_selected"] = sum(int(chosen.get(d) or 0) for d in keep)
-        drops = 0
-        for d in keep:
-            m = _CAP_NOTE.search(notes.get(d) or "")
-            drops += int(m.group(1)) if m else 0
-        g["runner_cap_drops"] = drops
     return groups
 
 
@@ -233,13 +211,5 @@ def render_text(groups: dict[str, dict], sessions: int | None = 10, since: Any =
             ]
         else:
             out.append("  morning sessions: 0")
-        rs = g.get("runner_sessions") or 0
-        if rs:
-            out += [f"  runner sessions: {rs}; candidates: {g.get('runner_candidates', 0)}; "
-                    f"selected: {g.get('runner_selected', 0)} "
-                    f"(per session {_per(g.get('runner_selected'), rs)}); "
-                    f"industry-cap drops: {g.get('runner_cap_drops', 0)}"]
-        else:
-            out.append("  runner sessions: 0")
         out.append("")
     return "\n".join(out).rstrip() + "\n"

@@ -78,12 +78,10 @@ def test_the_evening_mentions_the_log_only_inside_its_hook():
 # 2 ----------------------------------------------------- no learning import
 
 LEARNERS = ["agent/memory.py", "agent/backlog.py", "agent/research.py", "agent/integrity.py",
-            "agent/runner_selection.py", "agent/runner_research.py", "agent/grading.py",
-            "agent/loops/weekly.py", "agent/loops/morning.py", "agent/loops/runner.py",
+            "agent/grading.py", "agent/loops/weekly.py", "agent/loops/morning.py",
             "agent/loops/paired.py", "agent/playbook_enforcement.py", "agent/question_eval.py",
             "agent/structural.py", "agent/population.py", "agent/ablation.py",
-            "agent/runner_exits.py", "agent/grounding.py", "agent/persona_monitor.py",
-            "agent/llm.py"]
+            "agent/grounding.py", "agent/persona_monitor.py", "agent/llm.py"]
 
 
 @pytest.mark.parametrize("rel", LEARNERS)
@@ -195,15 +193,14 @@ def test_the_grader_prompt_never_carries_the_log(poisoned, monkeypatch):
     assert seen and not any(SENTINEL in s for s in seen)
 
 
-def test_the_runner_selector_and_morning_memory_never_carry_the_log(poisoned):
-    from agent import memory, runner_selection
+def test_morning_memory_never_carries_the_log(poisoned):
+    from agent import memory
     from agent.config import load_config
     cfg = load_config()
     con = ledger.connect()
     try:
         texts = [memory.build_morning_memory(con, cfg)["text"],
-                 json.dumps(memory.build_weekly_memory(con, cfg), default=str),
-                 runner_selection._playbook_section(con)]
+                 json.dumps(memory.build_weekly_memory(con, cfg), default=str)]
     finally:
         con.close()
     assert not any(SENTINEL in t for t in texts)

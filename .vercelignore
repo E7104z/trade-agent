@@ -19,3 +19,6 @@ deploy_log*.txt
 .claude/
 .vscode/
 specs/
+
+# Research harness (local only; reads ~/.trade-agent/research)
+research/

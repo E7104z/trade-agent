@@ -1,9 +1,9 @@
 """
-The runner lane's unit of evidence: one (session, industry) event, not one row.
+A field lane's unit of evidence: one (session, industry) event, not one row.
 
 WHY THIS EXISTS
 ---------------
-The runner prices every candidate the scan finds -- hundreds a session -- and
+A field lane prices every candidate its scan finds -- hundreds a session -- and
 the miner, the 2-D pairs, the win-frequency family, the evidence backlog and
 forward validation all counted each candidate as one observation toward n >= 8.
 Rows are not independent. On 2026-10-01 six of the ten picks were tanker and
@@ -14,7 +14,7 @@ session's 444 triggered operating-company rows were 110 (session, industry)
 units. A cell could clear n >= 8, and a rule its whole forward validation, on
 one morning's tape.
 
-So, for the runner lane only, every statistic is computed over UNITS: the rows
+So, for a field lane only, every statistic is computed over UNITS: the rows
 of one session that share an industry collapse to one value, their mean
 realized R. A row with no known industry is its own unit -- an unknown is not
 evidence of a duplicate. Within a unit the rows still count for the descriptive
@@ -31,7 +31,7 @@ __all__ = ["cluster_key", "unit_key", "unit_values", "unit_count", "units"]
 
 
 def cluster_key(row: dict) -> str:
-    """The cluster a runner row belongs to within its session: its industry,
+    """The cluster a row belongs to within its session: its industry,
     or the ticker itself when the industry is unknown."""
     ind = str(row.get("industry") or "").strip()
     return f"industry:{ind}" if ind else f"ticker:{str(row.get('ticker') or '').upper()}"
@@ -53,13 +53,13 @@ def units(rows: Iterable[dict], value: Callable[[dict], Any]) -> dict[tuple, lis
 
 
 # Lanes whose rows are a FIELD (every instance the scan finds, many per
-# session), so a session's rows in one industry are one event. The gap field
-# joined the runner here (EDGE_ACCELERATION_SPEC_v1 Part 4).
-UNIT_LANES = ("runner", "gapfield")
+# session), so a session's rows in one industry are one event
+# (EDGE_ACCELERATION_SPEC_v1 Part 4).
+UNIT_LANES = ("gapfield",)
 
 
 def unit_values(rows: Iterable[dict], value: Callable[[dict], Any],
-                lane: str = "runner") -> list[float]:
+                lane: str = "gapfield") -> list[float]:
     """One value per unit (the mean of its rows) for a field lane; one per
     row for any other lane."""
     if lane not in UNIT_LANES:
@@ -68,7 +68,7 @@ def unit_values(rows: Iterable[dict], value: Callable[[dict], Any],
     return [sum(v) / len(v) for v in units(rows, value).values()]
 
 
-def unit_count(rows: Iterable[dict], lane: str = "runner") -> int:
+def unit_count(rows: Iterable[dict], lane: str = "gapfield") -> int:
     """How many independent observations `rows` are."""
     rows = list(rows)
     if lane not in UNIT_LANES:

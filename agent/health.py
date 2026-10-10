@@ -25,7 +25,6 @@ OK_STATUSES = ("ok", "degraded")
 # the Hobby plan drift up to ~59 minutes past the schedule, and each run takes
 # minutes, so these are deliberately generous: they mark "overdue", not "due".
 MORNING_DUE = dtime(8, 30)
-RUNNER_DUE = dtime(13, 0)
 EVENING_DUE = dtime(18, 0)
 WEEKLY_MAX_AGE_DAYS = 8
 LEARNING_WINDOW_DAYS = 7
@@ -139,67 +138,6 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
             morning_stage["detail"] = (
                 f"{morning_stage['detail']} -- last heartbeat: {hb['detail']}")
     stages.append(morning_stage)
-
-    # --- 2. runner lane -------------------------------------------------
-    rcfg = (cfg.get("runner", {}) or {}) if cfg else {}
-    if rcfg.get("enabled"):
-        r_session = _expected_session(now, RUNNER_DUE)
-        row = _q(con, """SELECT universe_size, candidates_found, provider_degraded,
-                                selection_made, selection_skipped_reason, gates_unavailable
-                         FROM runner_sessions WHERE session_date = ?""", [r_session])
-        last = (runs.get("runner") or [None])[0]
-        if not row:
-            stages.append(_stage("runner", "Runner scan", "bad",
-                                 f"No runner scan recorded for {r_session}",
-                                 "the runner cron never scanned inside the 10:20-15:00 ET "
-                                 "window, or its tick was skipped", last=last))
-        else:
-            universe, found, degraded, selected, skip, gates = row[0]
-            try:
-                import json as _json
-                gates = _json.loads(gates) if gates else {}
-            except (TypeError, ValueError):
-                gates = {}
-            if degraded and gates.get("auth_failed"):
-                stages.append(_stage(
-                    "runner", "Runner scan", "bad",
-                    f"Runner could not scan {r_session}: Alpaca rejected the credentials (401)",
-                    f"Refused at {gates.get('auth_path') or '?'}. The same key pair serves every "
-                    "Alpaca feed and the paper broker; this is a credentials outage, not a "
-                    "stand-down. Fix ALPACA_API_KEY / ALPACA_SECRET_KEY and redeploy.",
-                    last=last))
-            elif degraded and gates.get("feed_downgraded") and gates.get("rvol_required"):
-                stages.append(_stage(
-                    "runner", "Runner scan", "bad",
-                    f"Runner stood down for {r_session}: no real-time SIP feed",
-                    "The Alpaca data plan refuses real-time SIP (only 15-minute-delayed "
-                    "SIP), so the scan fell back to IEX, where RVOL is unreadable -- and "
-                    "require_rvol stands the session down. Needs real-time SIP, or a "
-                    "delayed-SIP scan, or require_rvol off.", last=last))
-            elif degraded or not universe:
-                stages.append(_stage("runner", "Runner scan", "bad",
-                                     f"Runner scan DEGRADED for {r_session}",
-                                     "the provider failed -- a zero-candidate day here is "
-                                     "an outage, not a stand-down", last=last))
-            elif not found:
-                stages.append(_stage("runner", "Runner scan", "ok",
-                                     f"Scanned {universe:,} names for {r_session}; "
-                                     "no candidate qualified (stand-down)", last=last))
-            else:
-                sel = ("selection made" if selected
-                       else f"no selection ({skip or 'decision tick not reached'})")
-                status = "ok" if selected else "warn"
-                detail = ""
-                note_row = _q(con, "SELECT live_orders_note FROM runner_sessions "
-                                   "WHERE session_date = ?", [r_session])
-                note = (note_row[0][0] if note_row else None) or ""
-                if note:
-                    detail = f"live paper: {note[:300]}"
-                    if note.startswith("placed 0/") and not note.startswith("placed 0/0"):
-                        status = "bad"
-                stages.append(_stage("runner", "Runner scan", status,
-                                     f"{found} candidate(s) from {universe:,} names "
-                                     f"for {r_session}; {sel}", detail, last=last))
 
     # --- 2b. intraday monitor (live paper) ---------------------------------
     if ((cfg.get("live_paper", {}) or {}) if cfg else {}).get("enabled"):
@@ -392,8 +330,6 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
     signals = {
         "window_days": LEARNING_WINDOW_DAYS,
         "outcomes_graded": _count("SELECT COUNT(*) FROM outcomes WHERE eval_date >= ?"),
-        "runner_candidates_priced": _count(
-            "SELECT COUNT(*) FROM runner_candidate_outcomes WHERE eval_date >= ?"),
         "rejections_scored": _count(
             "SELECT COUNT(*) FROM rejections WHERE plan_date >= ? AND eod_outcome IS NOT NULL"),
         "lessons_created": _count("SELECT COUNT(*) FROM lessons WHERE created_date >= ?"),
@@ -405,7 +341,7 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
     }
     active = _q(con, "SELECT COUNT(*) FROM lessons WHERE status IN ('active', 'promoted')")
     signals["active_lessons"] = int(active[0][0] or 0) if active else 0
-    graded_any = signals["outcomes_graded"] + signals["runner_candidates_priced"]
+    graded_any = signals["outcomes_graded"]
     learned_any = (signals["lessons_created"] + signals["lesson_confirmations"]
                    + signals["rule_confirmations"])
     if graded_any and not learned_any:

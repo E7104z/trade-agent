@@ -208,17 +208,10 @@ def test_one_alpaca_alert_per_day_across_loops(con, monkeypatch):
 
 def test_health_explains_a_credentials_outage(con):
     from agent import health
-    # After 13:00 ET, when today's runner session is the one health expects.
     now = datetime(2026, 9, 24, 14, 0, tzinfo=timezone(timedelta(hours=-4)))
-    ledger.record_alert(con, now.date(), "alpaca_auth_failed", "runner",
-                        "runner: /v2/assets -- key from env:ALPACA_API_KEY: 26 chars, paper")
-    ledger.upsert_runner_session(con, {
-        "session_date": now.date(), "universe_size": 0, "candidates_found": 0,
-        "provider_degraded": True, "scan_version": 2,
-        "gates_unavailable": json.dumps({"auth_failed": True, "auth_path": "/v2/assets"})})
-    h = health.loop_health(con, Config(raw={"runner": {"enabled": True}}), now=now)
-    runner = next(s for s in h["stages"] if s["key"] == "runner")
-    assert runner["status"] == "bad" and "rejected the credentials" in runner["headline"]
+    ledger.record_alert(con, now.date(), "alpaca_auth_failed", "intraday",
+                        "intraday: /v2/assets -- key from env:ALPACA_API_KEY: 26 chars, paper")
+    h = health.loop_health(con, Config(raw={}), now=now)
     assert any("Alpaca rejected the API credentials" in w and "26 chars, paper" in w
                for w in h["warnings"])
 

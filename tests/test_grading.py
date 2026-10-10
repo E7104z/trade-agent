@@ -741,23 +741,15 @@ def test_rvol_checkpoints_use_full_session_bars_when_entry_sliced():
     assert out["vwap_at_fill"] is not None
 
 
-def test_grade_day_threads_full_session_bars_for_sliced_runner_picks():
-    class StubMD:
-        def minute_bars(self, ticker, d):
-            return _flat_bars(9, 30, 35, 100.0, 100.5, 99.5, 100.0, v=1000)
-
-        def daily_bar(self, ticker, d):
-            return None
-
-    picks = [_pick(ticker="MARA", entry_type="open", pick_id=1)]
-    outcomes = grade_day(
-        StubMD(), picks, date(2026, 1, 2), adv20_map={"MARA": 31_000.0},
-        entry_after_map={"MARA": datetime(2026, 1, 2, 10, 3)},
-    )
-    # Fill is sliced to 10:03 (2 bars), but RVOL@10:00 must read the whole
-    # session rather than collapsing to the first post-entry bar's volume.
-    assert outcomes[0]["rvol_at_1000"] == pytest.approx(1.0)
-    assert outcomes[0]["rvol_close"] == pytest.approx(35_000 / 31_000, abs=1e-3)
+def test_simulate_pick_reads_session_stats_from_the_full_session_not_the_sliced_bars():
+    full = _flat_bars(9, 30, 35, 100.0, 100.5, 99.5, 100.0, v=1000)
+    sliced = [b for b in full if b["t"].replace(tzinfo=None) >= datetime(2026, 1, 2, 10, 3)]
+    out = simulate_pick(_pick(ticker="MARA", entry_type="open", pick_id=1), sliced, None,
+                        adv20=31_000.0, session_bars=full, session_date=date(2026, 1, 2))
+    # The fill walks the sliced bars, but RVOL@10:00 must read the whole session
+    # rather than collapsing to the first post-entry bar's volume.
+    assert out["rvol_at_1000"] == pytest.approx(1.0)
+    assert out["rvol_close"] == pytest.approx(35_000 / 31_000, abs=1e-3)
 
 
 def test_missing_adv20_leaves_rvol_fields_null_but_vwap_fields_populate():

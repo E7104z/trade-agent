@@ -15,9 +15,9 @@ from agent.config import Config, _DEFAULTS
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "prompt_renders"
-PROMPTS = ("morning_analyst", "morning_risk", "evening_grader", "weekly_miner", "runner_selector")
+PROMPTS = ("morning_analyst", "morning_risk", "evening_grader", "weekly_miner")
 ROLE_OF = {"morning_analyst": "analyst", "morning_risk": "risk", "evening_grader": "grader",
-           "weekly_miner": "miner", "runner_selector": "selector"}
+           "weekly_miner": "miner"}
 
 
 def _capture_module():
@@ -59,7 +59,7 @@ def test_persona_file_has_exactly_the_spec_sections():
     text = (ROOT / "prompts" / "persona.md").read_text(encoding="utf-8")
     heads = [l for l in text.splitlines() if l.startswith("## ")]
     assert heads == ["## Shared", "## Role: analyst", "## Role: risk", "## Role: grader",
-                     "## Role: miner", "## Role: selector"]
+                     "## Role: miner"]
 
 
 def test_persona_block_is_shared_plus_own_role_only():
@@ -133,8 +133,8 @@ def test_missing_persona_file_with_flag_on_degrades_to_no_persona(tmp_path, monk
 
 # Bumped by TRADER_HYPOTHESIS_SPEC_v1 (hypothesis placeholders; the lane-off
 # render differs from the previous fixtures only by these version lines).
-PROMPT_VERSIONS = {"morning_analyst": "13", "morning_risk": "16", "evening_grader": "9",
-                   "weekly_miner": "17", "runner_selector": "3"}
+PROMPT_VERSIONS = {"morning_analyst": "13", "morning_risk": "16", "evening_grader": "10",
+                   "weekly_miner": "18"}
 
 # The paragraph each persona block must directly follow (its prompt's role
 # paragraph; the analyst's is its mission paragraph, which the sheet refines).
@@ -143,7 +143,6 @@ FOLLOWS = {
     "morning_risk": "a kill it shows was a loser is a save.",
     "evening_grader": "Your job is to turn today into durable memory.",
     "weekly_miner": "and **rewrite the playbook** — the living document that IS the desk's accumulated skill.",
-    "runner_selector": "You are selecting which intraday Runner candidates a trading desk should take today.",
 }
 
 
@@ -177,18 +176,16 @@ def test_persona_on_keeps_every_pinned_prompt_string():
     def on(name):
         return llm.load_prompt(name, {**CAPTURE.RENDER_CASES[name],
                                       "PERSONA": llm.persona_block(_cfg(True), ROLE_OF[name])})
-    risk, analyst, miner, grader, sel = (on("morning_risk"), on("morning_analyst"),
-                                         on("weekly_miner"), on("evening_grader"),
-                                         on("runner_selector"))
+    risk, analyst, miner, grader = (on("morning_risk"), on("morning_analyst"),
+                                    on("weekly_miner"), on("evening_grader"))
     assert "The desk trades every session." in risk and "The desk trades every session." in analyst
     assert "Your mission is singular: **win**" in analyst
     assert analyst.count("Your mission is singular") == 1, "the sheet refines the mission, never restates it"
     assert "must be **>= 2.0** using the analyst's own numbers" in risk
     assert "no_trade_reason" not in risk
     assert "may not tell the desk to stand down for the day" in miner
-    assert "No direction without significance" in miner and "## 3c. The Runner Lane is computed" in miner
+    assert "No direction without significance" in miner
     assert "INVALID FILL" in grader and "Do not inflate grades to keep rules alive" in grader
-    assert "no validated runner rules yet" in sel and "At most 2 picks may share one `industry`" in sel
 
 
 def test_persona_adds_no_number_to_any_prompt():

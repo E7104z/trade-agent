@@ -27,7 +27,6 @@ from datetime import date
 from typing import Any, Callable
 
 from . import ablation, friction, population, research
-from . import runner_research
 from .stats import annotate_stats_rows, evaluate_search
 
 __all__ = [
@@ -202,50 +201,11 @@ def build_search(con: Any, ledger_mod: Any, q: float = 0.10, min_n: int = 8):
     comps = []
     for dim, source in STATS_DIMENSION_SPEC:
         fn = ledger_mod.stats_by if source == "picks" else ledger_mod.stats_by_outcome
-        # MORNING lane only. With no lane these cells pooled runner picks (up
-        # to 10 a day, at the runner's own $/R and entry semantics) into every
-        # morning dimension, and counted selected runner trades a second time
-        # in the runner family below. The runner lane has its own family.
+        # MORNING lane only: legacy rows of the retired runner lane must not
+        # pool into any morning dimension.
         rows = _safe("integrity", f"stats_by({dim})",
                      lambda f=fn, d=dim: f(con, d, lane=MORNING_LANE), [])
         comps.extend(annotate_stats_rows(rows, dim, n_dimensions=1))
-
-    # Runner lane (RUNNER_PORT_SPEC §2.6). Folded into the SAME batch rather
-    # than corrected separately: the runner dimensions widen the same search,
-    # and correcting them apart would leave the across-family multiplicity
-    # uncontrolled — which is exactly where the width lives. Pinned to the
-    # current scan_version and sim_version (INTEGRITY_REPAIR_SPEC_v1 Phase 3).
-    runner_rows = _safe("integrity", "runner candidate rows",
-                        lambda: runner_research.current_candidate_rows(con), [])
-    if runner_rows:
-        comps.extend(_safe("integrity", "runner dimensions",
-                           lambda: runner_research.candidate_comparisons(runner_rows), []))
-        comps.append(runner_research.setup_edge(runner_rows, min_n=min_n)["comparison"])
-        comps.append(runner_research.selection_edge(runner_rows, min_n=min_n)["comparison"])
-
-    # RUNNER_TRADE_CONSTRUCTION_v1: continuation after entry -- drift in ATR
-    # from the first enterable price, every candidate, every runner dimension.
-    # Same batch: it asks the 1-D question again on a different outcome, and
-    # correcting it apart would hide that width.
-    drift_rows = _safe("integrity", "runner drift rows",
-                       lambda: runner_research.current_drift_rows(con), [])
-    if drift_rows:
-        comps.extend(_safe("integrity", "runner continuation family",
-                           lambda: runner_research.drift_comparisons(drift_rows), []))
-
-    # RUNNER_EXIT_SPEC_v1: every pre-registered exit policy vs the plan exit,
-    # paired, per session. Same batch -- each policy is a look whether or not
-    # it has rows yet.
-    from . import runner_exits
-    replay_rows = _safe("integrity", "runner exit replay rows",
-                        lambda: runner_exits.current_replay_rows(con), [])
-    comps.extend(_safe("integrity", "runner exit policies",
-                       lambda: runner_exits.exit_policy_comparisons(replay_rows), []))
-    # RUNNER_TRADE_CONSTRUCTION_v1: does each construction (plan, arms A/B/C)
-    # make money at all? Beating the plan can be nothing more than holding
-    # fewer shares into a falling field; this is the absolute test beside it.
-    comps.extend(_safe("integrity", "runner construction expectancy",
-                       lambda: runner_exits.arm_expectancy_comparisons(replay_rows), []))
 
     # STRUCTURAL_MINING_SPEC_v1: pre-registered 2-D pairs, exact win-frequency
     # tests, and the population family (the short side). All in THIS batch --
@@ -298,26 +258,12 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
                                                     search.comparisons, q),
                       looks)
 
-    # Runner rules whose forward n was counted per row (before scan_version 3)
-    # restart their clock BEFORE anything is promoted: a rule must never
-    # graduate on thirty correlated rows from one morning
-    # (research.restart_runner_forward_clocks; idempotent).
-    _safe("integrity", "runner forward-clock restart",
-          lambda: research.restart_runner_forward_clocks(con), [])
     # Rules the old one-look test retired for want of significance get one
     # fresh forward test under the sequential design (EDGE_ACCELERATION_SPEC_v1
     # Part 1). Idempotent; the evening loop runs it too.
     _safe("integrity", "reopen underpowered retirements",
           lambda: research.reopen_underpowered_retirements(con, session_date), [])
 
-    # A construction arm or exit policy that beat the plan in THIS batch is
-    # quarantined by the system (RUNNER_TRADE_CONSTRUCTION_v1): the family is
-    # pre-registered in code, so its candidacy is computed, not nominated.
-    # Quarantine starts today; only sessions after today count forward.
-    exit_registered = _safe(
-        "integrity", "exit-policy quarantine",
-        lambda: research.register_exit_policy_candidates(
-            con, session_date, getattr(search, "comparisons", None) or []), [])
     # EDGE_ACCELERATION_SPEC_v1 Part 2: every mean-R cell that survived this
     # batch goes to the forward test now, nominated or not. Same footing as
     # the exit policies above: a survivor is a computed fact.
@@ -366,41 +312,6 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         paired_cmp = _safe("integrity", "paired comparison",
                            lambda: paired_mod.paired_comparison(con), {})
 
-    runner_rows = _safe("integrity", "runner candidate rows",
-                        lambda: runner_research.current_candidate_rows(con), [])
-    runner_versions = _safe("integrity", "runner version mix",
-                            lambda: runner_research.version_mix(con), [])
-    runner_setup = _safe("integrity", "runner setup edge",
-                         lambda: runner_research.setup_edge(runner_rows, min_n=min_n),
-                         {"n": 0})
-    runner_selection_edge = _safe("integrity", "runner selection edge",
-                                  lambda: runner_research.selection_edge(runner_rows, min_n=min_n),
-                                  {"sessions_contested": 0, "n_selected": 0,
-                                   "n_unselected": 0, "mean_r_selected": None,
-                                   "mean_r_unselected": None, "delta_r": None,
-                                   "p_value": None, "verdict": "not computed"})
-    runner_random = _safe("integrity", "runner random control",
-                          lambda: runner_research.runner_random_ablation(runner_rows),
-                          {})
-    runner_coverage = _safe("integrity", "runner selection coverage",
-                            lambda: runner_research.selection_coverage(con), [])
-    drift_rows = _safe("integrity", "runner drift rows",
-                       lambda: runner_research.current_drift_rows(con), [])
-    # Reuse the scored comparisons from the search so the q-values shown to the
-    # miner are the corrected ones, not a second uncorrected pass.
-    all_comps = getattr(search, "comparisons", None) or []
-    runner_comps = [c for c in all_comps
-                    if str(getattr(c, "dimension", "")).startswith("runner_")]
-    drift_comps = [c for c in all_comps
-                   if str(getattr(c, "dimension", "")).startswith(runner_research.DRIFT_PREFIX)]
-    from . import runner_exits
-    exit_comps = [c for c in runner_comps if c.dimension == runner_exits.DIMENSION]
-    expectancy_comps = [c for c in runner_comps
-                        if c.dimension == runner_exits.EXPECTANCY_DIMENSION]
-    runner_comps = [c for c in runner_comps
-                    if c.dimension not in (runner_exits.DIMENSION,
-                                           runner_exits.EXPECTANCY_DIMENSION)]
-
     counterfactual = _safe("integrity", "counterfactual summary",
                            lambda: research.counterfactual_summary(con), {})
     parts = [
@@ -411,17 +322,6 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         _cumulative_md(cumulative),
         population.population_md(pop),
         ablation.ablation_md(abl),
-        _safe("integrity", "runner markdown",
-              lambda: runner_research.runner_md(runner_setup, runner_selection_edge,
-                                                runner_comps, runner_versions,
-                                                runner_coverage), ""),
-        _safe("integrity", "runner random markdown",
-              lambda: runner_research.runner_random_ablation_md(runner_random), ""),
-        _safe("integrity", "runner exit markdown",
-              lambda: runner_exits.exit_md(exit_comps, runner_exits.current_replay_rows(con),
-                                           expectancy_comps), ""),
-        _safe("integrity", "runner continuation markdown",
-              lambda: runner_research.continuation_md(drift_comps, drift_rows), ""),
     ]
     from . import gapfield
     parts.append(_safe("integrity", "gap field markdown",
@@ -450,18 +350,7 @@ def weekly_block(con: Any, cfg: Any, ledger_mod: Any, session_date: date) -> dic
         "population": pop,
         "ablation": abl,
         "paired": paired_cmp,
-        "runner_setup_edge": runner_setup,
-        "runner_selection_edge": runner_selection_edge,
-        "runner_random": runner_random,
-        "runner_comps": runner_comps,
-        "runner_exit_comps": exit_comps,
-        "runner_expectancy_comps": expectancy_comps,
-        "runner_exit_registered": exit_registered,
         "system_registered": system_registered,
-        "runner_drift_comps": drift_comps,
-        "runner_drift_rows": len(drift_rows),
-        "runner_drift_sessions": len({r.get("session_date") for r in drift_rows}),
-        "runner_coverage": runner_coverage,
     }
 
 
@@ -543,8 +432,7 @@ def _underpowered_md(search) -> str:
         "a rule on any of these, and do not describe them as 'promising'.\n",
     ]
     for c in rows[:25]:
-        # The continuation family (runner_research.DRIFT_PREFIX) is in ATR.
-        unit = "ATR" if str(c.dimension).startswith(runner_research.DRIFT_PREFIX) else "R"
+        unit = "R"
         avg = f"{c.mean_r:+.2f}{unit}" if c.mean_r is not None else "n/a"
         lines.append(f"- {c.dimension}/{c.level}: n={c.n}, avg{unit}={avg}, "
                      f"MDE={c.mde:.2f}{unit} — cannot detect anything smaller")

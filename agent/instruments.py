@@ -3,12 +3,10 @@ What an instrument IS, read from its registered name (Alpaca /v2/assets `name`).
 
 WHY THIS EXISTS
 ---------------
-The runner lane screens for ACCUMULATION in an operating company: price
-holding above VWAP on a rising 9 EMA, with float, earnings and borrow as the
-research factors. A leveraged single-stock ETF, a closed-end fund, a commodity
-trust or an exchange-traded note can pass that screen, and a "runner" reading
-on one is an artifact (runner_scan.EXCLUDED_TICKERS says the same of the 117
-products it lists). It is also not independent evidence: on 2026-10-01 three
+Any screen for an operating company's stock (the gap field's universe is one)
+must keep out wrappers: a leveraged single-stock ETF, a closed-end fund, a
+commodity trust or an exchange-traded note can pass a price/volume screen, and
+a reading on one is an artifact. It is also not independent evidence: on 2026-10-01 three
 2x Lumentum wrappers from three issuers (LITX, LITU, LITG) and two 2x Coherent
 wrappers (COHX, COHH) were five pool rows for two events.
 

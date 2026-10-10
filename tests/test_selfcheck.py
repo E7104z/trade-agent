@@ -67,10 +67,9 @@ def test_every_check_runs_on_an_empty_ledger_and_is_stored(con):
 
 def test_plumbing_is_bad_when_a_lane_produced_data_and_none_was_graded(con):
     _pick(con, D, graded=False)
-    con.execute("INSERT INTO runner_candidates (session_date, ticker) VALUES (?, 'R1')", [D])
     r = _by_key(selfcheck.run(con, _cfg(), D))["plumbing"]
     assert r["status"] == "bad"
-    assert "none graded" in r["headline"] and "none priced" in r["headline"]
+    assert "none graded" in r["headline"]
 
 
 def test_plumbing_is_ok_when_everything_graded(con):

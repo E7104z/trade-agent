@@ -9,7 +9,7 @@ Three evening runs (64/65/66) failed with:
     {'type': 'invalid_request_error',
      'message': 'Your credit balance is too low to access the Anthropic API...'}
 
-The account had run out of credit. Finding that out took hours, for four
+The account had run out of credit. Finding that out took hours, for three
 separable reasons, each pinned below:
 
   1. runs.error was persisted AND served in /api/status, and simply never
@@ -20,10 +20,6 @@ separable reasons, each pinned below:
      the same loop days earlier.
   3. A billing outage was written as status='error', byte-identical to a code
      crash. Same error had already hit morning on 09-02 and 09-04.
-  4. The runner reported "Healthy: 4289 symbols scanned, 78 candidates" for a
-     session whose selector had died on that same outage.
-
-Conventions follow tests/test_runner_view.py, which pins bugs the same way.
 """
 from __future__ import annotations
 
@@ -33,7 +29,6 @@ import pytest
 
 from agent import failures
 from agent.delivery import _error_cell
-from agent.runner_view import _health_line
 
 
 _CREDIT_ERROR = (
@@ -137,39 +132,3 @@ def test_format_failure_includes_type_and_message_first():
 def test_format_failure_without_an_active_exception_is_still_useful():
     detail = failures.format_failure(ValueError("standalone"))
     assert "ValueError: standalone" in detail
-
-
-# ------------------------------------------- 4. outage must not read healthy
-
-def _session(**over):
-    sess = {"universe_size": 4289, "provider_degraded": False,
-            "rejected_no_bars": 10, "rejected_too_few_bars": 5,
-            "selection_skipped_reason": None}
-    sess.update(over)
-    return {"session": sess, "gates": {"feed": "iex", "feed_downgraded": True},
-            "n_candidates": 78}
-
-
-def test_selection_failure_is_reported_as_degraded_not_healthy():
-    """The exact 2026-09-22 shape: a healthy scan whose selector died on the
-    API outage was reported as 'Healthy: 4289 symbols scanned, 78 candidates'."""
-    line = _health_line(_session(
-        selection_skipped_reason=f"selection_failed: {_CREDIT_ERROR}"))
-    assert not line.startswith("Healthy")
-    assert "DEGRADED" in line
-    assert "SELECTION FAILED" in line
-    assert "credit balance is too low" in line
-
-
-def test_a_legitimate_selection_skip_still_reads_healthy():
-    """'candidates <= max_picks' and 'no candidates' are real stand-downs, not
-    outages -- over-flagging them would destroy the distinction from the other
-    side."""
-    for benign in ("candidates <= max_picks", "no candidates",
-                   "selector returned no picks"):
-        line = _health_line(_session(selection_skipped_reason=benign))
-        assert line.startswith("Healthy"), benign
-
-
-def test_healthy_session_with_no_skip_reason_still_reads_healthy():
-    assert _health_line(_session()).startswith("Healthy")

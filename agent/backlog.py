@@ -118,8 +118,7 @@ def _cell_items(con: Any, since: date) -> list[dict]:
     from . import buckets, research
     from .clusters import unit_count
     out = []
-    for lane, rows, date_key in (("morning", research.morning_rows(con), "plan_date"),
-                                 ("runner", research.runner_rows(con), "session_date")):
+    for lane, rows, date_key in (("morning", research.morning_rows(con), "plan_date"),):
         cells: dict[tuple, list[dict]] = {}
         for r in rows:
             for dim in buckets.dimensions(lane):

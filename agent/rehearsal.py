@@ -115,7 +115,6 @@ def _cfg(paired: bool) -> Config:
     raw = json.loads(json.dumps(cfg.raw))
     raw["email_enabled"] = False
     raw.setdefault("live_paper", {})["enabled"] = False
-    raw.setdefault("runner", {})["live_orders_enabled"] = False
     raw.setdefault("paired", {})["enabled"] = bool(paired) and bool(
         (cfg.raw.get("paired") or {}).get("enabled"))
     cfg.raw = raw

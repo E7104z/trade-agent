@@ -17,8 +17,7 @@ in three ways:
 
   No new look (L-3). build_facts() copies what the system already reports:
   the day's fill-valid outcomes by planned R, the shadow ledger's scored count
-  and forgone R, runner counts and the exit replays exactly as
-  `run.py runner-exits` summarizes them, the backlog as the morning sees it,
+  and forgone R, the backlog as the morning sees it,
   calibration cells that clear n >= 8, and verdict lines copied verbatim from
   the playbook the weekly rendered. It computes no new comparison, split or
   test. day_contrast() (email only, never an LLM input) is counts only.
@@ -50,7 +49,7 @@ LANE = "combined"
 SCOPES = ("one_session", "cumulative", "computed_verdict", "count")
 SCOPE_LABEL = {"one_session": "one session", "cumulative": "cumulative",
                "computed_verdict": "computed verdict", "count": "count"}
-FAMILIES = ("day", "pick", "shadow", "runner", "deficit", "calibration", "verdict", "menu")
+FAMILIES = ("day", "pick", "shadow", "deficit", "calibration", "verdict", "menu")
 
 H_CANT_PROVE = "## What I still can't prove"
 H_HAPPENED = "## What happened"
@@ -124,9 +123,7 @@ def _day_facts(con: Any, d: date, s: _Slots) -> bool:
                          "execution_anomaly": anomaly, "r_planned": rp}
     src = "picks + outcomes (r_planned)"
     morning = [p for p in picks if p.get("setup_type") != ledger.RUNNER_SETUP]
-    runner = [p for p in picks if p.get("setup_type") == ledger.RUNNER_SETUP]
     s.add("day.picks_morning", len(morning), "one_session", "picks", "morning-lane picks taken")
-    s.add("day.picks_runner", len(runner), "one_session", "picks", "runner-lane picks taken")
 
     invalid = [p for p in picks if (outs.get(p["pick_id"]) or {}).get("exit_reason") == "invalid_fill"]
     anomalies = [p for p in picks if (outs.get(p["pick_id"]) or {}).get("execution_anomaly")
@@ -175,7 +172,7 @@ def _day_facts(con: Any, d: date, s: _Slots) -> bool:
     for p in picks:
         if p in invalid:
             continue                     # counted above, never narrated
-        lane = "runner" if p.get("setup_type") == ledger.RUNNER_SETUP else "morning"
+        lane = "morning"
         o = outs.get(p["pick_id"])
         tag = p.get("exploration_lane")
         what = (f"{p['ticker']} {p.get('direction')} {p.get('setup_type')}"
@@ -235,59 +232,6 @@ def _shadow_facts(con: Any, d: date, s: _Slots) -> bool:
     return True
 
 
-# The four runner exit policies the log reports, by the name a reader knows.
-_EXIT_NAMES = {
-    "plan": "plan exits (the selected plan's own stop and 2R target)",
-    "arm_a_floor": "arm A, stop floor (stop no tighter than 1 ATR)",
-    "arm_b_dashboard": "arm B, dashboard rules (half at 1R, 9 EMA trail)",
-    "arm_c_floor_dashboard": "arm C, floor + dashboard (arm A's stop, arm B's management)",
-}
-
-
-def _runner_facts(con: Any, d: date, s: _Slots) -> bool:
-    from . import ledger
-    n_cand = (_q(con, "SELECT COUNT(*) FROM runner_candidates WHERE session_date = ?", [d]) or [(0,)])[0][0]
-    if not n_cand:
-        return False
-    sel = (_q(con, """SELECT COUNT(*) FROM runner_candidate_outcomes
-                      WHERE session_date = ? AND selected""", [d]) or [(0,)])[0][0]
-    s.add("runner.candidates", int(n_cand), "one_session", "runner_candidates",
-          "runner candidates the intraday scan found")
-    s.add("runner.selected", int(sel or 0), "one_session", "runner_candidate_outcomes.selected",
-          "runner candidates selected")
-    note = (_q(con, "SELECT selection_skipped_reason FROM runner_sessions WHERE session_date = ?", [d])
-            or [(None,)])[0][0]
-    m = re.search(r"industry cap \S+ dropped (\d+)", note or "")
-    s.add("runner.industry_cap_drops", int(m.group(1)) if m else 0, "one_session",
-          "runner_sessions.selection_skipped_reason", "selections dropped by the per-industry cap")
-    # Why the count of selected is what it is. "0 of 533 selected" with no
-    # reason (10/05) read as a decision; it was a claim whose request died.
-    s.add("runner.selection", ledger.runner_selection_note(con, d)["text"], "one_session",
-          "runner_sessions via ledger.runner_selection_note",
-          "what happened to the session's one runner selection")
-    # The exit replays for this one session, summarized exactly as
-    # `run.py runner-exits` summarizes them (runner_exits.policy_summary).
-    try:
-        from . import runner_exits
-        rows = [r for r in ledger.runner_exit_replays_since(con, d)
-                if r.get("session_date") == d and r.get("policy_version") == runner_exits.POLICY_VERSION
-                and r.get("r_planned") is not None]
-        for summ in runner_exits.policy_summary(rows):
-            if summ["policy"] not in _EXIT_NAMES or not summ["n"]:
-                continue
-            win = "n/a" if summ["win_rate"] is None else f"{100 * summ['win_rate']:.0f}%"
-            # The value names its policy: the reader sees the value, not the
-            # slot, and four unnamed lines (10/05) had to be decoded by count.
-            s.add(f"runner.exit.{summ['policy']}",
-                  f"{_EXIT_NAMES[summ['policy']]}: {_r(summ['mean_r'])} per trade over "
-                  f"{summ['n']} replayed trades, {win} closed positive",
-                  "one_session", "runner_exit_replays via runner_exits.policy_summary",
-                  f"runner exit replay, policy {summ['policy']} (each in its own risk unit)")
-    except Exception as e:  # noqa: BLE001 -- one family must not cost the others
-        log("traders_log", f"WARN runner exit summary unavailable: {e}")
-    return True
-
-
 def _deficit_facts(con: Any, d: date, s: _Slots) -> dict[str, str]:
     """The backlog exactly as tomorrow morning's analyst is shown it. Returns
     {menu slot name: item id}."""
@@ -321,8 +265,7 @@ def _calibration_facts(con: Any, s: _Slots) -> None:
 
 _VERDICT_LINES = (("verdict.calibration_q3", re.compile(r"^Calibration verdict \(computed, Q3\):.*$", re.M),
                    "Open Question 3's computed calibration verdict"),
-                  ("verdict.runner_lane", re.compile(r"^Lane stop condition:.*$", re.M),
-                   "the runner lane's computed stop-condition status"))
+                  )
 
 
 def _verdict_facts(con: Any, s: _Slots) -> None:
@@ -340,12 +283,12 @@ def build_facts(con: Any, session_date: date) -> dict:
     """Every fact the log may state, as slots. Pure reads of what the system
     already computed. Never raises: a failing family is recorded in `errors`
     and the rest still build. `slots` is empty when the session has nothing
-    to report (no plan, no pick, no runner candidate, no scored rejection)."""
+    to report (no plan, no pick, no scored rejection)."""
     s = _Slots()
     errors: list[str] = []
     menu: dict[str, str] = {}
     session_has_data = False
-    for fn in (_day_facts, _shadow_facts, _runner_facts):
+    for fn in (_day_facts, _shadow_facts):
         try:
             session_has_data = bool(fn(con, session_date, s)) or session_has_data
         except Exception as e:  # noqa: BLE001
@@ -707,17 +650,10 @@ def day_contrast(con: Any, session_date: date) -> str:
         morning = research.morning_rows(con, on=session_date)
     except Exception:  # noqa: BLE001
         morning = []
-    try:
-        runner = research.runner_rows(con, on=session_date)
-    except Exception:  # noqa: BLE001
-        runner = []
-    if not morning and not runner:
+    if not morning:
         return ""
     out = [CONTRAST_HEADER]
     if morning:
         out += ["", f"Taken trades (morning lane, fill-valid, triggered): {len(morning)}"]
         out += _counts_table(morning, "morning", list(buckets.dimensions("morning")))
-    if runner:
-        out += ["", f"Runner candidates (triggered, fill-valid, current scan/sim): {len(runner)}"]
-        out += _counts_table(runner, "runner", list(buckets.dimensions("runner")))
     return "\n".join(out)

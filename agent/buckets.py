@@ -4,11 +4,10 @@ The single source of truth for every mined bucket (FORWARD_VALIDATION_SPEC_v1 Ph
 WHY THIS EXISTS
 ---------------
 A quarantined rule is a statement about a CELL -- `stop_atr_bucket=0.5-1`,
-`runner_rvol_bucket=2-3` -- and forward validation means deciding, trade by
+`gf_gap_atr=1-2` -- and forward validation means deciding, trade by
 trade, whether a new trade falls in that cell. Before this module, the
-morning lane's cells were SQL CASE expressions in ledger.py and the runner
-lane's were a Python function in runner_research.py. Code that matched a
-trade to a rule would have been a third copy, free to put a 1.0-ATR stop in a
+morning lane's cells were SQL CASE expressions in ledger.py. Code that matched
+a trade to a rule would have been a second copy, free to put a 1.0-ATR stop in a
 different bucket than the one the miner was shown -- and a rule validated on
 trades the weekly search would not have counted as its own.
 
@@ -25,9 +24,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 __all__ = [
-    "MORNING_PICK_DIMS", "MORNING_OUTCOME_DIMS", "MORNING_DIMS", "RUNNER_DIMS",
-    "LANES", "sql", "label", "runner_label", "dimensions", "RUNNER_STOP_ATR_COARSE",
-    "index_tape",
+    "MORNING_PICK_DIMS", "MORNING_OUTCOME_DIMS", "MORNING_DIMS",
+    "LANES", "sql", "label", "dimensions",
 ]
 
 
@@ -149,124 +147,9 @@ def _morning_label(dim: str, row: dict) -> str:
     return spec.py(row)
 
 
-# ---------------------------------------------------------------- runner lane
-
-RUNNER_DIMS: tuple[str, ...] = (
-    "runner_detection_bucket",
-    "runner_rvol_bucket",
-    "runner_price_tier",
-    "runner_vwap_bucket",
-    "runner_slope_bucket",
-    "runner_tc_bucket",
-    "runner_float_bucket",
-    "runner_stop_atr_bucket",
-    "runner_trend_side_200d",
-    "runner_regime",
-    # At-entry context (schema v28, specs/RUNNER_TRADE_CONSTRUCTION_v1.md):
-    # the three suspects the 2026-10-02 review named, measured from bars that
-    # had closed before the entry bar opened.
-    "runner_index_tape",
-    "runner_ext_bucket",
-    "runner_staleness_bucket",
-)
-
-
-def index_tape(spy_pct, qqq_pct) -> str:
-    """SPY and QQQ against their session VWAP just before entry: both above,
-    both below, or split. Exactly at VWAP counts as above (not fading)."""
-    if spy_pct is None or qqq_pct is None:
-        return "?"
-    spy_up, qqq_up = float(spy_pct) >= 0, float(qqq_pct) >= 0
-    if spy_up and qqq_up:
-        return "both_above"
-    if not spy_up and not qqq_up:
-        return "both_below"
-    return "split"
-
-
-def runner_label(dimension: str, row: dict) -> str:
-    """Deterministic bucket label for one runner candidate row.
-
-    '?' is the null/unmeasured bucket and is kept rather than dropped — a large
-    '?' bucket is itself a finding about data coverage, and silently discarding
-    it would make coverage gaps invisible.
-    """
-    def _b(value, edges, labels):
-        if value is None:
-            return "?"
-        for edge, lab in zip(edges, labels):
-            if value < edge:
-                return lab
-        return labels[-1]
-
-    if dimension == "runner_detection_bucket":
-        return _b(row.get("detection_minutes"), [600, 630, 660, 720],
-                  ["pre-10:00", "10:00-10:30", "10:30-11:00", "11:00-12:00", "12:00+"])
-    if dimension == "runner_rvol_bucket":
-        # The lowest label used to be "1.5-2", written when the scan gated on
-        # RVOL >= 1.5. The gate has been off (min_rvol 0) since the RVOL scale
-        # was corrected, so every candidate under 2.0x -- about nine in ten,
-        # median ~0.5x -- was filed as "1.5-2": one label over the whole lane.
-        return _b(row.get("rvol"), [0.5, 1.0, 1.5, 2.0, 3.0, 5.0],
-                  ["<0.5", "0.5-1", "1-1.5", "1.5-2", "2-3", "3-5", "5+"])
-    if dimension == "runner_price_tier":
-        return row.get("price_tier") or "?"
-    if dimension == "runner_vwap_bucket":
-        return _b(row.get("vwap_pct_above"), [1.0, 1.5, 2.5],
-                  ["0.5-1", "1-1.5", "1.5-2.5", "2.5+"])
-    if dimension == "runner_slope_bucket":
-        # Slope normalized by price: a $0.04 slope means something different on
-        # a $6 stock than on a $45 one, so the raw dollar value is not
-        # comparable across the price band.
-        slope, price = row.get("ema9_slope"), row.get("detection_price")
-        norm = (slope / price * 100) if (slope is not None and price) else None
-        return _b(norm, [0.05, 0.10, 0.20], ["<0.05%", "0.05-0.10%", "0.10-0.20%", "0.20%+"])
-    if dimension == "runner_tc_bucket":
-        return _b(row.get("trend_consistency"), [55, 65, 75, 85],
-                  ["45-55", "55-65", "65-75", "75-85", "85+"])
-    if dimension == "runner_float_bucket":
-        return _b(row.get("float_shares"), [20, 50, 100],
-                  ["<20M", "20-50M", "50-100M", "100M+"])
-    if dimension == "runner_stop_atr_bucket":
-        # The runner stop is the 5-minute 9 EMA measured against a DAILY
-        # ATR14, so it sits under 0.5 ATR by construction (median stop ~0.8%
-        # of price): with the morning lane's edges ~99% of candidates shared
-        # one cell and the dimension compared nothing. The morning band
-        # "<0.5" is split into three; the wider labels are unchanged, and
-        # RUNNER_STOP_ATR_COARSE maps the split back for cross-lane reads.
-        return _b(row.get("stop_dist_atr"), [0.15, 0.3, 0.5, 1.0, 2.0],
-                  ["<0.15", "0.15-0.3", "0.3-0.5", "0.5-1", "1-2", ">2"])
-    if dimension == "runner_trend_side_200d":
-        return row.get("trend_side_200d") or "?"
-    if dimension == "runner_regime":
-        return row.get("regime_tag") or "?"
-    if dimension == "runner_index_tape":
-        return index_tape(row.get("spy_vwap_pct"), row.get("qqq_vwap_pct"))
-    if dimension == "runner_ext_bucket":
-        # (entry - VWAP) / daily ATR14, on the same ATR grid as the stop
-        # bucket (0.15 / 0.3 / 0.5 / 1.0). The scan's 0.5%-above-VWAP gate is
-        # ~0.1-0.15 ATR on a typical runner, so the low cells are the gate
-        # itself; "<0" means price had already lost VWAP by the entry bar.
-        # Edges fixed 2026-10-02 before any outcome under them was seen.
-        return _b(row.get("ext_vwap_atr"), [0.0, 0.15, 0.3, 0.5, 1.0],
-                  ["<0", "0-0.15", "0.15-0.3", "0.3-0.5", "0.5-1", "1+"])
-    if dimension == "runner_staleness_bucket":
-        # Minutes from Held (conditions first held) to the entry bar. The plan
-        # is formed at the scan tick, but a candidate found before the
-        # selection tick is bought at it, up to ~1.5 hours later.
-        return _b(row.get("staleness_min"), [15, 30, 60, 120],
-                  ["<15m", "15-30m", "30-60m", "60-120m", "120m+"])
-    return "?"
-
-
-# Runner stop-ATR labels that subdivide the morning lane's "<0.5" cell, mapped
-# back to it so a morning finding can still be read in the runner field.
-RUNNER_STOP_ATR_COARSE = {"<0.15": "<0.5", "0.15-0.3": "<0.5", "0.3-0.5": "<0.5"}
-
-
 # ------------------------------------------------------------------- unified
 
-LANES = ("morning", "runner", "gapfield")
+LANES = ("morning", "gapfield")
 
 
 def _gapfield_dims() -> tuple[str, ...]:
@@ -279,8 +162,6 @@ def _gapfield_dims() -> tuple[str, ...]:
 def dimensions(lane: str) -> tuple[str, ...]:
     if lane == "morning":
         return tuple(MORNING_DIMS)
-    if lane == "runner":
-        return RUNNER_DIMS
     if lane == "gapfield":
         return _gapfield_dims()
     return ()
@@ -289,11 +170,9 @@ def dimensions(lane: str) -> tuple[str, ...]:
 def label(lane: str, dimension: str, row: dict) -> str:
     """The bucket `row` falls in for `dimension`, exactly as the weekly search
     would have counted it. `row` is a merged pick+outcome dict for the morning
-    lane, a joined candidate+outcome dict for the runner lane."""
+    lane."""
     if lane == "morning" and dimension in MORNING_DIMS:
         return _morning_label(dimension, row)
-    if lane == "runner" and dimension in RUNNER_DIMS:
-        return runner_label(dimension, row)
     if lane == "gapfield" and dimension in _gapfield_dims():
         from .gapfield import label as _gapfield_label
         return _gapfield_label(dimension, row)

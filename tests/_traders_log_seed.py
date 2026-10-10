@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from agent import ledger, runner_exits
+from agent import ledger
 
 D = date(2026, 10, 2)
 
@@ -13,10 +13,6 @@ PLAYBOOK = """# Trading Agent Playbook
 ## Calibration
 
 Calibration verdict (computed, Q3): not yet computable — conviction 4-5 has n=3 of 8.
-
-## Runner Lane
-
-Lane stop condition: 1/20 sessions measured -- too early to read. Nothing significantly positive yet.
 """
 
 
@@ -43,25 +39,6 @@ def seed_session(con, d: date = D) -> dict[str, int]:
     }
     for t, o in outs.items():
         ledger.save_outcome(con, {"pick_id": by[t], **o})
-    # A runner pick, its candidates, selection, cap note and exit replays.
-    from agent import runner_selection
-    from agent.config import Config
-    rid = runner_selection.save_runner_pick(
-        con, d, {"ticker": "RUN", "detection_price": 10.0, "stop_price": 9.8, "target_price": 10.4},
-        {"rationale": "x", "conviction": 3},
-        Config(raw={"runner": {"size_r": 0.25}, "min_size_r": 0.25}))
-    ledger.save_outcome(con, {"pick_id": rid, "triggered": True, "exit_reason": "eod",
-                              "r_planned": -0.4, "r_multiple": -0.4})
-    for t in ("RUN", "R2", "R3"):
-        con.execute("INSERT INTO runner_candidates (session_date, ticker) VALUES (?, ?)", [d, t])
-    ledger.mark_runner_selected(con, d, "RUN", 1, rid)
-    ledger.upsert_runner_session(con, {
-        "session_date": d, "selection_skipped_reason": "industry cap 2/industry dropped 1 (Banks: R3)"})
-    v = runner_exits.POLICY_VERSION
-    ledger.save_runner_exit_replays(con, d, [
-        {"ticker": t, "policy": pol, "policy_version": v, "r_planned": r}
-        for t, pol, r in (("RUN", "plan", -1.0), ("R2", "plan", 2.0),
-                          ("RUN", "arm_a_floor", -0.5), ("R2", "arm_a_floor", 1.0))])
     # Shadow ledger: two scored rejections, one unscored.
     for t, f, graded in (("SH1", 0.8, True), ("SH2", -1.0, True), ("SH3", None, False)):
         con.execute("""INSERT INTO rejections (plan_date, ticker, reason, forgone_r, eod_outcome,
@@ -82,7 +59,7 @@ def seed_session(con, d: date = D) -> dict[str, int]:
         ledger.add_calibration_row(con, d - timedelta(days=i + 1), f"C{i}", 3, 0.5 if i % 2 else -0.5)
     for i in range(2):
         ledger.add_calibration_row(con, d - timedelta(days=i + 1), f"F{i}", 5, 2.0)
-    return {**by, "RUN": rid}
+    return dict(by)
 
 
 def playbook(tmp_path, monkeypatch):

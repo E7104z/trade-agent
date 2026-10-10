@@ -87,9 +87,6 @@ __all__ = [
 # R...] tag") BLOCKS here and only here; elsewhere a sentence that merely
 # mentions edge is prose and is recorded as a warning.
 #
-# Runner Lane is deliberately absent: it is system-rendered (see
-# SYSTEM_SECTIONS), and when it is not, it has its own dedicated, blocking
-# checker (_check_runner_section: missing, small-n means, contradictory tags).
 RULE_SECTIONS = ("current best edge", "setup rules", "regime rules")
 
 # Every bullet here must carry a status marker (see _STATUS).
@@ -104,7 +101,6 @@ TIERED_SECTIONS = ("setup rules", "regime rules", "sizing policy")
 SYSTEM_SECTIONS: tuple[tuple[str, str], ...] = (
     ("calibration", "## Calibration"),
     ("selection edge", "## Selection Edge"),
-    ("runner lane", "## Runner Lane"),
     ("shadow ledger", "## Shadow Ledger Summary"),
     ("participation funnel", "## Participation Funnel"),
     ("open questions", "## Open Questions (pre-registered experiments)"),
@@ -114,7 +110,7 @@ SYSTEM_SECTIONS: tuple[tuple[str, str], ...] = (
 # inserting a missing system section in the right place.
 _ORDER = ("reading this file", "current best edge", "core principles", "sizing policy",
           "setup rules", "regime rules", "do-not-trade", "calibration", "selection edge",
-          "runner lane", "shadow ledger", "participation funnel", "open questions",
+          "shadow ledger", "participation funnel", "open questions",
           "retired rules")
 
 # A line that says there is NO edge is not an edge claim.
@@ -163,7 +159,7 @@ READING_TEMPLATE = """\
   as edge, and you must not size up on it.
 - Confidence tiers: none (n=0) < provisional (1 <= n < 8) < low (8 <= n < 20)
   < moderate (20 <= n < 40) < established (n >= 40). No rule is "high."
-- **System-rendered sections** -- Calibration, Selection Edge, Runner Lane,
+- **System-rendered sections** -- Calibration, Selection Edge,
   Shadow Ledger Summary, Participation Funnel, Open Questions -- are computed
   from the ledger, not written by the miner. An open question has a finding
   only when it shows a computed Result; until then it has none.
@@ -180,7 +176,6 @@ LOG_LABEL = {
     "calibration_table": "calibration-table suppression violation",
     "selection_edge_table": "selection-edge suppression violation",
     "sizing_banner": "sizing-policy banner violation",
-    "runner_section": "runner-section violation",
     "best_edge": "best-edge mislabel",
     "edge_bar": "edge-bar violation",
     "open_questions": "open-question registry violation",
@@ -268,7 +263,7 @@ def _is_system_section(heading: str, computed: dict | None) -> bool:
     for key, _h in SYSTEM_SECTIONS:
         if key not in computed:
             continue
-        if name.startswith(key) or (key == "runner lane" and "runner" in name):
+        if name.startswith(key):
             return True
     return False
 
@@ -454,8 +449,6 @@ def collect(md: str, states: Sequence[dict] | None = None,
 
     for msg in wk._check_sizing_banner(md):
         out.append(Violation("sizing_banner", "warn", "sizing policy", "", msg))
-    for msg in wk._check_runner_section(md):
-        out.append(Violation("runner_section", "block", "runner lane", "", msg))
     for msg in wk._check_best_edge(md):
         out.append(Violation("best_edge", "block", "current best edge", "", msg))
     for msg in open_questions.check_playbook_questions(md):
@@ -508,34 +501,6 @@ def _best_edge_block(states: Sequence[dict]) -> list[str]:
     return lines
 
 
-def _runner_block(runner: dict | None) -> list[str]:
-    from .runner_selection import NO_RUNNER_RULES
-    runner = runner or {}
-    setup = runner.get("runner_setup_edge") or {}
-    sel = runner.get("runner_selection_edge") or {}
-    lines = [
-        "",
-        f"**{NO_RUNNER_RULES}**",
-        "",
-        "> System-rendered: the miner's Runner Lane section failed a write-time",
-        "> integrity check (or was missing), so the selector is given this",
-        "> explicit no-rules statement instead. The withheld text is recorded in",
-        "> `playbook_violations`.",
-        "",
-        # Plain lines, not bullets: these are counts and the computed verdict,
-        # stated as measurements, never as a rule to act on.
-        f"Setup edge measurement: n={setup.get('n', 0)} triggered candidates under "
-        f"the current scan/sim version"
-        + (" (UNDERPOWERED)" if setup.get("underpowered") else "") + ".  ",
-        f"Selection edge measurement: {sel.get('n_selected', 0)} selected / "
-        f"{sel.get('n_unselected', 0)} unselected across "
-        f"{sel.get('sessions_contested', 0)} contested session(s): "
-        f"{sel.get('verdict', 'not computed')}.",
-        "",
-    ]
-    return lines
-
-
 def _ensure_reading(pre: list[str], sections: list[tuple[str, list[str]]]) -> None:
     body = [""] + READING_TEMPLATE.rstrip("\n").splitlines() + [""]
     for i, (heading, _old) in enumerate(sections):
@@ -548,7 +513,7 @@ def _ensure_reading(pre: list[str], sections: list[tuple[str, list[str]]]) -> No
 def _order_index(heading: str) -> int:
     name = _name(heading)
     for i, key in enumerate(_ORDER):
-        if name.startswith(key) or (key == "runner lane" and "runner" in name):
+        if name.startswith(key):
             return i
     return len(_ORDER)
 
@@ -563,8 +528,7 @@ def _place_system_sections(sections: list[tuple[str, list[str]]],
             continue
         body = list(body)
         idx = next((i for i, (h, _b) in enumerate(sections)
-                    if _name(h).startswith(key)
-                    or (key == "runner lane" and "runner" in _name(h))), None)
+                    if _name(h).startswith(key)), None)
         if idx is not None:
             sections[idx] = (heading, body)
             continue
@@ -727,9 +691,9 @@ def _withheld_line(line: str, v: Violation, section: str) -> str:
 # --------------------------------------------------------------------------
 
 # What a changelog line is ABOUT is the topic it opens with ("Calibration
-# table: ...", "Runner Lane: ADDED ...", "Q7: 24/8 met; finding: ..."). An open
+# table: ...", "Q7: 24/8 met; finding: ..."). An open
 # question named anywhere in the line is a statement about that question.
-_SYSTEM_TOPICS = ("calibration", "selection edge", "runner lane", "shadow ledger",
+_SYSTEM_TOPICS = ("calibration", "selection edge", "shadow ledger",
                   "participation", "open question")
 _QUESTION_REF = re.compile(r"\bQ\d{1,2}\b")
 
@@ -786,7 +750,7 @@ def _enforce_changelog(changelog: str, states: Sequence[dict], withheld_setups: 
         head.append(decay_line)
     if system_rendered:
         head.append("- System-rendered this version (computed from the ledger, not written "
-                    "by the miner): Calibration, Selection Edge, Runner Lane, Shadow Ledger "
+                    "by the miner): Calibration, Selection Edge, Shadow Ledger "
                     "Summary, Participation Funnel, Open Questions.")
     for r in sorted(replaced):
         head.append(f"- {r}: the miner's draft failed a write-time integrity check and "
@@ -824,7 +788,7 @@ def enforce(md: str, states: Sequence[dict] | None = None,
     """Repair `md` at the line/section level and re-check it.
 
     `states` is research.rule_states() as the miner was shown it; `runner` is
-    the weekly research block (for the runner fallback counts). The keyword
+    the weekly research block (unused; kept for callers' signature). The keyword
     arguments are the audit's additions, each optional so a caller without
     them gets the original behaviour:
 
@@ -840,12 +804,14 @@ def enforce(md: str, states: Sequence[dict] | None = None,
     md, _ = _strip_changelog_sections(md or "")
     pre, sections = _split(md)
     _ensure_reading(pre, sections)
+    # The runner lane was removed (2026-10-10): a "## Runner Lane" section left
+    # in an older draft describes a lane that no longer trades.
+    sections[:] = [(h, b) for h, b in sections if not _name(h).startswith("runner lane")]
     if computed:
         _place_system_sections(sections, computed)
 
     violations: list[Violation] = []
     replace_best_edge = False
-    replace_runner = False
     withheld_setups: set[str] = set()
     withheld_questions: set[int] = set()
 
@@ -862,10 +828,6 @@ def enforce(md: str, states: Sequence[dict] | None = None,
             if _name(heading).startswith("current best edge") and v.checker in (
                     "provenance", "edge_bar", "wr_suppression"):
                 replace_best_edge = True
-                v.action = "replaced"
-                continue
-            if _name(heading).startswith("runner lane"):
-                replace_runner = True
                 v.action = "replaced"
                 continue
             by_line.setdefault(i, []).append(v)
@@ -899,10 +861,6 @@ def enforce(md: str, states: Sequence[dict] | None = None,
     for msg in wk._check_best_edge(doc):
         violations.append(Violation("best_edge", "block", "current best edge", "", msg, "replaced"))
         replace_best_edge = True
-    if not (computed and "runner lane" in computed):
-        for msg in wk._check_runner_section(doc):
-            violations.append(Violation("runner_section", "block", "runner lane", "", msg, "replaced"))
-            replace_runner = True
     from . import open_questions
     for msg in open_questions.check_playbook_questions(doc):
         violations.append(Violation("open_questions", "warn", "open questions", "", msg))
@@ -915,18 +873,6 @@ def enforce(md: str, states: Sequence[dict] | None = None,
                 found = True
         if not found:
             sections.insert(1, ("## Current Best Edge", _best_edge_block(states)))
-    if replace_runner:
-        found = False
-        for i, (heading, _body) in enumerate(sections):
-            if "runner" in _name(heading):
-                sections[i] = ("## Runner Lane", _runner_block(runner))
-                found = True
-                break
-        if not found:
-            at = next((i for i, (h, _) in enumerate(sections)
-                       if _name(h).startswith("shadow ledger")), len(sections))
-            sections.insert(at, ("## Runner Lane", _runner_block(runner)))
-
     violations.extend(_fix_banner(sections))
     violations.extend(_cover_regimes(sections, regimes))
 
@@ -939,8 +885,6 @@ def enforce(md: str, states: Sequence[dict] | None = None,
         replaced = set()
         if replace_best_edge:
             replaced.add("Current Best Edge")
-        if replace_runner:
-            replaced.add("Runner Lane")
         new_changelog, cl_found = _enforce_changelog(
             changelog or "", states, withheld_setups, replaced, bool(computed), decay_line,
             withheld_questions)

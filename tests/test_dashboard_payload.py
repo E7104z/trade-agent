@@ -183,46 +183,6 @@ def test_conclusions_payload_guards_each_subaggregate(con, monkeypatch):
     assert "selection_edge" in payload
 
 
-# ------------------------------------------------------ runner picks payload
-
-def _insert_pick(con, d, ticker, setup_type, thesis):
-    con.execute(
-        "INSERT INTO picks (plan_date, ticker, direction, setup_type, thesis, "
-        "conviction, size_r, entry_price, stop_price, target_price) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        [d, ticker, "long", setup_type, thesis, 3, 1.0, 10.0, 9.5, 11.0],
-    )
-
-
-def test_runner_payload_picks_flat_and_filtered_to_dto_runner(con):
-    from api import index as web
-    d = date(2026, 9, 17)
-    _insert_pick(con, d, "RUNX", "dto_runner", "runner thesis")
-    _insert_pick(con, d, "NOTRUN", "gap_go", "gap thesis")
-
-    payload = web._runner_payload(con, d)
-    picks = payload["picks"]
-    assert [p["ticker"] for p in picks] == ["RUNX"]
-
-    p = picks[0]
-    assert p["direction"] == "long"
-    assert p["conviction"] == 3
-    assert p["size_r"] == 1.0
-    assert p["entry_price"] == 10.0
-    assert p["stop_price"] == 9.5
-    assert p["target_price"] == 11.0
-    assert p["thesis"] == "runner thesis"
-
-
-def test_runner_payload_never_raises_on_empty_session(con):
-    from api import index as web
-    d = date(2026, 9, 17)
-    payload = web._runner_payload(con, d)
-    assert payload["ran"] is False
-    assert payload["picks"] == []
-    assert payload["rows"] == []
-
-
 # ------------------------------------------- delivery.render_dashboard wiring
 
 def test_render_dashboard_consumes_new_section_placeholders(con, monkeypatch, tmp_path):

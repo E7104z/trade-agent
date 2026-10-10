@@ -110,19 +110,6 @@ def test_log_run_stamp(con):
     assert rows == [("morning", None), ("evening", "1")]
 
 
-def test_runner_pick_is_stamped_only_when_the_selector_call_chose_it(con):
-    from agent import runner_selection
-    from agent.config import Config
-    cfg = Config(raw={"runner": {"size_r": 0.25}, "min_size_r": 0.25})
-    c = {"ticker": "RUN", "detection_price": 10.0, "stop_price": 9.8, "target_price": 10.4}
-    runner_selection.save_runner_pick(con, D, c, {"rationale": "x", "conviction": 3,
-                                                  "persona_version": "1"}, cfg)
-    runner_selection.save_runner_pick(con, D, dict(c, ticker="AUTO"),
-                                      {"rationale": "auto-selected: candidates <= max_picks"}, cfg)
-    rows = dict(con.execute("SELECT ticker, persona_version FROM picks").fetchall())
-    assert rows == {"RUN": "1", "AUTO": None}
-
-
 # -------------------------------------------------------------------- monitor
 
 FORBIDDEN = ("p =", "q =", "significant", "edge", "better", "worse")
@@ -159,11 +146,6 @@ def _seed(con):
     con.execute("INSERT INTO outcomes (pick_id, triggered, exit_reason) VALUES (?, TRUE, 'stop')", [pid])
     con.execute("""INSERT INTO daily_plans (plan_date, no_trade, no_trade_category, analyst_json)
                    VALUES (?, TRUE, 'data_incomplete', '{}')""", [date(2026, 9, 30)])
-    con.execute("INSERT INTO runner_candidates (session_date, ticker) VALUES (?, 'R1'), (?, 'R2')",
-                [date(2026, 10, 2), date(2026, 10, 2)])
-    ledger.upsert_runner_session(con, {
-        "session_date": date(2026, 10, 2),
-        "selection_skipped_reason": "industry cap 2/industry dropped 1 (Banks: R2)"})
 
 
 def test_monitor_groups_by_stamp_and_prints_counts_only(con):
@@ -176,8 +158,6 @@ def test_monitor_groups_by_stamp_and_prints_counts_only(con):
     assert on["sessions"] == 1 and on["daily_floor_picks"] == 1 and on["triggered"] == 1
     assert on["candidate_conviction"] == {3: 1, 2: 1} and on["probe_candidates"] == 1
     assert on["mean_size_r"] == pytest.approx(0.5)
-    # Runner session 10/02 had no LLM-chosen pick, so it is not persona-influenced.
-    assert off["runner_sessions"] == 1 and off["runner_cap_drops"] == 1
     text = persona_monitor.render_text(groups, None)
     _clean(text)
     assert "== persona off ==" in text and "== persona v1 ==" in text

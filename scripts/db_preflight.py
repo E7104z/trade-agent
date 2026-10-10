@@ -21,8 +21,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent import ledger  # noqa: E402  (path must be set up first)
 
-V10_TABLES = ["runner_candidates", "runner_candidate_outcomes", "runner_sessions"]
-
 V4_TABLES = ["research_looks", "research_rules", "research_observations",
              "population_universe", "population_outcomes",
              "paired_arms", "paired_arm_picks"]
@@ -79,35 +77,6 @@ def main() -> int:
             print(f"[preflight] FAILED: daily_plans missing columns: {missing_plan}")
             return 1
         print("[preflight] daily_plans has context_mode + paired_run columns")
-
-        # --- v10 DTO Runner lane -----------------------------------------
-        missing_v10 = [t for t in V10_TABLES if t not in existing]
-        if missing_v10:
-            print(f"[preflight] FAILED: v10 runner tables missing: {missing_v10}")
-            return 1
-        print(f"[preflight] all {len(V10_TABLES)} v10 runner tables present")
-        for t in V10_TABLES:
-            n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            print(f"[preflight]   {t}: {n} row(s)")
-
-        # scan_version is the runner lane's equivalent of sim_version: without
-        # it, rows recorded under different detection semantics would silently
-        # pool into one comparison.
-        if "scan_version" not in _cols(con, "runner_candidates"):
-            print("[preflight] FAILED: runner_candidates missing scan_version column")
-            return 1
-        needed_sel = {"selected", "selection_rank", "pick_id", "sim_version"}
-        missing_sel = needed_sel - _cols(con, "runner_candidate_outcomes")
-        if missing_sel:
-            print(f"[preflight] FAILED: runner_candidate_outcomes missing: {missing_sel}")
-            return 1
-        needed_sess = {"universe_size", "provider_degraded", "selection_made",
-                       "selection_skipped_reason", "gates_unavailable"}
-        missing_sess = needed_sess - _cols(con, "runner_sessions")
-        if missing_sess:
-            print(f"[preflight] FAILED: runner_sessions missing: {missing_sess}")
-            return 1
-        print("[preflight] runner tables have scan_version + selection + telemetry columns")
     except Exception as e:
         print(f"[preflight] FAILED during verification: {type(e).__name__}: {e}")
         return 1

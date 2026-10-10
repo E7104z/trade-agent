@@ -17,13 +17,11 @@ import pytest
 
 from agent import ledger, memory, playbook_enforcement as pe
 from agent.loops import weekly
-from agent.runner_selection import NO_RUNNER_RULES, runner_playbook_section
 
 _BANNER = pe.SIZING_BANNER
 
 
 def _doc(best_edge="**NO VALIDATED EDGE YET.**", setup="- gap_go: hold above VWAP. [confidence: none, n=0, UNVALIDATED prior]",
-         runner="**(no validated runner rules yet — do not assume any)**\n\nSetup edge: n=3, underpowered.",
          calibration="| 5 | 0 | — | — | insufficient data |", sizing=_BANNER,
          questions="1. **gap_fade** — Threshold: n >= 8. **Progress: 1/8.**",
          reading="- whatever the miner wrote"):
@@ -61,10 +59,6 @@ def _doc(best_edge="**NO VALIDATED EDGE YET.**", setup="- gap_go: hold above VWA
 | Conviction | n | realized WR | realized avgR | verdict |
 |-----------:|--:|:-----------:|:-------------:|:--------|
 {calibration}
-
-## Runner Lane
-
-{runner}
 
 ## Shadow Ledger Summary
 
@@ -144,7 +138,7 @@ def test_selection_edge_row_below_floor_is_suppressed():
     table = ("## Selection Edge\n\n| Week | n (triggered) | Selection edge (R vs. baseline) | "
              "% of random portfolios beaten | verdict |\n|-----:|--:|--:|--:|:--|\n"
              "| 2026-09-18 | 3 | -1.20R | 12.6% | no detectable selection edge |\n")
-    md = _doc().replace("## Runner Lane", table + "\n## Runner Lane")
+    md = _doc().replace("## Shadow Ledger Summary", table + "\n## Shadow Ledger Summary")
     res = pe.enforce(md)
     assert "| 2026-09-18 | 3 | — | — | insufficient data |" in res.markdown
     assert "-1.20R" not in res.markdown
@@ -179,29 +173,13 @@ def test_a_validated_rule_is_named_with_its_tag_when_rebuilt():
     assert _clean(res.markdown, states)
 
 
-def test_a_runner_section_with_a_small_n_mean_becomes_the_explicit_no_rules_block():
-    bad = ("| dimension | bucket | n | mean R | q |\n|---|---|---|---|---|\n"
-           "| runner_tc_bucket | 75-85 | 4 | 0.812 | 0.4400 |")
-    runner = {"runner_setup_edge": {"n": 40, "underpowered": False},
-              "runner_selection_edge": {"n_selected": 5, "n_unselected": 30,
-                                        "sessions_contested": 2,
-                                        "verdict": "underpowered - 5 selected / 30 unselected"}}
-    res = pe.enforce(_doc(runner=bad), [], runner)
-    section = runner_playbook_section(res.markdown)
-    assert section.startswith("## Runner Lane")
-    assert NO_RUNNER_RULES in section
-    assert "0.812" not in section
-    assert "n=40 triggered candidates" in section
-    assert weekly._check_runner_section(res.markdown) == []
-
-
-def test_a_missing_runner_section_is_inserted_before_the_shadow_ledger():
-    md = _doc()
-    start = md.index("## Runner Lane")
-    md = md[:start] + md[md.index("## Shadow Ledger Summary"):]
+def test_a_leftover_runner_lane_section_is_dropped():
+    md = _doc().replace("## Shadow Ledger Summary",
+                        "## Runner Lane\n\n- the retired lane's old text\n\n## Shadow Ledger Summary")
     res = pe.enforce(md)
-    assert res.markdown.index("## Runner Lane") < res.markdown.index("## Shadow Ledger Summary")
-    assert NO_RUNNER_RULES in runner_playbook_section(res.markdown)
+    assert "Runner Lane" not in res.markdown
+    assert "old text" not in res.markdown
+    assert "## Shadow Ledger Summary" in res.markdown
 
 
 def test_sizing_banner_is_inserted_or_deduplicated():

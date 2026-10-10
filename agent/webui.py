@@ -97,7 +97,7 @@ tbody td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:t
 tbody tr:last-child td{border-bottom:none}tbody tr:hover{background:var(--surface-2)}
 td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
 td.num{color:var(--text)}td.pos{color:var(--green)}td.neg{color:var(--red)}td.dim{color:var(--text-dim)}
-td.wrap{max-width:380px;white-space:normal}
+td.wrap{min-width:300px;max-width:520px;white-space:normal}
 .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;letter-spacing:.04em;
   padding:2px 9px;border-radius:20px;border:1px solid var(--border);color:var(--text-muted);white-space:nowrap}
 .pill.ok{color:var(--green);background:var(--green-dim);border-color:rgba(63,185,80,.3)}
@@ -189,7 +189,32 @@ td.err{color:var(--red);max-width:280px;overflow:hidden;text-overflow:ellipsis;w
 .filter-row input[type=text]{background:var(--bg-soft);border:1px solid var(--border-strong);color:var(--text);
   padding:7px 10px;border-radius:var(--radius-sm);font-size:13px;min-width:180px}
 .filter-row label{font-size:12.5px;color:var(--text-muted);display:flex;align-items:center;gap:6px;cursor:pointer}
+/* trade cards: one card per trade, prose at full width instead of table cells */
+.tcards{display:flex;flex-direction:column;gap:12px}
+.tcard{background:var(--bg-soft);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px 16px;
+  border-left:3px solid var(--border-strong)}
+.tcard.long{border-left-color:var(--green)}.tcard.short{border-left-color:var(--red)}
+.tc-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tc-tk{font-size:16px;font-weight:700;margin-right:4px}
+.tc-spacer{flex:1}
+.tc-levels{display:flex;flex-wrap:wrap;gap:8px 26px;margin:12px 0 2px;padding:10px 12px;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--radius-sm)}
+.tc-lv{display:flex;flex-direction:column;gap:1px;min-width:64px}
+.tc-lv span{font-size:10px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--text-dim)}
+.tc-lv b{font-family:var(--mono);font-size:13.5px;font-weight:600}
+.tc-lv small{font-size:11px;color:var(--text-dim)}
+.tc-body{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px 22px;margin-top:12px}
+.tc-block h4{font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--text-dim);margin:0 0 4px}
+.tc-block.kill h4{color:var(--red)}
+.tc-text,.cell-long{font-size:13.5px;line-height:1.55;color:#c9d1d9;white-space:pre-wrap;overflow-wrap:anywhere}
+.tc-text.clamp,.cell-long.clamp{display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.tc-more{appearance:none;background:none;border:none;color:var(--accent-strong);font-size:12px;font-weight:600;
+  padding:3px 0 0;cursor:pointer}
+.tc-more:hover{text-decoration:underline}
+.cell-long{min-width:260px;max-width:460px;font-size:12.5px;cursor:pointer}
+.lesson{padding:12px 14px;background:var(--bg-soft);border:1px solid var(--border);border-radius:var(--radius-sm)}
 @media (max-width:820px){
+  .tc-body{grid-template-columns:1fr}
   .app{flex-direction:column}
   .sidebar{width:100%;flex:auto;position:static;height:auto;flex-direction:column;padding:12px}
   .brand{padding-bottom:10px}
@@ -233,7 +258,6 @@ window.TA = (function(){
       <div class="nav-group">Desk</div>
       <a class="nav-item active" data-page="overview" href="#/overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>Overview</span><span class="nav-dot" id="health-dot" title="Learning-loop health"></span></a>
       <a class="nav-item" data-page="today" href="#/today"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg><span>Today's Plan</span></a>
-      <a class="nav-item" data-page="runner" href="#/runner"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><span>Runner</span></a>
       <a class="nav-item" data-page="playbook" href="#/playbook"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg><span>Playbook</span></a>
       <a class="nav-item" data-page="research" href="#/research"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg><span>Research</span></a>
       <div class="nav-group">System</div>
@@ -262,7 +286,6 @@ window.TA = (function(){
         <div id="overview-body"><div class="empty">Loading…</div></div>
       </section>
       <section class="page" data-page="today"><div id="today-body"><div class="empty">Loading…</div></div></section>
-      <section class="page" data-page="runner"><div id="runner-body"><div class="empty">Loading…</div></div></section>
       <section class="page" data-page="playbook"><div id="playbook-body"><div class="empty">Loading…</div></div></section>
       <section class="page" data-page="research"><div id="research-body"><div class="empty">Loading…</div></div></section>
       <section class="page" data-page="history">
@@ -282,9 +305,6 @@ window.TA = (function(){
               <option value="open_question_progress">Question progress</option>
               <option value="runs">Run history</option>
               <option value="traders_log">Trader's log</option>
-              <option value="runner_sessions">Runner sessions</option>
-              <option value="runner_candidates">Runner candidates</option>
-              <option value="runner_candidate_outcomes">Runner outcomes</option>
               <option value="live_orders">Live paper orders</option>
               <option value="playbook_versions">Playbook versions (latest, any date)</option>
               <option value="llm_archive">LLM response archive (latest, any date)</option>
@@ -307,7 +327,6 @@ window.TA = (function(){
             <button class="btn primary" onclick="runLoop('morning')">Run Morning</button>
             <button class="btn primary" onclick="runLoop('evening')">Run Evening</button>
             <button class="btn primary" onclick="runLoop('weekly')">Run Weekly</button>
-            <button class="btn" onclick="runLoop('runner')">Run Runner Scan</button>
           </div>
           <pre id="log" class="log" style="display:none"></pre>
         </div>
@@ -347,12 +366,63 @@ function tickerLink(ticker, ctx){
   return `<a class="tk" href="${href}">${esc(ticker)}</a>`;
 }
 
+// Long prose never goes in a table cell (it renders as a sliver a word wide).
+// longText clamps to four lines with a Show more toggle; the toggle is handled
+// by one delegated listener below, and the open set survives the 60s refresh.
+const openText = new Set();
+const CLAMP_AT = 260;
+function longText(key, text){
+  const s = String(text ?? '').trim();
+  if(!s) return '<span class="dim">—</span>';
+  if(s.length <= CLAMP_AT) return `<div class="tc-text">${esc(s)}</div>`;
+  const open = openText.has(key);
+  return `<div class="tc-text ${open ? '' : 'clamp'}">${esc(s)}</div>
+    <button class="tc-more" data-more="${esc(key)}">${open ? 'Show less' : 'Show more'}</button>`;
+}
+const block = (title, key, text, cls) => `<div class="tc-block ${cls||''}"><h4>${title}</h4>${longText(key, text)}</div>`;
+const level = (label, value, sub) => `<div class="tc-lv"><span>${label}</span><b>${value}</b>${sub ? `<small>${sub}</small>` : ''}</div>`;
+const rr = p => {
+  const e = Number(p.entry_price), s = Number(p.stop_price), t = Number(p.target_price);
+  if(![e, s, t].every(isFinite) || e === s) return '—';
+  return (Math.abs(t - e) / Math.abs(e - s)).toFixed(2) + 'R';
+};
+const dirPill = d => `<span class="pill ${String(d).toLowerCase() === 'short' ? 'bad' : 'ok'}">${esc(String(d||'').toUpperCase())}</span>`;
+// One trade as a card: identity row, price strip, then each prose field at full width.
+// o = {key, ticker (html), p (levels), pills (html), right (html), size, blocks: [html]}
+function tradeCard(o){
+  const p = o.p;
+  const lv = [
+    level('Entry', `${esc(p.entry_type||'open')} @ ${px(p.entry_price)}`, o.entryNote),
+    level('Stop', px(p.stop_price)), level('Target', px(p.target_price)), level('Reward : risk', rr(p)),
+  ];
+  if(o.size != null) lv.push(level('Size', esc(o.size) + 'R'));
+  return `<div class="tcard ${String(p.direction||'').toLowerCase() === 'short' ? 'short' : 'long'}">
+    <div class="tc-head"><span class="tc-tk">${o.ticker}</span>${dirPill(p.direction)}
+      ${p.setup_type ? `<span class="pill neutral">${esc(p.setup_type)}</span>` : ''}${o.pills||''}
+      <span class="tc-spacer"></span>${o.right||''}</div>
+    <div class="tc-levels">${lv.join('')}</div>
+    <div class="tc-body">${o.blocks.join('')}</div>
+  </div>`;
+}
+document.addEventListener('click', e => {
+  const more = e.target.closest && e.target.closest('[data-more]');
+  if(more){
+    const k = more.dataset.more;
+    if(openText.has(k)) openText.delete(k); else openText.add(k);
+    const t = more.previousElementSibling;
+    t.classList.toggle('clamp', !openText.has(k));
+    more.textContent = openText.has(k) ? 'Show less' : 'Show more';
+    return;
+  }
+  const cell = e.target.closest && e.target.closest('.cell-long');
+  if(cell && !e.target.closest('a')) cell.classList.toggle('clamp');
+});
+
 let state = null;
 
 const PAGES = {
   overview:{t:'Overview', s:'Equity, edge, and today at a glance'},
   today:{t:"Today's Plan", s:'The paper account, the morning call, and the shadow ledger'},
-  runner:{t:'Runner', s:'The intraday scan, select, grade lane'},
   playbook:{t:'Playbook', s:"The desk's accumulated rules"},
   research:{t:'Research', s:'What the desk has concluded & changed'},
   history:{t:'History', s:'Raw ledger inspector, one session at a time'},
@@ -442,7 +512,7 @@ function tickUpdated(){
 }
 
 function renderAll(){
-  renderOverview(); renderToday(); renderRunner(); renderPlaybook(); renderResearch(); renderRuns();
+  renderOverview(); renderToday(); renderPlaybook(); renderResearch(); renderRuns();
   renderHealthDot();
 }
 
@@ -517,7 +587,6 @@ function healthCard(){
   const sg = h.signals || {};
   const sig = sg.window_days ? `<div class="lh-signals"><span>Last ${sg.window_days} days:</span>
       <span><b>${sg.outcomes_graded ?? 0}</b> trades graded</span>
-      <span><b>${sg.runner_candidates_priced ?? 0}</b> runner candidates priced</span>
       <span><b>${sg.rejections_scored ?? 0}</b> rejections scored</span>
       <span><b>${sg.lessons_created ?? 0}</b> lessons created</span>
       <span><b>${sg.lesson_confirmations ?? 0}</b> lesson confirmations</span>
@@ -532,8 +601,7 @@ function healthCard(){
 }
 
 // The morning lane's streak clamp and drawdown breaker read exactly these
-// lane-scoped numbers (the runner lane is shown for comparison; it has no
-// breaker of its own).
+// lane-scoped numbers.
 function laneCard(key, title, sub){
   const L = (state.lanes || {})[key];
   if(!L) return '';
@@ -576,8 +644,8 @@ function renderOverview(){
   else planMini = `<div class="kpi-line"><span class="pill neutral">NO PLAN</span><span>The morning call hasn't run for today.</span></div>`;
 
   const lanes = state.lanes ? `<div class="card"><div class="card-head"><h2>By lane</h2>
-      <span class="card-sub">two strategies, never pooled — each lane's risk rules read only its own record</span></div>
-      <div class="lanes">${laneCard('morning', 'Morning lane', 'premarket analyst + risk manager')}${laneCard('runner', 'Runner lane', 'intraday scan + selector')}</div></div>` : '';
+      <span class="card-sub">the morning desk's own record — its risk rules read only this</span></div>
+      <div class="lanes">${laneCard('morning', 'Morning lane', 'premarket analyst + risk manager')}</div></div>` : '';
   b.innerHTML = `
     ${healthCard()}
     <div class="stat-grid">
@@ -617,21 +685,23 @@ function planHtml(){
   // The plan JSON carries what the picks table does not: a level the
   // validator moved onto the computed one its thesis named.
   const planPick = t => (plan.picks||[]).find(x => String(x.ticker).toUpperCase() === String(t).toUpperCase()) || {};
-  const rows = source.map(p=>{
+  const rows = source.map((p, i)=>{
     const entryType = p.entry_type || (p.entry_plan && p.entry_plan.type) || 'open';
     const link = tickerLink(p.ticker, p.pick_id != null ? {date: state.today, lane:'morning', id: p.pick_id} : {date: state.today});
-    const lane = p.exploration_lane ? ` <span class="pill neutral">${esc(String(p.exploration_lane).replace('_',' '))}</span>` : '';
+    const lane = p.exploration_lane ? `<span class="pill neutral">${esc(String(p.exploration_lane).replace('_',' '))}</span>` : '';
     const fix = planPick(p.ticker).level_fix;
-    const fixNote = fix ? ` <span class="muted-note">(moved from ${px(fix.was)} to the computed ${esc(fix.named)})</span>` : '';
-    return `<tr><td>${link}</td><td>${esc(p.direction)}</td><td>${esc(p.setup_type||'')}${lane}</td>
-      <td>${esc(entryType)} @ ${px(p.entry_price)}${p.entry_not_before ? ` <span class="muted-note">(live ${esc(p.entry_not_before)} ET)</span>` : ''}${fixNote}</td><td>${px(p.stop_price)}</td>
-      <td>${px(p.target_price)}</td><td>${esc(p.size_r ?? '—')}R</td><td>${esc(p.conviction ?? '—')}</td>
-      <td class="wrap">${esc(p.thesis_final||p.thesis||'')}</td></tr>`;
+    const notes = [p.entry_not_before ? `live ${esc(p.entry_not_before)} ET` : '',
+      fix ? `moved from ${px(fix.was)} to the computed ${esc(fix.named)}` : ''].filter(Boolean).join(' · ');
+    return tradeCard({
+      ticker: link, p: {...p, entry_type: entryType}, pills: lane, entryNote: notes, size: p.size_r ?? '—',
+      right: `<span class="pill info">conviction ${esc(p.conviction ?? '—')}</span>`,
+      blocks: [block('Thesis', `plan:${p.ticker}:${i}`, p.thesis_final||p.thesis||'')],
+    });
   }).join('');
   const tests = source.filter(p => p.exploration_lane).length;
   const testNote = tests ? `<p class="muted-note">${tests} of these ${tests === 1 ? 'is a test pick' : 'are test picks'} (marked by lane): the risk manager rejected ${tests === 1 ? 'it' : 'them'}, and the desk trades ${tests === 1 ? 'it' : 'them'} at minimum size to test the setup. The kill reason stays in the shadow ledger below.</p>` : '';
   return `<p>${esc(plan.market_stance||'')}</p>${testNote}
-    <div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th><th>Stop</th><th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    <div class="tcards">${rows}</div>`;
 }
 
 function shadowHtml(){
@@ -641,15 +711,18 @@ function shadowHtml(){
   (state.picks_today||[]).forEach(p => { traded[String(p.ticker).toUpperCase()] = p.exploration_lane || 'approved'; });
   const rows = rejections.map(r=>{
     const lane = traded[String(r.ticker).toUpperCase()];
-    const outcome = (r.eod_outcome
-      ? `${esc(r.eod_outcome)}${r.forgone_r!=null ? ' (' + fmtR(r.forgone_r) + 'R)' : ''}`
-      : 'ungraded') + (lane ? ` <span class="pill neutral">traded anyway: ${esc(String(lane).replace('_',' '))}</span>` : '');
-    return `<tr><td>${tickerLink(r.ticker, {date: state.today, lane:'shadow', id: r.rejection_id})}</td><td>${esc(r.direction||'')}</td><td>${esc(r.setup_type||'')}</td>
-      <td>${esc(r.entry_type||'')} @ ${px(r.entry_price)}</td><td>${px(r.stop_price)}</td>
-      <td>${px(r.target_price)}</td><td>${esc(r.conviction ?? '—')}</td>
-      <td class="wrap">${esc(r.reason||'')}</td><td class="wrap">${esc(r.thesis||'')}</td><td>${outcome}</td></tr>`;
+    const oc = r.eod_outcome
+      ? `<span class="pill ${r.forgone_r > 0 ? 'warn' : (r.forgone_r < 0 ? 'ok' : 'neutral')}" title="what the killed trade did anyway">${esc(r.eod_outcome)}${r.forgone_r!=null ? ' ' + fmtR(r.forgone_r) + 'R' : ''}</span>`
+      : '<span class="pill neutral">ungraded</span>';
+    const anyway = lane ? `<span class="pill info">traded anyway: ${esc(String(lane).replace('_',' '))}</span>` : '';
+    return tradeCard({
+      ticker: tickerLink(r.ticker, {date: state.today, lane:'shadow', id: r.rejection_id}), p: r,
+      pills: anyway, right: `${oc}<span class="pill info">conviction ${esc(r.conviction ?? '—')}</span>`,
+      blocks: [block('Why the desk killed it', `kill:${r.rejection_id}`, r.reason||'', 'kill'),
+               block('Thesis', `kth:${r.rejection_id}`, r.thesis||'')],
+    });
   }).join('');
-  return `<div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Dir</th><th>Setup</th><th>Entry (type @ price)</th><th>Stop</th><th>Target</th><th>Conv</th><th>Kill reason</th><th>Thesis</th><th>Shadow outcome</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  return `<div class="tcards">${rows}</div>`;
 }
 
 // ---------------------------------------------------------- paper account
@@ -734,10 +807,9 @@ function paperHtml(){
       ${kpi('Buying power', a.buying_power!=null ? fmtMoney(a.buying_power) : '—', a.status || '')}
     </div>
     <div class="kpi-line" style="margin-bottom:12px">${mon}</div>
-    ${p.runner_note ? `<p class="muted-note">Runner orders today: ${esc(p.runner_note)}</p>` : ''}
     <h3>Open positions</h3>${posHtml}
     <h3>Recent broker orders</h3>${ordHtml}
-    <p class="muted-note">Straight from the broker. Morning picks go in as bracket orders at the open; runner picks at the 10:30 selection. The intraday monitor cancels entries still unfilled at their time stop and flattens every position at 15:55 ET.</p>`;
+    <p class="muted-note">Straight from the broker. Morning picks go in as bracket orders at the open. The intraday monitor cancels entries still unfilled at their time stop and flattens every position at 15:55 ET.</p>`;
 }
 
 function renderToday(){
@@ -748,126 +820,6 @@ function renderToday(){
     <div class="card"><div class="card-head"><h2>Today's plan — ${esc(state.today)}</h2>${state.plan?`<span class="pill neutral">playbook v${esc(state.playbook_version||'')}</span>`:''}</div>${planHtml()}</div>
     <div class="card"><div class="card-head"><h2>Shadow ledger</h2><span class="card-sub">candidates the desk killed, and what they did anyway</span></div>${shadowHtml()}</div>
   `;
-}
-function renderRunner(){
-  const b = $('runner-body');
-  if(!state){ b.innerHTML = empty('Loading…'); return; }
-  const rn = state.runner || {};
-  if(!rn.ran){
-    b.innerHTML = `<div class="card"><div class="card-head"><h2>Runner Lane — ${esc(state.today)}</h2></div>${empty(rn.health || 'No scan recorded for today.')}</div>`;
-    return;
-  }
-  const bad = /^DEGRADED|^NO SCAN/.test(rn.health || '');
-  const quiet = /stand-down/.test(rn.health || '');
-  // An auto-refresh rebuilds this page; keep the filter box's focus and caret.
-  const focused = document.activeElement;
-  const hadFocus = !!(focused && focused.id === 'rn-q');
-  const caret = hadFocus ? focused.selectionStart : 0;
-  const table = (rn.rows||[]).length
-    ? `<div class="filter-row"><input type="text" id="rn-q" placeholder="Filter ticker…" value="${esc(runnerFilter.q)}" autocomplete="off">
-        <label><input type="checkbox" id="rn-sel" ${runnerFilter.sel?'checked':''}> selected only</label>
-        <label><input type="checkbox" id="rn-trig" ${runnerFilter.trig?'checked':''}> triggered only</label>
-        <span class="card-sub" id="rn-count"></span></div><div id="rn-table"></div>`
-    : '';
-  let moversHtml = '';
-  const moves = rn.moves || [];
-  const exitLabel = (x) => x.exit_reason === 'invalid_fill' ? `invalid (${x.invalid_reason || 'fill'})` : (x.exit_reason || '');
-  if(moves.length){
-    const overlap = moves.filter(m=>m.selected).length;
-    const mvRows = moves.map(m=>{
-      const rc = m.post_move_atr==null ? '#8b949e' : (m.post_move_atr>=0 ? '#3fb950' : '#f85149');
-      const tag = m.selected ? `<span style="color:#3fb950;font-weight:700">#${m.rank} picked</span>` : `<span style="color:#8b949e">not picked</span>`;
-      const link = tickerLink(m.ticker, {date: state.today, lane:'runner', id: m.ticker.toUpperCase() + ':' + state.today});
-      return `<tr><td><b>${link}</b></td><td class="num" style="color:${rc}">${m.post_move_atr==null?'—':Number(m.post_move_atr).toFixed(2)}</td><td class="num ${rCls(m.r)}">${m.r==null?'—':Number(m.r).toFixed(2)}</td><td>${esc(exitLabel(m)||'no fill')}</td><td class="num">${m.change_pct==null?'—':Number(m.change_pct).toFixed(1)+'%'}</td><td>${tag}</td></tr>`;
-    }).join('');
-    moversHtml = `<h3>Biggest ${moves.length} moves after detection</h3>
-      <p class="muted-note">Ranked by (session close − plan price) ÷ ATR14 — the move after the system could act. ${overlap} of ${moves.length} were selected. "Chg% at detection" is the move that had already happened when the scan flagged the name: context, not an outcome. Same-day eyeball check, not a training signal; the FDR-corrected version, across many sessions, feeds the weekly miner instead.</p>
-      <div class="table-wrap"><table><thead><tr><th>Ticker</th><th class="num">Move (ATR)</th><th class="num">R</th><th>Exit</th><th class="num">Chg% at detection</th><th></th></tr></thead><tbody>${mvRows}</tbody></table></div>`;
-  }
-  let outcomeHtml = '';
-  const oc = rn.outcomes;
-  if(oc){
-    const side = (label, x) => x && x.n ? `${label}: <b class="${rCls(x.mean_r)}">${Number(x.mean_r).toFixed(2)}R</b> over ${x.n} fills (${x.units} industry units; ${x.invalid} invalid fills not counted)` : '';
-    const parts = [side('Selected', oc.selected), side('Field', oc.field)].filter(Boolean);
-    if(parts.length) outcomeHtml = `<p class="muted-note">${parts.join(' · ')} — realized R in planned-risk units, one session, not evidence on its own.</p>`;
-  }
-  // Plan vs the construction arms, and continuation after entry -- one
-  // session, descriptive (specs/RUNNER_TRADE_CONSTRUCTION_v1.md).
-  let constructionHtml = '';
-  const cs = rn.construction;
-  if(cs){
-    const ct = cs.continuation || {};
-    const tapes = (ct.by_tape||[]).map(t=>`${esc(t.tape)} ${t.up}/${t.n} up (${t.mean_drift_atr==null?'—':Number(t.mean_drift_atr).toFixed(2)} ATR)`).join(' · ');
-    const contLine = ct.n ? `<p class="muted-note">Continuation after entry: <b>${ct.up} of ${ct.n}</b> closed above their first enterable price; mean drift <b class="${rCls(ct.mean_drift_atr)}">${ct.mean_drift_atr==null?'—':Number(ct.mean_drift_atr).toFixed(2)} ATR</b>. By index tape at entry: ${tapes||'—'}. Where price does not keep rising after entry, no stop or target rule can win.</p>` : '';
-    const armRows = (cs.arms||[]).filter(a=>a.n).map(a=>`<tr><td><b>${esc(a.policy)}</b></td><td class="num">${a.n}</td><td class="num ${rCls(a.mean_r)}">${a.mean_r==null?'—':Number(a.mean_r).toFixed(3)}</td><td class="num">${a.win_rate==null?'—':Math.round(100*a.win_rate)+'%'}</td><td class="wrap">${esc(a.question||'')}</td></tr>`).join('');
-    const armTable = armRows ? `<h3>Construction arms — same candidates, replayed</h3>
-      <p class="muted-note">Each arm's R is in its own risk unit (sized by risk: a wider stop buys fewer shares for the same dollars), so mean R compares dollars at risk. One session; the weekly search tests per-session paired ΔR, never win rate — a 1R partial wins more often by construction. Live orders keep the plan bracket until an arm validates forward.</p>
-      <div class="table-wrap"><table><thead><tr><th>Policy</th><th class="num">n</th><th class="num">Mean R</th><th class="num">Win%</th><th>Rule</th></tr></thead><tbody>${armRows}</tbody></table></div>` : '';
-    constructionHtml = contLine + armTable;
-  }
-  let picksHtml = '';
-  if((rn.picks||[]).length){
-    const pRows = rn.picks.map(p=>`<tr><td><b>${tickerLink(p.ticker, {date: state.today, lane:'runner', id: p.ticker.toUpperCase() + ':' + state.today})}</b></td><td>${esc(p.direction)}</td><td>${esc(p.conviction||'')}</td>
-      <td class="num">${esc(p.size_r ?? '—')}R</td><td class="num">${px(p.entry_price)}</td><td class="num">${px(p.stop_price)}</td>
-      <td class="num">${px(p.target_price)}</td><td class="wrap">${esc(p.thesis||'')}</td></tr>`).join('');
-    picksHtml = `<h3>Selected picks (${rn.picks.length})</h3>
-      <div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Dir</th><th>Conviction</th><th>Size</th><th>Entry</th><th>Stop</th><th>Target</th><th>Thesis</th></tr></thead><tbody>${pRows}</tbody></table></div>`;
-  }
-  b.innerHTML = `
-    <div class="card">
-      <div class="card-head"><h2>Runner Lane — ${esc(state.today)}</h2><span class="pill ${bad?'bad':quiet?'warn':'ok'}">${esc(rn.health||'')}</span></div>
-      ${rn.skipped_reason ? `<p class="muted-note">selection: ${esc(rn.skipped_reason)}</p>` : ''}
-      ${rn.universe_note ? `<p class="muted-note">universe: ${esc(rn.universe_note)}</p>` : ''}
-      <div class="stat-grid">
-        ${kpi('Scanned', rn.universe||0, '')}
-        ${kpi('Candidates', rn.n_candidates||0, '')}
-        ${kpi('Selected', rn.n_selected||0, '')}
-        ${kpi('Live orders', rn.n_orders||0, '')}
-      </div>
-      ${picksHtml}
-      ${outcomeHtml}
-      ${constructionHtml}
-      ${moversHtml}
-      <h3>All candidates</h3>${table || '<div class="empty">No candidates.</div>'}
-      <p class="muted-note">Every candidate is priced by the evening simulator, selected or not — that is what makes "did picking help?" answerable. Each is entered no earlier than the scan tick that found it and the selection decision, so picks and field are priced from the same moment. Held = when the VWAP/EMA conditions first held; Seen = the scan tick that formed the plan (price, stop, target). R is realized R in planned-risk units; a fill that left too little of the plan's reward is an invalid fill, not a trade. Rows marked #N were chosen.</p>
-    </div>`;
-  if(table){
-    if(hadFocus){
-      const inp = $('rn-q'); inp.focus();
-      try { inp.setSelectionRange(caret, caret); } catch(_) {}
-    }
-    $('rn-q').addEventListener('input', e => { runnerFilter.q = e.target.value; renderRunnerTable(); });
-    $('rn-sel').addEventListener('change', e => { runnerFilter.sel = e.target.checked; renderRunnerTable(); });
-    $('rn-trig').addEventListener('change', e => { runnerFilter.trig = e.target.checked; renderRunnerTable(); });
-    renderRunnerTable();
-  }
-}
-
-// Kept across refreshes so the 60s auto-refresh never resets what you typed.
-const runnerFilter = {q:'', sel:false, trig:false};
-
-function renderRunnerTable(){
-  const box = $('rn-table');
-  if(!box || !state) return;
-  const all = ((state.runner||{}).rows) || [];
-  const q = runnerFilter.q.trim().toUpperCase();
-  const rows = all.filter(r => (!q || String(r.ticker||'').toUpperCase().includes(q))
-    && (!runnerFilter.sel || r.selected) && (!runnerFilter.trig || r.triggered));
-  $('rn-count').textContent = rows.length === all.length ? `${all.length} candidates` : `${rows.length} of ${all.length}`;
-  if(!rows.length){ box.innerHTML = '<div class="empty">No candidates match.</div>'; return; }
-  const n = (v, dg) => (v==null ? '—' : Number(v).toFixed(dg==null?2:dg));
-  const exitLabel = (x) => x.exit_reason === 'invalid_fill' ? `invalid (${x.invalid_reason || 'fill'})` : (x.exit_reason || '');
-  const body = rows.map(r=>{
-    const sel = r.selected ? `<span class="pos" style="font-weight:700">#${esc(r.rank)}</span>` : '';
-    const link = tickerLink(r.ticker, {date: state.today, lane:'runner', id: r.ticker.toUpperCase() + ':' + state.today});
-    return `<tr><td>${sel}</td><td><b>${link}</b></td><td>${esc(r.industry||'')}</td><td>${esc(r.detection_et||'')}</td><td>${esc(r.seen_et||'')}</td>
-      <td class="num">${n(r.price)}</td><td class="num">${n(r.stop)}</td><td class="num">${n(r.target)}</td>
-      <td class="num">${n(r.rvol)}</td><td class="num">${n(r.vwap_pct)}</td><td class="num">${n(r.tc,1)}</td>
-      <td class="num">${n(r.change_pct)}</td><td class="num">${n(r.staleness_min,0)}</td><td class="num">${n(r.ext_vwap_atr)}</td><td>${esc(r.index_tape||'')}</td>
-      <td class="num ${rCls(r.r)}">${n(r.r)}</td><td class="num">${n(r.post_move_atr)}</td><td class="num ${rCls(r.drift_atr)}">${n(r.drift_atr)}</td>
-      <td>${esc(exitLabel(r))}</td></tr>`;
-  }).join('');
-  box.innerHTML = `<div class="table-wrap" style="max-height:620px"><table><thead><tr><th></th><th>Ticker</th><th>Industry</th><th>Held</th><th>Seen</th><th class="num">Price</th><th class="num">Stop</th><th class="num">Target</th><th class="num">RVOL</th><th class="num">VWAP%</th><th class="num">TC</th><th class="num">Chg%</th><th class="num" title="minutes from Held to the entry bar">Stale (min)</th><th class="num" title="(entry - VWAP) / ATR14 at entry">Ext (ATR)</th><th title="SPY / QQQ vs session VWAP at entry">Tape</th><th class="num">R (plan)</th><th class="num">Move (ATR)</th><th class="num" title="(close - first enterable price) / ATR14">Drift (ATR)</th><th>Exit</th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 function renderPlaybook(){
   const b = $('playbook-body');
@@ -886,16 +838,21 @@ function renderResearch(){
 
   let lessonsHtml = '<div class="empty">No active lessons yet.</div>';
   if((cc.lessons||[]).length){
-    lessonsHtml = `<div class="table-wrap"><table><thead><tr><th>Lesson</th><th>Setup</th><th>Confidence</th><th>+/-</th><th>Status</th></tr></thead><tbody>` +
-      cc.lessons.map(l=>`<tr><td>${esc(l.lesson)}</td><td>${esc(l.setup_type||'')}</td><td>${esc(l.confidence||'')}</td>
-        <td style="white-space:nowrap">+${l.confirmations??0} / -${l.contradictions??0}</td><td>${esc(l.status||'')}</td></tr>`).join('') + '</tbody></table></div>';
+    lessonsHtml = `<div class="tcards">` + cc.lessons.map((l, i)=>`<div class="lesson">
+        <div class="tc-head">${l.setup_type ? `<span class="pill neutral">${esc(l.setup_type)}</span>` : ''}
+          ${l.confidence ? `<span class="pill info">${esc(l.confidence)} confidence</span>` : ''}
+          ${l.status ? `<span class="pill neutral">${esc(l.status)}</span>` : ''}<span class="tc-spacer"></span>
+          <span class="num"><span class="pos">+${l.confirmations??0}</span> / <span class="neg">-${l.contradictions??0}</span></span></div>
+        <div style="margin-top:8px">${longText(`lesson:${i}`, l.lesson)}</div></div>`).join('') + '</div>';
   }
 
   let questionsHtml = '<div class="empty">No open-question progress recorded yet.</div>';
   if((cc.open_questions||[]).length){
-    questionsHtml = `<div class="table-wrap"><table><thead><tr><th>Question</th><th>Progress</th><th>Answerable</th><th>Result / what is missing</th></tr></thead><tbody>` +
-      cc.open_questions.map(q=>`<tr><td title="${esc(q.title||'')}">Q${q.question_id}</td><td>${esc(q.progress||'')}</td>
-        <td>${q.answerable ? 'yes' : 'no'}</td><td>${esc(q.status||'')}</td></tr>`).join('') + '</tbody></table></div>';
+    questionsHtml = `<div class="tcards">` + cc.open_questions.map(q=>`<div class="lesson">
+        <div class="tc-head"><b>Q${q.question_id}</b>${q.progress ? `<span class="pill neutral">${esc(q.progress)}</span>` : ''}
+          <span class="pill ${q.answerable ? 'ok' : 'neutral'}">${q.answerable ? 'answerable' : 'not yet answerable'}</span></div>
+        ${q.title ? `<div style="margin-top:8px;font-weight:600">${esc(q.title)}</div>` : ''}
+        <div style="margin-top:6px">${longText(`oq:${q.question_id}`, q.status)}</div></div>`).join('') + '</div>';
   }
 
   let calHtml = '<div class="empty">No calibration data yet.</div>';
@@ -1010,8 +967,7 @@ async function loadHistoryDates(){
 // per-table knowledge otherwise. No lane/id: the drawer resolves via `contexts`.
 const TABLE_DATE_COL = {
   picks:'plan_date', outcomes:'eval_date', rejections:'plan_date', daily_plans:'plan_date',
-  regime_history:'date', runs:'run_date', runner_sessions:'session_date',
-  runner_candidates:'session_date', runner_candidate_outcomes:'session_date',
+  regime_history:'date', runs:'run_date',
   live_orders:'session_date', lessons:'created_date', calibration:'session_date',
   rule_confirmations:'session_date', open_question_progress:'session_date',
 };
@@ -1058,7 +1014,8 @@ function historyCell(column, row, dateCol){
     const rowDate = dateCol ? row[dateCol] : null;
     return tickerLink(value, rowDate ? {date: String(rowDate).slice(0, 10)} : {});
   }
-  return historyText(value);
+  const text = historyText(value);
+  return text.length > 140 ? `<div class="cell-long clamp" title="click to expand">${text}</div>` : text;
 }
 
 loadData();

@@ -10,20 +10,6 @@ Trade Agent CLI.
   python run.py regrade --from YYYY-MM-DD [--force]
                                            recompute outcomes under CURRENT sim
                                            semantics (explicit, never automatic)
-  python run.py regrade-runner --from YYYY-MM-DD [--force]
-                                           re-price runner candidates under the
-                                           CURRENT entry rule (explicit, opt-in)
-  python run.py regate-runner --from YYYY-MM-DD [--apply]
-                                           relabel scan_version 1 runner rows
-                                           that pass every v2 gate (dry run
-                                           unless --apply)
-  python run.py runner-exits [--from YYYY-MM-DD]
-                                           runner exit-policy replay report, incl.
-                                           the construction arms A/B/C
-                                           (read-only; fill it with regrade-runner)
-  python run.py runner-evidence           runner continuation after entry (drift
-                                           in ATR by bucket) + why each session is
-                                           or is not contested (read-only)
   python run.py research [--full]         research-integrity report: selection
                                            ablation + population baseline
                                            (zero API cost, read-only)
@@ -97,18 +83,6 @@ def cmd_status(cfg, args) -> None:
         for r in runs:
             print(f"  {r['run_date']} {r['loop']:8s} {r['status']:8s} "
                   f"${r['cost_usd']:.3f} {r['model']}")
-    try:
-        from agent import runner_view
-        rs = runner_view.session_summary(con, today_et())
-        if rs["session"] or rs["rows"]:
-            print("")
-            print(f"Runner today: {rs['n_candidates']} candidates, "
-                  f"{rs['n_selected']} selected, {len(rs['orders'])} live orders"
-                  + ("  [DEGRADED]" if rs["session"].get("provider_degraded") else ""))
-            print("  full detail: run.py runner-status")
-    except Exception as e:
-        print("")
-        print(f"Runner today: unavailable ({e})")
 
     total_cost = sum(r["cost_usd"] or 0 for r in ledger.recent_runs(con, 1000))
     print(f"\nAll-time API spend: ~${total_cost:.2f}")
@@ -172,78 +146,13 @@ def cmd_regrade(cfg, args) -> None:
                              trend_map=gctx["trend_map"],
                              fundamentals_map=gctx["fundamentals_map"],
                              prev_close_map=gctx["prev_close_map"],
-                             or_minutes=gctx["or_minutes"],
-                             entry_after_map=gctx["entry_after_map"])
+                             or_minutes=gctx["or_minutes"])
         for o in outcomes:
             ledger.save_outcome(con, o)
             n += 1
     log("regrade", f"Recomputed {n} outcome row(s) from {from_date} onward "
                    f"under sim_version={CURRENT_SIM_VERSION}")
     con.close()
-
-
-def cmd_regrade_runner(cfg, args) -> None:
-    """Re-price every runner candidate for sessions on/after --from under the
-    CURRENT simulation semantics -- in particular the honest entry time
-    (runner_scan.honest_entry_time: never before the scan tick that recorded
-    the candidate or the selection decision). Rows graded before sim_version 4
-    entered at the walked-back detection bar, up to an hour before anything
-    could have acted on it, which flatters every runner R the weekly miner
-    reads. Explicit and opt-in, like `regrade`: never run automatically.
-    Selection stamps (selected/rank/pick_id) are preserved by the upsert.
-    Runner PICKS (setup dto_runner) are morning-style outcome rows -- re-grade
-    those with `regrade`.
-    """
-    from agent.grading import CURRENT_SIM_VERSION
-    from agent.loops.evening import _grade_runner_candidates
-    from agent.providers import MarketData
-
-    from_date = parse_date(args.from_date)
-    con = ledger.connect()
-    rows = con.execute(
-        """SELECT session_date, COUNT(*) FROM runner_candidates
-           WHERE session_date >= ? GROUP BY session_date ORDER BY session_date""",
-        [from_date]).fetchall()
-    total = sum(int(r[1]) for r in rows)
-    if not rows:
-        log("regrade", f"No runner candidates on/after {from_date} -- nothing to do")
-        con.close()
-        return
-    if total > 500 and not args.force:
-        log("regrade", f"Refusing: this would re-price {total} runner candidate rows "
-                       f"across {len(rows)} session(s) (>500). Re-run with --force.")
-        con.close()
-        sys.exit(1)
-    con.close()
-    md = MarketData(cfg)
-    for d, n in rows:
-        # A fresh connection per session, and one retry if it drops: Neon
-        # closed one mid-session on 2026-09-26 (568 candidates). Re-grading a
-        # session is idempotent -- outcome rows are updated in place and
-        # replays are replaced per session -- so the retry is safe.
-        for attempt in (1, 2):
-            con = ledger.connect()
-            try:
-                tickers = ledger.runner_candidate_tickers(con, d)
-                md.prefetch_session(tickers, d, daily=False)
-                summary = _grade_runner_candidates(con, md, d, cfg)
-                restored = ledger.restore_runner_selection(con, d)
-                break
-            except Exception as e:  # noqa: BLE001
-                if attempt == 2 or type(e).__name__ not in ("OperationalError",
-                                                              "InterfaceError"):
-                    raise
-                log("regrade", f"{d}: connection lost ({type(e).__name__}); retrying session")
-            finally:
-                try:
-                    con.close()
-                except Exception:  # noqa: BLE001
-                    pass
-        log("regrade", f"{d}: re-priced {summary['scored']}/{n} candidate(s), "
-                       f"mean R {summary.get('mean_r')}"
-                       + (f"; restored selection on {', '.join(restored)}" if restored else ""))
-    log("regrade", f"Re-priced {total} runner candidate row(s) from {from_date} onward "
-                   f"under sim_version={CURRENT_SIM_VERSION}")
 
 
 def cmd_regrade_shadow(cfg, args) -> None:
@@ -663,44 +572,6 @@ def cmd_undo_progress_backfill(cfg, args) -> None:
     con.close()
 
 
-def cmd_regate_runner(cfg, args) -> None:
-    """Relabel scan_version 1 runner candidates whose STORED inputs pass every
-    scan_version 2 gate (agent/runner_regate.py). Dry run unless --apply.
-
-    Pair it with `regrade-runner` so the relabelled rows are also priced under
-    the current sim_version -- the weekly search mines only rows that match
-    BOTH current versions.
-    """
-    from agent import runner_regate
-    from agent.runner_scan import SCAN_VERSION
-
-    from_date = parse_date(args.from_date)
-    require_rvol = bool((cfg.get("runner", {}) or {}).get("require_rvol", True))
-    if SCAN_VERSION in runner_regate.UNREACHABLE:
-        log("regate", f"NOTE: the running scan_version is {SCAN_VERSION}, which no stored "
-                      f"row can be relabelled into ({runner_regate.UNREACHABLE[SCAN_VERSION]}). "
-                      f"This only relabels v{runner_regate.REGATE_FROM} -> "
-                      f"v{runner_regate.REGATE_TO} for the record; the weekly search "
-                      f"mines v{SCAN_VERSION} rows only.")
-    con = ledger.connect()
-    try:
-        res = runner_regate.plan(con, from_date, require_rvol=require_rvol)
-        log("regate", f"Checked {res['checked']} scan_version {runner_regate.REGATE_FROM} "
-                      f"row(s) on/after {from_date}: {len(res['admit'])} pass every "
-                      f"scan_version {runner_regate.REGATE_TO} gate across "
-                      f"{len(res['sessions'])} session(s)")
-        for why, n in sorted(res["rejected_by_reason"].items()):
-            log("regate", f"  stays v{runner_regate.REGATE_FROM}: {n} -- {why}")
-        if not args.apply:
-            log("regate", "Dry run -- nothing written. Re-run with --apply to relabel.")
-            return
-        n = runner_regate.apply(con, res["admit"])
-        log("regate", f"Relabelled {n} row(s) scan_version {runner_regate.REGATE_TO} "
-                      f"(regated_from={runner_regate.REGATE_FROM})")
-    finally:
-        con.close()
-
-
 def cmd_traders_log(cfg, args, run_date) -> None:
     """Show (--show) or regenerate a session's trader's log
     (specs/TRADERS_LOG_SPEC_v1.md). Regeneration refuses a session whose
@@ -736,95 +607,6 @@ def cmd_traders_log(cfg, args, run_date) -> None:
             print(f"validator: {row['violations_json']}")
         print()
         print(row.get("rendered_text") or "(nothing rendered)")
-    finally:
-        con.close()
-
-
-def cmd_runner(cfg, args) -> None:
-    """One intraday Runner tick (or a loop of them) from this machine.
-
-    The hosted path for this lane is POST /cron/intraday-check, driven by a
-    scheduler. On this account neither available scheduler can do it: GitHub
-    Actions returns startup_failure for every run (an account-level block -- a
-    trivial `echo hello` workflow fails identically), and Vercel Cron on the
-    Hobby plan rejects any schedule that fires more than once a day.
-
-    So this runs the same `agent.loops.runner.tick()` locally, against the
-    local ledger, using the credentials already in credentials.json. Orders go
-    to the SAME Alpaca paper account either way -- the only difference is which
-    database records the evidence.
-    """
-    import time as _time
-    from datetime import datetime, time as dtime
-
-    from agent.loops import runner as runner_loop
-    from agent.providers import MarketData
-    from agent.util import ET, now_et
-
-    if args.no_orders:
-        cfg.raw.setdefault("runner", {})["live_orders_enabled"] = False
-        log("runner", "--no-orders: order placement disabled for this run")
-
-    rcfg = cfg.get("runner", {}) or {}
-    if not rcfg.get("enabled"):
-        log("runner", "runner.enabled is false in config.json -- nothing to do")
-        return
-
-    md = MarketData(cfg)
-    con = ledger.connect()
-
-    def _at_override():
-        if not args.at:
-            return None
-        hh, mm = (int(x) for x in args.at.split(":"))
-        return datetime.combine(now_et().date(), dtime(hh, mm), tzinfo=ET)
-
-    try:
-        while True:
-            at = _at_override() or now_et()
-            started = _time.monotonic()
-            try:
-                res = runner_loop.tick(cfg, at=at, md=md, con=con)
-            except Exception as e:
-                # A tick must never kill the loop: a transient provider error
-                # at 10:35 should not cost the rest of the session.
-                log("runner", f"WARN tick failed ({type(e).__name__}: {e}) -- continuing")
-                res = {"error": str(e)}
-
-            if res.get("skipped"):
-                log("runner", f"skipped: {res['skipped']}")
-            elif "error" not in res:
-                log("runner",
-                    f"universe={res.get('universe_size')} "
-                    f"new={res.get('new_candidates')} "
-                    f"total={res.get('candidates')} "
-                    f"{res.get('elapsed_ms')}ms"
-                    + (" [DEGRADED]" if res.get("provider_degraded") else ""))
-                sel = res.get("selection") or {}
-                if sel.get("selected"):
-                    log("runner", f"SELECTED {len(sel['selected'])}: "
-                                  + ", ".join(sel["selected"]))
-                    orders = sel.get("orders") or {}
-                    log("runner", f"orders placed: {orders.get('placed', 0)}"
-                                  + (f" | skipped: {orders['skipped']}"
-                                     if orders.get("skipped") else ""))
-                elif sel.get("selection_skipped_reason"):
-                    log("runner", f"selection: {sel['selection_skipped_reason']}")
-
-            if not args.loop:
-                break
-
-            # Stop once the window has closed for the day rather than spinning
-            # until the process is killed.
-            end = str(rcfg.get("scan_end_et", "15:00"))
-            eh, em = (int(x) for x in end.split(":"))
-            now_t = now_et().timetz().replace(tzinfo=None)
-            if now_t > dtime(eh, em):
-                log("runner", f"scan window closed ({end} ET) -- exiting loop")
-                break
-
-            sleep_for = max(5.0, args.every - (_time.monotonic() - started))
-            _time.sleep(sleep_for)
     finally:
         con.close()
 
@@ -871,14 +653,6 @@ def main() -> None:
     p_regrade.add_argument("--from", dest="from_date", required=True, help="YYYY-MM-DD -- recompute picks on/after this date")
     p_regrade.add_argument("--force", action="store_true", help="required if this would rewrite more than 50 rows")
 
-    p_rregrade = sub.add_parser(
-        "regrade-runner",
-        help="re-price runner candidates under the current (honest) entry rule (explicit, opt-in)")
-    p_rregrade.add_argument("--from", dest="from_date", required=True,
-                            help="YYYY-MM-DD -- re-price sessions on/after this date")
-    p_rregrade.add_argument("--force", action="store_true",
-                            help="required if this would re-price more than 500 rows")
-
     p_sregrade = sub.add_parser(
         "regrade-shadow",
         help="re-price shadow-ledger rejections with the evening simulator (dry run unless --apply)")
@@ -917,45 +691,6 @@ def main() -> None:
                        help="YYYY-MM-DD -- first session whose evening recorded Q14 notes")
     p_upb.add_argument("--apply", action="store_true",
                        help="write the changes (default is a dry run)")
-
-    p_regate = sub.add_parser(
-        "regate-runner",
-        help="relabel scan_version 1 runner rows that pass every v2 gate (dry run unless --apply)")
-    p_regate.add_argument("--from", dest="from_date", required=True,
-                          help="YYYY-MM-DD -- check sessions on/after this date")
-    p_regate.add_argument("--apply", action="store_true",
-                          help="write the relabel (default is a dry run)")
-
-    p_runner = sub.add_parser(
-        "runner",
-        help="run one intraday Runner scan tick (scan -> select -> place)")
-    add_common(p_runner)
-    p_runner.add_argument("--at", type=str, default=None,
-                          help="override the tick time, HH:MM ET (testing)")
-    p_runner.add_argument("--loop", action="store_true",
-                          help="keep ticking every --every seconds until the "
-                               "scan window closes, then exit")
-    p_runner.add_argument("--every", type=int, default=300,
-                          help="seconds between ticks in --loop mode (default 300)")
-    p_runner.add_argument("--no-orders", action="store_true",
-                          help="scan and select but never place an order")
-
-    p_rstatus = sub.add_parser(
-        "runner-status",
-        help="show today's Runner scan: candidates, picks, outcomes")
-    p_rstatus.add_argument("--date", type=str, default=None,
-                           help="YYYY-MM-DD (default: today ET)")
-
-    p_rexits = sub.add_parser(
-        "runner-exits",
-        help="runner exit-policy replay report (read-only, zero API cost)")
-    p_rexits.add_argument("--from", dest="from_date", type=str, default=None,
-                          help="YYYY-MM-DD (default: last 120 days)")
-
-    sub.add_parser(
-        "runner-evidence",
-        help="runner continuation after entry (drift in ATR by bucket) and selection "
-             "coverage per session (read-only, zero API cost)")
 
     p_tlog = sub.add_parser(
         "traders-log",
@@ -1011,8 +746,6 @@ def main() -> None:
         cmd_dashboard(cfg, args)
     elif args.cmd == "regrade":
         cmd_regrade(cfg, args)
-    elif args.cmd == "regrade-runner":
-        cmd_regrade_runner(cfg, args)
     elif args.cmd == "regrade-shadow":
         cmd_regrade_shadow(cfg, args)
     elif args.cmd == "find-test-rows":
@@ -1021,8 +754,6 @@ def main() -> None:
         cmd_repair_test_rows(cfg, args)
     elif args.cmd == "undo-progress-backfill":
         cmd_undo_progress_backfill(cfg, args)
-    elif args.cmd == "regate-runner":
-        cmd_regate_runner(cfg, args)
     elif args.cmd == "research":
         cmd_research(cfg, args)
     elif args.cmd == "rehearse":
@@ -1064,30 +795,6 @@ def main() -> None:
             print(gapfield.report_text(con, args.top))
         finally:
             con.close()
-    elif args.cmd == "runner":
-        cmd_runner(cfg, args)
-    elif args.cmd == "runner-exits":
-        from datetime import timedelta
-        from agent import runner_exits
-        con = ledger.connect()
-        try:
-            since = (parse_date(args.from_date) if args.from_date
-                     else today_et() - timedelta(days=120))
-            rows = [r for r in ledger.runner_exit_replays_since(con, since)
-                    if r.get("policy_version") == runner_exits.POLICY_VERSION
-                    and r.get("r_planned") is not None]
-            print(runner_exits.report_text(rows))
-        finally:
-            con.close()
-    elif args.cmd == "runner-evidence":
-        from agent import runner_research
-        con = ledger.connect()
-        try:
-            print(runner_research.evidence_report_text(
-                runner_research.current_drift_rows(con),
-                runner_research.selection_coverage(con)))
-        finally:
-            con.close()
     elif args.cmd == "traders-log":
         cmd_traders_log(cfg, args, run_date)
     elif args.cmd == "persona-monitor":
@@ -1104,13 +811,6 @@ def main() -> None:
         con = ledger.connect()
         try:
             print(hypotheses.render_text(con, run_date or today_et(), args.show))
-        finally:
-            con.close()
-    elif args.cmd == "runner-status":
-        from agent import runner_view
-        con = ledger.connect()
-        try:
-            print(runner_view.render_text(con, run_date or today_et()))
         finally:
             con.close()
 

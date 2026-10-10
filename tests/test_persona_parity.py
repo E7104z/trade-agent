@@ -92,10 +92,3 @@ def test_mock_contracts_unchanged_with_the_persona_on(cfg, name, keys):
     assert keys <= set(res.parsed or {})
 
 
-def test_runner_selector_mock_still_parses(cfg):
-    from agent.runner_selection import parse_selection
-    res = llm.LLMClient(cfg).call(system="s", user="u", model="m", mock_name="runner_selector",
-                                  expect_json=False)
-    tickers = {p["ticker"] for p in json.loads(res.text)["picks"]}
-    selected, hallucinated = parse_selection(res.text, tickers)
-    assert selected and not hallucinated

@@ -122,7 +122,7 @@ def test_a_withheld_setup_line_says_which_setup_and_what_status_it_has():
 def test_the_changelog_is_checked_and_cannot_describe_system_sections():
     changelog = "\n".join([
         "- Decay check (applied FIRST): 5 rules, zero auto-demotions.",
-        "- Runner Lane: selection edge shows selected worse than unselected.",
+        "- Selection Edge: the edge shows selected worse than unselected.",
         "- Shadow Ledger Summary: filters SAVED money.",
         "- Q7: 24/8 met; finding: no separation.",
         "- gap_go: n=3, wr=67%, avgR=+0.9",
@@ -207,14 +207,11 @@ def test_an_observed_regime_with_no_rule_gets_an_explicit_line():
 
 def test_system_sections_replace_the_miners_text_in_contract_order():
     computed = {"shadow ledger": ["", "SYSTEM SHADOW", ""],
-                "participation funnel": ["", "SYSTEM FUNNEL", ""],
-                "runner lane": ["", "**(no validated runner rules yet — do not assume any)**",
-                                "", "SYSTEM RUNNER", ""]}
+                "participation funnel": ["", "SYSTEM FUNNEL", ""]}
     res = pe.enforce(_doc(), computed=computed)
     md = res.markdown
     assert "The filters are working." not in md
-    assert md.index("SYSTEM RUNNER") < md.index("SYSTEM SHADOW") < md.index("SYSTEM FUNNEL") \
-        < md.index("## Open Questions")
+    assert md.index("SYSTEM SHADOW") < md.index("SYSTEM FUNNEL") < md.index("## Open Questions")
     assert _blocks_left(md) == []
 
 
@@ -396,17 +393,6 @@ def test_a_cell_holding_the_whole_lane_is_not_a_finding():
     assert "restates the lane mean" in big.note
     assert small.test == "one_sample" and small.p_value is not None
     assert lane.test == "one_sample" and lane.significant       # the lane mean, tested once
-
-
-def test_one_contested_session_gives_no_selection_verdict():
-    from agent.runner_research import selection_edge
-    rows = ([{"session_date": D, "selected": True, "r_planned": -0.8 + 0.01 * i}
-             for i in range(9)]
-            + [{"session_date": D, "selected": False, "r_planned": -0.3 + 0.01 * i}
-               for i in range(40)])
-    se = selection_edge(rows)
-    assert se["underpowered"] is True
-    assert "no direction may be read" in se["verdict"]
 
 
 def test_structural_pairs_use_planned_r_like_the_one_d_search():

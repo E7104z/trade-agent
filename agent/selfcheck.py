@@ -112,8 +112,6 @@ def check_plumbing(con: Any, cfg: Any, d: date) -> dict:
     pop_u = _one(con, "SELECT COUNT(*) FROM population_universe WHERE plan_date = ?", [d])
     pop_o = _one(con, """SELECT COUNT(*) FROM population_outcomes
                          WHERE plan_date = ? AND r_multiple IS NOT NULL""", [d])
-    run_c = _one(con, "SELECT COUNT(*) FROM runner_candidates WHERE session_date = ?", [d])
-    run_o = _one(con, "SELECT COUNT(*) FROM runner_candidate_outcomes WHERE session_date = ?", [d])
     fwd = dict(_q(con, """SELECT COALESCE(source, 'taken'), COUNT(*) FROM research_observations
                           WHERE session_date = ? GROUP BY 1""", [d]))
     problems = []
@@ -121,16 +119,14 @@ def check_plumbing(con: Any, cfg: Any, d: date) -> dict:
         problems.append(f"{picks} morning pick(s) and none graded")
     if _cfg(cfg, "population").get("enabled") and pop_u and not pop_o:
         problems.append(f"{pop_u} gappers snapshotted and none graded")
-    if _cfg(cfg, "runner").get("enabled") and run_c and not run_o:
-        problems.append(f"{run_c} runner candidates and none priced")
     status = "bad" if problems else "ok"
     head = ("; ".join(problems) if problems else
             f"morning {graded}/{picks} graded ({triggered} triggered), shadow {priced}/{rejections} "
-            f"priced, population {pop_o} rows, runner {run_o}/{run_c} priced, forward "
+            f"priced, population {pop_o} rows, forward "
             f"observations {sum(int(v) for v in fwd.values())}")
     return _res(status, head, picks=picks, graded=graded, triggered=triggered,
                 rejections=rejections, rejections_priced=priced, population_universe=pop_u,
-                population_graded=pop_o, runner_candidates=run_c, runner_priced=run_o,
+                population_graded=pop_o,
                 forward_observations={str(k): int(v) for k, v in fwd.items()})
 
 
@@ -315,25 +311,6 @@ def check_entries(con: Any, cfg: Any, d: date) -> dict:
                 level_fixes_filled=fix_fill, validator_drops=dict(drops))
 
 
-def check_runner_selection(con: Any, cfg: Any, d: date) -> dict:
-    """Did the runner lane make its one selection today? A claim whose
-    request died left 10/05 with 533 candidates, 0 picks and no reason."""
-    rcfg = _cfg(cfg, "runner")
-    if not (rcfg.get("enabled") and rcfg.get("selection_enabled")):
-        return _res("info", "runner selection off")
-    from .ledger import runner_selection_note
-    n_cand = _one(con, "SELECT COUNT(*) FROM runner_candidates WHERE session_date = ?", [d])
-    try:
-        note = runner_selection_note(con, d)
-    except Exception as e:  # noqa: BLE001
-        return _res("warn", f"selection state unreadable ({type(e).__name__})")
-    if n_cand and note["state"] in ("unfinished", "not_run"):
-        status = "warn"
-    else:
-        status = "ok" if note["state"] == "decided" else "info"
-    return _res(status, f"{n_cand} candidate(s): {note['text']}", candidates=n_cand, **note)
-
-
 def check_grader_audit(con: Any, cfg: Any, d: date) -> dict:
     """What the evening audit (agent/review_audit.py) caught in today's grader
     output: claims the computed numbers contradict, before they were saved."""
@@ -515,7 +492,6 @@ CHECKS: tuple[tuple[str, str, Callable[[Any, Any, date], dict]], ...] = (
     ("plumbing", "Data collected today", check_plumbing),
     ("lanes", "Lanes and broker cap", check_lanes),
     ("entries", "Entries and fills", check_entries),
-    ("runner_selection", "Runner selection", check_runner_selection),
     ("grader_audit", "Grader audit", check_grader_audit),
     ("morning_budget", "Morning time budget", check_morning_budget),
     ("hypotheses", "Hypothesis notebook", check_hypotheses),

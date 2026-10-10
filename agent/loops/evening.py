@@ -16,17 +16,15 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime
-from functools import partial
 
 from .. import ledger
 from ..config import Config
 from ..delivery import evening_email_html, render_dashboard, send_email
-from ..grading import (CURRENT_SIM_VERSION, RUNNER_MIN_REWARD_R, classify_shadow,
+from ..grading import (CURRENT_SIM_VERSION, classify_shadow,
                        grade_day, outcomes_md, realized_r, simulate_pick)
 from ..grading_context import build_grading_context
 from ..llm import LLMClient, load_prompt, persona_block, persona_version, prompt_version
-from ..coverage import (OUTCOME_FIELDS, RUNNER_FIELDS, lane_of, outcome_coverage,
-                        plumbing)
+from ..coverage import OUTCOME_FIELDS, lane_of, outcome_coverage, plumbing
 from ..coverage import describe as describe_plumbing
 from ..failures import classify_failure, format_failure
 from ..grounding import (lesson_in_scope, tape_summary, ungrounded_tokens,
@@ -35,8 +33,7 @@ from ..providers import MarketData
 from ..util import is_market_day, log, now_et, prev_market_day, today_et
 
 # vercel.json functions.maxDuration. A run killed at the budget logs nothing,
-# so the warning fires on the runs that DO finish, while there is still room:
-# runner-heavy evenings took 455-518s before the prefetch fix (85a7993).
+# so the warning fires on the runs that DO finish, while there is still room.
 FUNCTION_BUDGET_S = 300
 BUDGET_WARN_FRACTION = 0.70
 BUDGET_WARN_S = FUNCTION_BUDGET_S * BUDGET_WARN_FRACTION
@@ -138,310 +135,6 @@ def _all_fills_tainted(outcomes: list[dict]) -> bool:
     if not fills:
         return False
     return all(o.get("exit_reason") == "invalid_fill" or o.get("execution_anomaly") for o in fills)
-
-
-def _runner_grader_block(con, d: date) -> str:
-    """The full runner candidate list, with the selected rows marked.
-
-    Spec 2.6: the grader is asked whether the SELECTION was defensible at
-    decision time, which is unanswerable from the picks alone. A grader that
-    cannot see what was passed over has to reconstruct the decision from a
-    fragment - and that is the exact condition under which it previously
-    invented a narrative around a trade that never validly existed.
-    """
-    candidates = ledger.runner_candidates_for_date(con, d)
-    if not candidates:
-        return ""
-    outcomes = {o["ticker"]: o for o in ledger.runner_outcomes_for_date(con, d)}
-    session = ledger.runner_session(con, d) or {}
-
-    def _n(v, dg=2):
-        return "" if v is None else f"{v:.{dg}f}"
-
-    lines = ["| sel | rank | ticker | industry | det ET | price | rvol | vwap% | tc | stop_dist | stop_atr | 200d | R | exit |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
-    n_sel = 0
-    for c in candidates:
-        o = outcomes.get(c["ticker"]) or {}
-        sel = bool(o.get("selected"))
-        n_sel += 1 if sel else 0
-        fp = c.get("first_pass_et")
-        # A fill that is not a trade (wrong side of its stop, or too little
-        # reward left at the fill) has no R. Mask it so no lesson is ever
-        # extracted from a structurally impossible outcome.
-        invalid = o.get("exit_reason") == "invalid_fill"
-        # R is planned-risk R (r_planned), the measure every runner statistic
-        # reads. r_multiple divides by the fill-to-stop distance, so a fill a
-        # few cents above a stale stop printed +5..7R "wins" (2026-10-01).
-        r_val = o.get("r_planned") if o.get("r_planned") is not None else o.get("r_multiple")
-        r_txt = "INVALID FILL" if invalid else _n(r_val)
-        lines.append(
-            f"| {'YES' if sel else ''} | {o.get('selection_rank') or ''} | {c['ticker']} | "
-            f"{c.get('industry') or ''} | "
-            f"{fp.strftime('%H:%M') if isinstance(fp, datetime) else ''} | "
-            f"{_n(c.get('detection_price'))} | {_n(c.get('rvol'))} | "
-            f"{_n(c.get('vwap_pct_above'))} | {_n(c.get('trend_consistency'), 1)} | "
-            f"{_n(c.get('stop_dist'))} | {_n(o.get('stop_dist_atr'))} | "
-            f"{o.get('trend_side_200d') or ''} | {r_txt} | {o.get('exit_reason') or ''} |")
-
-    skipped = session.get("selection_skipped_reason")
-    header = (f"{len(candidates)} candidate(s) detected, {n_sel} selected."
-              + (f" Selection note: {skipped}." if skipped else ""))
-    body = chr(10).join(lines)
-    return ("## RUNNER LANE - FULL CANDIDATE LIST (selected rows marked)" + chr(10) * 2
-            + header + chr(10) * 2 + body + chr(10) * 2
-            + "Every row was priced by the same simulator, selected or not. R is "
-              "realized R in PLANNED-risk units. Judge whether the SELECTION was "
-              "defensible on what was knowable at decision time - not on which row "
-              "happened to win. Several selected rows in one industry are one bet, "
-              "not several independent ones.")
-
-
-def _replay_exits(replays: list[dict], summary: dict, ticker: str, c: dict,
-                  bars: list[dict], cutoff, sim: dict, d: date,
-                  slippage: float, min_bar_volume: float, flatten_at,
-                  atr14: float | None = None) -> None:
-    """Append one triggered candidate's exit-policy replays (RUNNER_EXIT_SPEC_v1,
-    and the construction arms of RUNNER_TRADE_CONSTRUCTION_v1).
-
-    The `plan` arm must reproduce the grader's r_planned for this exact trade.
-    If it does not, the replay engine has drifted from simulate_pick, and every
-    ΔR it would report for this candidate measures that drift, not an exit --
-    so none of its rows are kept, and the mismatch is logged and counted.
-    """
-    from .. import runner_exits
-    try:
-        rows = runner_exits.replay(
-            bars, runner_exits.fill_index(bars, cutoff),
-            float(c.get("detection_price")), float(c.get("stop_price")),
-            slippage_bps=slippage, min_bar_volume=min_bar_volume,
-            flatten_at=flatten_at, session_date=d, atr14=atr14)
-    except Exception as e:
-        log("evening", f"  runner {ticker}: exit replay failed ({e})")
-        return
-    ref = next((r for r in rows if r["policy"] == runner_exits.REFERENCE), None)
-    graded = sim.get("r_planned")
-    if ref is None or graded is None or abs(ref["r_planned"] - graded) > 1e-3:
-        summary["exit_replay_parity_fail"] += 1
-        log("evening", f"  WARN runner {ticker}: exit replay plan arm "
-                       f"{ref and ref['r_planned']} != graded r_planned {graded} - "
-                       f"replays for this candidate not stored")
-        return
-    for r in rows:
-        r.update(ticker=ticker, policy_version=runner_exits.POLICY_VERSION,
-                 sim_version=sim.get("sim_version"))
-    replays.extend(rows)
-    summary["exit_replays"] += 1
-
-
-def _grade_runner_candidates(con, md: MarketData, d: date, cfg: Config) -> dict:
-    """Price EVERY runner candidate, traded or not (RUNNER_PORT_SPEC 1.5).
-
-    This is the free evidence engine. Simulating 40 candidates instead of 10
-    costs bar fetches, not tokens, and it is the only way to get a denominator
-    for "did selection help?" - you cannot measure a picker against the field
-    if the field was never priced.
-
-    Entry is the OPEN OF THE BAR FOLLOWING first_pass_et, never the detection
-    bar's close. Entering at the close of the bar that triggered detection is a
-    look-ahead fill: the condition check reads that bar's close, so filling
-    there buys at a price the rule needed in order to fire.
-
-    Implementation note on how that entry is expressed: simulate_pick with
-    entry_type="open" fills at bars[0]["o"], so the minute-bar array is SLICED
-    to begin at the first bar strictly after first_pass_et and handed over. The
-    persisted columns (triggered/fill/exit/R/MFE/MAE/EOD) are all post-entry
-    quantities, so the slice is exactly the right window for them. Session-wide
-    indicator fields that simulate_pick also computes would be wrong on a
-    sliced array - none of them are read or stored here.
-    """
-    candidates = ledger.runner_candidates_for_date(con, d)
-    summary = {"scored": 0, "triggered": 0, "sum_r": 0.0, "no_bars": 0, "skipped": 0,
-               "exit_replays": 0, "exit_replay_parity_fail": 0}
-    if not candidates:
-        return summary
-    replays: list[dict] = []
-    selection_at = (ledger.runner_session(con, d) or {}).get("selection_at")
-
-    slippage = float(cfg.get("slippage_bps", 0) or 0)
-    flatten_at = cfg.get("flatten_at")
-    min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
-
-    # Indicator layer v2 for the WHOLE runner pool, not just the picks. One
-    # batched daily_context fetch (the same the morning grader uses) yields
-    # ATR14 and the 200d trend snapshot, so stop_dist_atr and trend_side_200d
-    # can be stored per candidate and the weekly miner can test them against
-    # selected-vs-unselected the same way it already tests the morning lane.
-    atr_map: dict[str, float] = {}
-    trend_map: dict[str, dict] = {}
-    try:
-        ctx = md.daily_context([c["ticker"] for c in candidates])
-        atr_map = {t: x["atr14"] for t, x in ctx.items() if x.get("atr14")}
-        trend_map = {t: x["trend_snapshot"] for t, x in ctx.items()
-                     if x.get("trend_snapshot")}
-    except Exception as e:
-        log("evening", f"  runner daily_context fetch failed ({e}) - ATR/trend null")
-
-    def _stop_dist_atr(c: dict, atr14: float | None) -> float | None:
-        stop_dist = c.get("stop_dist")
-        if not stop_dist or not atr14:
-            return None
-        return round(stop_dist / atr14, 2)
-
-    def _trend_side(snapshot: dict | None) -> str | None:
-        if not snapshot:
-            return None
-        above = snapshot.get("above_ma200")
-        return "above" if above is True else ("below" if above is False else None)
-
-    # The index tape every candidate was bought into (schema v28): SPY and QQQ
-    # against their session VWAP just before each entry. Two fetches a
-    # session; a failure leaves the tape null (the '?' bucket), never the
-    # grading pass.
-    from ..runner_entry import INDEX_SYMBOLS, IndexTape, entry_context
-    tapes: dict[str, IndexTape] = {}
-    for sym in INDEX_SYMBOLS:
-        try:
-            tapes[sym] = IndexTape(md.minute_bars(sym, d))
-        except Exception as e:
-            log("evening", f"  runner index tape {sym}: bar fetch failed ({e}) - tape null")
-    summary["entry_context"] = 0
-
-    for c in candidates:
-        ticker = c["ticker"]
-        try:
-            bars = md.minute_bars(ticker, d)
-        except Exception as e:
-            log("evening", f"  runner {ticker}: bar fetch failed ({e})")
-            bars = []
-
-        first_pass = c.get("first_pass_et")
-        entry_bars = bars
-        cutoff = None
-        if bars and first_pass is not None:
-            fp = first_pass if isinstance(first_pass, datetime) else None
-            if fp is not None:
-                # Compare on naive ET wall-clock: first_pass_et is stored
-                # without a tzinfo, while provider bars carry one.
-                #
-                # The cutoff is never earlier than the detection BAR'S CLOSE
-                # (a first_pass_et of 10:20 labels the 5-minute bar running to
-                # 10:25, so the signal is not knowable until 10:25), and never
-                # earlier than the scan tick that first saw the candidate or
-                # the selection decision -- first_pass_et is walked back up to
-                # an hour, and entering there credits survivors with fills
-                # nobody could have taken. See runner_scan.honest_entry_time.
-                from ..runner_scan import honest_entry_time
-                cutoff = honest_entry_time(fp, c.get("scan_pass_et"), selection_at)
-                entry_bars = [b for b in bars
-                              if b["t"].replace(tzinfo=None) >= cutoff]
-
-        # The move AFTER the system could act, in ATR: what the dashboard
-        # ranks "biggest moves" by. change_pct is the move that had ALREADY
-        # happened at detection -- a feature the selector reads, not an
-        # outcome -- so ranking by it listed the most extended names and
-        # labelled the ones the selector passed over as misses.
-        session_close = bars[-1]["c"] if bars else None
-        det_px = c.get("detection_price")
-        atr = atr_map.get(ticker)
-        post_move_atr = (round((session_close - det_px) / atr, 3)
-                         if (session_close is not None and det_px and atr) else None)
-
-        if not entry_bars:
-            summary["no_bars"] += 1
-            ledger.save_runner_candidate_outcome(con, {
-                "session_date": d, "ticker": ticker, "eval_date": d,
-                "triggered": False, "exit_reason": "no_data",
-                "sim_version": CURRENT_SIM_VERSION,
-                "entry_after_et": cutoff,
-                "atr14": atr_map.get(ticker),
-                "stop_dist_atr": _stop_dist_atr(c, atr_map.get(ticker)),
-                "trend_side_200d": _trend_side(trend_map.get(ticker)),
-                "session_close": session_close, "post_move_atr": post_move_atr,
-            })
-            continue
-
-        shim = {"pick_id": 0, "direction": "long", "entry_type": "open",
-                "entry_price": c.get("detection_price"),
-                "stop_price": c.get("stop_price"),
-                "target_price": c.get("target_price")}
-        sim = simulate_pick(shim, entry_bars, None, slippage_bps=slippage,
-                            flatten_at=flatten_at, min_bar_volume=min_bar_volume,
-                            atr14=atr_map.get(ticker),
-                            trend_snapshot=trend_map.get(ticker),
-                            session_date=d, min_reward_r=RUNNER_MIN_REWARD_R)
-
-        # At-entry context and exit-independent continuation, for EVERY
-        # candidate with an enterable bar -- invalid fills included: "does
-        # price keep going up after entry" does not depend on whether this
-        # plan's bracket was still valid (specs/RUNNER_TRADE_CONSTRUCTION_v1.md).
-        try:
-            ctx_fields = entry_context(bars, cutoff, first_pass, atr, tapes)
-        except Exception as e:
-            log("evening", f"  runner {ticker}: entry context failed ({e}) - left null")
-            ctx_fields = {}
-        if ctx_fields:
-            summary["entry_context"] += 1
-
-        ledger.save_runner_candidate_outcome(con, {
-            **ctx_fields,
-            "session_date": d, "ticker": ticker, "eval_date": d,
-            "triggered": sim.get("triggered"),
-            "entry_fill": sim.get("entry_fill"),
-            "exit_price": sim.get("exit_price"),
-            "exit_reason": sim.get("exit_reason"),
-            "r_multiple": sim.get("r_multiple"),
-            # v23 added these columns, but this call never passed them, so every
-            # runner row kept r_planned NULL and the runner stats fell back to
-            # the floored (inflated) r_multiple.
-            "r_planned": sim.get("r_planned"),
-            "eod_r_planned": sim.get("eod_r_planned"),
-            "mfe_r": sim.get("mfe_r"),
-            "mae_r": sim.get("mae_r"),
-            "eod_r": sim.get("eod_r"),
-            "sim_version": sim.get("sim_version"),
-            "entry_after_et": cutoff,
-            "atr14": sim.get("atr14"),
-            "stop_dist_atr": sim.get("stop_dist_atr"),
-            "trend_side_200d": sim.get("trend_side_200d"),
-            "invalid_reason": sim.get("invalid_reason"),
-            "session_close": session_close, "post_move_atr": post_move_atr,
-        })
-        summary["scored"] += 1
-        if sim.get("exit_reason") == "invalid_fill":
-            summary["invalid_fill"] = summary.get("invalid_fill", 0) + 1
-        if sim.get("triggered"):
-            summary["triggered"] += 1
-            # Mean R is quoted as r_planned -- the number the weekly miner, the
-            # runner stats and the exit-replay parity check all read. This line
-            # used to report r_multiple, a different measure (fill-to-stop
-            # risk, floored at 25% of plan), so on 2026-09-26 the regrade log
-            # and `run.py runner-exits` printed two unrelated "mean R"s for the
-            # same trades (-0.05..-0.47 vs +0.32; the +0.32 was r_planned's own
-            # since-fixed detection-price basis, not this line's fault).
-            if sim.get("r_planned") is not None:
-                summary["sum_r"] += sim["r_planned"]
-            _replay_exits(replays, summary, ticker, c, bars, cutoff, sim, d,
-                          slippage, min_bar_volume, flatten_at, atr14=atr)
-
-    # Exit-policy replays (RUNNER_EXIT_SPEC_v1). Measurement only: nothing here
-    # changes a live exit, and a failure here must never fail the grading pass.
-    try:
-        ledger.save_runner_exit_replays(con, d, replays)
-    except Exception as e:
-        log("evening", f"  WARN runner exit replays not saved ({e})")
-
-    summary["sum_r"] = round(summary["sum_r"], 2)
-    summary["mean_r"] = (round(summary["sum_r"] / summary["triggered"], 3)
-                         if summary["triggered"] else None)
-    log("evening", f"Runner candidates priced: {summary['scored']} scored, "
-                   f"{summary['triggered']} triggered, mean R "
-                   f"{summary['mean_r'] if summary['mean_r'] is not None else 'n/a'}; "
-                   f"entry context {summary['entry_context']}; "
-                   f"exit replays {summary['exit_replays']}"
-                   + (f" ({summary['exit_replay_parity_fail']} parity failures)"
-                      if summary["exit_replay_parity_fail"] else ""))
-    return summary
 
 
 def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
@@ -635,10 +328,9 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
     by_id = {o["pick_id"]: o for o in outcomes}
     con.execute("DELETE FROM open_question_progress WHERE session_date = ?", [d])
 
-    # MORNING lane only. Runner picks share the `picks` table, and every
-    # calibration row and open question below is about the morning desk: its
-    # stated conviction (Q3), its stops (Q6/Q9), its R:R bar (Q13 -- which
-    # every runner pick, target fixed at 2R, used to satisfy).
+    # MORNING lane only: legacy rows from the retired runner lane share the
+    # `picks` table, and every calibration row and open question below is about
+    # the morning desk.
     picks = [p for p in picks if p.get("setup_type") != ledger.RUNNER_SETUP]
 
     # calibration rows (taken picks only; conviction as stated in the morning,
@@ -664,7 +356,6 @@ def _deterministic_events(con, md: MarketData, d: date, picks: list[dict],
             if len(picks) == 1:
                 # R here stays r_multiple: question_eval._q2 parses it back out
                 # of every note ever written, and those were all r_multiple.
-                # One series, one measure (see specs/RUNNER_POOL_INTEGRITY_v1.md).
                 ledger.add_question_progress(con, Q_SYMPATHY_STANDALONE, d, 1,
                                              f"{p['ticker']} standalone sympathy R={o.get('r_multiple')}")
                 counts["q_increments"] += 1
@@ -865,11 +556,6 @@ def _ground_lessons(con, d: date, new_lessons: list[dict], lesson_updates: list[
         kept_lessons.append(l)
 
     pick_rows = _fill_valid_rows(picks, outcomes)
-    try:
-        from .. import research
-        runner_rows = research.runner_rows(con, d)
-    except Exception:  # noqa: BLE001
-        runner_rows = []
     kept_updates = []
     seen = set()
     for upd in lesson_updates or []:
@@ -882,7 +568,7 @@ def _ground_lessons(con, d: date, new_lessons: list[dict], lesson_updates: list[
         lesson = ledger.get_lesson(con, lid)
         if lesson is None:
             continue
-        ok, why = lesson_in_scope(lesson, pick_rows, runner_rows)
+        ok, why = lesson_in_scope(lesson, pick_rows)
         if not ok:
             counts["updates_rejected"] += 1
             ledger.save_grader_rejection(con, d, "update_out_of_scope",
@@ -897,9 +583,8 @@ def _record_coverage(con, d: date, picks: list[dict], outcomes: list[dict]) -> l
     """Write this session's grading coverage and return the plumbing rows.
 
     One row per lane and field: how many rows were graded, how many had the
-    field null. Picks are split by lane (a runner day grades ten picks the
-    morning lane never saw); every runner candidate the evening priced is its
-    own lane. Never raises -- measurement must not cost the run.
+    field null. Picks are split by lane. Never raises -- measurement must not
+    cost the run.
     """
     try:
         by_pick = {o["pick_id"]: o for o in outcomes}
@@ -911,13 +596,6 @@ def _record_coverage(con, d: date, picks: list[dict], outcomes: list[dict]) -> l
         cov: list[dict] = []
         for lane, rows in lanes.items():
             cov += outcome_coverage(rows, f"{lane}_picks", OUTCOME_FIELDS, "grade_day")
-        try:
-            cand = ledger.runner_outcomes_for_date(con, d)
-        except Exception:
-            cand = []
-        if cand:
-            cov += outcome_coverage(cand, "runner_candidates", RUNNER_FIELDS,
-                                    "grade_runner_candidates")
         ledger.save_data_coverage(con, d, "evening", cov)
         return plumbing(cov)
     except Exception as e:  # noqa: BLE001
@@ -925,16 +603,13 @@ def _record_coverage(con, d: date, picks: list[dict], outcomes: list[dict]) -> l
         return []
 
 
-def _prefetch_grading_bars(con, md: MarketData, d: date, picks: list[dict],
-                           runner_enabled: bool) -> None:
+def _prefetch_grading_bars(con, md: MarketData, d: date, picks: list[dict]) -> None:
     """Warm MarketData's bar memo for every symbol this run will grade.
 
     The graders below each fetch the same session's bars symbol by symbol --
-    picks, the shadow ledger, the paired challenger arm and every runner
-    candidate -- and on a runner-heavy day that sequential walk alone
-    exceeded the 300s serverless budget, killing the run before the grading
-    call, the lessons, or the calibration rows were ever written. One
-    concurrent prefetch through the SAME fetch functions makes every later
+    picks, the shadow ledger and the paired challenger arm -- and a long
+    sequential walk can exceed the 300s serverless budget. One concurrent
+    prefetch through the SAME fetch functions makes every later
     call a memo hit returning identical data. Best effort: anything missed is
     fetched on demand exactly as before.
     """
@@ -953,15 +628,12 @@ def _prefetch_grading_bars(con, md: MarketData, d: date, picks: list[dict],
         #   picks      minute + session daily + previous-session daily
         #              (grade_day, stress ladder, grading context, Q4)
         #   arm B      minute + session daily (grade_paired_arms)
-        #   shadow +   minute only (simulated with daily=None)
-        #   runner
+        #   shadow     minute only (simulated with daily=None)
         #   population session daily only (grade_population)
         pick_syms = {str(p["ticker"]).upper() for p in picks}
         paired = _q("""SELECT DISTINCT ticker FROM paired_arm_picks
                        WHERE plan_date = ? AND arm <> 'A' AND graded_at IS NULL""") - pick_syms
         minute_only = {str(r["ticker"]).upper() for r in ledger.ungraded_rejections(con, d)}
-        if runner_enabled:
-            minute_only |= {str(t).upper() for t in ledger.runner_candidate_tickers(con, d)}
         minute_only -= pick_syms | paired
         pop = _q("SELECT symbol FROM population_universe WHERE plan_date = ?") \
             - pick_syms - paired - minute_only
@@ -1021,21 +693,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
 
     try:
         plan_row = ledger.plan_for_date(con, d)
-        # The runner lane produces picks WITHOUT a morning plan: it detects
-        # intraday and selects at 10:30, on its own schedule. Bailing here
-        # whenever the morning loop did not produce a plan meant that on any
-        # such day the runner's candidates were never graded, never reached
-        # lesson extraction, and never reached the weekly miner -- the lane
-        # accumulated evidence into a pipeline whose back half never ran.
-        runner_enabled = bool((cfg.get("runner", {}) or {}).get("enabled"))
-        has_runner_work = False
-        if runner_enabled:
-            try:
-                has_runner_work = bool(ledger.runner_candidate_tickers(con, d))
-            except Exception as e:
-                log("evening", f"WARN could not check for runner candidates: {e}")
-        if not plan_row and not has_runner_work:
-            log("evening", f"No plan and no runner candidates for {d} — nothing to grade")
+        if not plan_row:
+            log("evening", f"No plan for {d} — nothing to grade")
             ledger.log_run(con, "evening", d, started, "skipped")
             # Release the lock. An early return that leaves it 'in_progress'
             # wedges the date permanently: acquire_run_lock only re-issues a
@@ -1050,13 +709,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                 # suppressed as a duplicate trigger.
                 ledger.finish_run_lock(con, d, "evening", lock["request_id"], "failed")
             return
-        if not plan_row:
-            log("evening", f"No morning plan for {d}, but {len(ledger.runner_candidate_tickers(con, d))} "
-                           f"runner candidate(s) to grade — proceeding on the runner lane alone")
-
         picks = ledger.picks_for_date(con, d)
         md = MarketData(cfg)
-        _prefetch_grading_bars(con, md, d, picks, runner_enabled)
+        _prefetch_grading_bars(con, md, d, picks)
         _mark("prefetch")
         slippage = float(cfg.get("slippage_bps", 5))
         flatten_at = cfg.get("flatten_at")
@@ -1074,13 +729,11 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             trend_map = gctx["trend_map"]
             fundamentals_map = gctx["fundamentals_map"]
             prev_close_map = gctx["prev_close_map"]
-            entry_after_map = gctx["entry_after_map"]
             outcomes = grade_day(md, picks, d, slippage_bps=slippage,
                                  flatten_at=flatten_at, min_bar_volume=min_bar_volume,
                                  adv20_map=adv20_map, atr_map=atr_map, trend_map=trend_map,
                                  fundamentals_map=fundamentals_map, prev_close_map=prev_close_map,
-                                 or_minutes=gctx["or_minutes"],
-                                 entry_after_map=entry_after_map)
+                                 or_minutes=gctx["or_minutes"])
             for o in outcomes:
                 ledger.save_outcome(con, o)
 
@@ -1105,17 +758,6 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                     log("evening", f"WARN friction stress bars fetch failed for {t}: {e}")
                     continue
                 sim_fn = simulate_pick
-                if p.get("setup_type") == ledger.RUNNER_SETUP:
-                    # Re-simulated exactly as grade_day graded it: from its
-                    # honest entry time, under the runner lane's rules. On the
-                    # full session an `open` runner pick fills at 09:30.
-                    cut = entry_after_map.get(t)
-                    if cut is not None:
-                        bars = [b for b in bars
-                                if b["t"].replace(tzinfo=None) >= cut.replace(tzinfo=None)]
-                    sim_fn = partial(simulate_pick, min_reward_r=RUNNER_MIN_REWARD_R)
-                    if not bars:
-                        continue
                 stress = integrity.stress_ladder_for_pick(
                     p, bars, daily_bar, sim_fn, fparams,
                     atr_pct=atr_pct_map.get(t), adv20=adv20_map.get(t),
@@ -1144,20 +786,6 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         from .. import integrity
         integrity.on_evening(con, cfg, md, d, simulate=simulate_pick)
         _mark("population")
-
-        # v10: DTO Runner lane — price EVERY candidate the intraday scan found,
-        # selected or not. Additive and fully isolated: it runs after all
-        # existing grading, and a failure here must not cost the desk its
-        # already-computed outcomes, lessons, or email.
-        runner_summary = {"scored": 0}
-        if (cfg.get("runner", {}) or {}).get("enabled"):
-            try:
-                runner_summary = _grade_runner_candidates(con, md, d, cfg)
-            except Exception as e:
-                log("evening", f"WARN runner candidate grading failed; "
-                               f"existing grading unaffected: {e}")
-                runner_summary = {"scored": 0, "error": str(e)}
-        _mark("runner")
 
         # GRADER_GROUNDING_SPEC_v1 Phase 1: a COMPUTED tape per pick, from the
         # bars already fetched (memoized). It replaces the "tape narrative" the
@@ -1249,13 +877,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         user = (
             f"# GRADING DATE: {d.isoformat()}\n\n"
             f"## THE MORNING PLAN\n\n"
-            # The runner lane grades on days the morning loop never produced a
-            # plan. Say so plainly rather than rendering an empty plan block —
-            # a grader shown a blank stance would otherwise narrate one.
-            + ("(no morning plan was produced for this date — the picks below "
-               "come from the intraday runner lane, which selects at 10:30 ET "
-               "independently of the morning plan)\n\n" if not plan_row else
-               f"Market stance: {plan_row['plan'].get('market_stance','')}\n"
+            + (f"Market stance: {plan_row['plan'].get('market_stance','')}\n"
                f"No-trade: {plan_row['no_trade']}"
                + (f" — reason: {plan_row['plan'].get('no_trade_reason','')}"
                   if plan_row["no_trade"] else "")
@@ -1269,7 +891,6 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             f"{sum(1 for o in ledger.live_orders_for_date(con, d) if o.get('entry_fill_price') is not None)}. "
             "Build the narrative from fills when present; only call this a stand-down after confirming zero fills.\n\n"
             f"## SHADOW LEDGER TODAY (rejected candidates — context only, do not grade them)\n\n{shadow_md}\n\n"
-            + (f"{_runner_grader_block(con, d)}\n\n" if runner_summary.get("scored") else "")
             + f"## MARKET RECAP TODAY\n\n{recap_md or '(recap unavailable)'}\n\n"
             + f"## ACTIVE LESSONS (for confirm/contradict updates — use these IDs)\n\n{lessons_md}\n\n"
             + (f"{hyp_md}\n\n" if hyp_md else "")

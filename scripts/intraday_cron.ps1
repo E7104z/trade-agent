@@ -4,9 +4,8 @@
 # Why this exists
 # ---------------
 # /cron/intraday-check runs the live paper position monitor (fills, time
-# stops, the 15:55 ET end-of-day flatten, overnight-carry cleanup) AND the
-# runner lane's scan/selection tick, all server-side against the production
-# ledger. Nothing on the hosted side can call it often enough:
+# stops, the 15:55 ET end-of-day flatten, overnight-carry cleanup), server-side
+# against the production ledger. Nothing on the hosted side can call it often enough:
 #
 #   * Vercel Cron     - Hobby plan crons run at most once per day.
 #   * GitHub Actions  - every scheduled run since 2026-09-09 ends as

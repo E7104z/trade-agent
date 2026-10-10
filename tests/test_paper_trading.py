@@ -1,13 +1,11 @@
 """
 Pins the 2026-09-23 live paper-trading fixes (Algo Trader Plus upgrade):
 
-  - every runner bracket was refused by Alpaca for sub-penny prices (422), and
+  - every bracket was refused by Alpaca for sub-penny prices (422), and
     the refusal was swallowed into a bare None
   - positions a missed end-of-day flatten left open stayed open for days
   - nothing could prove the intraday monitor ran; the trigger needed a
     credential that also unlocked every protected endpoint
-  - the runner's earnings gate re-queried yfinance for every survivor on every
-    tick and abandoned dozens of lookups at the batch deadline
   - bar windows were clamped 16 minutes back even on a real-time plan
 """
 from __future__ import annotations
@@ -17,7 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 import requests
 
-from agent import ledger, live_broker, live_monitor, providers, runner_scan
+from agent import ledger, live_broker, live_monitor, providers
 from agent.config import Config
 
 ET = timezone(timedelta(hours=-4))
@@ -198,26 +196,6 @@ def test_health_reports_the_intraday_monitor(db):
 
 
 # ======================================================= earnings cache
-
-def test_earnings_are_looked_up_once_per_day(db, monkeypatch):
-    calls = []
-
-    class _MD:
-        def fundamentals(self, syms, con=None):
-            return {}
-
-        def next_earnings(self, syms):
-            calls.append(sorted(syms))
-            return {s: (5 if s == "AAA" else None) for s in syms}
-
-    runner_scan._session_gate_cache(TODAY).clear()
-    _f, e = runner_scan._fetch_gate_inputs(_MD(), ["AAA", "BBB"], TODAY, db)
-    assert e == {"AAA": 5, "BBB": None}
-    runner_scan._session_gate_cache(TODAY).clear()  # a cold serverless start
-    _f, e = runner_scan._fetch_gate_inputs(_MD(), ["AAA", "BBB", "CCC"], TODAY, db)
-    assert calls == [["AAA", "BBB"], ["CCC"]], "only the unchecked symbol is looked up"
-    assert e["AAA"] == 5 and e["BBB"] is None
-
 
 def test_next_earnings_tells_no_date_from_a_failed_lookup(monkeypatch):
     class _T:

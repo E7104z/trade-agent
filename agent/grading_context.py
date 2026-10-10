@@ -6,9 +6,6 @@ Both graders need the same context to reproduce identical outcomes:
   - atr_map/trend_map  -> indicator-layer v2 fields
   - prev_close_map     -> gap-relative fields (keyed to the GRADED date, not now)
   - fundamentals_map   -> short/float/mcap fields
-  - entry_after_map    -> runner picks detected intraday are simulated from the
-                          first bar they could have been acted on, not the 9:30
-                          open (else "open" fills land below their own stop)
 
 Keeping this in one place means a regrade recomputes outcomes under exactly the
 inputs the evening run that first wrote them used — no silent drift between the
@@ -73,29 +70,6 @@ def build_grading_context(md: MarketData, con: Any, d: date,
     except Exception as e:
         log(tag, f"WARN fundamentals fetch failed ({e}) — short/float/mcap fields null tonight")
 
-    # Picks detected INTRADAY cannot be simulated from the session open. A
-    # runner pick carries entry_type "open", which fills at bars[0] — the 09:30
-    # print — against a stop derived from, say, a 10:20 EMA. The fill lands
-    # below its own stop and the trade grades invalid_fill. Build the entry-time
-    # map so those picks are simulated from when they could first be acted on.
-    #
-    # The cutoff is runner_scan.honest_entry_time: never before the scan tick
-    # that recorded the candidate or the selection decision that picked it --
-    # the same rule _grade_runner_candidates applies to the unselected field,
-    # so pick and field are priced from the same decision point.
-    entry_after_map: dict[str, Any] = {}
-    try:
-        from .runner_scan import honest_entry_time
-        session = ledger.runner_session(con, d) or {}
-        for c in ledger.runner_candidates_for_date(con, d):
-            cutoff = honest_entry_time(c.get("first_pass_et"), c.get("scan_pass_et"),
-                                       session.get("selection_at"))
-            if cutoff is not None:
-                entry_after_map[c["ticker"].upper()] = cutoff
-    except Exception as e:
-        log(tag, f"WARN could not build runner entry times ({e}) — "
-                 f"runner picks would be graded from the session open")
-
     return {
         "adv20_map": adv20_map,
         "atr_map": atr_map,
@@ -103,6 +77,5 @@ def build_grading_context(md: MarketData, con: Any, d: date,
         "trend_map": trend_map,
         "fundamentals_map": fundamentals_map,
         "prev_close_map": prev_close_map,
-        "entry_after_map": entry_after_map,
         "or_minutes": int(cfg.data_cfg.get("or_minutes", 15)),
     }

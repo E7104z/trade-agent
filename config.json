@@ -106,33 +106,5 @@
   },
   "traders_log": {
     "enabled": true
-  },
-  "runner": {
-    "enabled": true,
-    "phase": 1,
-    "scan_start_et": "10:20",
-    "scan_end_et": "15:00",
-    "universe_size": 6000,
-    "price_min": 5.0,
-    "price_max": 50.0,
-    "min_vwap_pct": 0.5,
-    "min_rvol": 0.0,
-    "require_rvol": true,
-    "min_stop_abs": 0.1,
-    "min_stop_pct": 0.005,
-    "float_min_m": 5.0,
-    "float_max_m": 200.0,
-    "min_trend_consistency": 45.0,
-    "walkback": true,
-    "earnings_exclude_days": 2,
-    "decision_time_et": "10:30",
-    "max_picks": 10,
-    "selection_enabled": true,
-    "selection_model": "claude-sonnet-4-6",
-    "live_orders_enabled": true,
-    "max_live_orders_per_day": 10,
-    "dollars_per_r": 100,
-    "size_r": 0.25,
-    "null_gates": "dto"
   }
 }

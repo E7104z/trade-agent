@@ -47,7 +47,7 @@ def test_no_raw_ticker_or_symbol_escape_outside_tickerlink():
 def test_ticker_link_helper_is_defined_and_used():
     page = _assembled_page()
     assert "function tickerLink(" in page
-    assert page.count("tickerLink(") >= 8  # definition + every wired site
+    assert page.count("tickerLink(") >= 6  # definition + every wired site
 
 
 def test_chart_marker_and_drawer_are_present_in_served_page():

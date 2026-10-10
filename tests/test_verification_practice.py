@@ -174,4 +174,3 @@ def test_a_rehearsal_cannot_reach_production_email_or_the_broker(monkeypatch, tm
     cfg = rehearsal._cfg(paired=True)
     assert cfg.email_configured is False
     assert cfg.get("live_paper")["enabled"] is False
-    assert cfg.get("runner")["live_orders_enabled"] is False

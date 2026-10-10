@@ -54,13 +54,13 @@ def test_slot_families_scopes_and_sources(con):
 def test_day_facts_by_planned_r_and_fill_validity(con):
     seed_session(con)
     f = tl.build_facts(con, D)
-    assert _v(f, "day.picks_morning") == "5" and _v(f, "day.picks_runner") == "1"
-    # AAA +1.2, BBB -1.0, RUN -0.4 are fill-valid; DDD is an execution anomaly.
-    assert _v(f, "day.triggered") == "3"
-    assert _v(f, "day.wins") == "1" and _v(f, "day.losses") == "2"
-    assert _v(f, "day.net_r") == "-0.20R"            # r_planned, never r_multiple
+    assert _v(f, "day.picks_morning") == "5"
+    # AAA +1.2 and BBB -1.0 are fill-valid; DDD is an execution anomaly.
+    assert _v(f, "day.triggered") == "2"
+    assert _v(f, "day.wins") == "1" and _v(f, "day.losses") == "1"
+    assert _v(f, "day.net_r") == "+0.20R"            # r_planned, never r_multiple
     assert _v(f, "day.execution_anomalies") == "1"
-    assert _v(f, "day.exits") == "eod 1, stop 1, target 1"
+    assert _v(f, "day.exits") == "stop 1, target 1"
     assert _v(f, "day.untriggered") == "1"
     assert "AAA long gap_go" in _v(f, "pick.morning.AAA") and "+1.20R (target)" in _v(f, "pick.morning.AAA")
     assert "(coverage)" in _v(f, "pick.morning.BBB")
@@ -77,20 +77,13 @@ def test_invalid_fills_are_counted_never_narrated(con):
             assert "CCC" not in name and "CCC" not in s["value"]
 
 
-def test_shadow_runner_and_exit_replays(con):
+def test_shadow_facts(con):
     seed_session(con)
     f = tl.build_facts(con, D)
     assert _v(f, "shadow.scored") == "2" and _v(f, "shadow.forgone_r") == "-0.20R"
-    assert _v(f, "runner.candidates") == "3" and _v(f, "runner.selected") == "1"
-    assert _v(f, "runner.industry_cap_drops") == "1"
-    assert _v(f, "runner.exit.plan") == ("plan exits (the selected plan's own stop and 2R target): "
-                                         "+0.50R per trade over 2 replayed trades, 50% closed positive")
-    assert _v(f, "runner.exit.arm_a_floor").startswith(
-        "arm A, stop floor (stop no tighter than 1 ATR): +0.25R per trade over 2")
-    assert "runner.exit.arm_b_dashboard" not in f["slots"]      # no replays, no slot
-    # Every shadow row in the seed is priced, and the selection is explained.
+    # Every shadow row in the seed is priced.
     assert _v(f, "shadow.priced") == "2" and _v(f, "shadow.forgone_per_rejection") == "-0.10R"
-    assert _v(f, "runner.selection").startswith("selected 1")
+    assert not any(n.startswith("runner.") for n in f["slots"])
 
 
 def test_deficits_and_menu_are_the_morning_list(con):
@@ -119,8 +112,7 @@ def test_verdicts_are_copied_verbatim(con):
     f = tl.build_facts(con, D)
     assert _v(f, "verdict.calibration_q3") == \
         "Calibration verdict (computed, Q3): not yet computable — conviction 4-5 has n=3 of 8."
-    assert _v(f, "verdict.runner_lane").startswith("Lane stop condition: 1/20 sessions measured")
-    assert f["slots"]["verdict.runner_lane"]["scope"] == "computed_verdict"
+    assert "verdict.runner_lane" not in f["slots"]
 
 
 def test_empty_ledger_is_empty_facts(con):
@@ -142,23 +134,12 @@ def test_no_trade_day_with_a_genuine_category(con):
     assert _v(f, "day.stand_down_reason") == "stand-down recorded by the morning loop (all_failed_rr)"
 
 
-def test_runner_only_day_without_a_morning_plan(con):
-    from datetime import datetime
-    con.execute("INSERT INTO runner_candidates (session_date, ticker) VALUES (?, 'R1')", [D])
-    f = tl.build_facts(con, D)
-    assert _v(f, "runner.candidates") == "1"
-    assert "not distinguished by the system" in _v(f, "day.stand_down_reason")
-    ledger.log_run(con, "morning", D, datetime(2026, 10, 2, 6, 45), "api_error")
-    f = tl.build_facts(con, D)
-    assert _v(f, "day.stand_down_reason") == "no morning plan was produced (morning run status: api_error)"
-
-
 def test_a_failing_family_costs_only_itself(con, monkeypatch):
     seed_session(con)
-    monkeypatch.setattr(tl, "_runner_facts", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(tl, "_shadow_facts", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
     f = tl.build_facts(con, D)
     assert any("boom" in e for e in f["errors"])
-    assert "day.wins" in f["slots"] and not any(n.startswith("runner.") for n in f["slots"])
+    assert "day.wins" in f["slots"] and not any(n.startswith("shadow.") for n in f["slots"])
 
 
 # ---------------------------------------------------------- facts-only render
@@ -181,4 +162,4 @@ def test_a_trade_without_planned_r_is_unmeasured_not_backfilled(con):
     con.execute("UPDATE outcomes SET r_planned = NULL WHERE pick_id = ?", [ids["AAA"]])
     f = tl.build_facts(con, D)
     assert _v(f, "day.wins") == "0" and _v(f, "day.unmeasured_r") == "1"
-    assert _v(f, "day.net_r") == "-1.40R"            # BBB -1.0 + RUN -0.4; AAA's r_multiple unused
+    assert _v(f, "day.net_r") == "-1.00R"            # BBB -1.0; AAA's r_multiple unused

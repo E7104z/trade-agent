@@ -7,8 +7,6 @@ to run them.
   - a lock left by a run killed at the 300s budget wedged its session forever
   - the morning lane's streak clamp / drawdown breaker read runner-lane trades
   - the simulator filled limit/breakout entries AFTER the pick's own time stop
-  - runner candidates were entered at a walked-back bar, before any scan tick
-    or selection could have seen them (look-ahead)
   - the evening loop re-fetched identical bars sequentially per consumer
   - live bracket exits closed a position whose shares the legs still held,
     never cancelled an expired entry, never flattened at the close, and
@@ -24,7 +22,7 @@ from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 
-from agent import grading, health, ledger, live_broker, live_monitor, memory, providers, runner_scan
+from agent import grading, health, ledger, live_broker, live_monitor, memory, providers
 from agent.config import Config
 
 ET = timezone(timedelta(hours=-4))
@@ -138,9 +136,7 @@ def test_morning_discipline_reads_only_the_morning_lane(con):
 
     assert ledger.current_streak(con) == {"kind": "losing", "length": 4}
     assert ledger.current_streak(con, lane="morning") == {"kind": "winning", "length": 1}
-    assert ledger.current_streak(con, lane="runner")["length"] == 4
     assert ledger.trailing_weighted_r(con, 10, lane="morning") == {"n": 1, "sum_weighted_r": 0.25}
-    assert ledger.overall_stats(con, lane="runner")["triggered"] == 4
     assert ledger.overall_stats(con, lane="morning")["triggered"] == 1
     assert [t["setup_type"] for t in ledger.recent_trades(con, 20, lane="morning")] == ["gap_go"]
 
@@ -148,14 +144,14 @@ def test_morning_discipline_reads_only_the_morning_lane(con):
     assert "LOSING streak" not in text, "runner losers must not clamp the morning lane"
 
 
-def test_equity_curve_prices_each_lane_at_its_own_dollars_per_r(con):
+def test_equity_curve_for_the_morning_lane_leaves_out_legacy_runner_rows(con):
     _pick(con, SESSION, "gap_go", 2.0)                       # 0.5 weighted R
-    _pick(con, SESSION, ledger.RUNNER_SETUP, 2.0, "x")       # 0.5 weighted R
-    mixed = ledger.equity_curve(con, 100_000, 500)
-    split = ledger.equity_curve(con, 100_000, 500, runner_dollars_per_r=100)
-    assert mixed[-1]["equity"] == 100_500.0
-    assert split[-1]["equity"] == 100_000 + 0.5 * 500 + 0.5 * 100
-    assert split[-1]["day_r"] == mixed[-1]["day_r"] == 1.0
+    _pick(con, SESSION, ledger.RUNNER_SETUP, 2.0, "x")       # a retired lane's row: 0.5 weighted R
+    everything = ledger.equity_curve(con, 100_000, 500)
+    morning = ledger.equity_curve(con, 100_000, 500, lane="morning")
+    assert everything[-1]["equity"] == 100_500.0
+    assert morning[-1]["equity"] == 100_000 + 0.5 * 500
+    assert morning[-1]["day_r"] == 0.5 and everything[-1]["day_r"] == 1.0
 
 
 def test_lane_clause_rejects_unknown_lanes():
@@ -221,62 +217,6 @@ def test_open_entries_are_unaffected_by_the_cutoff():
             "time_stop": "by 09:30"}
     out = grading.simulate_pick(pick, _bars(SESSION, _flat(30)), None, session_date=SESSION)
     assert out["triggered"] is True and out["entry_fill"] == 100.0
-
-
-# ================================================== runner entry timing
-
-def test_honest_entry_time_is_the_latest_actionable_moment():
-    fp = datetime(2026, 9, 16, 10, 20)
-    assert runner_scan.honest_entry_time(fp) == datetime(2026, 9, 16, 10, 25)
-    scan = datetime(2026, 9, 16, 11, 18, 34)
-    assert runner_scan.honest_entry_time(fp, scan) == scan
-    sel = datetime(2026, 9, 16, 11, 18, 50)
-    assert runner_scan.honest_entry_time(fp, scan, sel) == sel
-    # A candidate first seen AFTER the decision was never selectable: the
-    # decision time does not apply to it, its own scan tick does.
-    late = datetime(2026, 9, 16, 12, 30)
-    assert runner_scan.honest_entry_time(fp, late, sel) == late
-    # tz-aware inputs normalize to the same naive ET wall clock
-    assert runner_scan.honest_entry_time(fp.replace(tzinfo=ET), scan.replace(tzinfo=ET)) == scan
-    assert runner_scan.honest_entry_time(None, scan) is None
-
-
-def test_selection_claim_records_the_decision_time(con):
-    at = datetime(2026, 9, 16, 11, 18, 50, tzinfo=ET)
-    assert ledger.claim_runner_selection(con, SESSION, at=at)
-    assert ledger.runner_session(con, SESSION)["selection_at"] == at.replace(tzinfo=None)
-    assert not ledger.claim_runner_selection(con, SESSION, at=at + timedelta(minutes=5))
-
-
-def test_runner_grading_enters_at_the_decision_not_the_walked_back_bar(con):
-    """Detected (walked back) at 10:20, first seen by the 11:18 tick. The name
-    ran from 10:30 to 11:00 -- an entry at 10:25 would book that run; the only
-    entry anyone could have taken is after 11:18."""
-    from agent.loops import evening
-
-    con.execute(
-        """INSERT INTO runner_candidates
-           (session_date, ticker, first_pass_et, scan_pass_et, detection_price,
-            stop_price, target_price, stop_dist, scan_version)
-           VALUES (?, 'RUNR', ?, ?, 10.0, 9.5, 11.0, 0.5, 2)""",
-        [SESSION, datetime(2026, 9, 16, 10, 20), datetime(2026, 9, 16, 11, 18, 34)])
-    ledger.claim_runner_selection(con, SESSION, at=datetime(2026, 9, 16, 11, 18, 50))
-
-    # 09:30-10:29 flat at 10, 10:30-11:18 climbs to 10.9, then flat at 10.9.
-    prices = _flat(60, 10.0) + [(10 + 0.02 * i,) * 4 for i in range(1, 46)] + _flat(282, 10.9)
-    bars = _bars(SESSION, prices)
-
-    class _MD:
-        def minute_bars(self, sym, d):
-            return bars
-
-        def daily_context(self, syms):
-            raise RuntimeError("offline")
-
-    evening._grade_runner_candidates(con, _MD(), SESSION, Config(raw={"slippage_bps": 0}))
-    out = ledger.runner_outcomes_for_date(con, SESSION)[0]
-    assert out["entry_after_et"] == datetime(2026, 9, 16, 11, 18, 50)
-    assert out["entry_fill"] == pytest.approx(10.9), "entry is the first bar after the decision"
 
 
 # ============================================================ bar memo
@@ -510,7 +450,7 @@ def test_status_is_compact_gzipped_and_carries_health_and_lanes(monkeypatch, tmp
     assert plain.status_code == 200
     assert b"\n  " not in plain.data, "the dashboard's status payload is compact"
     body = plain.get_json()
-    assert set(body["lanes"]) == {"morning", "runner"}
+    assert set(body["lanes"]) == {"morning"}
     assert body["loop_health"]["stages"]
 
     zipped = client.get("/api/status", headers={**hdr, "Accept-Encoding": "gzip"})
@@ -534,9 +474,7 @@ def test_weekly_has_its_own_cron_and_friday_evening_no_longer_chains_it(monkeypa
     assert client.get("/cron/weekly", headers=hdr).get_json()["cron"] == "weekly"
     assert ran == ["evening", "weekly"]
 
-    monkeypatch.setattr(util, "now_et", lambda: datetime(2026, 11, 16, 10, 48, tzinfo=ET))
-    client.get("/cron/runner-late", headers=hdr)
-    assert ran[-1] == "runner", "runner-late is the same lane, a later tick"
+    assert client.get("/cron/runner", headers=hdr).status_code == 400, "the runner cron is gone"
     assert client.get("/cron/nope", headers=hdr).status_code == 400
 
 

@@ -1,6 +1,6 @@
 """
 The 2026-10-05 evening review (specs/MORNING_BUDGET_SPEC_v1.md, Parts 2-6):
-a runner selection a killed request can no longer lose, a plan-time gate on
+a plan-time gate on
 triggers the open will cross, the scratch band, what the grader is shown
 (RVOL pace, lanes, scratches, the shadow line), testable hypotheses, and the
 health panel's lock warning.
@@ -15,7 +15,7 @@ import pytest
 from agent import grading, hypotheses, ledger, selfcheck
 from agent.config import Config
 from agent.health import loop_health
-from agent.loops import evening, runner as runner_loop
+from agent.loops import evening
 from agent.loops.morning import _validate_plan
 
 D = date(2026, 10, 5)
@@ -28,59 +28,6 @@ def con():
     for mig in ledger._MIGRATIONS:
         c.execute(mig)
     return c
-
-
-# ------------------------------------------------------------ runner selection
-
-def test_a_claim_whose_request_died_is_retaken_after_ten_minutes(con):
-    t0 = datetime(2026, 10, 5, 10, 31)
-    assert ledger.claim_runner_selection(con, D, at=t0)
-    assert not ledger.claim_runner_selection(con, D, at=t0 + timedelta(minutes=5))
-    assert ledger.runner_selection_note(con, D)["state"] == "unfinished"
-    assert ledger.claim_runner_selection(con, D, at=t0 + timedelta(minutes=11))
-    at = con.execute("SELECT selection_at FROM runner_sessions").fetchone()[0]
-    assert at == t0 + timedelta(minutes=11)                     # the honest decision time
-
-
-@pytest.mark.parametrize("trace", ["reason", "completed", "selected", "orders"])
-def test_any_trace_of_a_result_keeps_the_claim(con, trace):
-    t0 = datetime(2026, 10, 5, 10, 31)
-    assert ledger.claim_runner_selection(con, D, at=t0)
-    if trace == "reason":
-        ledger.upsert_runner_session(con, {"session_date": D, "selection_skipped_reason": "no candidates"})
-    elif trace == "completed":
-        ledger.complete_runner_selection(con, D)
-    elif trace == "selected":
-        ledger.mark_runner_selected(con, D, "AAA", 1, None)
-    else:
-        ledger.upsert_runner_session(con, {"session_date": D, "live_orders_note": "placed 0/0"})
-    assert not ledger.claim_runner_selection(con, D, at=t0 + timedelta(minutes=30))
-    assert ledger.runner_selection_note(con, D)["state"] == "decided"
-
-
-def test_the_selection_note_names_each_state(con):
-    assert ledger.runner_selection_note(con, D)["state"] == "no_session"
-    ledger.upsert_runner_session(con, {"session_date": D, "candidates_found": 533})
-    assert ledger.runner_selection_note(con, D)["state"] == "not_run"
-    ledger.claim_runner_selection(con, D, at=datetime(2026, 10, 5, 11, 18))
-    note = ledger.runner_selection_note(con, D)
-    assert note["state"] == "unfinished" and "claimed at 11:18 ET and never finished" in note["text"]
-
-
-def test_a_hosted_tick_with_its_budget_spent_does_not_claim(monkeypatch):
-    monkeypatch.delenv("VERCEL", raising=False)
-    assert runner_loop._budget_too_spent(299) is False            # local: no budget
-    monkeypatch.setenv("VERCEL", "1")
-    assert runner_loop._budget_too_spent(209) is False
-    assert runner_loop._budget_too_spent(211) is True
-
-
-def test_the_self_check_flags_a_lost_selection(con):
-    cfg = Config(raw={"runner": {"enabled": True, "selection_enabled": True}})
-    con.execute("""INSERT INTO runner_candidates (session_date, ticker) VALUES (?, 'AAA')""", [D])
-    ledger.claim_runner_selection(con, D, at=datetime(2026, 10, 5, 10, 31))
-    r = selfcheck.check_runner_selection(con, cfg, D)
-    assert r["status"] == "warn" and "never finished" in r["headline"]
 
 
 # ------------------------------------------------------------ plan-time gates

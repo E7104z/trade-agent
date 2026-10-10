@@ -43,33 +43,15 @@ __all__ = ["PAIR_SPEC_VERSION", "PAIR_SPEC", "PAIR_SEP", "lane_rows", "pair_comp
            "winrate_comparisons", "population_rows", "population_comparisons",
            "consistency", "consistency_md", "width_md", "pair_dimension"]
 
-PAIR_SPEC_VERSION = 2
+PAIR_SPEC_VERSION = 3        # v3 (2026-10-10): the runner lane's pairs were removed with the lane
 PAIR_SPEC: tuple[tuple[str, str, str], ...] = (
     ("morning", "setup_type", "regime_tag"),
     ("morning", "direction", "trend_side_200d"),
     ("morning", "direction", "regime_tag"),
     ("morning", "setup_type", "stop_atr_bucket"),
-    ("runner", "runner_stop_atr_bucket", "runner_rvol_bucket"),
-    ("runner", "runner_regime", "runner_detection_bucket"),
-    ("runner", "runner_trend_side_200d", "runner_tc_bucket"),
-    # v2 (2026-10-02, RUNNER_TRADE_CONSTRUCTION_v1), declared the day the two
-    # dimensions were first recorded, before any outcome under them existed:
-    # long momentum bought into a fading index tape, and extended above VWAP,
-    # are the review's two named suspects -- and the question is whether they
-    # compound.
-    ("runner", "runner_index_tape", "runner_ext_bucket"),
 )
 PAIR_SEP = "|"
 MIN_STRATA = 2
-
-# Dimensions that exist in both lanes (agent/buckets.py), so a morning finding
-# can be read in the runner field and vice versa as one more stratum. The
-# runner stop-ATR dimension subdivides the morning "<0.5" cell; the read goes
-# through buckets.RUNNER_STOP_ATR_COARSE (see `consistency`).
-CROSS_LANE = {"stop_atr_bucket": "runner_stop_atr_bucket",
-              "trend_side_200d": "runner_trend_side_200d"}
-CROSS_LANE.update({v: k for k, v in list(CROSS_LANE.items())})
-
 
 def _r(row: dict) -> float:
     """Realized R, on the same measure as the 1-D search (research.realized_r):
@@ -95,10 +77,10 @@ def _mean_std(values: list[float]) -> tuple[float | None, float | None]:
 
 
 def lane_rows(con: Any) -> dict[str, list[dict]]:
-    """Fill-valid triggered rows per lane (current scan/sim version for runner)."""
+    """Fill-valid triggered rows per lane."""
     from . import research
     out: dict[str, list[dict]] = {}
-    for lane, fn in (("morning", research.morning_rows), ("runner", research.runner_rows)):
+    for lane, fn in (("morning", research.morning_rows),):
         try:
             out[lane] = fn(con)
         except Exception:
@@ -108,7 +90,7 @@ def lane_rows(con: Any) -> dict[str, list[dict]]:
 
 def _level_counts(rows: list[dict], lane: str, dim: str) -> dict[str, int]:
     """n per level: rows for the morning lane, (session, industry) units for the
-    runner lane (agent/clusters.py)."""
+    gap-field lane (agent/clusters.py)."""
     from . import buckets
     cells: dict[str, list[dict]] = {}
     for r in rows:
@@ -120,7 +102,7 @@ def _level_counts(rows: list[dict], lane: str, dim: str) -> dict[str, int]:
 
 def _values(rows: list[dict], lane: str) -> list[float]:
     """Realized R per observation: one per row (morning), one per (session,
-    industry) unit (runner) -- see agent/clusters.py."""
+    industry) unit (gap field) -- see agent/clusters.py."""
     return unit_values(rows, _r, lane)
 
 
@@ -272,7 +254,7 @@ def _parse(dim: str) -> tuple[str, list[str]] | None:
     """(lane, [dims]) for a 1-D or pair comparison this check can stratify."""
     from . import buckets
     dims = dim.split(PAIR_SEP)
-    for lane in ("morning", "runner", "gapfield"):
+    for lane in ("morning", "gapfield"):
         if all(d in buckets.dimensions(lane) for d in dims):
             return lane, dims
     return None
@@ -309,25 +291,6 @@ def consistency(search: Any, rows_by_lane: dict[str, list[dict]], min_n: int = 8
             if d is not None:
                 strata_rows.setdefault(f"month={str(d)[:7]}", []).append(r)
         strata: dict[str, list[float]] = {k: _values(v, lane) for k, v in strata_rows.items()}
-        if len(dims) == 1 and dims[0] in CROSS_LANE:
-            other_dim = CROSS_LANE[dims[0]]
-            other_lane = "runner" if lane == "morning" else "morning"
-            # The runner lane splits the morning "<0.5" stop cell into finer
-            # labels; read a morning cell in the runner field through the
-            # coarse map. A runner-only label has no morning counterpart.
-            coarse = buckets.RUNNER_STOP_ATR_COARSE
-            if other_lane == "runner":
-                def _hit(r, dim=other_dim):
-                    lab = buckets.label("runner", dim, r)
-                    return coarse.get(lab, lab) == levels[0]
-            else:
-                def _hit(r, dim=other_dim):
-                    return buckets.label("morning", dim, r) == levels[0]
-            other = ([] if (lane == "runner" and levels[0] in coarse) else
-                     _values([r for r in rows_by_lane.get(other_lane) or [] if _hit(r)],
-                             other_lane))
-            if other:
-                strata[f"lane={other_lane}"] = other
         powered = {k: v for k, v in strata.items() if len(v) >= min_n}
         agree = [k for k, v in powered.items() if (1 if sum(v) / len(v) > 0 else -1) == want]
         out.append({"dimension": c.dimension, "level": c.level, "strata": len(powered),
@@ -367,10 +330,6 @@ def _family(dim: str) -> str:
         return "winner frequency (Fisher exact)"
     if PAIR_SEP in dim:
         return "2-D pre-registered pairs"
-    if dim in ("runner_setup_edge", "runner_selection_edge"):
-        return "runner setup/selection edge"
-    if dim.startswith("runner_"):
-        return "runner 1-D"
     return "morning 1-D"
 
 

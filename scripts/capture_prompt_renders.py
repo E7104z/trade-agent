@@ -1,5 +1,5 @@
 """
-Capture the rendered text of the five LLM system prompts (and the DATA-STARVED
+Capture the rendered text of the four LLM system prompts (and the DATA-STARVED
 block) as test fixtures.
 
 Why: PERSONA_CHARACTER_SHEET_SPEC_v1 is additive only -- with `persona.enabled`
@@ -43,11 +43,6 @@ RENDER_CASES: dict[str, dict[str, str]] = {
                      "COVERAGE_SECTION": _COVERAGE_SECTION, **_HYP_RISK_OFF},
     "evening_grader": dict(_HYP_GRADER_OFF),
     "weekly_miner": {},
-    "runner_selector": {"MAX_PICKS": "10", "MAX_PER_INDUSTRY": "2",
-                        "REGIME_TAG": "uptrend/risk_on/lowvol",
-                        "PLAYBOOK_SECTION": "## Runner Lane\n\n(no validated runner rules yet"
-                                            " — do not assume any)",
-                        "CANDIDATE_TABLE": "ticker | industry\nAAA | Banks - Regional"},
 }
 
 BACKLOG_ITEMS: list[dict] = [

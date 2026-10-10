@@ -113,29 +113,23 @@ def test_pick_dimensions_label_like_the_sql_cast():
     assert got == py
 
 
-def test_runner_research_reexports_the_single_source():
-    from agent import runner_research as rr
-    assert rr.bucket_of is buckets.runner_label
-    assert tuple(rr.MINING_DIMENSIONS) == buckets.RUNNER_DIMS
-
-
 # ------------------------------------------------------------------ Phase 2
 
 def _comps():
     return [Comparison("setup_type", "gap_go", 20, 0.3, 1.0, q_value=0.08),
             Comparison("setup_type", "breakout", 12, -0.1, 1.0, q_value=0.9),
             Comparison("stop_atr_bucket", "0.5-1", 15, 0.2, 1.1, q_value=0.4),
-            Comparison("runner_rvol_bucket", "2-3", 40, 0.1, 1.2, q_value=0.5)]
+            Comparison("gf_gap_atr", "1-2", 40, 0.1, 1.2, q_value=0.5)]
 
 
 @pytest.mark.parametrize("pred, state", [
     ({"lane": "morning", "conditions": [{"dimension": "setup_type", "level": "gap_go"}]}, ""),
     ({"lane": "morning", "conditions": [{"dimension": "setup_type", "level": "gap_go"},
                                          {"dimension": "stop_atr_bucket", "level": "0.5-1"}]}, ""),
-    ({"lane": "runner", "conditions": [{"dimension": "runner_rvol_bucket", "level": "2-3"}]}, ""),
+    ({"lane": "gapfield", "conditions": [{"dimension": "gf_gap_atr", "level": "1-2"}]}, ""),
     ({"lane": "morning", "conditions": [{"dimension": "setup_type", "level": "moonshot"}]},
      "REJECTED_UNMATCHABLE"),
-    ({"lane": "morning", "conditions": [{"dimension": "runner_rvol_bucket", "level": "2-3"}]},
+    ({"lane": "morning", "conditions": [{"dimension": "gf_gap_atr", "level": "1-2"}]},
      "REJECTED_UNMATCHABLE"),
     ({"lane": "morning", "conditions": [{"dimension": "setup_type", "level": "gap_go"},
                                          {"dimension": "stop_atr_bucket", "level": "0.5-1"},
@@ -228,29 +222,6 @@ def test_observe_session_records_only_fill_valid_matching_forward_rows(con):
     st = next(s for s in research.rule_states(con) if s["rule_id"] == reg["rule_id"])
     assert st["forward_n"] == 1 and st["forward_mean_r"] == pytest.approx(1.2)
     assert st["last_observed_at"] == str(d)
-
-
-def test_observe_session_matches_runner_rules_on_current_versions_only(con, monkeypatch):
-    from agent import runner_research as rr
-    # This fixture's dates predate unit counting; keep the clock restart out of it.
-    monkeypatch.setattr(research, "RUNNER_UNIT_COUNTING_FROM", date(2026, 1, 1))
-    pred = {"lane": "runner", "conditions": [{"dimension": "runner_rvol_bucket", "level": "2-3"}]}
-    q_day, d = date(2026, 9, 1), date(2026, 9, 2)
-    reg = research.register_candidate(con, {"statement": "rvol 2-3", "predicate": pred},
-                                      q_day, _comps(), {})
-    scan_v, sim_v = rr.current_versions()
-    for t, rvol, sv in (("A", 2.5, sim_v), ("B", 4.0, sim_v), ("C", 2.5, sim_v - 1)):
-        con.execute("""INSERT INTO runner_candidates (session_date, ticker, rvol, scan_version)
-                       VALUES (?,?,?,?)""", [d, t, rvol, scan_v])
-        ledger.save_runner_candidate_outcome(con, {
-            "session_date": d, "ticker": t, "eval_date": d, "triggered": True,
-            "r_multiple": 1.0, "exit_reason": "eod", "sim_version": sv})
-    assert research.observe_session(con, d)["recorded"] == 1
-    obs = con.execute("SELECT source, source_key FROM research_observations WHERE rule_id = ?",
-                      [reg["rule_id"]]).fetchall()
-    # One observation per (session, industry) unit; A has no industry, so it
-    # is its own unit, keyed by ticker (agent/clusters.py).
-    assert obs == [("runner_field", f"runner:{d}:ticker:A")]
 
 
 def test_counterfactual_sources_are_recorded_but_not_counted(con):
@@ -414,9 +385,9 @@ def _survivors():
         Comparison("setup_type", "gap_go", 20, 0.3, 1.0, q_value=0.04, significant=True),
         Comparison("setup_type", "breakout", 30, -0.4, 1.0, q_value=0.02, significant=True),
         Comparison("stop_atr_bucket", "0.5-1", 15, 0.2, 1.1, q_value=0.4),            # not significant
-        Comparison("runner_rvol_bucket", "2-3", 40, 0.25, 1.2, q_value=0.06, significant=True),
+        Comparison("gf_gap_atr", "1-2", 40, 0.25, 1.2, q_value=0.06, significant=True),
         Comparison("winrate:setup_type", "gap_go", 20, None, None, q_value=0.01, significant=True),
-        Comparison("drift:runner_rvol_bucket", "2-3", 40, 0.3, 1.0, q_value=0.01, significant=True),
+        Comparison("drift:gf_gap_atr", "1-2", 40, 0.3, 1.0, q_value=0.01, significant=True),
         Comparison("setup_type|stop_atr_bucket", "gap_go|0.5-1", 12, 0.5, 1.0, q_value=0.05,
                    significant=True),
     ]
@@ -425,7 +396,7 @@ def _survivors():
 def test_every_batch_survivor_is_quarantined_by_the_system(con):
     out = research.register_batch_survivors(con, date(2026, 10, 3), _survivors(), {})
     cells = {r["cell"] for r in out}
-    assert cells == {"setup_type=gap_go", "setup_type=breakout", "runner_rvol_bucket=2-3",
+    assert cells == {"setup_type=gap_go", "setup_type=breakout", "gf_gap_atr=1-2",
                      "setup_type=gap_go AND stop_atr_bucket=0.5-1"}
     # smallest q first; losers too (a validated loser is an exclusion)
     assert out[0]["cell"] == "setup_type=breakout"
@@ -441,11 +412,11 @@ def test_every_batch_survivor_is_quarantined_by_the_system(con):
 
 def test_survivor_registration_is_idempotent_and_capped_per_lane(con):
     # Cap 2 PER LANE: the morning lane's three survivors yield its two smallest
-    # q; the runner lane's one survivor is not crowded out by them.
+    # q; the gap-field lane's one survivor is not crowded out by them.
     first = research.register_batch_survivors(con, date(2026, 10, 3), _survivors(), {}, max_new=2)
     assert sorted((r["lane"], r["cell"]) for r in first) == [
-        ("morning", "setup_type=breakout"), ("morning", "setup_type=gap_go"),
-        ("runner", "runner_rvol_bucket=2-3")]
+        ("gapfield", "gf_gap_atr=1-2"),
+        ("morning", "setup_type=breakout"), ("morning", "setup_type=gap_go")]
     again = research.register_batch_survivors(con, date(2026, 10, 10), _survivors(), {})
     assert [r["cell"] for r in again] == ["setup_type=gap_go AND stop_atr_bucket=0.5-1"]
     assert {r["rule_id"] for r in first}.isdisjoint({r["rule_id"] for r in again})
