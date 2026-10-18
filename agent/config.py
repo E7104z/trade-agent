@@ -81,6 +81,12 @@ _DEFAULTS: dict[str, Any] = {
         "blocking_kills": ["grounding", "entry_type", "event_risk", "hypothesis_fit"],
     },
     "max_entry_ref_distance_pct": 15.0,  # entry further than this from last price = ungrounded, dropped
+    # Mechanical validator switches. enforce_entry_semantics: an entry order that
+    # contradicts its setup (a sell limit on a breakdown, a buy limit under the
+    # market for a momentum long...) is always TAGGED on the pick (picks.entry_semantics);
+    # with this on it is also dropped. Off until the tag's fill rate and R are read
+    # (docs/FIX_PHASE0.md, D5).
+    "validator": {"enforce_entry_semantics": False},
     "atr_gate": "warn",         # "warn" | "enforce" -- noise-stop gate rollout switch, default warn-only
     "earnings_gate": "warn",    # "warn" | "enforce" -- binary-event gate rollout switch, default warn-only
     "min_stop_atr": 0.35,       # stop closer than this many ATRs from entry = inside daily noise
@@ -95,6 +101,10 @@ _DEFAULTS: dict[str, Any] = {
         "trading_base": "https://paper-api.alpaca.markets",
         "max_picks_per_day": 4,
         "intraday_check_secret_env": "CRON_SECRET",
+        # Symbols the end-of-day backstop and the morning sweep must never
+        # close. Empty by default: every lane is intraday, so the account is
+        # flat after the close (docs/FIX_PHASE0.md, D1).
+        "allow_overnight_symbols": [],
     },
     "min_bar_volume": 0,       # thin-bar filter threshold, default OFF (0 = disabled)
     "lesson_holdout_sessions": 0,  # trailing-window lesson-confirmation holdout, default OFF

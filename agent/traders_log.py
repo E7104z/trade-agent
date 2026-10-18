@@ -65,6 +65,10 @@ CONTRAST_HEADER = ("One session, descriptive. This table is a count of what happ
 
 TOMORROW_CLAUSE_MAX = 160   # "at most one short clause" after the menu id
 _TOKEN = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
+# A claim about what the filters saved or cost (docs/FIX_PHASE0.md, D4).
+_FILTER_CLAIM = re.compile(
+    r"\bfilter\w*\b[^.\n]{0,80}\b(?:sav(?:e|ed|es|ing)|cost(?:s|ing)?)\b"
+    r"|\b(?:sav(?:e|ed|es|ing)|cost(?:s|ing)?)\b[^.\n]{0,40}\bfilter\w*\b", re.IGNORECASE)
 _DIGIT = re.compile(r"\d")
 # Numbers in words. "one" and "two" are ordinary prose (the spec permits them);
 # anything larger is a count, and a count must come through a slot.
@@ -189,6 +193,26 @@ def _day_facts(con: Any, d: date, s: _Slots) -> bool:
         s.add(f"pick.{lane}.{_key(p['ticker'])}", f"{what}: {result}", "one_session",
               "picks + outcomes (r_planned)", "one pick and its planned-R result")
 
+    # The paper account's own result for the picks that went to the broker
+    # (docs/FIX_PHASE0.md, D3): the headline for live picks, with every place it
+    # and the simulator disagree. The simulated R above stays the research number.
+    if picks:
+        marks = ",".join("?" for _ in picks)
+        live = _q(con, f"""SELECT o.pick_id, o.live_r, o.sim_broker_divergence FROM outcomes o
+                           WHERE o.pick_id IN ({marks}) AND o.broker_status IS NOT NULL""",
+                  [p["pick_id"] for p in picks])
+        if live:
+            by_id = {p["pick_id"]: p for p in picks}
+            booked = [float(lr) for _, lr, _ in live if lr is not None]
+            s.add("day.broker_net_r", _r(sum(booked)) if booked else "n/a", "one_session",
+                  "outcomes.live_r (the paper account's fills)",
+                  "the paper account's own result: sum of live R over the picks that went to the "
+                  "broker -- the headline for live picks")
+            div = [f"{by_id[pid]['ticker']}: {dv}" for pid, _, dv in live if dv not in (None, "none")]
+            s.add("day.divergences", "; ".join(div) if div else "none", "one_session",
+                  "outcomes.sim_broker_divergence",
+                  "live picks where the simulator and the broker disagree (none = they agree)")
+
     if not morning:
         s.add("day.stand_down_reason", _stand_down_reason(con, d, plan), "one_session",
               "daily_plans.no_trade_category / runs.status", "why the morning lane had no picks")
@@ -213,22 +237,50 @@ def _stand_down_reason(con: Any, d: date, plan: dict | None) -> str:
 
 
 def _shadow_facts(con: Any, d: date, s: _Slots) -> bool:
+    # A rejection the desk traded anyway through a test lane ('traded_via_lane',
+    # docs/FIX_PHASE0.md D4) was not stopped by the filters: it is listed apart
+    # with the R it was TAKEN at, never in the forgone figures. 2026-10-15 read
+    # "-1.41R forgone, the filters saved money" from two such rows.
     rows = _q(con, """SELECT COUNT(*), COUNT(forgone_r), SUM(forgone_r) FROM rejections
-                      WHERE plan_date = ? AND graded_at IS NOT NULL""", [d])
+                      WHERE plan_date = ? AND graded_at IS NOT NULL
+                        AND COALESCE(eod_outcome, '') <> 'traded_via_lane'""", [d])
     n, priced, net = rows[0] if rows else (0, 0, None)
-    if not n:
+    lane = _q(con, """SELECT r.ticker, p.exploration_lane, o.triggered, o.r_planned, o.r_multiple
+                      FROM rejections r
+                      LEFT JOIN picks p ON p.plan_date = r.plan_date AND UPPER(p.ticker) = UPPER(r.ticker)
+                                       AND LOWER(p.direction) = LOWER(r.direction)
+                      LEFT JOIN outcomes o ON o.pick_id = p.pick_id
+                      WHERE r.plan_date = ? AND r.eod_outcome = 'traded_via_lane'
+                      ORDER BY r.rejection_id""", [d])
+    if not n and not lane:
         return False
-    s.add("shadow.scored", int(n), "one_session", "rejections (shadow ledger)",
-          "rejected candidates scored by the shadow ledger")
-    # Unmeasurable rows (no bars, invalid fill) carry no forgone R. Saying
-    # "7 scored, -0.14R" when the R covers 6 made two honest counts disagree.
-    s.add("shadow.priced", int(priced or 0), "one_session", "rejections.forgone_r IS NOT NULL",
-          "of those, rejections with a measurable forgone R (the rest had no usable bars)")
-    s.add("shadow.forgone_r", _r(net or 0.0), "one_session", "rejections.forgone_r",
-          "net forgone R over the priced rejections (positive = the filters cost the desk)")
-    if priced:
-        s.add("shadow.forgone_per_rejection", _r((net or 0.0) / int(priced)), "one_session",
-              "rejections.forgone_r / priced", "forgone R per priced rejection")
+    if n:
+        s.add("shadow.scored", int(n), "one_session", "rejections (shadow ledger)",
+              "rejected candidates the filters actually stopped, scored by the shadow ledger")
+        # Unmeasurable rows (no bars, invalid fill) carry no forgone R. Saying
+        # "7 scored, -0.14R" when the R covers 6 made two honest counts disagree.
+        s.add("shadow.priced", int(priced or 0), "one_session", "rejections.forgone_r IS NOT NULL",
+              "of those, rejections with a measurable forgone R (the rest had no usable bars)")
+        zero = not priced or abs(float(net or 0.0)) < 0.005
+        s.add("shadow.forgone_r", _r(net or 0.0), "one_session", "rejections.forgone_r",
+              "net forgone R of the rejections the filters stopped: zero, so the filters neither "
+              "saved nor cost the desk anything today; say no such thing" if zero else
+              "net forgone R of the rejections the filters actually stopped (positive = the "
+              "filters cost the desk, negative = they saved it): the only figure a sentence about "
+              "what the filters saved or cost may quote")
+        if priced:
+            s.add("shadow.forgone_per_rejection", _r((net or 0.0) / int(priced)), "one_session",
+                  "rejections.forgone_r / priced", "forgone R per priced rejection")
+    if lane:
+        parts = []
+        for ticker, lane_name, trig, rp, rm in lane:
+            r = rp if rp is not None else rm
+            parts.append(f"{ticker} ({lane_name or 'main'}) "
+                         + (f"{_r(r)} taken" if trig and r is not None else "did not fill"))
+        s.add("shadow.traded_via_lane", "; ".join(parts), "one_session",
+              "rejections.eod_outcome = 'traded_via_lane' + outcomes (r_planned)",
+              "rejected candidates the desk traded anyway through a test lane, with the R each "
+              "was taken at: the filters did not stop these, so they are not forgone R")
     return True
 
 
@@ -423,6 +475,15 @@ def render(raw_text: str, facts: dict, max_chars: int = 3000) -> tuple[str, list
         clause = _TOKEN.sub("", rest).replace(NO_CHANGE, "").strip(" .:-—")
         if len(clause) > TOMORROW_CLAUSE_MAX:
             v.append("the Tomorrow line allows one short clause after the item")
+    # "The filters saved / cost the desk ..." only with a non-zero forgone R, quoting it.
+    fr = slots.get("shadow.forgone_r")
+    for sent in (x for x in re.split(r"(?<=[.!?])\s+|\n+", text) if x.strip()):
+        if not _FILTER_CLAIM.search(_TOKEN.sub(" ", sent)):
+            continue
+        if fr is None or fr["value"] in ("+0.00R", "-0.00R") or "shadow.forgone_r" not in _TOKEN.findall(sent):
+            v.append("a sentence about what the filters saved or cost needs {{shadow.forgone_r}} in it, "
+                     "and only when that figure is not zero")
+            break
     belief_i = next((i for i, h in heads if h == H_BELIEVE), None)
     if belief_i is not None:
         body = "\n".join(lines[belief_i + 1:last_i if last.startswith(TOMORROW) else len(lines)])

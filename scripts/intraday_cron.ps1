@@ -34,21 +34,37 @@
 #   -IntervalSec    default 300 (5 minutes). Ticks are aligned to the wall
 #                   clock (09:35, 09:40, ... 15:55), so the 15:55 flatten
 #                   always gets a tick no matter how long earlier ticks took.
-#   -StartEt/-EndEt default 09:35 / 15:59 ET
+#                   Two RETRY ticks follow the 15:55 one (15:57 and 15:59; on
+#                   an early close 12:57 and 12:59): the server's end-of-day
+#                   backstop closes every broker position on each of them, so
+#                   a close refused at 15:55 is tried twice more before the bell.
+#                   Until 2026-10-16 there was exactly one flatten tick a day.
+#   -StartEt/-EndEt default 09:35 / 16:00 ET
 #   -LogFile        default %USERPROFILE%\.trade-agent\intraday.log
 #   -Once           fire a single request and exit (use this to test)
 #
 # The server re-checks market day, holiday and every window on each call, so
 # an extra tick outside the window is a cheap no-op, never a bad trade.
+#
+# A running copy of this script keeps the schedule it started with: after
+# changing it, stop the scheduled task and start it again.
 # =============================================================================
 
 param(
     [string]$BaseUrl     = "https://iwilltrade.com",
     [int]   $IntervalSec = 300,
     [string]$StartEt     = "09:35",
-    [string]$EndEt       = "15:59",
+    [string]$EndEt       = "16:00",
     [string]$LogFile     = "",
     [switch]$Once
+)
+
+# Clock times (seconds after midnight ET) of the end-of-day retry ticks. The
+# 5-minute grid already ticks at 15:55:02 / 12:55:02; these are the two that
+# follow it.
+$RetrySeconds = @(
+    (12 * 3600 + 57 * 60), (12 * 3600 + 59 * 60),
+    (15 * 3600 + 57 * 60), (15 * 3600 + 59 * 60)
 )
 
 $ErrorActionPreference = "Stop"
@@ -117,7 +133,7 @@ if ($Once) {
 $start = [DateTime]::ParseExact($StartEt, "HH:mm", $null).TimeOfDay
 $end   = [DateTime]::ParseExact($EndEt,   "HH:mm", $null).TimeOfDay
 
-Write-Log "Intraday trigger -> $url  (window $StartEt-$EndEt ET, every $IntervalSec s, wall-clock aligned)"
+Write-Log "Intraday trigger -> $url  (window $StartEt-$EndEt ET, every $IntervalSec s, wall-clock aligned, plus end-of-day retry ticks at 15:57 and 15:59)"
 
 while ($true) {
     $et = Get-EtNow
@@ -142,5 +158,10 @@ while ($true) {
     $secs = $et.TimeOfDay.TotalSeconds
     $next = [math]::Floor($secs / $IntervalSec) * $IntervalSec + $IntervalSec + 2
     if ($secs -lt $start.TotalSeconds) { $next = [math]::Max($next, $start.TotalSeconds + 2) }
+    # The end-of-day retry ticks (15:57 and 15:59, or 12:57 and 12:59 on an
+    # early close) sit between grid points: take the nearest one still ahead.
+    foreach ($r in $RetrySeconds) {
+        if ($secs -lt ($r + 2) -and ($r + 2) -lt $next) { $next = $r + 2 }
+    }
     Start-Sleep -Seconds ([int][math]::Max(5, $next - $secs))
 }

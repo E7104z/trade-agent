@@ -67,6 +67,12 @@ _WORKING = {"new", "accepted", "held", "pending_new", "partially_filled",
             "accepted_for_bidding", "pending_replace", "calculated"}
 
 
+def _eod_at(close: time) -> time:
+    """The clock time the end-of-day flatten starts: EOD_FLATTEN_MINUTES before
+    the session close (15:55; 12:55 on an early close)."""
+    return (datetime.combine(date.min, close) - timedelta(minutes=EOD_FLATTEN_MINUTES)).time()
+
+
 def _past_cutoff(pick: dict, live_cfg: dict, current: datetime,
                  close: time | None = None) -> str | None:
     stop_at = _time_stop(pick.get("time_stop"))
@@ -76,9 +82,7 @@ def _past_cutoff(pick: dict, live_cfg: dict, current: datetime,
     if flatten_at and current.time() >= flatten_at:
         return "flatten"
     if close is not None:
-        eod_at = (datetime.combine(date.min, close)
-                  - timedelta(minutes=EOD_FLATTEN_MINUTES)).time()
-        if current.time() >= eod_at:
+        if current.time() >= _eod_at(close):
             return "eod"
     return None
 
@@ -109,21 +113,29 @@ _CLOSE_RETRY_WAITS = (0.5, 1.0, 1.5, 2.0)
 _sleep = time_mod.sleep
 
 
+def _close_with_retries(ticker: str, cfg: Config, qty: float | None = None) -> dict:
+    """close_position (all of it, or `qty` shares), retried within this tick
+    while cancelled legs settle. Returns the close order (empty when every
+    attempt was refused)."""
+    kw = {} if qty is None else {"qty": qty}
+    close_order = live_broker.close_position(ticker, cfg=cfg, **kw) or {}
+    for wait in _CLOSE_RETRY_WAITS:
+        if close_order:
+            break
+        _sleep(wait)
+        close_order = live_broker.close_position(ticker, cfg=cfg, **kw) or {}
+    if not close_order:
+        log("intraday", f"{ticker}: close refused after {len(_CLOSE_RETRY_WAITS) + 1} "
+                        f"attempts ({live_broker.last_error()})")
+    return close_order
+
+
 def _close_position_after_legs(ticker: str, order: dict | None, cfg: Config) -> dict:
     """Cancel the working legs of `order`, then close the position, retrying
     within this tick while the cancels settle. Returns the close order (empty
     when every attempt was refused)."""
     _cancel_working_legs(order, cfg)
-    close_order = live_broker.close_position(ticker, cfg=cfg) or {}
-    for wait in _CLOSE_RETRY_WAITS:
-        if close_order:
-            break
-        _sleep(wait)
-        close_order = live_broker.close_position(ticker, cfg=cfg) or {}
-    if not close_order:
-        log("intraday", f"{ticker}: close refused after {len(_CLOSE_RETRY_WAITS) + 1} "
-                        f"attempts ({live_broker.last_error()})")
-    return close_order
+    return _close_with_retries(ticker, cfg)
 
 
 def _record_close(con, row: dict, pick: dict, reason: str, close_order: dict,
@@ -386,9 +398,382 @@ def carry_cleanup(con, cfg: Config, today: date) -> dict:
             out["closed"] += 1
             log("intraday", f"{ticker}: position from {row['session_date']} was still open "
                             f"(missed end-of-day flatten) -- closing now")
+            _note_carry(con, row, entry, close_order, today)
         else:
             out["skipped"].append(f"{ticker}: close refused ({live_broker.last_error()})")
     return out
+
+
+def _note_carry(con, row: dict, entry: float | None, close_order: dict, today: date) -> None:
+    """Record a carry carry_cleanup just closed, so the FLATTEN MISSED line
+    covers it. Bookkeeping only: the close already went out."""
+    try:
+        ledger.record_backstop_close(
+            con, session_date=today, kind="morning_sweep", symbol=row["ticker"],
+            position_side="long" if row.get("side") == "buy" else "short",
+            qty=float(row.get("qty") or 0), avg_entry_price=entry, reason="ledger_open",
+            claimed_by=row["live_order_id"], carried_from=row["session_date"],
+            close_order_id=str(close_order["id"]) if close_order.get("id") else None,
+            status="submitted")
+    except Exception as e:  # noqa: BLE001
+        log("intraday", f"WARN could not record the carry close of {row.get('ticker')}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# The account is flat after the close (docs/FIX_PHASE0.md, D1)
+# ---------------------------------------------------------------------------
+# check() and carry_cleanup() both walk LEDGER rows. A position no row knows
+# about -- IOVA, 250 shares, bought 2026-09-30 by a run that wrote to a local
+# ledger -- is invisible to both, and was carried for 16 sessions. These two
+# functions read the BROKER's positions instead:
+#
+#   eod_backstop  at/after close - EOD_FLATTEN_MINUTES, closes every position
+#                 whatever any ledger says;
+#   orphan_sweep  before that, closes what was opened in a PRIOR session. A
+#                 claim only protects what was opened today.
+#
+# Both are idempotent (a lease, plus a check for a close already in flight),
+# both do nothing when the account cannot be read (None is not "holds
+# nothing"), and both record what they closed in eod_backstop_closes -- the
+# FLATTEN MISSED line is built from those rows.
+
+_IN_FLIGHT = _WORKING | {"pending_cancel"}
+_EPS = 1e-6
+
+
+def _allow_overnight(cfg: Config) -> set[str]:
+    live = cfg.get("live_paper", {}) or {}
+    return {str(s).upper().strip() for s in (live.get("allow_overnight_symbols") or [])
+            if str(s).strip()}
+
+
+def _num(v) -> float | None:
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _signed_qty(pos: dict) -> float:
+    q = _num(pos.get("qty")) or 0.0
+    if str(pos.get("side", "")).lower() == "short" and q > 0:
+        q = -q
+    return q
+
+
+def _pos_fields(pos: dict) -> dict:
+    q = _signed_qty(pos)
+    return {"position_side": "long" if q > 0 else "short", "qty": abs(q),
+            "avg_entry_price": _num(pos.get("avg_entry_price"))}
+
+
+def _fills_net(fills: list[dict], symbol: str) -> float:
+    """Shares bought minus shares sold in `symbol` today, from the broker's
+    own fill feed."""
+    net = 0.0
+    for f in fills or []:
+        if str(f.get("symbol", "")).upper() != symbol:
+            continue
+        q = _num(f.get("qty")) or 0.0
+        side = str(f.get("side", "")).lower()
+        if side == "buy":
+            net += q
+        elif side.startswith("sell"):
+            net -= q
+    return net
+
+
+def _open_claims(con, today: date) -> dict[str, list[dict]]:
+    """{SYMBOL: [live_orders rows still without an exit]} for today and every
+    earlier session: what the ledger believes is open."""
+    cols = [c[0] for c in con.execute("DESCRIBE live_orders").fetchall()]
+    rows = con.execute(
+        "SELECT * FROM live_orders WHERE exit_reason IS NULL AND session_date <= ? "
+        "ORDER BY session_date, live_order_id", [today]).fetchall()
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        row = dict(zip(cols, r))
+        out.setdefault(str(row["ticker"]).upper(), []).append(row)
+    return out
+
+
+def _working_close(con, cfg: Config, d: date, symbol: str, closing_side: str,
+                   open_orders: list[dict]) -> str | None:
+    """The id of a close for `symbol` that is already working at the broker, or
+    None. A second tick must not send another one: it would open the opposite
+    position (a long 250 closed twice is a short 250). Our own recorded closes
+    are checked against the broker's current state, so one the broker dropped
+    (cancelled, rejected) is NOT working and is retried; an order that cannot
+    be read is assumed to be working."""
+    for r in ledger.backstop_closes_for_date(con, d, symbol=symbol):
+        if r.get("status") not in ("submitted", "in_flight") or not r.get("close_order_id"):
+            continue
+        order = live_broker.get_order(str(r["close_order_id"]), cfg=cfg)
+        if order is None:
+            return str(r["close_order_id"])
+        state = str(order.get("status", "")).lower()
+        if state in _IN_FLIGHT:
+            return str(r["close_order_id"])
+        price, at = _fill(order)
+        ledger.update_backstop_close(con, r["close_id"], status=state or "failed",
+                                     filled_price=price, filled_at=at)
+    # A close that did not come through this table: check()'s own flatten, or
+    # one sent by hand, is a working market order on the closing side.
+    for o in open_orders or []:
+        if (str(o.get("symbol", "")).upper() == symbol
+                and str(o.get("side", "")).lower() == closing_side
+                and str(o.get("type", "")).lower() == "market"
+                and str(o.get("status", "")).lower() in _IN_FLIGHT):
+            return str(o.get("id") or "unknown")
+    return None
+
+
+def _cancel_working_orders(cfg: Config, symbol: str, open_orders: list[dict],
+                           before: date | None = None) -> int:
+    """Cancel the working orders on `symbol` (bracket legs hold the position's
+    shares, and Alpaca refuses a close while they do). With `before`, only
+    orders submitted before that date: a morning sweep must never cancel the
+    order the desk placed for the same ticker today."""
+    n = 0
+    for o in open_orders or []:
+        if str(o.get("symbol", "")).upper() != symbol or not o.get("id"):
+            continue
+        if str(o.get("status", "")).lower() not in _WORKING:
+            continue
+        if before is not None:
+            sub = str(o.get("submitted_at") or "")[:10]
+            if not sub or sub >= before.isoformat():
+                continue
+        live_broker.cancel_order(str(o["id"]), cfg=cfg)
+        n += 1
+    return n
+
+
+def _settle_rows(con, rows: list[dict], close_order: dict, reason: str,
+                 fallback_entry: float | None) -> None:
+    """Point every ledger row that claimed the closed position at its close, so
+    the fill is read back and R computed (the same path a monitor flatten
+    takes). Rows whose entry never filled claim no shares and are left."""
+    picks: dict = {}
+    for row in rows:
+        if row.get("entry_fill_price") is None or row.get("close_order_id") \
+                or row.get("exit_reason") is not None:
+            continue
+        sd = row["session_date"]
+        if sd not in picks:
+            picks[sd] = {p["pick_id"]: p for p in ledger.picks_for_date(con, sd)}
+        entry = row.get("entry_fill_price")
+        _record_close(con, row, picks[sd].get(row.get("pick_id"), {}), reason, close_order,
+                      entry if entry is not None else fallback_entry)
+
+
+def _book_close(con, cfg: Config, fields: dict, order: dict) -> None:
+    price, at = _fill(order)
+    ledger.record_backstop_close(
+        con, status="filled" if price is not None else "submitted",
+        close_order_id=str(order["id"]) if order.get("id") else None,
+        filled_price=price, filled_at=at, **fields)
+
+
+def eod_backstop(con, cfg: Config, now: datetime | None = None) -> dict:
+    """At and after close - EOD_FLATTEN_MINUTES, close EVERY broker position
+    not in live_paper.allow_overnight_symbols, whatever any ledger says.
+
+    The intraday trigger calls this on every tick from 15:55 (15:55, 15:57 and
+    15:59), so a close refused at 15:55 is retried twice more before the bell.
+    Idempotent: a lease serializes overlapping ticks and a close already
+    working at the broker is never sent twice. When the account cannot be read
+    nothing is closed."""
+    live_cfg = cfg.get("live_paper", {}) or {}
+    if not live_cfg.get("enabled"):
+        return {"skipped": "live paper disabled"}
+    now = now or now_et()
+    d = now.date()
+    if not is_market_day(d):
+        return {"skipped": "not a market day"}
+    close = market_close_et(d)
+    eod_at = _eod_at(close)
+    if now.time() < eod_at:
+        return {"skipped": f"before the {eod_at.strftime('%H:%M')} flatten window"}
+    if now.time() > close:
+        return {"skipped": "after the close: the next morning's sweep closes anything left"}
+    name = f"eod_backstop:{d}"
+    lease = ledger.acquire_tick_lease(con, name, 90)
+    if lease is None:
+        return {"skipped": "another tick holds the eod_backstop lease"}
+    try:
+        return _run_backstop(con, cfg, d)
+    finally:
+        ledger.release_tick_lease(con, name, lease)
+
+
+def _run_backstop(con, cfg: Config, d: date) -> dict:
+    positions = live_broker.list_positions(cfg=cfg)
+    if positions is None:
+        return {"error": f"could not read positions -- nothing closed ({live_broker.last_error()})"}
+    allow = _allow_overnight(cfg)
+    open_orders = live_broker.list_open_orders(cfg=cfg)
+    claims = _open_claims(con, d)
+    out: dict = {"closed": [], "in_flight": [], "refused": [], "allowed": []}
+    for pos in positions:
+        sym = str(pos.get("symbol", "")).upper()
+        q = _signed_qty(pos)
+        if not sym or abs(q) < _EPS:
+            continue
+        if sym in allow:
+            out["allowed"].append(sym)
+            continue
+        if _working_close(con, cfg, d, sym, "sell" if q > 0 else "buy", open_orders):
+            out["in_flight"].append(sym)
+            continue
+        rows = claims.get(sym, [])
+        reason = ("ledger_open" if any(r["session_date"] == d for r in rows)
+                  else "prior_session_claim" if rows else "unledgered")
+        fields = dict(session_date=d, kind="eod_backstop", symbol=sym, reason=reason,
+                      claimed_by=rows[0]["live_order_id"] if rows else None, **_pos_fields(pos))
+        _cancel_working_orders(cfg, sym, open_orders)
+        order = _close_with_retries(sym, cfg)
+        if not order:
+            err = live_broker.last_error() or "no detail"
+            ledger.record_backstop_close(con, status="refused", detail=err, **fields)
+            out["refused"].append(f"{sym}: close refused ({err})")
+            continue
+        _book_close(con, cfg, fields, order)
+        _settle_rows(con, rows, order, "eod_backstop", _num(pos.get("avg_entry_price")))
+        out["closed"].append(sym)
+        log("intraday", f"{sym}: EOD BACKSTOP closed {abs(q):g} sh ({reason}) -- a position the "
+                        f"15:55 flatten did not close")
+    return out
+
+
+def orphan_sweep(con, cfg: Config, today: date, now: datetime | None = None) -> dict:
+    """Close what the broker holds that was opened in a PRIOR session.
+
+    Every lane is intraday, so the account is flat after each close; anything
+    still open at the next morning is a carry, closed even when a ledger row
+    claims it. A claim only protects a position opened TODAY: the quantity
+    protected is the larger of what today's fills and today's open ledger rows
+    account for, and only the rest is closed (a partial close when the desk
+    also bought the name this morning). The claiming prior-session row, if any,
+    is settled as 'overnight_carry' with the real fill.
+
+    Run from the morning loop (pre-open, nothing can have been bought today)
+    and every intraday tick before the end-of-day window. Mid-session it needs
+    the broker's fill feed; unreadable, it closes nothing."""
+    live_cfg = cfg.get("live_paper", {}) or {}
+    if not live_cfg.get("enabled"):
+        return {"skipped": "live paper disabled"}
+    if not is_market_day(today):
+        return {"skipped": "not a market day"}
+    now = now or now_et()
+    if now.time() >= _eod_at(market_close_et(today)):
+        return {"skipped": "inside the end-of-day window: the backstop owns it"}
+    name = f"orphan_sweep:{today}"
+    lease = ledger.acquire_tick_lease(con, name, 90)
+    if lease is None:
+        return {"skipped": "another tick holds the orphan_sweep lease"}
+    try:
+        return _run_sweep(con, cfg, today, now)
+    finally:
+        ledger.release_tick_lease(con, name, lease)
+
+
+def _run_sweep(con, cfg: Config, today: date, now: datetime) -> dict:
+    positions = live_broker.list_positions(cfg=cfg)
+    if positions is None:
+        return {"error": f"could not read positions -- nothing closed ({live_broker.last_error()})"}
+    out: dict = {"closed": [], "carried": [], "left_alone": [], "in_flight": [],
+                 "refused": [], "allowed": []}
+    if not positions:
+        return out
+    # Before 09:30 nothing can have been bought today; after it, the fill feed
+    # is what separates today's shares from the carried ones.
+    fills = [] if now.time() < time(9, 30) else live_broker.fills_for_date(today, cfg=cfg)
+    if fills is None:
+        return {"error": "could not read today's fills -- nothing closed (an unreadable feed "
+                         "is not proof that nothing was bought today)"}
+    allow = _allow_overnight(cfg)
+    open_orders = live_broker.list_open_orders(cfg=cfg)
+    claims = _open_claims(con, today)
+    for pos in positions:
+        sym = str(pos.get("symbol", "")).upper()
+        q = _signed_qty(pos)
+        if not sym or abs(q) < _EPS:
+            continue
+        if sym in allow:
+            out["allowed"].append(sym)
+            continue
+        sgn = 1.0 if q > 0 else -1.0
+        rows = claims.get(sym, [])
+        today_rows = [r for r in rows if r["session_date"] == today]
+        prior_rows = [r for r in rows if r["session_date"] < today]
+        ledger_today = sum((r["qty"] if r.get("side") == "buy" else -r["qty"]) for r in today_rows
+                           if r.get("entry_fill_price") is not None and r.get("qty"))
+        protected = max(0.0, sgn * _fills_net(fills, sym), sgn * ledger_today)
+        carry = abs(q) - protected
+        if carry <= _EPS:
+            out["left_alone"].append(sym)
+            continue
+        reason = "ledger_open" if prior_rows else "unledgered"
+        fields = dict(session_date=today, kind="morning_sweep", symbol=sym, reason=reason,
+                      claimed_by=prior_rows[0]["live_order_id"] if prior_rows else None,
+                      carried_from=prior_rows[0]["session_date"] if prior_rows else None,
+                      **{**_pos_fields(pos), "qty": carry})
+        working = _working_close(con, cfg, today, sym, "sell" if q > 0 else "buy", open_orders)
+        if working:
+            # Someone (a manual close, an earlier tick) already has a close
+            # working: send nothing. The position WAS a carry, so say so once;
+            # the morning email must not stay silent about it.
+            out["in_flight"].append(sym)
+            if not ledger.backstop_closes_for_date(con, today, kind="morning_sweep", symbol=sym):
+                ledger.record_backstop_close(
+                    con, status="in_flight", close_order_id=working,
+                    detail="a close order was already working when the sweep found it", **fields)
+            continue
+        whole = carry >= abs(q) - _EPS
+        qty_arg = None if whole else round(carry, 6)
+        _cancel_working_orders(cfg, sym, open_orders, before=today)
+        order = _close_with_retries(sym, cfg, qty=qty_arg)
+        if not order:
+            err = live_broker.last_error() or "no detail"
+            ledger.record_backstop_close(con, status="refused", detail=err, **fields)
+            out["refused"].append(f"{sym}: close refused ({err})")
+            continue
+        _book_close(con, cfg, fields, order)
+        _settle_rows(con, prior_rows, order, "overnight_carry", _num(pos.get("avg_entry_price")))
+        out["closed"].append(sym)
+        out["carried"].append({"symbol": sym, "qty": carry, "reason": reason})
+        log("intraday", f"{sym}: ORPHAN SWEEP closed {carry:g} sh carried from a prior session "
+                        f"({reason})")
+    return out
+
+
+def _qty_text(q) -> str:
+    q = float(q or 0)
+    return str(int(q)) if q == int(q) else f"{q:g}"
+
+
+def flatten_missed_lines(con, since: date) -> list[str]:
+    """One FLATTEN MISSED line per carry closed on/after `since`: a position
+    that was still open after a close. Empty on a clean day -- the morning
+    email and /api/status show nothing then."""
+    how = {"unledgered": "no ledger row knew about it, so no flatten could have caught it",
+           "ledger_open": "its ledger row had no exit",
+           "prior_session_claim": "only a past session's ledger row claimed it"}
+    lines = []
+    for r in ledger.flatten_missed_rows(con, since):
+        px = f" @ {r['avg_entry_price']:.2f}" if r.get("avg_entry_price") else ""
+        origin = f" from {r['carried_from']}" if r.get("carried_from") else ""
+        status = r.get("status")
+        did = ("found a close order already working (sent by someone else) and sent none"
+               if status == "in_flight" else "closed it at market"
+               + (" -- the close was REFUSED, so it is still open" if status == "refused" else ""))
+        lines.append(
+            f"FLATTEN MISSED: {r['symbol']} {r.get('position_side') or ''} "
+            f"{_qty_text(r.get('qty'))} sh{px} was still open after the close{origin} "
+            f"({how.get(r.get('reason'), r.get('reason') or 'unknown')}); "
+            f"the {r['session_date']} sweep {did}.")
+    return lines
 
 
 def _live_prices(md, tickers: list[str]) -> dict[str, float]:

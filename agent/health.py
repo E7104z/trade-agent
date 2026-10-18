@@ -265,6 +265,17 @@ def _loop_health(con: Any, cfg: Any, now: datetime) -> dict:
                 "(no intraday tick reached them before the close). The next intraday tick "
                 "or morning run settles them, closing any position still open.")
 
+    # --- a position that outlived a close (docs/FIX_PHASE0.md, D1) ---------
+    # Every lane is intraday, so the account is flat after each close. A carry
+    # the morning sweep had to close is shown for LEARNING_WINDOW_DAYS: the
+    # flatten failed, and "it was closed in the morning" is not "it worked".
+    if ((cfg.get("live_paper", {}) or {}) if cfg else {}).get("enabled"):
+        try:
+            from .live_monitor import flatten_missed_lines
+            warnings.extend(flatten_missed_lines(con, now.date() - timedelta(days=LEARNING_WINDOW_DAYS)))
+        except Exception:  # noqa: BLE001 -- a health line never breaks the status payload
+            pass
+
     # --- data continuity (DATA_CONTINUITY_SPEC_v1) -------------------------
     # A provider refusing requests, a session whose data never arrived, and a
     # run creeping toward the function budget are each silent until counted.

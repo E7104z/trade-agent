@@ -15,13 +15,15 @@ v3 additions (specs/EVENING_GRADER_SPEC_v3.md):
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import date, datetime
 
 from .. import ledger
 from ..config import Config
 from ..delivery import evening_email_html, render_dashboard, send_email
-from ..grading import (CURRENT_SIM_VERSION, classify_shadow,
-                       grade_day, outcomes_md, realized_r, simulate_pick)
+from ..grading import (CURRENT_SIM_VERSION, TRADED_VIA_LANE, broker_summary_line,
+                       classify_divergence, classify_shadow, grade_day, outcomes_md,
+                       realized_r, shadow_pick, shadow_time_stop, simulate_pick)
 from ..grading_context import build_grading_context
 from ..llm import LLMClient, load_prompt, persona_block, persona_version, prompt_version
 from ..coverage import OUTCOME_FIELDS, lane_of, outcome_coverage, plumbing
@@ -137,31 +139,83 @@ def _all_fills_tainted(outcomes: list[dict]) -> bool:
     return all(o.get("exit_reason") == "invalid_fill" or o.get("execution_anomaly") for o in fills)
 
 
+def _lane_trades(picks: list[dict]) -> dict[tuple[str, str], dict]:
+    """{(TICKER, direction): pick} for every pick the desk put on today, in any
+    lane. A rejection that matches one was traded anyway."""
+    return {(str(p["ticker"]).upper(), str(p.get("direction") or "").lower()): p for p in picks}
+
+
+def _taken_r(con, pick_id: int) -> tuple[float | None, str]:
+    """(the planned-risk R a taken pick was reported at, how it ended), from its
+    stored outcome: filled | not_filled | invalid_fill | ungraded."""
+    row = con.execute("SELECT r_planned, r_multiple, triggered, exit_reason FROM outcomes "
+                      "WHERE pick_id = ?", [pick_id]).fetchone()
+    if not row:
+        return None, "ungraded"
+    if row[3] == "invalid_fill":
+        return None, "invalid_fill"
+    if not row[2]:
+        return None, "not_filled"
+    r = row[0] if row[0] is not None else row[1]
+    return (None if r is None else float(r)), "filled"
+
+
 def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
                       flatten_at: str | None = None, min_bar_volume: float = 0) -> dict:
     """Shadow ledger: simulate every rejected candidate; never touches the equity curve.
 
-    Uses the same friction and exit rules (flatten_at, min_bar_volume) as taken
-    picks -- comparisons between taken and rejected are only fair if both sides
-    are graded identically. Rejections don't carry a time_stop (not stored on
-    the rejections table), which behaves the same as a pick with no time_stop.
+    Priced by the SAME simulate_pick call a taken pick goes through, with the
+    same friction and exit rules (flatten_at, min_bar_volume), the same entry
+    window and the same time stop (grading.shadow_pick): comparisons between
+    taken and rejected are only fair if both sides are graded identically. The
+    time stop is the analyst's, recovered from daily_plans.analyst_json (the
+    rejections table never stored one, so INTC 2026-10-15 was priced to its
+    15:42 stop at -1.01R when the taken trade exited at its 14:30 time stop at
+    -0.51R).
+
+    A rejection the desk TRADED ANYWAY (coverage, daily floor, hypothesis) is
+    not a counterfactual -- the filters did not stop it. It is priced with its
+    taken pick's own parameters, so its shadow R IS the pick's R, stored as
+    eod_outcome='traded_via_lane' with NO forgone_r (so it enters no total,
+    mean or test), and listed under summary["traded_via_lane"] with its taken R.
     """
     rejections = ledger.ungraded_rejections(con, d)
     summary = {"scored": 0, "priced": 0, "triggered": 0, "net_forgone_r": 0.0,
-               "gap_fade_notes": [], "rr_band_notes": []}
+               "gap_fade_notes": [], "rr_band_notes": [], "traded_via_lane": []}
+    if not rejections:
+        return summary
+    traded = _lane_trades(ledger.picks_for_date(con, d))
+    try:
+        row = con.execute("SELECT analyst_json FROM daily_plans WHERE plan_date = ?", [d]).fetchone()
+        analyst_json = row[0] if row else None
+    except Exception:  # noqa: BLE001 -- a plan row without candidates prices with no time stop
+        analyst_json = None
     for r in rejections:
         try:
             bars = md.minute_bars(r["ticker"], d)
         except Exception:
             bars = []
-        shim = {"pick_id": r["rejection_id"], "direction": r["direction"],
-                "entry_type": r["entry_type"], "entry_price": r["entry_price"],
-                "stop_price": r["stop_price"], "target_price": r["target_price"],
-                # Same entry window a taken pick of this type carried (v27).
-                "entry_not_before": r.get("entry_not_before")}
+        pick = traded.get((str(r["ticker"]).upper(), str(r.get("direction") or "").lower()))
+        shim = shadow_pick(
+            r, pick=pick,
+            time_stop=None if pick is not None else shadow_time_stop(
+                analyst_json, r["ticker"], r.get("direction"), r.get("entry_price")))
         sim = simulate_pick(shim, bars, None, slippage_bps=slippage_bps,
                             flatten_at=flatten_at, min_bar_volume=min_bar_volume,
                             session_date=d)
+        if pick is not None:
+            eod_outcome, forgone = TRADED_VIA_LANE, None
+            filled = bool(sim.get("triggered")) and sim.get("exit_reason") != "invalid_fill"
+            taken_r, taken_status = _taken_r(con, pick["pick_id"])
+            summary["traded_via_lane"].append({
+                "ticker": r["ticker"], "lane": pick.get("exploration_lane") or "main",
+                "shadow_r": realized_r(sim) if filled else None,
+                "taken_r": taken_r, "taken_status": taken_status})
+            ledger.save_rejection_outcome(con, r["rejection_id"], eod_outcome, forgone,
+                                          sim_version=sim.get("sim_version"))
+            log("evening", f"  shadow {r['ticker']} ({r['reason'][:40]}): traded via "
+                           f"{pick.get('exploration_lane') or 'main'} -- excluded from forgone R")
+            continue
         eod_outcome, forgone = classify_shadow(sim)
         ledger.save_rejection_outcome(con, r["rejection_id"], eod_outcome, forgone,
                                       sim_version=sim.get("sim_version"))
@@ -188,22 +242,90 @@ def _grade_rejections(con, md: MarketData, d: date, slippage_bps: float = 0.0,
     return summary
 
 
+def _record_broker_truth(con, d: date, picks: list[dict], outcomes: list[dict]) -> list[dict]:
+    """Store what the paper account actually did next to each simulated outcome
+    (docs/FIX_PHASE0.md, D3), and say where it disagrees.
+
+    For every pick with a live order: the broker's entry fill, exit fill, exit
+    reason and live_r (R from its own fills) go onto the outcomes row, with
+    sim_broker_divergence = none | sim_only_fill | broker_only_fill |
+    price_gap. The simulated columns are never touched: the simulated R stays
+    the research number. The outcome dicts are enriched in place so the
+    grader's bundle and the email lead with the broker's result. Idempotent.
+    Returns [{pick_id, ticker, divergence}] for the picks that went live."""
+    live = {r["pick_id"]: r for r in ledger.live_orders_for_date(con, d)}
+    if not live:
+        return []
+    by_pick = {p["pick_id"]: p for p in picks}
+    out = []
+    for o in outcomes:
+        row = live.get(o["pick_id"])
+        if row is None:
+            continue
+        broker = {"entry_fill": row.get("entry_fill_price"), "exit_fill": row.get("exit_fill_price"),
+                  "exit_reason": row.get("exit_reason"), "live_r": row.get("live_r"),
+                  "status": row.get("status")}
+        div = classify_divergence(o, broker, by_pick.get(o["pick_id"]))
+        o.update(broker_entry_fill=broker["entry_fill"], broker_exit_fill=broker["exit_fill"],
+                 broker_exit_reason=broker["exit_reason"], broker_status=broker["status"] or "unknown",
+                 live_r=broker["live_r"], sim_broker_divergence=div)
+        con.execute(
+            "UPDATE outcomes SET broker_entry_fill = ?, broker_exit_fill = ?, "
+            "broker_exit_reason = ?, broker_status = ?, sim_broker_divergence = ? WHERE pick_id = ?",
+            [broker["entry_fill"], broker["exit_fill"], broker["exit_reason"],
+             o["broker_status"], div, o["pick_id"]])
+        if broker["live_r"] is not None:
+            ledger.set_live_r(con, o["pick_id"], broker["live_r"])
+        out.append({"pick_id": o["pick_id"], "ticker": (by_pick.get(o["pick_id"]) or {}).get("ticker"),
+                    "divergence": div})
+    return out
+
+
+def _lane_line(shadow: dict) -> str:
+    """The rejections the desk traded anyway, on their own line with their
+    taken R. Empty when there were none."""
+    rows = shadow.get("traded_via_lane") or []
+    if not rows:
+        return ""
+    parts = []
+    for t in rows:
+        r = t.get("taken_r")
+        what = (f"{r:+.2f}R taken" if r is not None else
+                {"invalid_fill": "invalid fill, not a trade",
+                 "ungraded": "not graded yet"}.get(t.get("taken_status"), "did not fill"))
+        parts.append(f"{t['ticker']} ({t['lane']}) {what}")
+    return ("Traded via a lane (the filters did NOT stop these, so they are excluded from "
+            "forgone R; each shows the R it was taken at): " + "; ".join(parts) + ".")
+
+
 def _shadow_md(shadow: dict) -> str:
-    """The grader's one line on the shadow ledger. Counts what the net
-    covers, and says plainly what one session of it can and cannot show:
-    on 2026-10-05 the grader read -0.14R over six priced rejections (0.02R a
-    rejection) as "confirms filters are working"."""
+    """The grader's lines on the shadow ledger. Counts what the net covers, and
+    says plainly what one session of it can and cannot show: on 2026-10-05 the
+    grader read -0.14R over six priced rejections (0.02R a rejection) as
+    "confirms filters are working".
+
+    The count is of the rejections the filters actually stopped: ones the desk
+    traded anyway are excluded and listed apart (see _lane_line). The sign
+    legend ("positive = the filters cost the desk") appears only when there is
+    a net to read -- beside a zero it was being quoted as a verdict, and when
+    every rejection was traded the line says the filters stopped nothing."""
     scored, priced = int(shadow.get("scored") or 0), int(shadow.get("priced") or 0)
     net = float(shadow.get("net_forgone_r") or 0.0)
-    if not scored:
+    lane = _lane_line(shadow)
+    if not scored and not lane:
         return "No rejected candidates were scored today."
+    if not scored:
+        return ("Every rejected candidate was traded anyway, so the filters stopped "
+                "nothing today and there is no forgone R to read.\n" + lane)
     per = f", {net / priced:+.2f}R per priced rejection" if priced else ""
-    return (f"{scored} rejected candidates scored, {priced} priced "
+    head = (f"{scored} rejected candidates scored, {priced} priced "
             f"({shadow.get('triggered', 0)} of them would have triggered; "
-            f"{scored - priced} unmeasurable); net forgone {net:+.2f}R over the priced"
-            f"{per} (positive = the filters cost the desk). One session of forgone R is "
-            "a single noisy draw over a handful of names: it neither confirms nor refutes "
-            "the filters. Only the weekly miner's cumulative shadow read can.")
+            f"{scored - priced} unmeasurable); net forgone {net:+.2f}R over the priced{per}")
+    head += (", so the filters neither saved nor cost R on what they stopped."
+             if not priced or abs(net) < 0.005 else " (positive = the filters cost the desk).")
+    return (head + " One session of forgone R is a single noisy draw over a handful of names: "
+            "it neither confirms nor refutes the filters. Only the weekly miner's cumulative "
+            "shadow read can." + ("\n" + lane if lane else ""))
 
 
 def _rr_band_note(ticker: str, rr: float, eod_outcome: str,
@@ -847,9 +969,36 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         stages["forward_observations"] = forward["recorded"]
         _mark("events")
 
+        # BROKER TRUTH before anyone reads the day (docs/FIX_PHASE0.md, D3): on
+        # 2026-10-15 the review said -1.56R and one winner while the paper
+        # account lost $222 with no winner, because the winner (RKLB) was an
+        # order Alpaca cancelled unfilled and nothing compared the two. Guarded:
+        # a broker that cannot be read leaves the review on simulated outcomes.
+        live_summary: dict = {"reconciled": 0, "divergence": []}
+        broker_rows: list[dict] = []
+        if not cfg.mock:
+            try:
+                from ..live_monitor import reconcile_evening
+                live_summary = reconcile_evening(con, cfg, d)
+                broker_rows = _record_broker_truth(con, d, picks, outcomes)
+            except Exception as e:  # noqa: BLE001
+                log("evening", f"WARN broker reconciliation failed; the review stays on "
+                               f"simulated outcomes: {e}")
+        stages["broker_divergences"] = sum(1 for r in broker_rows
+                                           if r["divergence"] not in (None, "none"))
         out_md = outcomes_md(picks, outcomes) if picks else "(no picks today — no-trade day)"
+        broker_line = broker_summary_line(picks, outcomes) if picks else ""
+        if broker_line:
+            out_md = broker_line + "\n\n" + out_md
         tape_md = "\n".join(f"- {p['ticker']} (pick_id={p['pick_id']}): {tapes[p['pick_id']]}"
                             for p in picks if p["pick_id"] in tapes)
+        # How each entry order works and why it filled when it did, computed from the
+        # plan and the simulated outcome (docs/FIX_PHASE0.md, D6): on 2026-10-16 the
+        # review called AMAT's breakout fill "97 minutes late ... chasing" and INTC's
+        # breakout short senseless, because nothing told it a breakout is a stop order
+        # that fills when the level breaks.
+        from .. import review_audit
+        mech_md = review_audit.mechanics_md(picks, outcomes) if picks else ""
         recap = md.market_recap(d)
         recap_md = ", ".join(f"{k} {v:+.2f}%" for k, v in (recap.get("pct_change") or {}).items())
 
@@ -886,6 +1035,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             + f"## PICKS + COMPUTED OUTCOMES (mechanically simulated from real bars)\n\n{out_md}\n\n"
             + (f"## COMPUTED TAPE (from the real bars — the ONLY tape facts you may cite)\n\n"
                f"{tape_md}\n\n" if tape_md else "")
+            + (f"## ORDER MECHANICS (computed from the plan: how each entry order works and why it "
+               f"filled when it did. A resting or stop order fills when price reaches it; the fill "
+               f"time is the tape's, never a desk decision)\n\n{mech_md}\n\n" if mech_md else "")
             + f"## EXECUTION GROUND TRUTH\n\n"
             f"Live fills recorded for {d}: "
             f"{sum(1 for o in ledger.live_orders_for_date(con, d) if o.get('entry_fill_price') is not None)}. "
@@ -907,6 +1059,9 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
             stages["llm"] = "failed"
             raise
         stages["llm"] = "complete"
+        # Which grader prompt wrote this review (the order-mechanics paragraph is v11):
+        # scripts/verify_fixes.py reads it back, since `runs` keeps no prompt version.
+        stages["grader_prompt_version"] = prompt_version("evening_grader")
         _mark("llm")
         review = result.parsed or {}
         review = _drop_invalid_fill_reviews(review, picks, outcomes)
@@ -935,6 +1090,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         review = audit["review"]
         stages["audit"] = {
             "findings": len(audit["findings"]),
+            # counts first: `runs.stages` is cut at 4000 characters and the items below are long
+            "by_check": dict(Counter(f["check"] for f in audit["findings"])),
             "dropped_lessons": audit["dropped_lessons"],
             "dropped_ideas": audit["dropped_ideas"],
             "items": [{k: str(v)[:300] for k, v in f.items()} for f in audit["findings"][:20]]}
@@ -945,10 +1102,8 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
         # 3. persist grades + lessons
         n_graded = ledger.apply_grades(con, review.get("pick_reviews", []), picks)
 
-        # Observation only: live paper fills are reconciled alongside the
-        # simulator after grading. The simulator's r_multiple remains intact.
-        from ..live_monitor import reconcile_evening
-        live_summary = reconcile_evening(con, cfg, d)
+        # (Live paper fills were reconciled above, before the grader read the
+        # day: the broker's result is the headline, the simulator's R intact.)
 
         tainted_day = _all_fills_tainted(outcomes)
         new_lessons = review.get("lessons", []) or []
@@ -1022,6 +1177,7 @@ def run(cfg: Config, run_date: date | None = None, force: bool = False) -> None:
                        f"open-question increments={counts['q_increments']}, "
                        f"forward observations={forward['recorded']}, "
                        f"live reconciled={live_summary['reconciled']}, "
+                       f"sim/broker divergences={stages['broker_divergences']}, "
                        f"lessons extracted={len(new_lessons)}, "
                        f"lessons rejected (ungrounded)={grounding['lessons_rejected']}, "
                        f"lesson updates rejected (out of scope)={grounding['updates_rejected']}, "

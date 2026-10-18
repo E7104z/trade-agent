@@ -1086,3 +1086,377 @@ def test_no_entry_fills_at_or_after_the_flatten():
     bars = _full_session({"15:57": 98.5})                   # the only dip, after 15:55
     out = simulate_pick(pick, bars, None, session_date=FULL_DAY)
     assert out["triggered"] is False
+
+
+# ----------------------------------- D2: a resting limit fills on a trade-THROUGH
+# docs/FIX_PHASE0.md. RKLB, 2026-10-15: short limit 54.00, stop 56.50. The
+# simulator filled it at 11:15 (a +0.24R "winner", the day's only one); Alpaca
+# cancelled the order unfilled. The only bar above 54.00 in the whole live
+# window was 11:15, high 54.02: two cents through, not a touch. So the rule is
+# not just ">" but a trade-through of at least max(1 tick, 5 bps). The broker's
+# own 28 post-10/02 entries are replayed in tests/test_fill_reconcile.py.
+
+RKLB_DAY = date(2026, 10, 15)
+
+
+def _rklb_session(high_1115, low_1115=53.73):
+    """09:45-14:05, a quiet tape under the limit, with the real 11:15 bar
+    (open 53.74, close 53.96) reaching `high_1115`."""
+    bars, t = [], datetime(2026, 10, 15, 9, 45)
+    while t.strftime("%H:%M") <= "14:05":
+        if t.strftime("%H:%M") == "11:15":
+            bars.append({"t": t, "o": 53.74, "h": high_1115, "l": low_1115, "c": 53.96, "v": 179_558})
+        else:
+            bars.append({"t": t, "o": 53.50, "h": 53.80, "l": 53.30, "c": 53.50, "v": 90_000})
+        t = t.replace(minute=t.minute + 1) if t.minute < 59 else t.replace(hour=t.hour + 1, minute=0)
+    return bars
+
+
+def _rklb_pick(**extra):
+    return _pick(direction="short", entry_type="limit", entry=54.00, stop=56.50, target=48.00,
+                 time_stop="by 14:00", entry_not_before="09:45", **extra)
+
+
+@pytest.mark.parametrize("high", [54.00, 54.01, 54.02])
+def test_a_bar_that_only_touches_or_barely_pierces_a_sell_limit_is_not_a_fill(high):
+    out = simulate_pick(_rklb_pick(), _rklb_session(high), None, session_date=RKLB_DAY)
+    assert out["triggered"] is False
+    assert out["touch_only_bars"] == 1
+    assert out["exit_reason"] == "no_trigger"
+
+
+@pytest.mark.parametrize("high", [54.03, 54.05, 54.40])
+def test_a_bar_that_trades_through_a_sell_limit_by_the_cushion_fills_at_the_limit(high):
+    out = simulate_pick(_rklb_pick(), _rklb_session(high), None, slippage_bps=0,
+                        session_date=RKLB_DAY)
+    assert out["triggered"] is True
+    assert out["entry_fill"] == 54.00            # filled at the limit, not at the bar's high
+    assert out["touch_only_bars"] == 0
+
+
+def test_the_real_rklb_1115_bar_does_not_fill_what_alpaca_never_filled():
+    """The headline: 11:15 high 54.02 (3.7 bps through). Before sim_version 8 the
+    simulator filled 53.973 here and booked +0.21R at the 14:00 time stop."""
+    out = simulate_pick(_rklb_pick(), _rklb_session(54.02), None, slippage_bps=5,
+                        session_date=RKLB_DAY)
+    assert out["triggered"] is False and out.get("r_planned") is None
+    assert out["touch_only_bars"] >= 1
+    assert out["untriggered_reason"] == "entry_condition_not_met"      # a near miss, not "no setup"
+    assert out["trigger_gap_r"] is not None and out["trigger_gap_r"] <= 0
+
+
+CMC_DAY = date(2026, 10, 15)
+
+
+def _cmc_session(low_1000):
+    bars, t = [], datetime(2026, 10, 15, 9, 45)
+    while t.strftime("%H:%M") <= "10:30":
+        if t.strftime("%H:%M") == "10:00":
+            bars.append({"t": t, "o": 66.80, "h": 66.90, "l": low_1000, "c": 66.70, "v": 50_000})
+        else:
+            bars.append({"t": t, "o": 66.90, "h": 67.00, "l": 66.70, "c": 66.90, "v": 50_000})
+        t = t.replace(minute=t.minute + 1) if t.minute < 59 else t.replace(hour=t.hour + 1, minute=0)
+    return bars
+
+
+@pytest.mark.parametrize("low,filled", [(66.50, False), (66.48, False), (66.47, False),
+                                        (66.46, True), (66.20, True)])
+def test_a_buy_limit_needs_the_same_trade_through(low, filled):
+    """CMC's real buy limit 66.50: cushion = max(1c, 5 bps) = 3.325c, so a low
+    must reach 66.46675 or lower. The long mirror of the RKLB cases."""
+    pick = _pick(direction="long", entry_type="limit", entry=66.50, stop=64.00, target=72.00,
+                 entry_not_before="09:45")
+    out = simulate_pick(pick, _cmc_session(low), None, slippage_bps=0, session_date=CMC_DAY)
+    assert out["triggered"] is filled
+    if filled:
+        assert out["entry_fill"] == 66.50
+    else:
+        assert out["touch_only_bars"] == 1
+
+
+def test_a_limit_that_opens_through_the_price_still_fills_at_the_open():
+    """Gap-through-at-open is unchanged: the order is marketable, no cushion."""
+    short = _pick(direction="short", entry_type="limit", entry=54.00, stop=56.50, target=48.00)
+    out = simulate_pick(short, [_bar(54.40, 54.45, 54.30, 54.35)], None, slippage_bps=0)
+    assert out["triggered"] is True and out["entry_fill"] == 54.40
+    long_ = _pick(direction="long", entry_type="limit", entry=66.50, stop=64.00, target=72.00)
+    out = simulate_pick(long_, [_bar(66.31, 66.40, 66.25, 66.35)], None, slippage_bps=0)
+    assert out["triggered"] is True and out["entry_fill"] == 66.31
+
+
+def test_a_limit_that_opens_one_tick_through_the_price_is_marketable_and_fills_at_the_open():
+    """The order is marketable the moment the bar opens through it, however
+    little: it fills at that open, not at the limit and not after a cushion."""
+    short = _pick(direction="short", entry_type="limit", entry=54.00, stop=56.50, target=48.00)
+    out = simulate_pick(short, [_bar(54.01, 54.02, 53.95, 53.98)], None, slippage_bps=0)
+    assert out["triggered"] is True and out["entry_fill"] == 54.01
+    long_ = _pick(direction="long", entry_type="limit", entry=66.50, stop=64.00, target=72.00)
+    out = simulate_pick(long_, [_bar(66.49, 66.52, 66.48, 66.50)], None, slippage_bps=0)
+    assert out["triggered"] is True and out["entry_fill"] == 66.49
+
+
+def test_a_long_stop_entry_triggers_when_the_high_only_touches_the_trigger():
+    """UNG 2026-10-07: buy stop 11.12 filled with the bar 0.99 cents through."""
+    pick = _pick(direction="long", entry_type="breakout", entry=11.12, stop=10.80, target=11.80)
+    out = simulate_pick(pick, [_bar(11.05, 11.12, 11.00, 11.08)], None, slippage_bps=0)
+    assert out["triggered"] is True and out["entry_fill"] == 11.12
+    assert out["touch_only_bars"] is None
+
+
+def test_a_limit_that_only_opens_at_the_price_is_not_filled():
+    pick = _pick(direction="short", entry_type="limit", entry=54.00, stop=56.50, target=48.00)
+    out = simulate_pick(pick, [_bar(54.00, 54.00, 53.90, 53.95)], None)
+    assert out["triggered"] is False and out["touch_only_bars"] == 1
+
+
+def test_stop_entries_still_trigger_on_a_touch():
+    """AMAT 2026-10-16: sell stop 418.00. The broker filled it 2.4 bps through
+    (67 of 68 stop legs fill within a minute of the first touching bar), so
+    breakout entries keep touch semantics and carry no touch count."""
+    pick = _pick(direction="short", entry_type="breakout", entry=418.00, stop=433.00, target=400.00)
+    out = simulate_pick(pick, [_bar(418.60, 418.70, 418.00, 418.20)], None, slippage_bps=0)
+    assert out["triggered"] is True and out["entry_fill"] == 418.00
+    assert out["touch_only_bars"] is None
+
+
+def test_touch_only_bars_is_zero_for_a_limit_nothing_touched_and_none_otherwise():
+    far = _pick(direction="short", entry_type="limit", entry=54.00, stop=56.50, target=48.00)
+    assert simulate_pick(far, [_bar(51.0, 51.5, 50.8, 51.2)], None)["touch_only_bars"] == 0
+    assert simulate_pick(_pick(entry_type="open"), [_bar(100.0, 100.5, 99.5, 100.2)], None
+                         )["touch_only_bars"] is None
+
+
+def test_a_touch_after_the_cutoff_is_not_called_a_missed_trigger():
+    """time_stop_expired_pretrigger means the entry WOULD have fired after the
+    cutoff. A bar that only touches the limit would not have, so it must not be
+    reported as a trigger the time stop cut off."""
+    pick = _pick(direction="short", entry_type="limit", entry=54.00, stop=56.50, target=48.00,
+                 time_stop="by 10:00", entry_not_before="09:45")
+    from datetime import timedelta
+    bars = [{"t": datetime(2026, 10, 15, 9, 45) + timedelta(minutes=i), "o": 53.5, "h": 53.8,
+             "l": 53.3, "c": 53.5, "v": 1000} for i in range(30)]          # 09:45 .. 10:14
+    bars[20]["h"] = 54.01                                         # 10:05, after the cutoff: a touch
+    out = simulate_pick(pick, bars, None, session_date=RKLB_DAY)
+    assert out["triggered"] is False
+    assert out["untriggered_reason"] != "time_stop_expired_pretrigger"
+    bars[20]["h"] = 54.30                                         # 10:05: a real trade-through
+    out = simulate_pick(pick, bars, None, session_date=RKLB_DAY)
+    assert out["untriggered_reason"] == "time_stop_expired_pretrigger"
+
+
+def test_a_v7_row_is_not_the_same_semantics_as_v8():
+    """Resting-limit fills changed in v8, so a v7 morning row is not equivalent
+    (the chart drawer flags it instead of replaying it as if it matched)."""
+    from agent.grading import same_semantics
+    assert CURRENT_SIM_VERSION >= 8
+    assert not same_semantics(7, "morning") and not same_semantics(7, "shadow")
+    assert same_semantics(CURRENT_SIM_VERSION, "morning")
+
+
+# ------------------------ Phase 5: r_if_held_to_flatten, the time-stop counterfactual
+# docs/FIX_PHASE0.md. AMAT, 2026-10-16: breakout short 418.00, stop 433.00, time stop
+# 14:00. It booked +0.06R at 14:00 and the stock kept falling to the 15:55 flatten with
+# the stop 16 points away. `r_if_held_to_flatten` is that number: the SAME fill held with
+# only its initial stop (no target, no time stop) to the live desk's flatten, in the
+# planned-risk R a taken pick is reported in. It is a reference: never added to r_multiple,
+# r_planned or any total.
+
+def _stepped_session(steps, day=FULL_DAY, overrides=None):
+    """1-minute bars 09:30-15:59. `steps` is {"HH:MM": price}: the price holds from that
+    minute until the next step (default 100.0 before the first); `overrides` replaces whole
+    bars by minute."""
+    from datetime import timedelta
+    t0 = datetime(day.year, day.month, day.day, 9, 30)
+    marks = sorted(steps.items())
+    out, price = [], 100.0
+    for i in range(390):
+        t = t0 + timedelta(minutes=i)
+        hhmm = t.strftime("%H:%M")
+        for k, v in marks:
+            if k <= hhmm:
+                price = v
+        bar = {"t": t, "o": price, "h": price + 0.05, "l": price - 0.05, "c": price, "v": 10_000}
+        if overrides and hhmm in overrides:
+            bar.update(overrides[hhmm])
+        out.append(bar)
+    return out
+
+
+def _amat_like(**pick_extra):
+    pick = _pick(direction="short", entry_type="breakout", entry=418.0, stop=433.0, target=400.0,
+                 time_stop="by 14:00", entry_not_before="09:45", **pick_extra)
+    bars = _stepped_session(
+        {"09:30": 420.0, "10:06": 417.0, "14:00": 416.75, "14:01": 412.0, "15:55": 409.3},
+        overrides={"10:05": {"o": 418.2, "h": 418.3, "l": 417.9, "c": 418.0}})
+    return pick, bars
+
+
+def test_amat_1016_levels_time_stop_is_small_and_the_held_counterfactual_is_the_trend_it_cut():
+    """The prompt's case: fill 417.79, 14:00 time stop ~ +0.06R, a 15:55 bar near 409.3 and
+    the 433 stop never touched -> held ~ +0.57R (the exact figure depends on the 5 bps exit
+    friction: 0.552 here)."""
+    pick, bars = _amat_like()
+    out = simulate_pick(pick, bars, None, slippage_bps=5, session_date=FULL_DAY)
+    assert out["entry_fill"] == pytest.approx(417.791, abs=0.001)
+    assert out["exit_reason"] == "time_stop" and out["exit_time"].strftime("%H:%M") == "14:00"
+    assert out["r_planned"] == pytest.approx(0.06, abs=0.01)
+    assert out["r_if_held_to_flatten"] == pytest.approx(0.57, abs=0.03)
+    assert out["r_if_held_to_flatten"] == pytest.approx(0.552, abs=0.002)
+    # the reference changes none of the numbers the desk is judged on
+    assert out["r_multiple"] == pytest.approx(0.056, abs=0.002)
+
+
+def test_the_real_amat_1016_session_held_to_the_flatten():
+    import json
+    import pathlib
+    fx = json.loads((pathlib.Path(__file__).parent / "fixtures" / "shadow_day_bars.json")
+                    .read_text(encoding="utf-8"))
+    d = date(2026, 10, 16)
+    bars = [{"t": datetime.combine(d, datetime.strptime(r[0], "%H:%M").time()), "o": r[1],
+             "h": r[2], "l": r[3], "c": r[4], "v": r[5]} for r in fx["AMAT-2026-10-16"]]
+    pick = _pick(direction="short", entry_type="breakout", entry=418.0, stop=433.0, target=400.0,
+                 time_stop="by 14:00", entry_not_before="09:45")
+    out = simulate_pick(pick, bars, None, slippage_bps=5, session_date=d)
+    assert out["exit_reason"] == "time_stop"
+    assert out["r_planned"] == pytest.approx(0.056, abs=0.002)
+    assert out["r_if_held_to_flatten"] == pytest.approx(0.626, abs=0.002)    # 15:55 opened 408.20
+    assert out["r_if_held_to_flatten"] == out["eod_r_planned"]               # the stop was never near
+
+
+def test_held_equals_the_taken_r_when_the_trade_really_ended_at_its_stop():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = _stepped_session({"09:30": 100.0}, overrides={"11:00": {"l": 97.9}})
+    out = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    assert out["exit_reason"] == "stop" and out["r_planned"] == -1.0
+    assert out["r_if_held_to_flatten"] == -1.0
+
+
+def test_a_stop_touched_on_the_fill_bar_ends_the_held_trade_too():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = _stepped_session({"09:30": 100.0}, overrides={"09:30": {"l": 97.9}})
+    out = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    assert out["exit_reason"] == "stop"
+    assert out["r_if_held_to_flatten"] == -1.0
+
+
+def test_held_equals_the_taken_r_when_the_trade_was_flattened_at_1555():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0)
+    bars = _stepped_session({"09:30": 100.0, "15:55": 101.0})
+    out = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    assert out["exit_reason"] == "eod" and out["r_planned"] == pytest.approx(0.2)
+    assert out["r_if_held_to_flatten"] == out["r_planned"]
+
+
+def test_a_target_hit_before_a_later_reversal_shows_what_the_target_saved():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=104.0)
+    bars = _stepped_session({"09:30": 100.0},
+                            overrides={"10:30": {"h": 104.1}, "13:00": {"l": 97.8}})
+    out = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    assert out["exit_reason"] == "target" and out["r_planned"] == 2.0
+    assert out["r_if_held_to_flatten"] == -1.0               # held, it would have been stopped
+
+
+def test_a_time_stop_that_beat_a_later_stop_out_shows_what_it_saved():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=110.0, time_stop="by 11:00")
+    bars = _stepped_session({"09:30": 100.0, "10:30": 99.5}, overrides={"14:00": {"l": 97.9}})
+    out = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    assert out["exit_reason"] == "time_stop" and out["r_planned"] == pytest.approx(-0.25)
+    assert out["r_if_held_to_flatten"] == -1.0
+
+
+def test_held_short_mirrors_long_and_a_gap_through_the_stop_exits_at_the_open():
+    pick = _pick(direction="short", entry_type="open", entry=100.0, stop=102.0, target=90.0,
+                 time_stop="by 11:00")
+    bars = _stepped_session({"09:30": 100.0, "10:30": 99.0, "13:00": 104.0})   # gaps over 102
+    out = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    assert out["exit_reason"] == "time_stop" and out["r_planned"] == pytest.approx(0.5)
+    assert out["r_if_held_to_flatten"] == pytest.approx(-2.0)    # out at the 104.00 open, not 102
+
+
+def test_held_charges_the_same_exit_friction_as_the_taken_exit():
+    pick = _pick(entry_type="open", entry=100.0, stop=95.0, target=110.0)
+    bars = _stepped_session({"09:30": 100.0, "15:55": 101.0})
+    free = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    paid = simulate_pick(pick, bars, None, slippage_bps=50, session_date=FULL_DAY)
+    assert paid["r_if_held_to_flatten"] < free["r_if_held_to_flatten"]
+    assert paid["r_if_held_to_flatten"] == paid["r_planned"]
+
+
+def test_a_thin_bar_cannot_stop_the_held_trade_any_more_than_the_taken_one():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=110.0)
+    bars = _stepped_session({"09:30": 100.0}, overrides={"11:00": {"l": 97.0, "v": 10}})
+    out = simulate_pick(pick, bars, None, slippage_bps=0, min_bar_volume=1000, session_date=FULL_DAY)
+    assert out["exit_reason"] == "eod"
+    assert out["r_if_held_to_flatten"] == out["r_planned"] == 0.0
+
+
+def test_no_fill_and_invalid_fill_have_no_held_counterfactual():
+    pick = _pick(entry_type="limit", entry=90.0, stop=88.0, target=95.0)
+    out = simulate_pick(pick, _stepped_session({"09:30": 100.0}), None, session_date=FULL_DAY)
+    assert out["triggered"] is False and out["r_if_held_to_flatten"] is None
+    bad = _pick(entry_type="limit", entry=100.0, stop=97.0, target=103.0)
+    bars = _stepped_session({"09:30": 96.0})                 # opens under the long's own stop
+    out = simulate_pick(bad, bars, None, session_date=FULL_DAY)
+    assert out["exit_reason"] == "invalid_fill" and out["r_if_held_to_flatten"] is None
+
+
+def test_the_counterfactual_is_stored_and_never_enters_a_total():
+    import pathlib
+    from agent import ledger
+    assert "r_if_held_to_flatten" in ledger._OUTCOME_SIM_COLS
+    # nothing that sums or averages R may read it: the only code that names it is the
+    # simulator that computes it, the ledger columns that store it, and the one-off
+    # reference report (fix_verification.held_counterfactual: held minus booked R,
+    # printed beside each other, never added to a desk total)
+    root = pathlib.Path(__file__).resolve().parent.parent / "agent"
+    users = sorted(p.relative_to(root).as_posix() for p in root.rglob("*.py")
+                   if "r_if_held_to_flatten" in p.read_text(encoding="utf-8"))
+    assert users == ["fix_verification.py", "grading.py", "ledger.py", "migrations_v37.py"]
+
+
+def test_the_held_counterfactual_round_trips_through_the_ledger(tmp_path, monkeypatch):
+    from agent import ledger
+    monkeypatch.setattr(ledger, "DB_PATH", str(tmp_path / "held.duckdb"))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    con = ledger.connect()
+    plan = {"no_trade": False, "picks": [{
+        "ticker": "AMAT", "direction": "short", "setup_type": "breakdown_short",
+        "entry_plan": {"type": "breakout", "price": 418.0}, "entry_price": 418.0,
+        "stop_price": 433.0, "target_price": 400.0, "time_stop": "by 14:00", "size_r": 0.25,
+        "conviction": 3, "entry_not_before": "09:45"}]}
+    pid = ledger.save_daily_plan(con, date(2026, 10, 16), plan, {"candidates": []}, "chop")[0]
+    pick, bars = _amat_like()
+    pick = {**pick, "pick_id": pid}
+    out = simulate_pick(pick, bars, None, slippage_bps=5, session_date=FULL_DAY)
+    out["eval_date"] = date(2026, 10, 16)
+    ledger.save_outcome(con, out)
+    stored = con.execute("SELECT r_planned, r_multiple, r_if_held_to_flatten FROM outcomes "
+                         "WHERE pick_id = ?", [pid]).fetchone()
+    con.close()
+    assert stored[2] == out["r_if_held_to_flatten"] and stored[0] == out["r_planned"]
+    assert stored[2] != stored[0]
+
+
+def test_when_the_bars_end_before_the_flatten_the_held_trade_ends_at_the_last_close():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=110.0)
+    bars = _stepped_session({"09:30": 100.0}, overrides={"11:59": {"o": 99.0, "c": 100.8}})[:150]
+    out = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    assert out["exit_reason"] == "eod" and out["exit_price"] == 100.8
+    assert out["r_if_held_to_flatten"] == out["r_planned"] == pytest.approx(0.4)
+
+
+def test_a_held_short_is_stopped_by_a_spike_it_later_recovers_from():
+    pick = _pick(direction="short", entry_type="open", entry=100.0, stop=102.0, target=90.0,
+                 time_stop="by 11:00")
+    bars = _stepped_session({"09:30": 100.0, "10:30": 99.0}, overrides={"13:00": {"h": 102.2}})
+    out = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    assert out["exit_reason"] == "time_stop" and out["r_planned"] == pytest.approx(0.5)
+    assert out["r_if_held_to_flatten"] == -1.0               # the 13:00 spike took it out at 102
+
+
+def test_a_held_long_that_gaps_under_its_stop_is_out_at_the_open():
+    pick = _pick(entry_type="open", entry=100.0, stop=98.0, target=110.0, time_stop="by 11:00")
+    bars = _stepped_session({"09:30": 100.0, "13:00": 96.0})
+    out = simulate_pick(pick, bars, None, slippage_bps=0, session_date=FULL_DAY)
+    assert out["exit_reason"] == "time_stop" and out["r_planned"] == 0.0
+    assert out["r_if_held_to_flatten"] == pytest.approx(-2.0)    # 96.00 open, not the 98 stop

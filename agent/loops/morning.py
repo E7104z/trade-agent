@@ -59,6 +59,11 @@ def _reference_prices(bundle: dict) -> dict[str, float]:
         sym, last = q.get("symbol"), q.get("last")
         if sym and last and str(sym).upper() not in out:
             out[str(sym).upper()] = float(last)
+    # the funds' live prices (D8): the analyst anchors on them, so the gate judges against them
+    for q in (bundle.get("fund_quotes") or []):
+        sym, last = q.get("symbol"), q.get("last")
+        if sym and last and str(sym).upper() not in out:
+            out[str(sym).upper()] = float(last)
     return out
 
 
@@ -437,6 +442,79 @@ def _data_health(gate_counts: dict[str, int], n_proposed: int,
     return out
 
 
+# ---- entry semantics (docs/FIX_PHASE0.md, D5) -------------------------------------------
+# An entry order has to express the setup it was proposed for. The mistype gate in
+# _validate_plan only sees a limit/breakout on the wrong side of the market; nothing
+# linked setup_type to entry_type. 2026-10-15/16: CMC (catalyst_momentum) as a buy limit
+# under a market that was running away from it; USO (sector_rotation) the same, never
+# filled while the ETF closed +3%; RKLB (breakdown_short) as a sell LIMIT above the market
+# instead of a sell stop below it, "filled" by the simulator on a bar the broker never
+# traded through.
+ENTRY_OK = "ok"
+_STRENGTH_SETUPS = frozenset({"catalyst_momentum", "sector_rotation"})
+
+
+def _clock_minutes(value) -> int | None:
+    m = re.search(r"(\d{1,2}):(\d{2})", str(value or ""))
+    return int(m.group(1)) * 60 + int(m.group(2)) if m else None
+
+
+def _entry_semantics(setup_type, direction, entry_type, entry, ref,
+                     time_stop=None, entry_expires=None) -> tuple[str, str]:
+    """(tag, why): `ok`, or the specific way this entry order contradicts its setup.
+
+    Every rule is about a resting LIMIT; any other entry type is `ok` here (the
+    mistype gate owns the wrong-side cases):
+
+      strength_buy_limit_below_ref      catalyst_momentum / sector_rotation long whose
+                                        buy limit sits under the premarket reference: a
+                                        strength thesis does not wait for a dip
+      weakness_sell_limit_above_ref     the mirror, a short whose sell limit sits above it
+      breakdown_short_with_limit        a breakdown is a sell STOP below the level
+      breakout_long_with_limit          a breakout is a buy STOP above the level
+      gap_fade_limit_without_expiry     a gap-fade limit may rest until its time stop and
+                                        fill hours after the fade it was written for; it
+                                        needs an entry expiry earlier than the time stop
+                                        (`entry_plan.expires_by`, which no prompt asks for
+                                        yet, so today every gap-fade limit carries this tag)
+      unknown_ref                       a reference-priced rule applies and there is no
+                                        reference (the validator drops such a pick before
+                                        this runs; the tag is for recomputing history)
+
+    Pure: nothing here reads a ledger, a clock or a provider."""
+    setup = str(setup_type or "").lower().strip()
+    side = str(direction or "").lower().strip()
+    if str(entry_type or "").lower().strip() != "limit":
+        return ENTRY_OK, ""
+    if setup == "breakdown_short":
+        return ("breakdown_short_with_limit",
+                f"a breakdown_short entered with a {side or 'short'} limit at {entry}: a breakdown "
+                "is a sell stop below the level, not a limit that waits for price to come back")
+    if setup == "breakout" and side == "long":
+        return ("breakout_long_with_limit",
+                f"a breakout long entered with a buy limit at {entry}: a breakout is a buy stop "
+                "above the level, a limit waits for price to fall away from it")
+    if setup == "gap_fade":
+        exp, stop = _clock_minutes(entry_expires), _clock_minutes(time_stop)
+        if exp is not None and (stop is None or exp < stop):
+            return ENTRY_OK, ""
+        return ("gap_fade_limit_without_expiry",
+                f"a gap_fade limit at {entry} with no entry expiry earlier than its time stop "
+                f"({time_stop or 'none'}): it can fill hours after the fade it was written for")
+    if setup in _STRENGTH_SETUPS:
+        if not isinstance(ref, (int, float)) or ref <= 0:
+            return "unknown_ref", f"{setup} limit at {entry} with no reference price to judge it against"
+        if side == "long" and entry < ref:
+            return ("strength_buy_limit_below_ref",
+                    f"a {setup} long (a strength thesis) with a buy limit at {entry}, below the "
+                    f"reference {ref}: it waits for a dip the thesis does not expect")
+        if side == "short" and entry > ref:
+            return ("weakness_sell_limit_above_ref",
+                    f"a {setup} short (a weakness thesis) with a sell limit at {entry}, above the "
+                    f"reference {ref}: it waits for a bounce the thesis does not expect")
+    return ENTRY_OK, ""
+
+
 def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                    drawdown: dict | None = None,
                    ref_prices: dict[str, float] | None = None,
@@ -530,6 +608,7 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
     atr_gate_mode = str(cfg.get("atr_gate", "warn")).lower()
     earnings_gate_mode = str(cfg.get("earnings_gate", "warn")).lower()
     leveraged_gate_mode = str(cfg.get("leveraged_gate", "warn")).lower()
+    enforce_semantics = bool((cfg.get("validator") or {}).get("enforce_entry_semantics", False))
     min_stop_atr = float(cfg.get("min_stop_atr", 0.35))
     warn_stop_atr = float(cfg.get("warn_stop_atr", 2.5))
     warn_target_atr = float(cfg.get("warn_target_atr", 3.5))
@@ -641,6 +720,21 @@ def _validate_plan(plan: dict, cfg: Config, streak: dict | None = None,
                 f"last price {ref} for a {p['direction']} (reads as {mistyped_as}) — dropped "
                 f"rather than let it fill as a disguised market order")
             continue
+
+        # ENTRY-SEMANTICS TAG (docs/FIX_PHASE0.md, D5): does the order express the
+        # setup? Stamped on every pick that reaches the tape, with the reference it was
+        # judged on. TAG ONLY unless validator.enforce_entry_semantics is on: it
+        # changes no order until the tag's fill rate and R have been read.
+        sem_tag, sem_why = _entry_semantics(
+            p.get("setup_type"), p["direction"], entry_type, entry, ref,
+            time_stop=p.get("time_stop"),
+            entry_expires=(p.get("entry_plan") or {}).get("expires_by"))
+        p["entry_semantics"], p["entry_ref_price"] = sem_tag, round(float(ref), 4)
+        if sem_tag != ENTRY_OK:
+            if enforce_semantics:
+                _drop(t, "validity", f"{t}: {sem_why} — dropped (validator.enforce_entry_semantics)")
+                continue
+            warnings.append(f"[ENTRY SEMANTICS tag-only, would drop if enforced] {t}: {sem_why}")
 
         # TRIGGER-ALREADY-CROSSED / TARGET-ALREADY-REACHED GATE (2026-10-05).
         # The plan is written ~07:10 ET; a breakout goes live at the 09:45
@@ -1769,6 +1863,37 @@ def _join_arm_b(thread: threading.Thread, t_start: float,
     return "complete"
 
 
+def _close_overnight_carry(con, cfg: Config, d: date, plan: dict) -> None:
+    """Close what a missed end-of-day flatten left open from a prior session,
+    then tell the morning email (plan["flatten_missed"]) and /api/status.
+
+    Two passes, both guarded (they must never cost the day's plan):
+      carry_cleanup  walks LEDGER rows still without an exit;
+      orphan_sweep   reads the BROKER's positions, so a position no ledger row
+                     claims (IOVA, held 2026-09-30 -> 2026-10-16) is found too.
+    Every lane is intraday: anything still open from a prior session is closed,
+    claimed or not. A claim only protects what was opened today."""
+    if not (cfg.get("live_paper", {}) or {}).get("enabled"):
+        return
+    try:
+        from ..live_monitor import carry_cleanup
+        carry = carry_cleanup(con, cfg, d)
+        if carry.get("stale"):
+            log("morning", f"Live paper carry cleanup: {carry}")
+    except Exception as e:
+        log("morning", f"WARN live paper carry cleanup failed: {e}")
+    try:
+        from ..live_monitor import flatten_missed_lines, orphan_sweep
+        sweep = orphan_sweep(con, cfg, d, now_et())
+        if sweep.get("carried") or sweep.get("error") or sweep.get("refused"):
+            log("morning", f"Live paper orphan sweep: {sweep}")
+        plan["flatten_missed"] = flatten_missed_lines(con, d)
+        for line in plan["flatten_missed"]:
+            log("morning", line)
+    except Exception as e:
+        log("morning", f"WARN live paper orphan sweep failed: {e}")
+
+
 def _place_premarket_orders(con, cfg: Config, d: date, plan: dict,
                             pick_ids: list[int]) -> dict:
     """Send the morning run's pre-market orders: `open` entries only.
@@ -2332,14 +2457,7 @@ def _risk_half(cfg: Config, con, d: date, payload: dict, request_id: str | None,
         # Before today's orders: close anything a missed end-of-day flatten
         # left open from a previous session (queued for the open when this runs
         # pre-market). Guarded -- it must never cost the day's plan.
-        if (cfg.get("live_paper", {}) or {}).get("enabled"):
-            try:
-                from ..live_monitor import carry_cleanup
-                carry = carry_cleanup(con, cfg, d)
-                if carry.get("stale"):
-                    log("morning", f"Live paper carry cleanup: {carry}")
-            except Exception as e:
-                log("morning", f"WARN live paper carry cleanup failed: {e}")
+        _close_overnight_carry(con, cfg, d, plan)
 
         # Live paper orders are a separate ledger concern. The simulator's
         # picks are already locked above; a broker failure cannot change them.

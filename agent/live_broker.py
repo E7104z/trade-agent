@@ -191,9 +191,48 @@ def list_open_orders(*, cfg: Config | None = None) -> list[dict]:
     return result if isinstance(result, list) else []
 
 
-def close_position(ticker: str, *, cfg: Config | None = None) -> dict | None:
-    result = _request("DELETE", f"/v2/positions/{str(ticker).upper()}", cfg=cfg)
+def _qty_text(qty: float) -> str:
+    q = float(qty)
+    return str(int(q)) if q == int(q) else f"{q:.9f}".rstrip("0").rstrip(".")
+
+
+def close_position(ticker: str, *, cfg: Config | None = None,
+                   qty: float | None = None) -> dict | None:
+    """Liquidate a position (all of it, or `qty` shares of it): Alpaca submits
+    a market order on the opposite side. A partial close is how a carried
+    position is closed without touching the shares the desk bought today."""
+    path = f"/v2/positions/{str(ticker).upper()}"
+    if qty is not None:
+        path += f"?qty={_qty_text(qty)}"
+    result = _request("DELETE", path, cfg=cfg)
     return result if isinstance(result, dict) else None
+
+
+_FILLS_PAGE = 100
+
+
+def fills_for_date(d, *, cfg: Config | None = None) -> list[dict] | None:
+    """Every fill the account had on session date `d` (the broker's activity
+    feed: symbol, side, qty, price, order_id), or None when it cannot be read.
+    None is NOT "no fills": the caller must not treat an unreadable feed as
+    proof that nothing was bought today."""
+    out: list[dict] = []
+    token = None
+    for _ in range(20):                        # 2,000 fills is far past any session
+        path = (f"/v2/account/activities/FILL?date={d.isoformat()}"
+                f"&direction=asc&page_size={_FILLS_PAGE}")
+        if token:
+            path += f"&page_token={token}"
+        page = _request("GET", path, cfg=cfg)
+        if not isinstance(page, list):
+            return None
+        out.extend(page)
+        if len(page) < _FILLS_PAGE:
+            return out
+        token = (page[-1] or {}).get("id")
+        if not token:
+            return None
+    return None
 
 
 def list_positions(*, cfg: Config | None = None) -> list[dict] | None:

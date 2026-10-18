@@ -100,9 +100,16 @@ def morning_email_html(plan_date: date, plan: dict, regime_md: str) -> str:
           <th>Target</th><th>Size</th><th>Conv</th><th>Thesis</th></tr>
           {''.join(rows)}
         </table>"""
+    # D1: a position that outlived a close. Shown first -- it is the one thing
+    # in this email that means yesterday's flatten failed. Nothing on a clean day.
+    import html as _html
+    missed_html = "".join(
+        f'<p style="color:#b00020;font-weight:bold">{_html.escape(str(line))}</p>'
+        for line in (plan.get("flatten_missed") or []))
     return f"""
     <html><body style="font-family:sans-serif">
       <h2>Trade Agent — Morning Plan — {plan_date.isoformat()}</h2>
+      {missed_html}
       <p><i>{plan.get('market_stance','')}</i></p>
       {picks_html}
       <h3>Regime</h3>

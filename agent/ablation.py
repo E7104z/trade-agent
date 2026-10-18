@@ -132,8 +132,11 @@ def candidate_pool(
     # evening loop. 'unmeasurable' means no intraday data or an invalid_fill
     # artifact -- excluded. 'scratch' from a non-trigger is a real, measurable
     # zero and stays in.
+    # 'traded_via_lane' (docs/FIX_PHASE0.md, D4) is a rejection the desk traded
+    # anyway: it is already in the pool as the taken pick and carries no forgone
+    # R, so pooling it again added a 0.0R twin of a real trade.
     rej_where = ["COALESCE(r.eod_outcome,'') <> ''",
-                 "COALESCE(r.eod_outcome,'') <> 'unmeasurable'"]
+                 "COALESCE(r.eod_outcome,'') NOT IN ('unmeasurable', 'traded_via_lane')"]
     rej_params: list[Any] = []
     if sim_version is not None:
         rej_where.append("COALESCE(r.sim_version, 1) = ?")

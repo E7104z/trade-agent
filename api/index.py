@@ -21,7 +21,7 @@ import re
 import sys
 import time
 import traceback
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import wraps
 from typing import Any
@@ -293,8 +293,12 @@ def api_status():
             }
         lock_cols = [c[0] for c in con.execute("DESCRIBE run_locks").fetchall()]
         from agent import health
+        from agent.live_monitor import flatten_missed_lines
         return json_response({
             "today": d.isoformat(),
+            # A position still open after a close, closed by the next sweep.
+            # Empty on a clean day (docs/FIX_PHASE0.md, D1).
+            "flatten_missed": flatten_missed_lines(con, d - timedelta(days=7)),
             "plan": plan_row["plan"] if plan_row else None,
             # the DEFINITIVE, resolved pick rows (entry_type always a single flat
             # field here, unlike plan.picks[] which may only carry a nested
@@ -462,6 +466,54 @@ def api_history_dates():
                 # database is missing an optional v3 table.
                 continue
         return json_response({"dates": sorted(dates, reverse=True)})
+    finally:
+        con.close()
+
+
+def _pnl_lane(lane: str | None) -> str | None:
+    """Validate ?lane= for the P&L breakdown endpoints. None = every lane,
+    'morning' = the morning desk (matches the equity curve the dashboard draws)."""
+    if lane in (None, "", "morning"):
+        return "morning"
+    if lane == "all":
+        return None
+    raise ValueError("lane must be 'morning' or 'all'")
+
+
+@app.route("/api/pnl/day")
+@login_required
+def api_pnl_day():
+    """Per-day P&L breakdown: every pick/trade behind one session's day_r."""
+    if not request.args.get("date"):
+        return json_response({"error": "missing ?date=YYYY-MM-DD"}, 400)
+    try:
+        d = parse_date(request.args["date"])
+        lane = _pnl_lane(request.args.get("lane"))
+    except ValueError as e:
+        return json_response({"error": str(e)}, 400)
+    con = ledger.connect()
+    try:
+        return json_response({"day": ledger.day_breakdown(con, d, lane=lane)})
+    finally:
+        con.close()
+
+
+@app.route("/api/pnl/history")
+@login_required
+def api_pnl_history():
+    """Full-history P&L breakdown: every session's day_r expanded to its trades."""
+    try:
+        lane = _pnl_lane(request.args.get("lane"))
+    except ValueError as e:
+        return json_response({"error": str(e)}, 400)
+    con = ledger.connect()
+    try:
+        days = ledger.pnl_breakdown_history(con, lane=lane)
+        return json_response({
+            "days": days,
+            "sessions": len(days),
+            "total_day_r": round(sum(x["day_r"] for x in days), 3),
+        })
     finally:
         con.close()
 
@@ -778,6 +830,34 @@ def intraday_check():
         except Exception as e:
             log("intraday", f"WARN deferred order placement failed; monitor unaffected: {e}")
             result["deferred"] = {"error": str(e)}
+        # BROKER TRUTH (docs/FIX_PHASE0.md, D1). Everything above walks ledger
+        # rows, so a position no row knows about (IOVA, 2026-09-30 -> 2026-10-16)
+        # was never closed. These read the account itself: a prior session's
+        # carry is closed before the open, and from 15:55 every position is
+        # closed whatever any ledger says -- on every tick, so the 15:57 and
+        # 15:59 ticks retry a close the 15:55 one lost. Each is guarded on its
+        # own: the sweep failing must never cost the end-of-day backstop.
+        from agent.util import now_et as _now_et
+        try:
+            from agent.live_monitor import orphan_sweep
+            con = ledger.connect()
+            try:
+                result["sweep"] = orphan_sweep(con, cfg, today_et(), _now_et())
+            finally:
+                con.close()
+        except Exception as e:
+            log("intraday", f"WARN orphan sweep failed; monitor unaffected: {e}")
+            result["sweep"] = {"error": str(e)}
+        try:
+            from agent.live_monitor import eod_backstop
+            con = ledger.connect()
+            try:
+                result["backstop"] = eod_backstop(con, cfg, _now_et())
+            finally:
+                con.close()
+        except Exception as e:
+            log("intraday", f"WARN EOD backstop failed; monitor unaffected: {e}")
+            result["backstop"] = {"error": str(e)}
     # A broker 401 is the credentials, not an order: every live position is
     # unmanaged until the key pair is fixed, so the owner hears about it once.
     try:
@@ -797,7 +877,9 @@ def intraday_check():
         con = ledger.connect()
         try:
             ledger.beat(con, "intraday_check", json.dumps(
-                {"monitor": {k: monitor.get(k) for k in ("skipped", "reason", "updated")}},
+                {"monitor": {k: monitor.get(k) for k in ("skipped", "reason", "updated")},
+                 "backstop": {k: v for k, v in (result.get("backstop") or {}).items()
+                              if k in ("closed", "refused", "error")}},
                 default=str))
         finally:
             con.close()

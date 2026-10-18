@@ -443,6 +443,18 @@ _MIGRATIONS = _MIGRATIONS + migrations_v34.STATEMENTS
 from . import migrations_v35  # noqa: E402
 _MIGRATIONS = _MIGRATIONS + migrations_v35.STATEMENTS
 
+# --- v36 the account is flat after the close (broker-truth sweeps) -----------
+from . import migrations_v36  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v36.STATEMENTS
+
+# --- v37 limit fills need a trade-through; the broker's result beside the sim's
+from . import migrations_v37  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v37.STATEMENTS
+
+# --- v38 an entry order must express its setup (entry_semantics tag) ----------
+from . import migrations_v38  # noqa: E402
+_MIGRATIONS = _MIGRATIONS + migrations_v38.STATEMENTS
+
 
 # Fingerprint of the full schema + migration list. Stored in schema_meta once
 # every statement has run, so a connection whose database already carries the
@@ -740,8 +752,9 @@ def save_daily_plan(
                 size_r, entry_type, entry_price, stop_price, target_price, target2_price,
                 time_stop, invalidation, regime_tag, prompt_version, playbook_version,
                     in_scan_universe, exploration_lane, exploration_rr, probe_for,
-                    entry_not_before, persona_version, hypothesis_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    entry_not_before, persona_version, hypothesis_id,
+                    entry_semantics, entry_ref_price)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                RETURNING pick_id""",
             [
                 plan_date,
@@ -771,6 +784,10 @@ def save_daily_plan(
                 # v31: the idea this pick tests, stamped by the morning loop
                 # before any outcome exists (agent/hypotheses.py).
                 p.get("hypothesis_id"),
+                # v38: whether the entry order expresses the setup (morning
+                # validator, docs/FIX_PHASE0.md D5) and the reference it was judged on.
+                p.get("entry_semantics"),
+                p.get("entry_ref_price"),
             ],
         ).fetchone()
         ids.append(row[0])
@@ -855,6 +872,104 @@ def set_live_r(con: duckdb.DuckDBPyConnection, pick_id: int, live_r: float) -> N
     con.execute("UPDATE outcomes SET live_r = ? WHERE pick_id = ?", [live_r, pick_id])
 
 
+# ---- the account is flat after the close (schema v36) -----------------------
+# The monitor's flatten and carry_cleanup walk LEDGER rows, so a position no row
+# knew about (IOVA, 2026-09-30 -> 2026-10-16) was never closed. These record
+# what the broker-truth sweeps (live_monitor.eod_backstop / orphan_sweep) did.
+
+def acquire_tick_lease(con: Any, name: str, ttl_s: int = 60) -> str | None:
+    """Take a short named lease on a piece of intraday work. Returns the
+    holder token, or None when another tick holds an unexpired lease. The
+    database decides who wins (INSERT ... ON CONFLICT, then a guarded UPDATE),
+    never a read followed by a write, and an expired lease is simply taken
+    over, so a tick killed mid-run cannot block the next one."""
+    holder = uuid.uuid4().hex
+    ttl = int(ttl_s)
+    row = con.execute(
+        f"""INSERT INTO tick_leases (lease_name, holder, acquired_at, expires_at)
+            VALUES (?, ?, current_timestamp, current_timestamp + INTERVAL '{ttl} seconds')
+            ON CONFLICT (lease_name) DO NOTHING RETURNING holder""",
+        [name, holder]).fetchone()
+    if row:
+        return holder
+    row = con.execute(
+        f"""UPDATE tick_leases
+            SET holder = ?, acquired_at = current_timestamp,
+                expires_at = current_timestamp + INTERVAL '{ttl} seconds'
+            WHERE lease_name = ? AND expires_at < current_timestamp
+            RETURNING holder""",
+        [holder, name]).fetchone()
+    return holder if row else None
+
+
+def release_tick_lease(con: Any, name: str, holder: str | None) -> None:
+    """Let go of a lease early (only the holder's own); a missed release just
+    expires. Never raises: releasing is bookkeeping, not the work."""
+    if not holder:
+        return
+    try:
+        con.execute(
+            """UPDATE tick_leases SET expires_at = current_timestamp - INTERVAL '1 second'
+               WHERE lease_name = ? AND holder = ?""", [name, holder])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_BACKSTOP_UPDATABLE = {"status", "close_order_id", "filled_price", "filled_at", "detail"}
+
+
+def record_backstop_close(con: Any, **f: Any) -> str:
+    """One row for a position a broker-truth sweep tried to close. Returns the
+    close_id. See migrations_v36 for kind / reason / status."""
+    close_id = uuid.uuid4().hex
+    con.execute(
+        """INSERT INTO eod_backstop_closes
+           (close_id, session_date, kind, symbol, position_side, qty, avg_entry_price,
+            reason, claimed_by, carried_from, close_order_id, status, submitted_at,
+            filled_price, filled_at, detail)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [close_id, f.get("session_date"), f.get("kind"), str(f.get("symbol") or "").upper(),
+         f.get("position_side"), f.get("qty"), f.get("avg_entry_price"), f.get("reason"),
+         f.get("claimed_by"), f.get("carried_from"), f.get("close_order_id"),
+         f.get("status"), f.get("submitted_at") or datetime.now(), f.get("filled_price"),
+         f.get("filled_at"), (f.get("detail") or "")[:500] or None])
+    return close_id
+
+
+def update_backstop_close(con: Any, close_id: str, **fields: Any) -> None:
+    updates = [(k, v) for k, v in fields.items() if k in _BACKSTOP_UPDATABLE]
+    if not updates:
+        return
+    con.execute(f"UPDATE eod_backstop_closes SET {', '.join(k + ' = ?' for k, _ in updates)} "
+                f"WHERE close_id = ?", [v for _, v in updates] + [close_id])
+
+
+def backstop_closes_for_date(con: Any, d: date, kind: str | None = None,
+                             symbol: str | None = None) -> list[dict]:
+    cols = [c[0] for c in con.execute("DESCRIBE eod_backstop_closes").fetchall()]
+    sql, params = "SELECT * FROM eod_backstop_closes WHERE session_date = ?", [d]
+    if kind:
+        sql, params = sql + " AND kind = ?", params + [kind]
+    if symbol:
+        sql, params = sql + " AND symbol = ?", params + [str(symbol).upper()]
+    rows = con.execute(sql + " ORDER BY submitted_at, close_id", params).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def flatten_missed_rows(con: Any, since: date) -> list[dict]:
+    """Every carry the morning sweep closed on/after `since` (newest first):
+    a position that was still open at the next session's start."""
+    try:
+        cols = [c[0] for c in con.execute("DESCRIBE eod_backstop_closes").fetchall()]
+        rows = con.execute(
+            """SELECT * FROM eod_backstop_closes WHERE kind = 'morning_sweep'
+               AND session_date >= ? ORDER BY session_date DESC, submitted_at DESC""",
+            [since]).fetchall()
+    except Exception:  # noqa: BLE001 -- a ledger without the table has recorded no carry
+        return []
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def plan_for_date(con: duckdb.DuckDBPyConnection, d: date) -> dict | None:
     row = con.execute(
         "SELECT plan_date, no_trade, market_summary, plan_json, regime_tag, notes_for_evening "
@@ -897,6 +1012,7 @@ _OUTCOME_SIM_COLS = (
     "r_multiple_2x", "r_multiple_3x", "slippage_bps_used", "friction_model",
     "participation_pct", "session_length", "flatten_inert",
     "untriggered_reason", "untriggered_note", "trigger_gap_r",
+    "touch_only_bars", "r_if_held_to_flatten",
 )
 
 
@@ -1489,6 +1605,132 @@ def equity_curve(con: duckdb.DuckDBPyConnection, account_size: float, dollars_pe
 TEST_LANES = ("coverage", "daily_floor", "hypothesis")
 
 
+# ---------------------------------------------------------------- daily P&L
+#
+# The equity curve reduces a session to a single number (day_r). These helpers
+# expand that number back into the picks/trades that produced it, so the
+# dashboard can answer "what actually made or lost money today" instead of only
+# showing the aggregate. day_r reconciles exactly with equity_curve().
+
+_PNL_KEYS = ("eval_date", "pick_id", "ticker", "direction", "setup_type", "size_r",
+             "exploration_lane", "triggered", "exit_reason", "realized_r",
+             "weighted_r", "mfe_r", "mae_r")
+
+_PNL_SQL = """
+    SELECT o.eval_date, p.pick_id, p.ticker, p.direction, p.setup_type,
+           p.size_r, p.exploration_lane, o.triggered, o.exit_reason,
+           COALESCE(o.r_planned, o.r_multiple) AS realized_r,
+           COALESCE(o.r_planned, o.r_multiple, 0) * COALESCE(p.size_r, 1) AS weighted_r,
+           o.mfe_r, o.mae_r
+      FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
+     WHERE {where}{lane}
+     ORDER BY o.eval_date DESC, p.pick_id DESC
+"""
+
+
+def _pick_lane(setup_type: str | None, exploration_lane: str | None) -> str:
+    if setup_type == RUNNER_SETUP:
+        return "runner (retired)"
+    if exploration_lane in TEST_LANES:
+        return exploration_lane
+    return "morning"
+
+
+def _breakdown_trade(row: dict) -> dict:
+    """Map one outcomes+picks row to the per-trade fields the UI shows."""
+    realized = row["realized_r"]
+    realized = None if realized is None else round(float(realized), 3)
+    triggered = bool(row["triggered"])
+    if not triggered or realized is None:
+        outcome = None
+    elif realized > SCRATCH_R:
+        outcome = "win"
+    elif realized < -SCRATCH_R:
+        outcome = "loss"
+    else:
+        outcome = "scratch"
+    size = row["size_r"]
+    return {
+        "pick_id": row["pick_id"],
+        "ticker": row["ticker"],
+        "direction": row["direction"],
+        "setup_type": row["setup_type"],
+        "lane": _pick_lane(row["setup_type"], row["exploration_lane"]),
+        "exploration_lane": row["exploration_lane"],
+        "runner": row["setup_type"] == RUNNER_SETUP,
+        "size_r": None if size is None else round(float(size), 3),
+        "triggered": triggered,
+        "exit_reason": row["exit_reason"],
+        "realized_r": realized,
+        "weighted_r": round(float(row["weighted_r"] or 0.0), 3),
+        "outcome": outcome,
+        "mfe_r": None if row["mfe_r"] is None else round(float(row["mfe_r"]), 3),
+        "mae_r": None if row["mae_r"] is None else round(float(row["mae_r"]), 3),
+    }
+
+
+def _pnl_trades(con, lane, d=None):
+    where = "o.eval_date = ?" if d is not None else "1=1"
+    params = [d] if d is not None else []
+    rows = con.execute(_PNL_SQL.format(where=where, lane=lane_clause(lane)),
+                       params).fetchall()
+    return [(r[0], _breakdown_trade(dict(zip(_PNL_KEYS, r)))) for r in rows]
+
+
+def _day_summary(trades: list[dict], day_r: float) -> str:
+    if not trades:
+        return "No picks recorded for this session."
+    parts = []
+    for t in trades:
+        if not t["triggered"]:
+            continue
+        r = t["realized_r"]
+        if r is None:
+            parts.append(f"{t['ticker']} unmeasured")
+        else:
+            parts.append(f"{t['ticker']} {'+' if r >= 0 else ''}{r:.2f}R "
+                         f"({t['exit_reason'] or 'unknown'})")
+    untriggered = sum(1 for t in trades if not t["triggered"])
+    if untriggered:
+        parts.append(f"{untriggered} pick{'s' if untriggered != 1 else ''} untriggered")
+    if not parts:
+        return "No triggered trades this session."
+    return " · ".join(parts) + f" → day {('+' if day_r >= 0 else '')}{day_r:.2f}R"
+
+
+def _day_payload(d, trades: list[dict]) -> dict:
+    triggered = [t for t in trades if t["triggered"]]
+    day_r = round(sum(t["weighted_r"] for t in triggered), 3)
+    return {
+        "date": str(d),
+        "day_r": day_r,
+        "picks": len(trades),
+        "triggered": len(triggered),
+        "wins": sum(1 for t in triggered if t["outcome"] == "win"),
+        "losses": sum(1 for t in triggered if t["outcome"] == "loss"),
+        "scratches": sum(1 for t in triggered if t["outcome"] == "scratch"),
+        "trades": trades,
+        "summary": _day_summary(trades, day_r),
+    }
+
+
+def day_breakdown(con, d, lane=None) -> dict:
+    """Per-pick explanation of one session's paper P&L.
+
+    `d` is a `date`; `lane` is None (all lanes) or 'morning' (default for the
+    desk's own record). Reconciles with equity_curve()'s day_r.
+    """
+    return _day_payload(d, [t for _, t in _pnl_trades(con, lane, d=d)])
+
+
+def pnl_breakdown_history(con, lane=None) -> list[dict]:
+    """day_breakdown() for every session with a graded outcome, newest first."""
+    grouped: dict = {}
+    for dt, t in _pnl_trades(con, lane):
+        grouped.setdefault(dt, []).append(t)
+    return [_day_payload(dt, grouped[dt]) for dt in grouped]
+
+
 def judgment_clause(alias: str = "p") -> str:
     """SQL predicate (with leading AND) that leaves out TEST_LANES picks: the
     streak rule and the drawdown breaker are discipline on the desk's own
@@ -1880,6 +2122,12 @@ _KILL_CATEGORY_SQL = (
     "ELSE COALESCE(rejection_category, 'uncategorized') END")
 
 
+# A rejection the desk traded anyway through a test lane (eod_outcome
+# 'traded_via_lane', docs/FIX_PHASE0.md D4) is not a counterfactual: the filters
+# did not stop it. It is counted apart, never in the shadow ledger's totals.
+_SHADOW_COUNTERFACTUAL = "COALESCE(eod_outcome, '') <> 'traded_via_lane'"
+
+
 def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20,
                    since: date | None = None) -> dict:
     """Shadow-ledger aggregates over a window of sessions.
@@ -1894,11 +2142,13 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20,
         lo = since
         n_sessions = con.execute(
             "SELECT COUNT(DISTINCT plan_date) FROM rejections "
-            "WHERE eod_outcome IS NOT NULL AND plan_date >= ?", [lo]).fetchone()[0] or 0
+            f"WHERE eod_outcome IS NOT NULL AND plan_date >= ? AND {_SHADOW_COUNTERFACTUAL}",
+            [lo]).fetchone()[0] or 0
     else:
         dates = [r[0] for r in con.execute(
             "SELECT DISTINCT plan_date FROM rejections WHERE eod_outcome IS NOT NULL "
-            "ORDER BY plan_date DESC LIMIT ?", [trailing_sessions]).fetchall()]
+            f"AND {_SHADOW_COUNTERFACTUAL} ORDER BY plan_date DESC LIMIT ?",
+            [trailing_sessions]).fetchall()]
         lo = min(dates) if dates else None
         n_sessions = len(dates)
     if lo is None or not n_sessions:
@@ -1910,7 +2160,7 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20,
                 "mean_forgone_r": None, "std_forgone_r": None, "t_forgone": None,
                 "p_forgone": None, "degraded_rows": 0, "ungraded_rows": 0,
                 "top_rows": [], "by_reason": [], "by_category": [],
-                "captured_r_window": 0.0, "captured_n": 0}
+                "captured_r_window": 0.0, "captured_n": 0, "traded_via_lane": 0}
     row = con.execute(
         """SELECT COUNT(*),
                   SUM(CASE WHEN eod_outcome='would_have_won' THEN 1 ELSE 0 END),
@@ -1918,10 +2168,16 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20,
                   SUM(CASE WHEN eod_outcome='scratch' THEN 1 ELSE 0 END),
                   SUM(CASE WHEN eod_outcome='unmeasurable' THEN 1 ELSE 0 END),
                   SUM(COALESCE(forgone_r, 0))
-           FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?""", [lo]).fetchone()
+           FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?
+             AND {_SHADOW_COUNTERFACTUAL}""".format(_SHADOW_COUNTERFACTUAL=_SHADOW_COUNTERFACTUAL),
+        [lo]).fetchone()
+    traded_via_lane = con.execute(
+        "SELECT COUNT(*) FROM rejections WHERE eod_outcome = 'traded_via_lane' AND plan_date >= ?",
+        [lo]).fetchone()[0] or 0
     degraded_rows = con.execute(
         f"""SELECT COUNT(*) FROM rejections
-            WHERE eod_outcome IS NOT NULL AND plan_date >= ? AND {_DEGRADED_REJECTION}""",
+            WHERE eod_outcome IS NOT NULL AND plan_date >= ? AND {_DEGRADED_REJECTION}
+              AND {_SHADOW_COUNTERFACTUAL}""",
         [lo]).fetchone()[0] or 0
     ungraded_rows = con.execute(
         f"""SELECT COUNT(*) FROM rejections
@@ -1938,7 +2194,7 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20,
     by_reason = con.execute(
         f"""SELECT reason, COUNT(*), ROUND(CAST(SUM(COALESCE(forgone_r,0)) AS NUMERIC), 2)
            FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?
-             AND NOT {_DEGRADED_REJECTION}
+             AND NOT {_DEGRADED_REJECTION} AND {_SHADOW_COUNTERFACTUAL}
            GROUP BY reason ORDER BY SUM(COALESCE(forgone_r,0)) DESC""", [lo]).fetchall()
     # `reason` is the risk manager's verbatim prose, so grouping on it produces
     # one group per rejection -- a list wearing a GROUP BY. Open Question #5
@@ -1951,16 +2207,17 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20,
                   ROUND(CAST(SUM(COALESCE(forgone_r,0)) AS NUMERIC), 2),
                   SUM(CASE WHEN forgone_r IS NOT NULL THEN 1 ELSE 0 END)
            FROM rejections WHERE eod_outcome IS NOT NULL AND plan_date >= ?
-             AND NOT {_DEGRADED_REJECTION}
+             AND NOT {_DEGRADED_REJECTION} AND {_SHADOW_COUNTERFACTUAL}
            GROUP BY 1 ORDER BY SUM(COALESCE(forgone_r,0)) DESC""", [lo]).fetchall()
     # What the desk's own taken trades did over the same sessions, on the SAME
-    # measure as forgone R: morning lane, unweighted r_multiple (the shadow
-    # simulator's measure; rejections carry no size). It used to be size-
-    # weighted, pooled with runner picks, and windowed on eval_date.
+    # measure as forgone R: morning lane, unweighted planned-risk R (what
+    # grading.classify_shadow prices a rejection in since D4; r_multiple only for
+    # a legacy row with nothing else; rejections carry no size). It used to be
+    # size-weighted, pooled with runner picks, and windowed on eval_date.
     captured, captured_n = con.execute(
-        f"""SELECT COALESCE(SUM(o.r_multiple), 0), COUNT(*)
+        f"""SELECT COALESCE(SUM(COALESCE(o.r_planned, o.r_multiple)), 0), COUNT(*)
            FROM outcomes o JOIN picks p ON p.pick_id = o.pick_id
-           WHERE o.triggered AND o.r_multiple IS NOT NULL
+           WHERE o.triggered AND COALESCE(o.r_planned, o.r_multiple) IS NOT NULL
              AND COALESCE(o.exit_reason, '') <> 'invalid_fill'
              AND p.plan_date >= ?{lane_clause("morning")}""", [lo]).fetchone()
 
@@ -2020,6 +2277,7 @@ def shadow_summary(con: duckdb.DuckDBPyConnection, trailing_sessions: int = 20,
                          "scored": int(r[3] or 0)} for r in by_category],
         "captured_r_window": round(float(captured or 0.0), 2),
         "captured_n": int(captured_n or 0),
+        "traded_via_lane": int(traded_via_lane),
     }
 
 

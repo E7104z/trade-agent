@@ -22,6 +22,11 @@ This module does, for the claim shapes a reviewer kept catching by hand:
                         control, backlog probe) graded C-F for having been
                         taken at all
   forgone_conclusion    one session's forgone R read as proof about the filters
+  mechanics_contradiction
+                        a resting-order or stop-order fill called "late", "chasing"
+                        or "N minutes after the open" as if the desk chose when to
+                        enter, or a breakout described as an order that "makes no
+                        sense" (docs/FIX_PHASE0.md, D6)
 
 What happens to a finding:
   * a lesson or a new idea carrying one is DROPPED: it never becomes memory;
@@ -39,7 +44,7 @@ from typing import Any
 
 from .grading import SCRATCH_R, outcome_class, realized_r
 
-__all__ = ["audit", "text", "TEST_LANES"]
+__all__ = ["audit", "text", "TEST_LANES", "order_mechanics", "mechanics_md"]
 
 TEST_LANES = frozenset({"coverage", "daily_floor", "hypothesis", "rr_below_control",
                         "backlog_probe"})
@@ -69,6 +74,132 @@ _FORGONE = re.compile(
     r"(?:forgone|shadow|filter|rejection)[^.]{0,100}?\b(?:confirm|validat|prove|proof|vindicat|"
     r"justif|working|works|worked)"
     r"|\b(?:confirm|validat|prove|vindicat|justif)\w*[^.]{0,100}?(?:forgone|shadow|filter)", re.I)
+
+
+# ---- order mechanics (docs/FIX_PHASE0.md, D6) --------------------------------------
+# A `breakout` entry is a STOP order and a `limit` entry a RESTING order: both go live
+# at their window and fill whenever price gets there, so the fill time is the tape's,
+# never a desk decision. 2026-10-16 the grader wrote of AMAT (a breakout short, filled
+# 11:07 when 418.00 broke) that it "entered 97 minutes late ... chasing", and of INTC
+# (a breakout short, a sell stop below the level) that the breakout "makes no sense":
+# narrative about orders it had never been told how to read.
+
+def _hhmm(value) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M")
+    m = re.search(r"(\d{1,2}):(\d{2})", str(value))
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else None
+
+
+def _cancel_at(p: dict) -> str:
+    """When an unfilled entry order is cancelled: the time stop, else the flatten."""
+    return _hhmm(p.get("time_stop")) or "the 15:55 flatten"
+
+
+def order_mechanics(p: dict, o: dict | None) -> str:
+    """One computed line on how this pick's entry order works and why it filled when
+    it did. Pure: a function of the plan and the simulated outcome."""
+    o = o or {}
+    etype = str(p.get("entry_type") or "open").lower()
+    long = str(p.get("direction") or "long").lower() != "short"
+    side = "buy" if long else "sell"
+    px = p.get("entry_price")
+    live = _hhmm(p.get("entry_not_before")) or "the open"
+    ft = _hhmm(o.get("fill_time"))
+    fill = o.get("entry_fill")
+    invalid = o.get("exit_reason") == "invalid_fill"
+    filled = bool(o.get("triggered")) and not invalid
+    gapped = (f" (price gapped past it: filled {fill:.2f})"
+              if filled and isinstance(fill, (int, float)) and isinstance(px, (int, float))
+              and abs(fill - px) / px > 0.001 else "")
+    if etype == "open":
+        if not filled:
+            return "market order at the open; it did not produce a valid fill"
+        px_txt = f"{fill:.2f}" if isinstance(fill, (int, float)) else "?"
+        return (f"market order sent at the open; filled at the opening print "
+                f"({px_txt}). The desk chose this time: the open.")
+    if not isinstance(px, (int, float)):
+        return f"{etype} entry with no price"
+    if etype == "breakout":
+        head = f"breakout {'long' if long else 'short'} = {side} stop at {px:.2f}, live from {live}"
+        if invalid:
+            return head + "; its simulated fill was invalid (wrong side of the stop), not a trade"
+        if filled:
+            return (head + f"; filled {ft or '?'} when price first traded through {px:.2f}{gapped}. "
+                    "The fill time is when the level broke, not a decision.")
+        return (head + f"; never filled: price never traded through {px:.2f} while the order was "
+                f"live, and it was cancelled at {_cancel_at(p)}.")
+    if etype == "limit":
+        head = f"resting {side} limit at {px:.2f} from {live}"
+        if invalid:
+            return head + "; its simulated fill was invalid (wrong side of the stop), not a trade"
+        if filled:
+            return (head + f"; filled {ft or '?'} whenever price reached it{gapped}. "
+                    "No one chose the fill time.")
+        touched = o.get("touch_only_bars")
+        why = (f"price touched {px:.2f} on {touched} bar(s) but never traded through it (a touch is "
+               "not a fill)" if touched else f"price never reached {px:.2f} while the order was live")
+        return head + f"; never filled: {why}, and it was cancelled at {_cancel_at(p)}."
+    return f"{etype} entry at {px:.2f}"
+
+
+def mechanics_md(picks: list[dict], outcomes: list[dict]) -> str:
+    """The grader's ORDER MECHANICS section body: one line per pick."""
+    by_pick = {o.get("pick_id"): o for o in outcomes or []}
+    return "\n".join(f"- {p['ticker']} (pick_id={p['pick_id']}, {str(p.get('entry_type') or 'open').lower()}): "
+                     f"{order_mechanics(p, by_pick.get(p['pick_id']))}" for p in picks or [])
+
+
+# A fill described as the desk's timing decision.
+_TIMING = re.compile(
+    r"\b\d+\s+minutes?\s+(?:late|after\s+the\s+(?:open|bell)|into\s+the\s+(?:session|day))\b"
+    r"|\b(?:too\s+)?late\b[^.;]{0,40}\b(?:entry|entries|enter(?:ed|s)?|fill(?:ed|s)?)\b"
+    r"|\b(?:entry|entries|enter(?:ed|s)?|fill(?:ed|s)?|got\s+in|came\s+in)\b[^.;]{0,40}\b(?:too\s+)?late\b"
+    r"|\bchas(?:e|ed|es|ing)\b"
+    r"|\bentered\b[^.;]{0,30}\bafter\s+the\s+open\b", re.I)
+# ... that a sentence is about an entry, for the words that are ambiguous alone.
+_ENTRY_WORDS = re.compile(
+    r"\b(?:entry|entries|enter(?:ed|ing|s)?|fill(?:ed|s)?|order|breakout|breakdown|limit|stop\s+order|"
+    r"got\s+in|came\s+in|bought|sold|shorted)\b", re.I)
+# ... unless the sentence itself says the timing was the tape's.
+_MECH_AWARE = re.compile(
+    r"not\s+(?:a\s+)?(?:desk\s+)?(?:decision|choice|chase|chasing)|no\s+one\s+chose|nobody\s+chose"
+    r"|when\s+(?:the\s+)?(?:level|price)\s+(?:broke|reached|traded)|resting\s+(?:order|limit)"
+    r"|tape\s+(?:set|chose|decided)|wasn'?t\s+(?:a\s+)?chas\w*|not\s+a\s+timing", re.I)
+# A breakout (a stop order) called senseless.
+_NONSENSE = re.compile(
+    r"(?:makes?|made)\s+no\s+sense|doesn'?t\s+make\s+sense|does\s+not\s+make\s+sense"
+    r"|nonsens\w+|illogical|incoherent|self[- ]contradict\w*", re.I)
+_BREAKOUT_WORDS = re.compile(r"\b(?:breakout|stop\s+order|sell\s+stop|buy\s+stop)\b", re.I)
+_SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _mechanics_conflict(text: str, p: dict, o: dict) -> str | None:
+    """Why the pick's order mechanics contradict a sentence of `text`, or None.
+    Fires only where it cannot be a judgment call: a resting or stop order that
+    FILLED (not a market-order anomaly) described as a timing decision, or a
+    breakout order called senseless."""
+    etype = str(p.get("entry_type") or "open").lower()
+    if etype not in ("limit", "breakout"):
+        return None
+    filled = bool(o.get("triggered")) and o.get("exit_reason") != "invalid_fill" \
+        and not o.get("execution_anomaly")
+    for sent in (s for s in _SENTENCE.split(text or "") if s.strip()):
+        if _MECH_AWARE.search(sent):
+            continue
+        hits = [m.group(0).strip() for m in _TIMING.finditer(sent)]
+        # a "<N> minutes late / after the open" claim is about timing by itself; the
+        # ambiguous words (late, chasing) must sit in a sentence about the entry
+        if filled and hits and (_ENTRY_WORDS.search(sent) or any(h[:1].isdigit() for h in hits)):
+            quoted = next((h for h in hits if h[:1].isdigit()), hits[0])
+            return (f"calls the fill a timing decision (\"{quoted}\"), but "
+                    f"{order_mechanics(p, o)}")
+        if etype == "breakout" and _NONSENSE.search(sent) and _BREAKOUT_WORDS.search(sent):
+            return ("calls the breakout order senseless, but " + order_mechanics(p, o)
+                    + " A breakout is the correct order for a break of a level, short or long.")
+    return None
 
 
 def _finding(check: str, where: str, ticker: str | None, why: str, action: str) -> dict:
@@ -138,6 +269,10 @@ def _audit(review: dict, picks: list[dict], outcomes: list[dict]) -> dict:
                    "win or a loss; its sign is noise")
             findings.append(_finding("scratch_as_result", "pick_review", t, msg, "noted"))
             notes.append(msg)
+        mech = _mechanics_conflict(why, p, o)
+        if mech:
+            findings.append(_finding("mechanics_contradiction", "pick_review", t, mech, "noted"))
+            notes.append(mech)
         if p.get("exploration_lane") in TEST_LANES and str(r.get("grade") or "").upper()[:1] in "CDF" \
                 and _PENALTY.search(why):
             msg = (f"graded {r.get('grade')} for having been taken, but it is a "
@@ -157,6 +292,17 @@ def _audit(review: dict, picks: list[dict], outcomes: list[dict]) -> dict:
         findings.append(_finding("forgone_conclusion", "plan_notes", None, msg, "noted"))
         review["plan_notes"] = notes_txt + " [AUDIT: " + msg + "]"
 
+    # -- plan notes: a sentence about a ticker's resting order read as a timing choice
+    mech_notes = []
+    for t, p in pick_by_ticker.items():
+        for sent in (s for s in _SENTENCE.split(notes_txt) if _mentions(s, t)):
+            mech = _mechanics_conflict(sent, p, by_pick.get(p["pick_id"]) or {})
+            if mech:
+                findings.append(_finding("mechanics_contradiction", "plan_notes", t, mech, "noted"))
+                mech_notes.append(f"{t}: {mech}")
+    if mech_notes:
+        review["plan_notes"] = str(review.get("plan_notes") or "") + " [AUDIT: " + "; ".join(mech_notes) + "]"
+
     # -- lessons and new ideas: a failing one never becomes memory
     def gate(items: list, where: str, fields: tuple[str, ...]) -> tuple[list, int]:
         kept, dropped = [], 0
@@ -166,19 +312,26 @@ def _audit(review: dict, picks: list[dict], outcomes: list[dict]) -> dict:
                 continue
             body = " ".join(str(item.get(f) or "") for f in fields)
             reasons = []
+            checks = []
             for t in pick_by_ticker:
                 if not _mentions(body, t):
                     continue
-                _, o = facts(t)
+                p, o = facts(t)
                 conflict = _volume_conflict(body, o)
                 if conflict:
                     reasons.append(f"{t}: {conflict}")
+                    checks.append("volume_contradiction")
                 if outcome_class(realized_r(o)) == "scratch" and _RESULT_WORD.search(body):
                     reasons.append(f"{t}: cites a scratch ({realized_r(o):+.2f}R) as a result")
+                    checks.append("scratch_as_result")
+                mech = _mechanics_conflict(body, p, o) if p else None
+                if mech:
+                    reasons.append(f"{t}: {mech}")
+                    checks.append("mechanics_contradiction")
             if reasons:
                 dropped += 1
                 findings.append(_finding(
-                    "volume_contradiction" if "participation" in reasons[0] else "scratch_as_result",
+                    "volume_contradiction" if "participation" in reasons[0] else checks[0],
                     where, None, "; ".join(reasons) + f" — dropped: {body[:160]}", "dropped"))
                 continue
             kept.append(item)

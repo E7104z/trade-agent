@@ -41,6 +41,8 @@ RUNNER = "dto_runner"
 LOOKBACK_SESSIONS = 10
 MORNING_WARN_S = 270          # of the 300s function budget
 PERSONA_SESSIONS = 3          # the persona spec's descriptive check
+FIX_STREAK = 5                # sessions in a row the 2026-10 fixes must pass (docs/FIX_VERIFICATION.md)
+ENTRY_SEMANTICS_MIN_N = 8     # graded picks a mismatch tag needs before enforcing it is a decision
 _ORDER = {"bad": 3, "warn": 2, "info": 1, "ok": 0}
 
 
@@ -456,6 +458,149 @@ def check_persona(con: Any, cfg: Any, d: date) -> dict:
                                       for k, v in groups.items()})
 
 
+class _NoAccount:
+    """Live paper trading off: there is no account, so nothing can be carried."""
+
+    def positions(self) -> list:
+        return []
+
+    def fills(self, d: date) -> list:
+        return []
+
+
+def _fix_sessions(con: Any, d: date) -> list[date]:
+    """Finished sessions before d whose evening ran on the fixed code (only that code
+    records the grader prompt version in runs.stages), newest first."""
+    rows = _q(con, "SELECT DISTINCT run_date FROM runs WHERE loop = 'evening' AND run_date < ? "
+                   "AND stages LIKE '%grader_prompt_version%' ORDER BY run_date DESC", [d])
+    return [x for x in (_as_date(r[0]) for r in rows) if x is not None]
+
+
+def check_fix_verification(con: Any, cfg: Any, d: date) -> dict:
+    """The 2026-10 execution fixes, verified by the system on production instead of by
+    someone remembering to run scripts/verify_fixes.py (docs/FIX_VERIFICATION.md).
+
+    Each evening judges the sessions that are FINISHED -- their evening, the nightly that
+    books the gap field (D7) and the next morning's sweep (D1) have all run -- with the
+    six checks in agent/fix_verification.py, plus the account right after today's close.
+    A session counts when every item passes. Five in a row and the fixes are verified:
+    the check says so, and from the next evening on it is one retired line."""
+    from . import fix_verification as fv
+    from .util import now_et
+    prev = _q(con, "SELECT value_json FROM self_checks WHERE check_key = 'fix_verification' "
+                   "AND session_date < ? ORDER BY session_date DESC LIMIT 1", [d])
+    try:
+        done = (json.loads(prev[0][0]) or {}).get("verified_through") if prev and prev[0][0] else None
+    except (TypeError, ValueError):
+        done = None
+    if done:
+        return _res("info", f"verified: {FIX_STREAK} straight sessions passed through {done}; "
+                            "this check has retired", verified_through=done)
+
+    if getattr(cfg, "offline", False) or getattr(cfg, "mock", False):
+        broker = None                           # a dev or test run never reads the account
+    elif _cfg(cfg, "live_paper").get("enabled"):
+        broker = fv.Broker(cfg)                 # GET reads only: positions and fills
+    else:
+        broker = _NoAccount()
+    now = now_et()
+    judged = []
+    for s in _fix_sessions(con, d)[:FIX_STREAK]:
+        results = fv.run_checks(con, s, cfg, broker, None, now)
+        bad = [r for r in results if r.status != fv.PASS]
+        judged.append({"date": str(s), "items": {r.item: r.status for r in results},
+                       "why": [f"{r.item} {r.status}: {r.lines[0] if r.lines else r.title}" for r in bad]})
+        if bad:
+            break                              # the streak ends at the newest session that failed
+    streak = 0
+    for j in judged:
+        if j["why"]:
+            break
+        streak += 1
+    passed = [j["date"] for j in judged[:streak]]
+
+    status = "ok"
+    if not judged:
+        head = "no finished session on the fixed code yet: each session is judged the evening after it"
+    elif streak >= FIX_STREAK:
+        head = (f"VERIFIED: {FIX_STREAK} straight sessions passed ({passed[-1]} to {passed[0]}); "
+                "every fixed defect held. From tomorrow this check is one retired line")
+    else:
+        head = f"{streak}/{FIX_STREAK} sessions in a row pass" + (
+            f" ({', '.join(reversed(passed))})" if passed else "")
+        stop = judged[-1] if judged[-1]["why"] else None
+        if stop is not None:
+            # Only the newest finished session decides the colour: an older failure is the
+            # reason the count restarted, already reported the evening it happened.
+            if streak == 0:
+                worst = max(stop["items"].values(), key=lambda v: {"PASS": 0, "PENDING": 1,
+                                                                   "UNVERIFIED": 2, "FAIL": 3}[v])
+                status = "bad" if worst == "FAIL" else "warn"
+            head += f"; {stop['date']} did not: " + "; ".join(stop["why"])[:600]
+    today = None
+    if broker is not None and d == now.date():     # the live evening: the account right now
+        t = fv.check_d1(con, d, cfg, broker, now)
+        today = t.status
+        if t.status == fv.FAIL:
+            status = "bad"
+            head += " | TODAY: " + "; ".join(x for x in t.lines if "STILL OPEN" in x or "NOT" in x)[:400]
+        elif t.status == fv.PASS:
+            head += " | today: flat after the close"
+        else:
+            head += f" | today: {t.status.lower()} ({t.lines[-1] if t.lines else 'no reading'})"
+    value = {"streak": streak, "needed": FIX_STREAK, "sessions": judged, "today_d1": today}
+    if judged and streak >= FIX_STREAK:
+        value["verified_through"] = passed[0]
+    return _res(status, head, **value)
+
+
+def check_entry_semantics(con: Any, cfg: Any, d: date) -> dict:
+    """D5's evidence for the enforcement decision (docs/FIX_VERIFICATION.md 4.5). The tag is
+    measured, not enforced; once a mismatch tag has ENTRY_SEMANTICS_MIN_N graded picks this
+    says 'decision due' every evening, with its fill rate and mean R beside the ok picks,
+    until validator.enforce_entry_semantics is decided."""
+    rows = _q(con, """SELECT p.entry_semantics, o.triggered, o.r_planned, o.r_multiple, o.exit_reason
+                      FROM picks p JOIN outcomes o ON o.pick_id = p.pick_id
+                      WHERE p.entry_semantics IS NOT NULL AND p.plan_date <= ?""", [d])
+    stats: dict[str, dict] = {}
+    for tag, trig, rp, rm, why in rows:
+        if why in ("invalid_fill", "no_data", "invalid_plan"):
+            continue
+        s = stats.setdefault(str(tag), {"n": 0, "filled": 0, "r": []})
+        s["n"] += 1
+        if trig:
+            s["filled"] += 1
+            r = rp if rp is not None else rm
+            if r is not None:
+                s["r"].append(float(r))
+    if not stats:
+        return _res("info", "no tagged pick graded yet (tags begin with the first session on the fixed code)")
+
+    def desc(tag: str) -> str:
+        s = stats.get(tag) or {"n": 0, "filled": 0, "r": []}
+        mean = sum(s["r"]) / len(s["r"]) if s["r"] else None
+        return (f"{tag}: n {s['n']}, filled {s['filled']}/{s['n']}, mean "
+                f"{'n/a' if mean is None else f'{mean:+.2f}R'}")
+
+    mismatch = sorted(t for t in stats if t != "ok")
+    table = {t: {"n": v["n"], "filled": v["filled"],
+                 "mean_r": round(sum(v["r"]) / len(v["r"]), 3) if v["r"] else None}
+             for t, v in stats.items()}
+    if _cfg(cfg, "validator").get("enforce_entry_semantics"):
+        return _res("info", "enforcement is ON; " + " | ".join(desc(t) for t in ["ok"] + mismatch),
+                    table=table)
+    due = [t for t in mismatch if stats[t]["n"] >= ENTRY_SEMANTICS_MIN_N]
+    if due:
+        return _res("warn", "DECISION DUE (enforcement is off): " + " | ".join(desc(t) for t in due)
+                    + f" -- against {desc('ok')}. Enforcing drops such picks in every lane "
+                      "(validator.enforce_entry_semantics)", table=table, due=due)
+    if not mismatch:
+        return _res("info", f"no mismatch tagged yet; {desc('ok')}", table=table)
+    return _res("info", "collecting (tag only): " + ", ".join(
+        f"{t} {stats[t]['n']}/{ENTRY_SEMANTICS_MIN_N}" for t in mismatch)
+        + f"; ok n {stats.get('ok', {}).get('n', 0)}", table=table)
+
+
 def check_gapfield(con: Any, cfg: Any, d: date) -> dict:
     """Is the nightly job pricing each session, and how far is the history?"""
     from . import gapfield
@@ -489,6 +634,7 @@ def check_gapfield(con: Any, cfg: Any, d: date) -> dict:
 
 
 CHECKS: tuple[tuple[str, str, Callable[[Any, Any, date], dict]], ...] = (
+    ("fix_verification", "Fix verification (5 sessions)", check_fix_verification),
     ("plumbing", "Data collected today", check_plumbing),
     ("lanes", "Lanes and broker cap", check_lanes),
     ("entries", "Entries and fills", check_entries),
@@ -499,6 +645,7 @@ CHECKS: tuple[tuple[str, str, Callable[[Any, Any, date], dict]], ...] = (
     ("edge_pipeline", "From data to edge", check_edge_pipeline),
     ("gapfield", "Gap field (nightly)", check_gapfield),
     ("persona", "Persona check", check_persona),
+    ("entry_semantics", "Entry semantics (D5)", check_entry_semantics),
 )
 
 

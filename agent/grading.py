@@ -5,10 +5,15 @@ Outcome grading engine — deterministic simulation of each pick against real
 Simulation rules (documented, conservative):
   Entry:
     open      -> fill at official 9:30 open price
-    limit     -> long fills when bar.low <= entry (fill at entry, or at open if it
-                 gaps through favorably); short mirrored via bar.high
+    limit     -> a RESTING limit fills only when price trades THROUGH it (sim_version
+                 8): long when bar.low <= entry - need, short when bar.high >= entry
+                 + need, where need = max(LIMIT_FILL_TICK, entry * LIMIT_FILL_CUSHION_BPS
+                 / 1e4); fill at entry. A bar that only touches the limit, or goes
+                 through it by less than `need`, is NOT a fill (counted in
+                 touch_only_bars). A bar that OPENS already through the limit fills at
+                 that open (the order is marketable), exactly as before.
     breakout  -> long fills when bar.high >= entry (stop-order semantics);
-                 short mirrored via bar.low
+                 short mirrored via bar.low. Touch triggers a stop, so no cushion.
     A limit/breakout entry that has not filled by the pick's time_stop (or the
     flatten cutoff, whichever is earlier) is CANCELLED: no bar at or after that
     cutoff may fill it (sim_version 4). The plan's "by 11:00" is the window the
@@ -96,6 +101,7 @@ Simulation rules (documented, conservative):
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any
@@ -135,7 +141,26 @@ _CLOCK_RE = re.compile(r"(\d{1,2}):(\d{2})")
 # at that bar exits at its OPEN (when the monitor's market order goes in), no
 # entry may fill at or after it, and the hold-to-close counterfactual (eod_r)
 # ends there too. The open->close null model (baseline_r) is unchanged.
-CURRENT_SIM_VERSION = 7
+# v8 = a resting LIMIT entry fills only when the bar trades through the limit by
+# max(1 tick, 5 bps) -- a touch is not a fill (docs/FIX_PHASE0.md, D2). Alpaca's
+# paper account did not fill RKLB's 2026-10-15 sell limit at 54.00 although the
+# 11:15 bar printed 54.02 (3.7 bps through); across its 35 limit-entry and 10
+# stop-entry orders the smallest filled limit was 5.07 bps through (NVDA
+# 2026-10-08), and a touch preceded the fill by 1-4 minutes twice (MAT, ALEC).
+# Stops, targets and breakout entries still trigger on a touch (67 of 68 filled
+# stop legs did, within a minute). Gap-through-at-open is unchanged. Outcomes
+# record touch_only_bars. A v7 row is therefore NOT equivalent to a v8 row for
+# any lane (SAME_SEMANTICS). v8 also records r_if_held_to_flatten, a reference
+# number that changes no fill and no R.
+CURRENT_SIM_VERSION = 8
+
+# How far a bar must trade through a resting limit for the order to count as
+# filled: the larger of one tick and this many basis points of the limit price.
+# 5 bps is also the configured friction (slippage_bps): the market has to pay
+# at least what the simulator charges. Part of the sim version: change it only
+# with a bump of CURRENT_SIM_VERSION.
+LIMIT_FILL_CUSHION_BPS = 5.0
+LIMIT_FILL_TICK = 0.01
 
 # Minutes before the session close at which the live monitor flattens every
 # position (and the simulator exits it). The single source: live_monitor
@@ -169,8 +194,8 @@ def outcome_class(r: float | None) -> str | None:
 # version is compared to the running one (the chart drawer's replay guard),
 # so a v6 bump that changed nothing for the morning lane does not flag every
 # morning chart as "graded under another simulator".
-SAME_SEMANTICS = {"morning": frozenset({7}), "shadow": frozenset({7}),
-                  "live": frozenset({7})}
+SAME_SEMANTICS = {"morning": frozenset({8}), "shadow": frozenset({8}),
+                  "live": frozenset({8})}
 
 
 # The morning lane's entry window: "no entries in the first 15 minutes after
@@ -286,6 +311,28 @@ def _is_thin(bar: dict, min_bar_volume: float) -> bool:
     return v < min_bar_volume
 
 
+def _limit_need(entry: float) -> float:
+    """How far a bar must trade THROUGH a resting limit for it to count as
+    filled (sim_version 8): one tick, or LIMIT_FILL_CUSHION_BPS of the price,
+    whichever is larger. See the v8 note on CURRENT_SIM_VERSION for the broker
+    evidence behind the number."""
+    return max(LIMIT_FILL_TICK, abs(float(entry)) * LIMIT_FILL_CUSHION_BPS / 1e4)
+
+
+def _limit_fills_on_bar(b: dict, entry: float, long: bool) -> bool:
+    """True when this bar fills a resting limit: the bar opens already through
+    the limit (the order is marketable: it fills at that open), or trades
+    through it by at least `_limit_need`. A touch is not a fill."""
+    if long:
+        return b["o"] < entry or b["l"] <= entry - _limit_need(entry)
+    return b["o"] > entry or b["h"] >= entry + _limit_need(entry)
+
+
+def _limit_touched(b: dict, entry: float, long: bool) -> bool:
+    """True when this bar reached the limit at all."""
+    return b["l"] <= entry if long else b["h"] >= entry
+
+
 def _resample_5m(bars: list[dict]) -> list[dict]:
     """Positionally bucket 1-minute bars into 5-minute candles (o/h/l/c/v +
     the bucket's opening timestamp). Assumes contiguous 1-minute bars, same
@@ -363,12 +410,16 @@ def _closest_approach(bars, entry, long, entry_type, min_bar_volume=0):
         return None, None
 
     if entry_type == "limit":
-        # long limit fills on a dip to entry; short limit on a pop to entry
+        # long limit fills on a dip THROUGH entry; short limit on a pop through
+        # it (sim_version 8). The shortfall is measured to the level a bar has
+        # to reach for the order to fill, so a bar that only touched the limit
+        # is still short of the trigger (a small negative trigger_gap_r).
+        need = _limit_need(entry)
         if long:
             approach = min(b["l"] for b in usable)
-            return approach - entry, approach
+            return approach - (entry - need), approach
         approach = max(b["h"] for b in usable)
-        return entry - approach, approach
+        return (entry + need) - approach, approach
     # breakout (stop-order semantics), and anything else that needs price to
     # travel TOWARD the entry in the trade's direction
     if long:
@@ -388,7 +439,7 @@ def _would_have_triggered_after(bars, entry, long, entry_type, cutoff_idx,
         if _is_thin(b, min_bar_volume):
             continue
         if entry_type == "limit":
-            if (long and b["l"] <= entry) or (not long and b["h"] >= entry):
+            if _limit_fills_on_bar(b, entry, long):
                 return True
         else:
             if (long and b["h"] >= entry) or (not long and b["l"] <= entry):
@@ -487,8 +538,17 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
         "untriggered_reason": None,
         "untriggered_note": None,
         "trigger_gap_r": None,
+        # sim_version 8: for a LIMIT entry, how many live bars (up to the fill, or
+        # the cutoff) reached the limit without trading through it enough to fill
+        # it. 0 = none; None = not a limit entry. A pick that never triggered with
+        # touch_only_bars >= 1 is a touch the old simulator would have filled.
+        "touch_only_bars": None,
         "baseline_r": None,
         "eod_r": None,
+        # The time-stop counterfactual (docs/FIX_PHASE0.md, Phase 5): planned-risk R if
+        # this fill were held with only its initial stop until the 15:55 flatten. A
+        # reference number, never added to r_multiple, r_planned or any total.
+        "r_if_held_to_flatten": None,
         "target_hit_after_stop": None,
         "execution_anomaly": False,
         "fill_vs_plan_r": None,
@@ -635,6 +695,7 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     # ---- find fill -------------------------------------------------------
     fill_price = None
     fill_idx = None
+    touch_only = 0           # limit entries: live bars that reached the limit but did not fill it
     if entry_type == "open":
         fill_price = bars[0]["o"]
         fill_idx = 0
@@ -647,14 +708,17 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
             if _is_thin(b, min_bar_volume):
                 continue  # thin-bar filter: don't trust a quiet bar to trigger entry
             if entry_type == "limit":
-                if long and b["l"] <= entry:
-                    fill_price = min(entry, b["o"]) if b["o"] < entry else entry
+                # A RESTING limit fills on a trade-THROUGH, not a touch (sim_version
+                # 8): RKLB's sell limit at 54.00 never filled at the broker on a bar
+                # that printed 54.02. A bar that opens through the limit still fills
+                # at that open (marketable), as before.
+                if _limit_fills_on_bar(b, entry, long):
+                    fill_price = ((min(entry, b["o"]) if b["o"] < entry else entry) if long
+                                  else (max(entry, b["o"]) if b["o"] > entry else entry))
                     fill_idx = i
                     break
-                if not long and b["h"] >= entry:
-                    fill_price = max(entry, b["o"]) if b["o"] > entry else entry
-                    fill_idx = i
-                    break
+                if _limit_touched(b, entry, long):
+                    touch_only += 1
             else:  # breakout (stop-order semantics)
                 if long and b["h"] >= entry:
                     fill_price = max(entry, b["o"]) if b["o"] > entry else entry
@@ -664,6 +728,9 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
                     fill_price = min(entry, b["o"]) if b["o"] < entry else entry
                     fill_idx = i
                     break
+
+    if entry_type == "limit":
+        out["touch_only_bars"] = touch_only
 
     if fill_price is None:
         # Measured over the bars the order was LIVE for: a move that happened
@@ -924,6 +991,31 @@ def simulate_pick(pick: dict, bars: list[dict], daily: dict | None,
     out["eod_r"] = round(sign * (eod_exit - fill_price) / risk, 3)
     out["eod_r_planned"] = round(sign * (eod_exit - ref) / planned_risk, 3)
 
+    # r_if_held_to_flatten: the same fill held with ONLY the initial stop (no target,
+    # no time stop) to the live desk's 15:55 flatten, in the planned-risk R a taken
+    # pick is reported in. AMAT 2026-10-16 booked +0.06R at its 14:00 time stop; held,
+    # it was +0.57R at 15:55 with the 433 stop never touched. When the real exit WAS the
+    # stop or the flatten the two numbers are equal.
+    held_exit = None
+    for i in range(fill_idx, len(bars)):
+        b = bars[i]
+        if eod_idx is not None and i >= eod_idx and i > fill_idx:
+            held_exit = b["o"]
+            break
+        if _is_thin(b, min_bar_volume):
+            continue
+        if long and b["l"] <= stop:
+            held_exit = b["o"] if b["o"] < stop else stop      # gapped through: out at the open
+            break
+        if not long and b["h"] >= stop:
+            held_exit = b["o"] if b["o"] > stop else stop
+            break
+    if held_exit is None:
+        held_exit = bars[-1]["c"]
+    if slip > 0:
+        held_exit = held_exit * (1 - slip) if long else held_exit * (1 + slip)
+    out["r_if_held_to_flatten"] = round(sign * (held_exit - ref) / planned_risk, 3)
+
     # target_hit_after_stop: only meaningful for stopped trades. Scans from the
     # exit bar onward (the same-bar case counts, consistent with the conservative
     # stop-first tie rule above).
@@ -959,17 +1051,86 @@ def classify_shadow(outcome: dict) -> tuple[str, float | None]:
                      nothing) or |R| <= 0.2 noise
     would_have_won / would_have_lost -> triggered with meaningful signed R
     forgone_r: positive = the filter cost us; negative = the filter saved us.
+
+    forgone_r is the planned-risk R a TAKEN pick is reported in (`realized_r`:
+    r_planned, falling back to r_multiple only on a legacy row), so a rejection
+    that was also traded is priced in the same unit as its taken twin. It was
+    r_multiple, the floored-denominator diagnostic (docs/FIX_PHASE0.md, D4).
     """
     if outcome.get("exit_reason") in ("no_data", "invalid_plan", "invalid_fill"):
         return "unmeasurable", None
     if not outcome.get("triggered"):
         return "scratch", 0.0
-    r = outcome.get("r_multiple") or 0.0
+    r = realized_r(outcome) or 0.0
     if r >= 0.2:
         return "would_have_won", round(r, 3)
     if r <= -0.2:
         return "would_have_lost", round(r, 3)
     return "scratch", round(r, 3)
+
+
+# A rejection the desk traded anyway (the coverage lane, the daily floor, a
+# hypothesis test) is not a counterfactual: the filters did not stop it. Such a
+# row keeps this label, carries no forgone_r, and is reported beside the
+# filters' real effect -- 2026-10-15's "-1.41R, the filters saved money" was
+# INTC and CMC, both traded by coverage, and 2026-10-16's "+0.62R, the filters
+# cost the desk" was AMAT, traded by coverage at +0.06R (docs/FIX_PHASE0.md, D4).
+TRADED_VIA_LANE = "traded_via_lane"
+
+
+def shadow_time_stop(analyst_json: Any, ticker: str, direction: str | None,
+                     entry_price: float | None = None) -> str | None:
+    """The time stop the ANALYST wrote for the candidate behind a rejection.
+
+    The rejections table never stored one, so the shadow ledger priced every
+    rejection as if it held to the close: INTC 2026-10-15 was -1.01R in the
+    shadow (stopped out at 15:42) and -0.51R as taken (14:30 time stop). Every
+    session's candidates are stored whole in daily_plans.analyst_json, so the
+    stop is recovered from there, history included. Matches on ticker and
+    direction, preferring the candidate whose entry price matches; None when
+    the candidate or its time stop is not there."""
+    try:
+        data = json.loads(analyst_json) if isinstance(analyst_json, (str, bytes)) else analyst_json
+    except (TypeError, ValueError):
+        return None
+    cands = [c for c in ((data or {}).get("candidates") or [])
+             if isinstance(c, dict) and str(c.get("ticker", "")).upper() == str(ticker).upper()
+             and (not direction or str(c.get("direction") or "").lower() == str(direction).lower())]
+    if not cands:
+        return None
+    if entry_price is not None and len(cands) > 1:
+        def _entry(c):
+            ep = c.get("entry_plan") if isinstance(c.get("entry_plan"), dict) else {}
+            return ep.get("price", c.get("entry_price"))
+        exact = [c for c in cands if isinstance(_entry(c), (int, float))
+                 and abs(float(_entry(c)) - float(entry_price)) < 1e-9]
+        cands = exact or cands
+    ts = cands[0].get("time_stop")
+    return str(ts) if ts else None
+
+
+def shadow_pick(rejection: dict, *, time_stop: str | None = None,
+                pick: dict | None = None) -> dict:
+    """The dict a rejection is priced with: the ONE definition of a shadow
+    trade, handed to the same simulate_pick a taken pick goes through.
+
+    A rejection that was also traded takes the TAKEN pick's own trading
+    parameters (entry type, levels, entry window, time stop), so its shadow R
+    is the pick's R by construction -- the validator can move a lane pick's
+    levels, and only the pick knows where it actually went. A rejection that
+    was not traded takes its own levels and the analyst's time stop."""
+    src = pick if pick is not None else rejection
+    return {
+        "pick_id": rejection["rejection_id"] if "rejection_id" in rejection else src.get("pick_id"),
+        "direction": src.get("direction"),
+        "entry_type": src.get("entry_type"),
+        "entry_price": src.get("entry_price"),
+        "stop_price": src.get("stop_price"),
+        "target_price": src.get("target_price"),
+        # Same entry window a taken pick of this type carried (v27).
+        "entry_not_before": src.get("entry_not_before"),
+        "time_stop": (pick or {}).get("time_stop") if pick is not None else time_stop,
+    }
 
 
 def grade_day(md: MarketData, picks: list[dict], d: date,
@@ -1047,6 +1208,120 @@ def _volume_share(part: float | None, whole: float | None) -> str | None:
     return f"{min(part / whole, 1.0):.0%}"
 
 
+# ---------------------------------------------------------------------------
+# Simulator vs broker (docs/FIX_PHASE0.md, D3)
+# ---------------------------------------------------------------------------
+# A pick that went to the broker has two results: the simulator's (the research
+# number, comparable across every pick) and the paper account's (what was
+# actually earned). On 2026-10-15 the review showed only the first: -1.56R and
+# one winner, against -$222 realized and no winner at the broker, because the
+# simulated RKLB winner was an order Alpaca cancelled unfilled.
+
+# Both filled, and the broker's R and the simulated R differ by at least this
+# much: the fills or the exit differ. Ordinary friction and price improvement on
+# the paper account move R by well under this (CRWV, INTC, CMC and AMAT on
+# 2026-10-15/16 all sit within 0.07R).
+DIVERGENCE_R = 0.10
+
+_DIVERGENCE_TEXT = {
+    "sim_only_fill": ("the simulator filled this entry and the broker did not. The simulated R "
+                      "below is a research number, NOT a result the paper account earned; do not "
+                      "grade the trade on it."),
+    "broker_only_fill": ("the broker filled this entry and the simulator did not (it never "
+                         "triggered, or called the fill invalid). The broker's R is the result; "
+                         "the simulated outcome below did not happen."),
+    "price_gap": (f"both filled, but the broker's R and the simulated R differ by "
+                  f"{DIVERGENCE_R:.2f}R or more (a different fill or exit). The broker's R is "
+                  f"the result."),
+}
+
+
+def classify_divergence(sim: dict, broker: dict | None, pick: dict | None = None) -> str | None:
+    """How the simulator and the paper account disagree about one pick.
+
+    `broker` is {entry_fill, exit_fill, exit_reason, live_r, status} from the
+    pick's live order; None when the pick never went to the broker (nothing to
+    compare, returns None).
+
+      sim_only_fill    the simulator filled the entry; the broker never did
+      broker_only_fill the broker filled it; the simulator did not (untriggered,
+                       or an invalid_fill it refused to call a trade)
+      price_gap        both filled but live_r and the simulated R differ by
+                       DIVERGENCE_R or more (or, with no exit yet, the entries
+                       differ by that many planned-risk units)
+      none             they agree (including: neither filled)
+    """
+    if not broker:
+        return None
+    sim_filled = bool(sim.get("triggered")) and sim.get("exit_reason") != "invalid_fill"
+    b_entry = broker.get("entry_fill")
+    if sim_filled and b_entry is None:
+        return "sim_only_fill"
+    if b_entry is not None and not sim_filled:
+        return "broker_only_fill"
+    if not sim_filled:
+        return "none"
+    live_r, sim_r = broker.get("live_r"), realized_r(sim)
+    if live_r is not None and sim_r is not None:
+        return "price_gap" if abs(float(live_r) - float(sim_r)) >= DIVERGENCE_R else "none"
+    # The broker has not exited yet: compare the entries in planned-risk units.
+    try:
+        risk = abs(float(pick["entry_price"]) - float(pick["stop_price"]))
+        gap = abs(float(b_entry) - float(sim["entry_fill"])) / risk
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return "none"
+    return "price_gap" if gap >= DIVERGENCE_R else "none"
+
+
+def _broker_lines(o: dict) -> list[str]:
+    """The paper account's result for a pick that went to the broker, as the
+    HEADLINE of its review, plus one line when it disagrees with the
+    simulator. Empty for a pick that never went to the broker."""
+    if o.get("broker_status") is None:
+        return []
+    status, reason = o.get("broker_status"), o.get("broker_exit_reason")
+    entry, exit_px, live_r = o.get("broker_entry_fill"), o.get("broker_exit_fill"), o.get("live_r")
+    if entry is None:
+        why = (reason or status or "no fill").replace("_", " ")
+        lines = [f"- BROKER (the headline: what the paper account actually did): the entry was "
+                 f"NEVER FILLED ({why}). No trade, no R."]
+    elif exit_px is None:
+        lines = [f"- BROKER (the headline: what the paper account actually did): filled @ {entry}; "
+                 f"no exit recorded yet ({status})."]
+    else:
+        r_txt = f"{float(live_r):+.2f}" if live_r is not None else "n/a"
+        lines = [f"- BROKER (the headline: what the paper account actually did): filled @ {entry}, "
+                 f"exit @ {exit_px} ({reason or status}), R = {r_txt} (planned-risk R from the "
+                 f"broker's own fills)"]
+    div = o.get("sim_broker_divergence")
+    if div and div != "none":
+        lines.append(f"  ⚠ SIM/BROKER DIVERGENCE ({div}): {_DIVERGENCE_TEXT.get(div, div)}")
+    return lines
+
+
+def broker_summary_line(picks: list[dict], outcomes: list[dict]) -> str:
+    """One line for the top of the evening review: what the paper account
+    earned against what the simulator says, and which picks disagree. Empty
+    when nothing went to the broker."""
+    live = [o for o in outcomes if o.get("broker_status") is not None]
+    if not live:
+        return ""
+    names = {p["pick_id"]: p["ticker"] for p in picks}
+    filled = [o for o in live if o.get("broker_entry_fill") is not None]
+    broker_rs = [float(o["live_r"]) for o in filled if o.get("live_r") is not None]
+    sim_rs = [realized_r(o) for o in live
+              if o.get("triggered") and o.get("exit_reason") != "invalid_fill"
+              and realized_r(o) is not None]
+    diverged = [f"{names.get(o['pick_id'], o['pick_id'])} {o['sim_broker_divergence']}"
+                for o in live if o.get("sim_broker_divergence") not in (None, "none")]
+    line = (f"LIVE vs SIMULATED: {len(live)} pick(s) went to the broker, {len(filled)} filled. "
+            f"Broker result {sum(broker_rs):+.2f}R over {len(broker_rs)} settled trade(s); "
+            f"simulator {sum(sim_rs):+.2f}R over {len(sim_rs)}.")
+    if diverged:
+        line += " DIVERGENT: " + ", ".join(diverged) + "."
+    return line
+
+
 def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
     """Render computed outcomes for the evening grader prompt."""
     by_id = {o["pick_id"]: o for o in outcomes}
@@ -1064,11 +1339,16 @@ def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
                          f"was traded.")
         lines.append(f"- Thesis: {p['thesis']}")
         lines.append(f"- Invalidation: {p['invalidation']}")
+        # A pick that went to the broker has two results. The paper account's is
+        # the headline; the simulator's is the research number, and says so.
+        live = o.get("broker_status") is not None
+        lines.extend(_broker_lines(o))
+        tag = "SIMULATED (research number, not the headline)" if live else "OUTCOME"
         if o.get("triggered"):
             times = f" [{o['fill_time']} -> {o['exit_time']}]" if o.get("fill_time") and o.get("exit_time") else ""
             scratch = (f" — a SCRATCH (inside +/-{SCRATCH_R:.2f}R: neither a win nor a loss, "
                        f"its sign is noise)" if outcome_class(realized_r(o)) == "scratch" else "")
-            lines.append(f"- OUTCOME: filled @ {o['entry_fill']}, exit @ {o['exit_price']} "
+            lines.append(f"- {tag}: filled @ {o['entry_fill']}, exit @ {o['exit_price']} "
                          f"({o['exit_reason']}), R = {realized_r(o):+.2f} (planned-risk R){scratch}, "
                          f"MFE {o['mfe_r']:+.2f}R, MAE {o['mae_r']:+.2f}R{times}")
             if o.get("execution_anomaly"):
@@ -1098,13 +1378,17 @@ def outcomes_md(picks: list[dict], outcomes: list[dict]) -> str:
                             f"never a guess): {', '.join(bits)}")
         elif o.get("exit_reason") == "invalid_fill":
             lines.append(
-                f"- OUTCOME: INVALID FILL — {o.get('invalid_fill_detail', 'fill landed on the wrong side of the stop; not a real trade.')} "
+                f"- {tag}: INVALID FILL — {o.get('invalid_fill_detail', 'fill landed on the wrong side of the stop; not a real trade.')} "
                 f"This is an execution-simulation artifact, not a trade outcome. Do not grade it, "
                 f"do not construct a narrative to explain it, and do not extract a lesson from it.")
         else:
             mm = o.get("missed_move_r")
             extra = f" — untriggered; the move from entry level would have been {mm:+.2f}R" if mm is not None else ""
-            lines.append(f"- OUTCOME: NOT TRIGGERED ({o.get('exit_reason','no_trigger')}){extra}")
+            touched = o.get("touch_only_bars")
+            if touched:
+                extra += (f"; price touched the limit on {touched} bar(s) without trading through it "
+                          f"enough to fill (a resting limit needs a trade-through)")
+            lines.append(f"- {tag}: NOT TRIGGERED ({o.get('exit_reason','no_trigger')}){extra}")
         if o.get("day_open") is not None:
             lines.append(f"- Day OHLC: O {o['day_open']} H {o['day_high']} L {o['day_low']} "
                          f"C {o['day_close']} Vol {o.get('day_volume','?')}")

@@ -86,6 +86,20 @@ INTERNATIONAL = {"^N225": "Nikkei", "^HSI": "Hang Seng", "^GDAXI": "DAX", "^FTSE
 SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC", "XLRE"]
 INDEX_ETFS = ["SPY", "QQQ", "IWM"]
 
+# The funds the analyst may name, each with a LIVE price in the morning bundle
+# (docs/FIX_PHASE0.md, D8). On 2026-10-15/16 it priced USO at 68.50 (it traded ~153.6),
+# XLV at 148 (176.70) and XLE at 87 (66.85): the bundle showed the sector ETFs as percent
+# moves only and USO not at all, so it priced them from memory, and the 15% grounding gate
+# killed each pick after the fact. A fund not on this list may be named only with a live
+# quote the analyst retrieved itself (prompts/morning_analyst.md). Leveraged and inverse
+# products stay out: EXCLUDED_PRODUCTS.
+NAMEABLE_FUNDS = list(dict.fromkeys(
+    INDEX_ETFS + ["DIA"] + SECTOR_ETFS
+    + ["SMH", "XBI", "IBB", "KRE", "XOP", "ITB"]       # industries the desk has traded
+    + ["USO", "GLD", "SLV", "UNG"]                     # commodities
+    + ["TLT", "HYG"]                                   # rates and credit
+    + ["EEM", "FXI", "KWEB", "IBIT"]))                 # international, crypto
+
 # Leveraged, inverse, and volatility products. These move on mechanical leverage
 # and decay, not on company-specific catalysts, so a gap in one is a restatement
 # of its underlying index, not an idea — a 3x semiconductor ETF gapping 6% is
@@ -946,6 +960,7 @@ class MarketData:
         safe("movers", self._movers)
         safe("news", self._news)
         safe("catalyst_quotes", lambda: self._catalyst_quotes(bundle))
+        safe("fund_quotes", self._fund_quotes)
         safe("filings_8k", lambda: edgar_recent_8ks(self.cfg.data_cfg["edgar_user_agent"]))
         bundle["econ_today"] = econ_events(d)
         bundle["econ_upcoming"] = econ_upcoming(d + timedelta(days=1), 3)
@@ -1098,6 +1113,38 @@ class MarketData:
                 out.append(q)
             except (KeyError, TypeError, ZeroDivisionError):
                 continue
+        return out
+
+    def _fund_quotes(self) -> list[dict]:
+        """Live last price for every fund in NAMEABLE_FUNDS: one batched snapshot call.
+
+        The bundle used to give the sector ETFs as percent moves only, so the
+        analyst priced the ones it named from memory (USO, XLV and XLE on
+        2026-10-15/16). Raises when nothing comes back, so a dead feed lands in
+        bundle["missing"] and the prompt says no fund may be named, rather than
+        an empty list reading as "no funds today"."""
+        if not self.alpaca:
+            raise RuntimeError("Alpaca not configured — fund quotes unavailable")
+        snaps = self.alpaca.snapshots(list(NAMEABLE_FUNDS))
+        out: list[dict] = []
+        for sym in NAMEABLE_FUNDS:
+            s = snaps.get(sym)
+            if not isinstance(s, dict):
+                continue
+            try:
+                last = (s.get("latestTrade") or {}).get("p") or (s.get("minuteBar") or {}).get("c")
+                prev_close = (s.get("prevDailyBar") or {}).get("c")
+                if not last:
+                    continue
+                q: dict[str, Any] = {"symbol": sym, "last": round(float(last), 2)}
+                if prev_close:
+                    q["prev_close"] = round(float(prev_close), 2)
+                    q["gap_pct"] = round((float(last) - float(prev_close)) / float(prev_close) * 100, 2)
+                out.append(q)
+            except (KeyError, TypeError, ZeroDivisionError):
+                continue
+        if not out:
+            raise RuntimeError("no fund quotes returned")
         return out
 
     def pick_quotes(self, symbols: list[str], d: date) -> dict[str, float]:
@@ -1761,7 +1808,22 @@ def render_bundle_md(b: dict) -> str:
         sectors = sorted(((s, v) for s, v in pc.items() if s not in ("SPY", "QQQ", "IWM")),
                          key=lambda x: -x[1])
         sec = " | ".join(f"{s} {v:+.1f}%" for s, v in sectors)
-        parts.append(f"**Yesterday ({recap['date']}):** {idx}\n**Sectors:** {sec}")
+        parts.append(f"**Yesterday ({recap['date']}):** {idx}\n**Sectors (percent moves, NOT prices):** {sec}")
+
+    # The funds' live prices. Absent key = a bundle that never had the feed (offline
+    # fixtures, stored history): say nothing. None = the fetch failed this morning.
+    if "fund_quotes" in b:
+        fq = b.get("fund_quotes")
+        if fq:
+            parts.append("**ETF live prices (anchor EVERY ETF level on these; the Sectors line above is "
+                         "percent moves, not prices. An ETF not listed here may be named only with a live "
+                         "quote you retrieved by search, stated in the thesis):** " + " | ".join(
+                             f"{q['symbol']} {q['last']}"
+                             + (f" ({q['gap_pct']:+.1f}%)" if q.get("gap_pct") is not None else "")
+                             for q in fq))
+        else:
+            parts.append("**ETF live prices: UNAVAILABLE this morning.** Name no ETF unless you retrieve "
+                         "its live price by search and state it in the thesis.")
 
     gappers = b.get("premarket_gappers")
     if gappers:

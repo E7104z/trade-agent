@@ -595,7 +595,10 @@ def _shadow_md(sh: dict) -> str:
         f"would_have_lost {sh.get('would_have_lost', 0)}, "
         f"scratch {sh.get('scratch', 0)} [untriggered or |R| < 0.2], "
         f"unmeasurable {sh.get('unmeasurable', 0)}); {unjudged} of {total} decide "
-        "nothing either way\n"
+        "nothing either way"
+        + (f"; {sh['traded_via_lane']} further rejection(s) were traded anyway through a test "
+           "lane: not counterfactuals, excluded from every figure here" if sh.get("traded_via_lane") else "")
+        + "\n"
         f"- of those, {sh.get('degraded_rows', 0)} are from degraded sessions: graded and "
         "counted in the totals, excluded from the category table; "
         f"{sh.get('ungraded_rows', 0)} further rejections in the window are not graded yet\n"

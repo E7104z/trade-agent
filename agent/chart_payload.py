@@ -25,7 +25,7 @@ from typing import Any
 from . import indicators as ind
 from . import ledger
 from .config import Config
-from .grading import (CURRENT_SIM_VERSION, classify_shadow,
+from .grading import (CURRENT_SIM_VERSION, TRADED_VIA_LANE, classify_shadow,
                       realized_r, same_semantics, simulate_pick)
 from .grading_context import build_grading_context
 from .providers import MarketData
@@ -286,16 +286,26 @@ def _replay_morning(md: MarketData, con, cfg: Config, pick: dict, d: date,
                          or_minutes=gctx["or_minutes"], session_date=d, session_bars=bars)
 
 
-def _replay_shadow(cfg: Config, rejection: dict, d: date, bars: list[dict]) -> dict:
-    shim = {"pick_id": rejection["rejection_id"], "direction": rejection["direction"],
-           "entry_type": rejection["entry_type"], "entry_price": rejection["entry_price"],
-           "stop_price": rejection["stop_price"], "target_price": rejection["target_price"],
-           "entry_not_before": rejection.get("entry_not_before")}
+def _replay_shadow(con, cfg: Config, rejection: dict, d: date, bars: list[dict]) -> tuple[dict, dict | None]:
+    """The shadow trade exactly as the evening priced it (grading.shadow_pick, D4):
+    a rejection the desk traded anyway takes its pick's own parameters, any other the
+    analyst's time stop. Returns (simulated outcome, the traded pick or None)."""
+    from .grading import shadow_pick, shadow_time_stop
+    pick = next((p for p in ledger.picks_for_date(con, d)
+                 if str(p["ticker"]).upper() == str(rejection["ticker"]).upper()
+                 and str(p.get("direction") or "").lower() == str(rejection.get("direction") or "").lower()),
+                None)
+    analyst_json = None
+    if pick is None:
+        row = con.execute("SELECT analyst_json FROM daily_plans WHERE plan_date = ?", [d]).fetchone()
+        analyst_json = row[0] if row else None
+    shim = shadow_pick(rejection, pick=pick, time_stop=None if pick is not None else shadow_time_stop(
+        analyst_json, rejection["ticker"], rejection.get("direction"), rejection.get("entry_price")))
     slippage = float(cfg.get("slippage_bps", 0) or 0)
     flatten_at = cfg.get("flatten_at")
     min_bar_volume = float(cfg.get("min_bar_volume", 0) or 0)
     return simulate_pick(shim, bars, None, slippage_bps=slippage, flatten_at=flatten_at,
-                         min_bar_volume=min_bar_volume, session_date=d)
+                         min_bar_volume=min_bar_volume, session_date=d), pick
 
 
 # ---------------------------------------------------------------------- guard
@@ -416,7 +426,8 @@ def build(con, cfg: Config, ticker: str, d: date, lane: str | None, ctx_id: Any,
 _EXIT_LABELS = {"target": "Target hit", "stop": "Stopped out", "eod": "Flat at close",
                 "time_stop": "Time stop", "no_trigger": "Not triggered", "no_data": "No data"}
 _SHADOW_LABELS = {"would_have_won": "Would have won", "would_have_lost": "Would have lost",
-                  "scratch": "Scratch", "unmeasurable": "Unmeasurable"}
+                  "scratch": "Scratch", "unmeasurable": "Unmeasurable",
+                  "traded_via_lane": "Traded anyway via a test lane (not a counterfactual)"}
 
 
 def _humanize(raw, table: dict) -> str | None:
@@ -599,13 +610,22 @@ def _build_shadow(con, cfg, md, out, t, d, rejection_id, bars, tf, asof, warning
     out["windows"] = [{"kind": "premarket", "start": _ms(datetime.combine(d, dtime(4, 0), tzinfo=ET)),
                        "end": _ms(datetime.combine(d, dtime(9, 30), tzinfo=ET))}]
 
-    sim = _replay_shadow(cfg, rejection, d, bars)
+    sim, traded = _replay_shadow(con, cfg, rejection, d, bars)
     out["markers"] = markers_from_replay(sim, rejection.get("direction") or "long")
 
     eod_outcome, forgone_replay = classify_shadow(sim)
     stored_forgone = rejection.get("forgone_r")
-    guards.append(_replay_guard("replay_vs_ledger", stored_forgone, forgone_replay, None,
-                                graded=rejection.get("eod_outcome") is not None))
+    if rejection.get("eod_outcome") == TRADED_VIA_LANE and traded is not None:
+        # Traded anyway (D4): no forgone R to compare; the replay must equal the taken R.
+        row = con.execute("SELECT r_planned, r_multiple, triggered FROM outcomes WHERE pick_id = ?",
+                          [traded["pick_id"]]).fetchone()
+        taken = (row[0] if row[0] is not None else row[1]) if row and row[2] else None
+        filled = bool(sim.get("triggered")) and sim.get("exit_reason") != "invalid_fill"
+        guards.append(_replay_guard("replay_vs_taken", taken, realized_r(sim) if filled else None,
+                                    None, graded=row is not None))
+    else:
+        guards.append(_replay_guard("replay_vs_ledger", stored_forgone, forgone_replay, None,
+                                    graded=rejection.get("eod_outcome") is not None))
     if not guards[-1]["ok"]:
         for m in out["markers"]:
             if m.get("source") == "replay":

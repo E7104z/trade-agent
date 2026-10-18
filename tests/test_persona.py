@@ -133,7 +133,9 @@ def test_missing_persona_file_with_flag_on_degrades_to_no_persona(tmp_path, monk
 
 # Bumped by TRADER_HYPOTHESIS_SPEC_v1 (hypothesis placeholders; the lane-off
 # render differs from the previous fixtures only by these version lines).
-PROMPT_VERSIONS = {"morning_analyst": "13", "morning_risk": "16", "evening_grader": "10",
+# evening_grader 10 -> 11: the order-mechanics paragraph (docs/FIX_PHASE0.md, D6).
+# morning_analyst 13 -> 14: ETF levels priced from the ETF live prices line (D8).
+PROMPT_VERSIONS = {"morning_analyst": "14", "morning_risk": "16", "evening_grader": "11",
                    "weekly_miner": "18"}
 
 # The paragraph each persona block must directly follow (its prompt's role

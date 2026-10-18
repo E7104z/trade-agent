@@ -289,6 +289,10 @@ window.TA = (function(){
       <section class="page" data-page="playbook"><div id="playbook-body"><div class="empty">Loading…</div></div></section>
       <section class="page" data-page="research"><div id="research-body"><div class="empty">Loading…</div></div></section>
       <section class="page" data-page="history">
+        <div class="card" id="pnl-day-card" style="display:none">
+          <div class="card-head"><h2>P&L breakdown</h2><span class="card-sub" id="pnl-day-sub"></span></div>
+          <div id="pnl-day-body"></div>
+        </div>
         <div class="card">
           <div class="card-head"><h2>Raw ledger inspector</h2><span class="card-sub">every whitelisted table, one session at a time</span></div>
           <div class="history-controls">
@@ -573,6 +577,100 @@ function equityChart(curve){
     <div class="eq-meta"><span>${esc(first.date)}</span><span class="eq-last" style="color:${c}">${fmtMoney(last.equity)}</span><span>${esc(last.date)}</span></div>
   </div>`;
 }
+
+// ---- Daily P&L breakdown (per-history on Overview, per-day on History) ----
+
+let pnlHistory = null;
+
+function pnlCls(n){
+  if(n == null || isNaN(n)) return 'dim';
+  if(n > 0.0005) return 'pos';
+  if(n < -0.0005) return 'neg';
+  return 'dim';
+}
+
+function pnlResultPill(outcome, triggered){
+  if(!triggered) return '<span class="pill neutral">no trade</span>';
+  if(outcome === 'win') return '<span class="pill ok">win</span>';
+  if(outcome === 'loss') return '<span class="pill bad">loss</span>';
+  if(outcome === 'scratch') return '<span class="pill neutral">scratch</span>';
+  return '<span class="pill neutral">unmeasured</span>';
+}
+
+function pnlDayTable(day){
+  const rows = (day.trades || []).map(t => {
+    const lane = t.runner ? undefined : 'morning';
+    const tk = tickerLink(t.ticker, {date: day.date, lane, id: t.pick_id});
+    return `<tr>
+      <td>${dirPill(t.direction)} ${tk}</td>
+      <td>${esc(t.setup_type||'')}</td>
+      <td>${esc(t.lane||'')}</td>
+      <td class="num">${t.size_r==null ? '—' : t.size_r.toFixed(2)}</td>
+      <td class="num ${pnlCls(t.realized_r)}">${fmtR(t.realized_r)}</td>
+      <td class="num ${pnlCls(t.weighted_r)}">${fmtR(t.weighted_r)}</td>
+      <td>${pnlResultPill(t.outcome, t.triggered)}</td>
+      <td>${esc(t.exit_reason||'')}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="table-wrap"><table><thead><tr>
+      <th>Ticker</th><th>Setup</th><th>Lane</th><th class="num">Size (R)</th>
+      <th class="num">Realized R</th><th class="num">P&L (R)</th><th>Result</th><th>Exit</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>
+    <div style="margin-top:12px;color:var(--text-muted);font-size:13px">${esc(day.summary||'')}</div>`;
+}
+
+function pnlHistoryTable(days){
+  const rows = days.map(d => `<tr>
+      <td>${esc(d.date)}</td>
+      <td class="num ${pnlCls(d.day_r)}">${fmtR(d.day_r)}</td>
+      <td class="num">${d.triggered||0}</td>
+      <td>${esc(d.summary||'')}</td>
+    </tr>`).join('');
+  return `<div class="table-wrap"><table><thead><tr>
+      <th>Date</th><th class="num">Day R</th><th class="num">Trades</th><th>What happened</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function renderPnlHistory(){
+  const el = $('pnl-history-body');
+  if(!el) return;
+  if(!pnlHistory || !pnlHistory.length){ el.innerHTML = empty('No graded P&L history yet.'); return; }
+  el.innerHTML = pnlHistoryTable(pnlHistory);
+}
+
+async function loadPnlHistory(){
+  try {
+    const r = await fetch('/api/pnl/history');
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error || 'Could not load P&L history');
+    pnlHistory = d.days || [];
+  } catch(e) {
+    pnlHistory = [];
+  }
+  renderPnlHistory();
+}
+
+async function loadPnlDay(date){
+  const card = $('pnl-day-card');
+  const body = $('pnl-day-body');
+  if(!card || !body) return;
+  card.style.display = 'none';
+  if(!date) return;
+  try {
+    const r = await fetch('/api/pnl/day?date=' + encodeURIComponent(date));
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error || 'Could not load P&L breakdown');
+    const day = d.day;
+    card.style.display = 'block';
+    $('pnl-day-sub').textContent = day.date + ' · ' + fmtR(day.day_r) + 'R day (size-weighted)';
+    body.innerHTML = (day.trades && day.trades.length) ? pnlDayTable(day) : empty('No picks recorded for this session.');
+  } catch(e) {
+    card.style.display = 'block';
+    $('pnl-day-sub').textContent = 'P&L breakdown';
+    body.innerHTML = empty('Could not load breakdown: ' + e.message);
+  }
+}
+
 const NO_EDGE = /^No (positive|validated) edge/;
 const HEALTH_LABEL = {ok:'HEALTHY', warn:'NEEDS ATTENTION', bad:'STAGE FAILING', unknown:'UNKNOWN'};
 const HEALTH_PILL = {ok:'ok', warn:'warn', bad:'bad'};
@@ -657,11 +755,13 @@ function renderOverview(){
       ${kpi('Streak', state.streak || '—', 'all lanes')}
     </div>
     <div class="card"><div class="card-head"><h2>Equity curve</h2><span class="card-sub">paper P&L, size-adjusted, each lane at its own $/R</span></div>${equityChart(state.equity_curve||[])}</div>
+    <div class="card"><div class="card-head"><h2>Daily P&L breakdown</h2><span class="card-sub">what moved equity each session</span></div><div id="pnl-history-body"><div class="empty">Loading…</div></div></div>
     ${lanes}
     ${best ? `<div class="card best-edge ${NO_EDGE.test(best) ? 'none' : ''}"><div class="card-head"><h2>Current best edge</h2></div><p>${esc(best)}</p></div>` : ''}
     <div class="card"><div class="card-head"><h2>Performance by setup</h2><span class="card-sub">realized edge per playbook setup</span></div>${setupTable()}</div>
     <div class="card"><div class="card-head"><h2>Today at a glance</h2><span class="card-sub">${esc(state.today)}</span></div>${planMini}</div>
   `;
+  if(pnlHistory === null){ loadPnlHistory(); } else { renderPnlHistory(); }
 }
 
 function setupTable(){
@@ -978,6 +1078,7 @@ async function loadHistory(){
   const result = $('historyResult');
   const view = $('historyTableView');
   if(!date) return;
+  loadPnlDay(date);
   result.textContent = 'Loading...';
   view.innerHTML = '';
   try {
