@@ -1,9 +1,10 @@
 # FIX SESSION — VERIFICATION REPORT
 
-**Sessions covered:** 2026-10-13, 10-15, 10-16 incidents · **Work done:** 2026-10-16 evening → 10-17
-**Repo:** `master` @ `7f8053d` + uncommitted working tree (nothing committed, nothing deployed)
+**Sessions covered:** 2026-10-13, 10-15, 10-16 incidents · **Work done:** 2026-10-16 evening → 10-18
+**Repo:** shipped 2026-10-18 as `61b9648`: deployed, both regrades applied. The §8 follow-up is in the working tree, not yet committed or deployed.
 **Read with:** `docs/FIX_PHASE0.md` (the evidence behind every "cause" below)
-**2026-10-17 update:** you decided the open questions (§6). The out-of-allowlist follow-ups are applied. The fixes now verify themselves in the evening email, and `scripts\ship_fixes.ps1` is the one thing left to run.
+**2026-10-17 update:** you decided the open questions (§6). The out-of-allowlist follow-ups are applied. The fixes now verify themselves in the evening email.
+**2026-10-18 update:** shipped. §8 has what the production impact report showed, and the three flaws it exposed in my new tools, now fixed.
 
 What was **not** done, by rule: no order placed, cancelled or closed; no production row written or read; no `--apply`; no config flag flipped. The broker was only ever read with GET requests, through a guard that raises on any other verb. Production was not read: I have no read path to it. Every production number below therefore comes from `scripts/verify_fixes.py`, which you run.
 
@@ -26,15 +27,17 @@ What was **not** done, by rule: no order placed, cancelled or closed; no product
 | **Phase 8** `agent/fix_verification.py` + `scripts/verify_fixes.py` | | the per-session checks (the evening self-check runs them itself) + `--impact` | 38 | 25/25 |
 | **follow-ups** (applied 10-17) | | the trader's log, weekly totals, ablation pool and chart replay treat lane trades as taken, not forgone | 16 | 12/12 |
 | **self-verification** (10-17) | | SELF-CHECK "Fix verification (5 sessions)" and "Entry semantics (D5)" | 16 | 14/14 |
+| **precision** (10-18, after the first production run) | | the audit spares an order already through its level at go-live and a remark about the setup label; the impact report quotes what fired and finds the ETF kills where they were recorded (§8) | 29 | 26/26 |
 
 ## 2. The suite
 
 ```
 baseline (HEAD 7f8053d, before any change):  1232 passed
-now (working tree):                          1494 passed in 209.71s     <- full run, DATABASE_URL unset
+before shipping (my last full run, 10-17):   1494 passed in 209.71s     <- full run, DATABASE_URL unset
+now (61b9648 + the §8 follow-up):            1528 passed in 212.57s     <- same; +29 mine, +5 the P&L breakdown's (§8)
 ```
 
-The +262 are all in new or extended test files (collected counts, HEAD export vs working tree):
+The +296 are all in new or extended test files (collected counts, HEAD export vs working tree):
 
 | file | HEAD | now | for |
 |---|---|---|---|
@@ -43,9 +46,11 @@ The +262 are all in new or extended test files (collected counts, HEAD export vs
 | `tests/test_fill_reconcile.py` | — | 46 | D2 (28 real broker entries replayed) + D3 |
 | `tests/test_shadow.py` | — | 13 | D4 |
 | `tests/test_entry_semantics.py` | — | 19 | D5 |
-| `tests/test_mechanics_audit.py` | — | 41 | D6 |
+| `tests/test_mechanics_audit.py` | — | 40 | D6 (41 until one case moved, §8) |
+| `tests/test_mechanics_precision.py` | — | 25 | D6 precision (§8) |
 | `tests/test_etf_grounding.py` | — | 12 | D8 |
-| `tests/test_verify_fixes.py` | — | 38 | Phase 8 |
+| `tests/test_verify_fixes.py` | — | 43 | Phase 8 (38) + the impact fixes (5, §8) |
+| `tests/test_pnl_breakdown.py` | — | 5 | not this session's: the P&L breakdown that came in with `61b9648` (§8) |
 | `tests/test_fix_followups.py` | — | 16 | the follow-ups (§6) |
 | `tests/test_fix_selfcheck.py` | — | 16 | the self-verification (§6) |
 
@@ -53,9 +58,10 @@ The +262 are all in new or extended test files (collected counts, HEAD export vs
 - `PROMPT_VERSIONS`: `evening_grader` 10 → 11, `morning_analyst` 13 → 14 (one line, with a comment saying why);
 - `tests/fixtures/prompt_renders/evening_grader.md` and `morning_analyst.md` regenerated with `scripts/capture_prompt_renders.py`, the repo's own procedure for a deliberate prompt change. The other three fixtures came out byte-identical.
 
-No other pre-existing test was touched. One caught a wording change I had made in the evening's shadow line (`test_the_shadow_line_counts_what_its_net_covers_and_claims_nothing`). I changed **the code back**, not the test (§4.4). Two of this session's own new tests were later adjusted on purpose:
+No other pre-existing test was touched. One caught a wording change I had made in the evening's shadow line (`test_the_shadow_line_counts_what_its_net_covers_and_claims_nothing`). I changed **the code back**, not the test (§4.4). Three of this session's own new tests were later adjusted on purpose:
 - `tests/test_shadow.py`, for the follow-ups: a day whose only rejection was traded now has no forgone-R slot at all, and lists the lane trade.
 - `tests/test_grading.py`'s guard on who may name `r_if_held_to_flatten` now also allows `fix_verification.py`, the reference report.
+- `tests/test_mechanics_audit.py` (10-18): "The fill came 97 minutes after the open." left the cases that must be flagged. A fill time stated as a fact is true by the numbers, and the audit fires only on claims they contradict. The fix-it prompt's own phrase, "entered N minutes after the open", is still flagged (§8).
 
 ## 3. Mutation table
 
@@ -73,7 +79,8 @@ Each mutation is a deliberate bug put into the fixed code, then the named tests 
 | verify_fixes.py | `tests/test_verify_fixes.py` | yes | yes | **25/25** |
 | follow-ups | `tests/test_fix_followups.py` | (new readers) | yes | **12/12** |
 | self-verification | `tests/test_fix_selfcheck.py` | (new check) | yes | **14/14** |
-| **total** | | | | **187/187** |
+| precision (10-18) | `tests/test_mechanics_precision.py`, `tests/test_verify_fixes.py` | yes: 13 of the first 24 precision tests, and all 5 impact tests (the other 11 are guards that pass both ways) | yes | **26/26** |
+| **total** | | | | **213/213** |
 
 Some examples of what "caught" covers:
 - D1: a second close that would flip long 250 into short 250; an unreadable account read as flat; the allow-list ignored.
@@ -194,7 +201,8 @@ Plus: the pick's own levels win over a stale rejection row; the opposite directi
 - every pick in the bundle gets a computed `ORDER MECHANICS` line (AMAT's is exactly the spec's sentence);
 - the prompt says a resting/stop fill time is the tape's, and restricts "chased" to `open` entries;
 - the audit flags `mechanics_contradiction`: a filled limit/breakout fill called late, chasing or "N minutes after the open", or a breakout order called senseless. It is checked sentence by sentence, with a sentence that itself says the timing was the tape's exempt, market entries exempt, and execution anomalies exempt. A flagged pick review or plan note keeps its words with an `[AUDIT: …]` note; **a lesson or idea built on it is dropped**;
-- the evening records `grader_prompt_version` and the audit counts in `runs.stages`, so `verify_fixes` can check both.
+- the evening records `grader_prompt_version` and the audit counts in `runs.stages`, so `verify_fixes` can check both;
+- (10-18, §8) an order already through its level when it went live was a market order in effect: its mechanics line says so, and its timing may be criticised. "Breakout ... makes no sense" counts only when the words are about the order, not the setup label. A fill time stated as a fact is not flagged.
 
 **Tests** (`tests/test_mechanics_audit.py`, 41): the AMAT sentence ("97 minutes late … chasing") flagged and its lesson dropped; the INTC sentence ("breakout … makes no sense") flagged; correct sentences not flagged; each phrasing; the bundle end to end.
 
@@ -238,7 +246,7 @@ MU 10-13 was a **short** (sell stop 940, filled 10:50:50), so its market *buy* a
 5. **The trader's-log halves of D3 and D4** needed files outside every allowlist. They were held back as a tested patch until you approved them on 10-17 (§6).
 6. **Pullback lane / `EXECUTION_FIX_SPEC_v1.md`** do not exist in the repo. Phase 1 built from the prompt's bullets; claims are `live_orders` rows behind an interface a future lane can use.
 
-## 6. Decided, automated, and the one thing left
+## 6. Decided, automated, shipped
 
 **Your decisions (2026-10-17):**
 
@@ -268,7 +276,7 @@ MU 10-13 was a **short** (sell stop 940, filled 10:50:50), so its market *buy* a
   - after 5 in a row it says **VERIFIED**, and from the next evening it is one retired line.
 - **Entry semantics (D5).** Fill rate and mean R per tag. Once any mismatch tag has 8 graded picks it says **DECISION DUE**, every evening, with the numbers beside the `ok` picks, until you decide on enforcement.
 
-**The one thing left: run one script, once.** It does, in order:
+**Shipped 2026-10-18 with one script** (marker: `%USERPROFILE%\.trade-agent\fixes_shipped.txt`; §8). It does, in order:
 1. the test suite;
 2. commit;
 3. rehearse, skipped if a passing rehearsal already covers the commit;
@@ -305,3 +313,65 @@ The evening self-check runs these every session. `python scripts/verify_fixes.py
 It opens production read-only (a Postgres session in read-only mode, with no migration run), reads the broker with GETs only, and re-prices `--impact` history in an in-memory database. It writes nothing and places nothing.
 
 As a tool check, I ran `--impact` once on the **local** ledger, which holds dev-era sessions 8/19–9/30, not production. It completed all six sections against real Alpaca bars, and the ledger file's hash was the same before and after. The local numbers are the ones quoted in §4.4; they say nothing about production.
+
+## 8. Shipped, and what production showed (2026-10-18)
+
+`scripts\ship_fixes.ps1` ran end to end: the suite, commit `61b9648`, the rehearsal, the deploy, the impact report (`reports\fix_impact_2026-10-18.txt`), the shadow regrade of all history and the taken-pick regrade from 2026-10-02.
+
+**Also in `61b9648`.** Step 2 commits the whole working tree, and it held two pieces of another session's uncommitted work:
+- the dashboard's P&L breakdown: `agent/webui.py`, `/api/pnl/day` and `/api/pnl/history` in `api/index.py`, `ledger.day_breakdown` and `pnl_breakdown_history`, with `tests/test_pnl_breakdown.py`;
+- `specs/PULLBACK_LANE_PHASE0_REPORT.md`.
+
+Both passed the suite and the rehearsal, and the P&L breakdown is live.
+
+### What the impact report showed (production, 2026-09-17 to 10-16, read-only)
+
+| item | before the fixes | after |
+|---|---|---|
+| D4 shadow ledger, 21 sessions, 141 rejections | net forgone **+8.12R**: "the filters cost the desk" | **−4.12R**. 35 rejections were traded anyway, and they made up +2.84R of the old net. The rest is the time stop, planned-risk R and sim v8. The incident days: 10-15 −1.41R → 0.00, 10-16 +0.62R → 0.00 |
+| the weekly verdict | not distinguishable from zero (mean +0.063R per rejection, p 0.275) | still not distinguishable (mean −0.043R, p 0.311). The sign flipped. Neither "the filters work" nor "the filters are too tight" is supported |
+| D2: 36 graded limit picks | the touch rule fills 22 | the trade-through rule fills 21. The one difference is RKLB 10-15: +0.21R booked that was never real |
+| Phase 5: 22 time-stopped trades | | holding each to the flatten instead would have averaged −0.012R per trade (planned R). The time stops cost nothing on net. AMAT 10-16 is the largest the other way (+0.57R given up); ALEC 10-05's stop saved 0.63R |
+
+D5, graded picks by entry semantics (history tagged from the stored levels):
+
+| tag | n | filled | mean R per filled trade |
+|---|---|---|---|
+| ok | 121 | 88% | −0.56R |
+| strength_buy_limit_below_ref | 13 | 69% | −0.04R |
+| breakdown_short_with_limit | 4 | 100% | +0.04R |
+| gap_fade_limit_without_expiry | 3 | 100% | −0.46R |
+
+So far the mismatched entries did better than the `ok` ones, on small numbers, and enforcement would have dropped them. It stays off. The evening self-check counts tagged picks from the tag's first production day (10-19) and says DECISION DUE at 8 graded picks per tag. The larger fact in this table is the `ok` row: −0.56R per filled trade over 107 trades. Rows before 10-02 were graded by older simulator versions, and lane trades are included.
+
+### Three flaws in my new tools, now fixed (working tree, not yet deployed)
+
+**1. The audit flagged 7 reviews it should not have.** It flagged 9 of 140 stored reviews: AMAT 10-16 and INTC 10-15, the incidents it was built for, and 7 more. The report printed only each review's first 140 characters, which show two kinds of false flag:
+- **An order already through its level when it went live.** CMC 10-15 is the clear case: a buy limit at 66.50 with the market at 66.03 when it went live at 09:45, so it filled at once. That was a market order in effect (`live_monitor` sends a crossed breakout as one). The go-live time set its fill time, so the grader's timing criticism was fair. S 10-13 (09:45) and NKE 10-02 (at the 09:30 open; it had no entry window) also filled on their first live bar, by their own notes.
+- **A remark about the setup label.** NVDA 10-05: "... so labeling as breakout is ..." criticised the label, not the stop order.
+
+For C 10-14, ACN 10-14 and CRWV 10-15, what fired is past the 140 characters the report printed.
+
+**The fix** (`agent/review_audit.py`; it runs every evening in production):
+- An order that filled on its first live bar (the entry window, else the 09:30 open), more than 0.1% past its level on the side the market already was, was a market order in effect. Its ORDER MECHANICS line now says so: "already through 66.50 when the order went live ... in effect a market order sent at 09:45. The go-live time set this fill time." Neither its timing nor "makes no sense" is flagged.
+- "Breakout ... makes no sense" is flagged only when the words name the order ("breakout short", "sell stop", "entering on a breakout") or call the entry itself senseless (INTC's own words: "entry logic makes no sense").
+- A fill time stated as a fact ("the fill came 97 minutes after the open") is no longer flagged. "Entered" or "got in N minutes after the open" still is, and so is "late" or "chasing" said of a fill the tape timed.
+
+On the real bars, AMAT (11:07) and INTC (09:49) are still flagged and CMC is not.
+
+**2. The replay could not say what fired.** It now prints the phrase and the sentence for each flag, and lists the reviews it leaves alone and why. It reads each fill time from the evening's stored tape summary, which a regrade keeps, and re-simulates when that is missing.
+
+**3. D8 printed 0, which was wrong.** The incident kills were lane trials. A lane trial's validator line is kept in `plan.validation_warnings`, not in `validator_drops`, so the report never looked there. It now counts both, plus the risk manager's kills of a fund for its price (kill check `grounding`, or a reason saying the price came from memory). Also, the D5 header printed "141 graded pick(s) (155 tagged ...)", because the tagged count included the rows the table leaves out. It now counts only what it tables, and says how many were left out.
+
+**Tests:** `tests/test_mechanics_precision.py` (25: the CMC and INTC fills simulated from the real bars, every boundary of the go-live rule, the label case, the phrases that stay flagged) and 5 more in `tests/test_verify_fixes.py`. One case moved in `tests/test_mechanics_audit.py` (§2). Mutations **26/26**. Suite: 1528 passed in 212.57s, DATABASE_URL unset.
+
+**To ship it.** The audit runs in production, so it needs a deploy. `review_audit.py` is a runtime file, so the deploy gate needs a fresh rehearsal (about $2–3). The last line re-runs the impact report read-only. It then shows the remaining flags with their sentences. It also checks the regrades: D4's stored net should now read about −4.12R, with the lane rows marked traded via lane.
+
+```powershell
+cd "C:\Users\Quantum Lab\Desktop\Trade Agent"
+git add agent/review_audit.py agent/fix_verification.py tests/test_mechanics_audit.py tests/test_mechanics_precision.py tests/test_verify_fixes.py docs/FIX_VERIFICATION.md
+git commit -m "D6 audit precision: orders through their level at go-live, setup-label remarks; impact report fixes" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+.venv\Scripts\python.exe run.py rehearse
+powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
+.venv\Scripts\python.exe scripts\verify_fixes.py --impact > reports\fix_impact_after_precision.txt
+```

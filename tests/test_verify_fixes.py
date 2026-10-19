@@ -607,3 +607,116 @@ def test_d1_a_position_carried_through_a_past_session_fails_from_the_next_mornin
     # the same row is, for Monday itself, an earlier carry its own sweep closed
     sold = [{"symbol": "IOVA", "side": "sell", "qty": "250"}]
     assert vf.check_d1(db.ro(), monday, CFG, _Broker(fills=sold), _at(date(2026, 10, 21), 18, 0)).status == vf.PASS
+
+
+# ---------------------------------- impact precision (2026-10-18, the first production run)
+
+CMC_1015 = dict(direction="long", setup_type="catalyst_momentum", entry_plan={"type": "limit", "price": 66.5},
+                entry_price=66.5, stop_price=64.0, target_price=72.0, exploration_lane="coverage")
+
+
+def _seed_reviews(con, tapes=True):
+    """INTC and CMC 10-15 as stored: graded, reviewed and, when `tapes`, with the evening's
+    tape summary, where the replay reads each fill time (a re-grade keeps it)."""
+    ledger.save_daily_plan(con, D1015, _plan([_pick("INTC", D1015, **INTC), _pick("CMC", D1015, **CMC_1015)]),
+                           {"candidates": []}, "chop")
+    by = {p["ticker"]: p["pick_id"] for p in ledger.picks_for_date(con, D1015)}
+    ledger.save_outcome(con, {"pick_id": by["INTC"], "eval_date": D1015, "triggered": True, "entry_fill": 91.954,
+                              "exit_reason": "time_stop", "r_planned": -0.51, "r_multiple": -0.51})
+    ledger.save_outcome(con, {"pick_id": by["CMC"], "eval_date": D1015, "triggered": True, "entry_fill": 66.063,
+                              "exit_reason": "time_stop", "r_planned": -0.39, "r_multiple": -0.39})
+    con.execute("UPDATE outcomes SET grade = 'C', grade_notes = ? WHERE pick_id = ?",
+                ["Stop was fine. A breakout short makes no sense on a stock already this weak.", by["INTC"]])
+    con.execute("UPDATE outcomes SET grade = 'C', grade_notes = ? WHERE pick_id = ?",
+                ["Thesis partially right, structure lazy. Entry 66.06 filled @09:45 chasing a falling open.",
+                 by["CMC"]])
+    if tapes:
+        ledger.set_outcome_grounding(con, by["INTC"], tape_summary=(
+            "open 93.60; HOD 93.86 @09:30; LOD 91.50 @10:40; filled 91.95 @09:49; exit 94.01 (time_stop) @14:30"))
+        ledger.set_outcome_grounding(con, by["CMC"], tape_summary=(
+            "open 69.38; HOD 69.50 @09:30; LOD 65.60 @09:46; filled 66.06 @09:45; exit 65.81 (time_stop) @14:00"))
+
+
+def test_impact_replay_quotes_what_fired_and_spares_an_order_through_its_level_at_go_live(db):
+    db.seed(_seed_reviews)
+    text = vf.mechanics_replay(db.ro(), D1015)
+    assert "1 of 2 stored pick review(s) would have been flagged mechanics_contradiction" in text
+    assert ('2026-10-15 INTC (grade C): senseless "makes no sense" in "A breakout short makes no sense on a '
+            'stock already this weak."') in text
+    assert "CMC (grade C)" not in text
+    assert ("1 more left alone: the order was already through its level when it went live, a market order "
+            "in effect (CMC 2026-10-15)") in text
+
+
+def test_impact_replay_resimulates_a_fill_time_the_tape_summary_lacks(db):
+    db.seed(lambda con: _seed_reviews(con, tapes=False))
+    unknown = vf.mechanics_replay(db.ro(), D1015)                 # no fill times: nothing can be spared
+    assert "2 of 2 stored pick review(s)" in unknown and "CMC (grade C)" in unknown
+    md = _MD({"INTC": _real("INTC", D1015), "CMC": _real("CMC", D1015)})
+    text = vf.mechanics_replay(db.ro(), D1015, md, CFG)
+    assert "1 of 2 stored pick review(s)" in text and "CMC (grade C)" not in text
+
+
+def test_impact_report_hands_the_replay_its_market_data(db, monkeypatch):
+    db.seed(lambda con: None)
+    seen = {}
+    monkeypatch.setattr(vf, "mechanics_replay", lambda con, since, md=None, cfg=None: seen.update(md=md, cfg=cfg) or "D6")
+    md = _MD({})
+    vf.impact_report(db.ro(), md, CFG, D1015)
+    assert seen == {"md": md, "cfg": CFG}
+
+
+def test_impact_counts_fund_kills_wherever_they_were_recorded(db):
+    """The first production run printed 0. The incident kills were lane trials, whose
+    validator lines are kept in plan.validation_warnings, not validator_drops; and the risk
+    manager can kill a fund for its price before any validator sees it."""
+    plan = _plan([], validation_warnings=[
+        "coverage XLE: XLE: entry 87.0 is 30% away from last price 66.85 (max 15%) — dropped as ungrounded; "
+        "the level was priced off something other than the actual market",
+        "XLE: entry 87.0 is 30% away from last price 66.85 (max 15%) — dropped as ungrounded",     # same kill
+        "coverage NVDA: NVDA: entry 100.0 is 44% away from last price 180.0 (max 15%) — dropped as ungrounded",
+        "COVERAGE: 1 setup(s) traded at 0.25R: AMAT breakdown_short"])
+
+    def seed(con):
+        ledger.save_daily_plan(con, D1016, plan, {"candidates": []}, "chop")
+        base = dict(direction="long", setup_type="sector_rotation", entry_type="limit", stop_price=1.0,
+                    target_price=3.0, conviction=3, thesis="t", source_stage="risk_rejected")
+        ledger.save_rejections(con, D1016, [
+            {**base, "ticker": "XLE", "entry_price": 87.0, "reason": "R:R 1.5 below 2.0",
+             "primary_kill_check": "rr", "kill_checks": ["rr"]},                   # killed for R:R; the gate later
+            {**base, "ticker": "USO", "entry_price": 68.5, "reason": "entry 68.50 vs live 153.6",
+             "primary_kill_check": "grounding", "kill_checks": ["grounding"]},
+            {**base, "ticker": "XLV", "entry_price": 148.0, "reason": "levels priced from memory; stale",
+             "primary_kill_check": "staleness", "kill_checks": ["staleness"]},
+            {**base, "ticker": "XLU", "entry_price": 61.0, "reason": "chasing the gap",
+             "primary_kill_check": "chase", "kill_checks": ["chase", "grounding"]},   # grounding binds too
+            {**base, "ticker": "MSFT", "entry_price": 300.0, "reason": "ungrounded price",
+             "primary_kill_check": "grounding", "kill_checks": ["grounding"]}])   # not a fund
+    db.seed(seed)
+    text = vf.etf_gate_kills(db.ro(), D1016)
+    assert text.splitlines()[0] == ("D8 ETF GROUNDING from 2026-10-16: 1 fund pick(s) the 15% gate killed "
+                                    "as priced from memory")
+    assert text.count("2026-10-16 XLE") == 1 and "2026-10-16 XLE (coverage lane validator): XLE: entry 87.0" in text
+    assert "  and 3 fund candidate(s) the risk manager killed for their price" in text
+    assert "2026-10-16 XLU (risk manager, chase): chasing the gap" in text
+    assert "2026-10-16 USO (risk manager, grounding): entry 68.50 vs live 153.6" in text
+    assert "2026-10-16 XLV (risk manager, staleness): levels priced from memory; stale" in text
+    assert "MSFT" not in text and "NVDA" not in text
+
+
+def test_impact_d5_counts_only_the_picks_in_its_table(db):
+    """The first production run printed "141 graded pick(s) (155 tagged here ...)": the tagged
+    count included the invalid and no-data rows the table leaves out."""
+    def seed(con):
+        ledger.save_daily_plan(con, D1016, _plan([_pick("AMAT"), _pick("INTC", D1016, **INTC)]),
+                               {"candidates": []}, "chop")
+        ids = {p["ticker"]: p["pick_id"] for p in ledger.picks_for_date(con, D1016)}
+        con.execute("UPDATE picks SET entry_semantics = NULL")       # history from before the tag
+        ledger.save_outcome(con, {"pick_id": ids["AMAT"], "eval_date": D1016, "triggered": True,
+                                  "exit_reason": "time_stop", "r_planned": 0.06, "r_multiple": 0.055})
+        ledger.save_outcome(con, {"pick_id": ids["INTC"], "eval_date": D1016, "triggered": True,
+                                  "exit_reason": "invalid_fill"})
+    db.seed(seed)
+    text = vf.entry_semantics_table(db.ro(), None, D1016)
+    assert text.splitlines()[0] == ("D5 ENTRY SEMANTICS from 2026-10-16: 1 graded pick(s) (1 tagged here from "
+                                    "stored levels); 1 left out: invalid fill, no data or invalid plan")

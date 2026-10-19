@@ -623,7 +623,7 @@ def format_shadow_impact(res: dict) -> str:
 def _graded_picks(con, since: date, where: str = "") -> list[dict]:
     pcols = [c[0] for c in con.execute("DESCRIBE picks").fetchall()]
     ocols = ["triggered", "entry_fill", "exit_reason", "r_planned", "r_multiple", "execution_anomaly",
-             "grade", "grade_notes", "touch_only_bars", "sim_version"]
+             "grade", "grade_notes", "touch_only_bars", "sim_version", "tape_summary"]
     have = _cols(con, "outcomes")
     ocols = [c for c in ocols if c in have]
     rows = con.execute(
@@ -702,8 +702,12 @@ def entry_semantics_table(con, md, since: date) -> str:
     from agent.loops.morning import _entry_semantics
     picks = _graded_picks(con, since)
     table: dict[str, dict] = {}
-    recomputed = 0
+    recomputed = skipped = 0
     for p in picks:
+        s = p["stored"]
+        if s.get("exit_reason") in ("invalid_fill", "no_data", "invalid_plan"):
+            skipped += 1
+            continue
         tag = p.get("entry_semantics")
         if not tag:
             ref = _num(p.get("entry_ref_price"))
@@ -713,9 +717,6 @@ def entry_semantics_table(con, md, since: date) -> str:
             tag, _ = _entry_semantics(p.get("setup_type"), p.get("direction"), p.get("entry_type"),
                                       _num(p.get("entry_price")), ref, time_stop=p.get("time_stop"))
             recomputed += 1
-        s = p["stored"]
-        if s.get("exit_reason") in ("invalid_fill", "no_data", "invalid_plan"):
-            continue
         row = table.setdefault(tag, {"n": 0, "filled": 0, "r": []})
         row["n"] += 1
         if s.get("triggered"):
@@ -724,7 +725,8 @@ def entry_semantics_table(con, md, since: date) -> str:
             if r is not None:
                 row["r"].append(r)
     lines = [f"D5 ENTRY SEMANTICS from {since}: {sum(v['n'] for v in table.values())} graded pick(s) "
-             f"({recomputed} tagged here from stored levels)",
+             f"({recomputed} tagged here from stored levels)"
+             + (f"; {skipped} left out: invalid fill, no data or invalid plan" if skipped else ""),
              "  tag                               n   filled  fill rate   mean R (filled)   sum R"]
     for tag, v in sorted(table.items(), key=lambda kv: (kv[0] != "ok", kv[0])):
         mean = sum(v["r"]) / len(v["r"]) if v["r"] else None
@@ -762,40 +764,100 @@ def held_counterfactual(con, md, cfg, since: date) -> str:
     return "\n".join(lines)
 
 
-def mechanics_replay(con, since: date) -> str:
-    """D6: the stored pick reviews the new audit rule would have flagged."""
+_TAPE_FILL = re.compile(r"\bfilled\s+\S+\s+@(\d{1,2}:\d{2})")
+
+
+def _replay_fill_time(p: dict, md, cfg):
+    """When a stored pick filled: the evening's tape summary ("filled 66.06 @09:45"), which a
+    re-grade keeps; else a re-simulation, when market data is given; else unknown."""
+    s = p["stored"]
+    m = _TAPE_FILL.search(str(s.get("tape_summary") or ""))
+    if m:
+        return m.group(1)
+    if not s.get("triggered") or md is None or cfg is None:
+        return None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return _sim(md, cfg, p).get("fill_time")
+    except Exception:  # noqa: BLE001 -- no bars for a session: the fill time stays unknown
+        return None
+
+
+def mechanics_replay(con, since: date, md=None, cfg=None) -> str:
+    """D6: the stored pick reviews the audit rule flags, each with the phrase and the sentence
+    that fired, and the reviews it leaves alone because the order was already through its
+    level when it went live. Without a fill time no order can be shown to be that one, so
+    the rule judges it as a tape fill."""
     from agent import review_audit
     picks = _graded_picks(con, since, "AND o.grade_notes IS NOT NULL")
-    flagged = []
+    flagged, spared = [], []
     for p in picks:
         s = p["stored"]
+        text = str(s.get("grade_notes") or "")
         o = {"triggered": s.get("triggered"), "exit_reason": s.get("exit_reason"),
              "execution_anomaly": s.get("execution_anomaly"), "entry_fill": _num(s.get("entry_fill"))}
-        why = review_audit._mechanics_conflict(str(s.get("grade_notes") or ""), p, o)
-        if why:
-            flagged.append((p["plan_date"], p["ticker"], s.get("grade"), str(s.get("grade_notes"))[:140]))
+        o["fill_time"] = _replay_fill_time(p, md, cfg) if o["triggered"] else None
+        hit = review_audit._mechanics_hit(text, p, o)
+        if hit:
+            flagged.append((p["plan_date"], p["ticker"], s.get("grade"), hit))
+        elif review_audit._went_live_through(p, o) and review_audit._mechanics_hit(text, p, {**o, "fill_time": None}):
+            spared.append(f"{p['ticker']} {p['plan_date']}")
     lines = [f"D6 MECHANICS AUDIT from {since}: {len(flagged)} of {len(picks)} stored pick review(s) "
              "would have been flagged mechanics_contradiction"]
-    lines += [f"    {d} {t} (grade {g}): \"{txt}\"" for d, t, g, txt in flagged]
+    lines += [f"    {d} {t} (grade {g}): {kind} \"{phrase}\" in \"{sentence[:220]}\""
+              for d, t, g, (kind, phrase, sentence) in flagged]
+    if spared:
+        lines.append(f"  {len(spared)} more left alone: the order was already through its level when it went "
+                     f"live, a market order in effect ({', '.join(spared)})")
     return "\n".join(lines)
 
 
+# "coverage XLE: XLE: entry 87.0 is 30% away ... dropped as ungrounded": a lane trial's
+# validator line (plan.validation_warnings); a main pick's line has no lane in front
+_WARNING_KILL = re.compile(r"(?:(coverage|floor|hypothesis)\s+)?([A-Z][A-Z0-9.]{0,9}):")
+_MEMORY_PRICE = re.compile(r"ungrounded|not\s+grounded|from\s+memory|priced\s+off", re.I)
+
+
 def etf_gate_kills(con, since: date) -> str:
-    """D8: fund picks the grounding gate killed as ungrounded (the price came from memory)."""
+    """D8: fund picks killed because their price came from memory. The 15% gate's kills are
+    in plan.validator_drops for the desk's own picks and in plan.validation_warnings for lane
+    trials (coverage, floor, hypothesis), where the 10-15/10-16 incidents were; the risk
+    manager's are rejections whose kill check is grounding, or whose reason says so."""
     from agent.providers import NAMEABLE_FUNDS, SECTOR_ETFS
     funds = set(NAMEABLE_FUNDS) | set(SECTOR_ETFS) | {"USO"}
-    kills = []
+    kills: dict[tuple, tuple[str, str]] = {}
     for d, plan_json in con.execute("SELECT plan_date, plan_json FROM daily_plans WHERE plan_date >= ? "
                                     "ORDER BY plan_date", [since]).fetchall():
         try:
-            drops = (json.loads(plan_json) if isinstance(plan_json, str) else plan_json or {}).get("validator_drops") or []
+            plan = json.loads(plan_json) if isinstance(plan_json, str) else plan_json or {}
         except (TypeError, ValueError):
             continue
-        for x in drops:
-            if str(x.get("ticker", "")).upper() in funds and "ungrounded" in str(x.get("reason", "")):
-                kills.append((d, x["ticker"], str(x["reason"])[:120]))
+        for x in plan.get("validator_drops") or []:
+            t = str(x.get("ticker", "")).upper()
+            if t in funds and "ungrounded" in str(x.get("reason", "")):
+                kills.setdefault((d, t), ("validator", str(x["reason"])))
+        for w in plan.get("validation_warnings") or []:
+            m = _WARNING_KILL.match(str(w))
+            if m and m.group(2) in funds and "dropped as ungrounded" in str(w):
+                where = f"{m.group(1)} lane validator" if m.group(1) else "validator"
+                body = str(w)[m.end():] if m.group(1) else str(w)        # drop "coverage XLE:"
+                key = (d, m.group(2))
+                if key not in kills or (m.group(1) and kills[key][0] == "validator"):
+                    kills[key] = (where, body.strip())
+    risk = []
+    have = _cols(con, "rejections")
+    if {"primary_kill_check", "kill_checks"} <= have:
+        for d, t, reason, primary, checks in con.execute(
+                "SELECT plan_date, ticker, reason, primary_kill_check, kill_checks FROM rejections "
+                "WHERE plan_date >= ? ORDER BY plan_date, ticker", [since]).fetchall():
+            grounding = primary == "grounding" or "grounding" in str(checks or "").split(",")
+            if str(t).upper() in funds and (grounding or _MEMORY_PRICE.search(str(reason or ""))):
+                risk.append((d, str(t).upper(), primary or "no kill check", str(reason or "")))
     lines = [f"D8 ETF GROUNDING from {since}: {len(kills)} fund pick(s) the 15% gate killed as priced from memory"]
-    lines += [f"    {d} {t}: {why}" for d, t, why in kills]
+    lines += [f"    {d} {t} ({where}): {why[:140]}" for (d, t), (where, why) in sorted(kills.items())]
+    if risk:
+        lines.append(f"  and {len(risk)} fund candidate(s) the risk manager killed for their price")
+        lines += [f"    {d} {t} (risk manager, {k}): {why[:140]}" for d, t, k, why in risk]
     return "\n".join(lines)
 
 
@@ -805,7 +867,7 @@ def impact_report(con, md, cfg, since: date) -> str:
                       ("D2", lambda: limit_fill_impact(con, md, cfg, since)),
                       ("D5", lambda: entry_semantics_table(con, md, since)),
                       ("Phase 5", lambda: held_counterfactual(con, md, cfg, since)),
-                      ("D6", lambda: mechanics_replay(con, since)),
+                      ("D6", lambda: mechanics_replay(con, since, md, cfg)),
                       ("D8", lambda: etf_gate_kills(con, since))):
         try:
             parts.append(fn())

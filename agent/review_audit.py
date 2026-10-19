@@ -24,9 +24,11 @@ This module does, for the claim shapes a reviewer kept catching by hand:
   forgone_conclusion    one session's forgone R read as proof about the filters
   mechanics_contradiction
                         a resting-order or stop-order fill called "late", "chasing"
-                        or "N minutes after the open" as if the desk chose when to
-                        enter, or a breakout described as an order that "makes no
-                        sense" (docs/FIX_PHASE0.md, D6)
+                        or "entered N minutes after the open" as if the desk chose
+                        when to enter, or a breakout order described as one that
+                        "makes no sense" (docs/FIX_PHASE0.md, D6). An order already
+                        through its level when it went live was a market order in
+                        effect, so its timing is fair game
 
 What happens to a finding:
   * a lesson or a new idea carrying one is DROPPED: it never becomes memory;
@@ -98,6 +100,33 @@ def _cancel_at(p: dict) -> str:
     return _hhmm(p.get("time_stop")) or "the 15:55 flatten"
 
 
+# A fill this far through its level (0.1%) is a gap, not the simulator's slippage (config
+# slippage_bps, 5): keep it above that, or a breakout filled at its level reads as gapped.
+_GAP = 0.001
+
+
+def _went_live_through(p: dict, o: dict) -> bool:
+    """A limit or breakout that was already through its level when it went live: it filled
+    on its first live bar (the entry window, else the 09:30 open), more than slippage past
+    the level on the side the market already was. That order was a market order in effect
+    (live_monitor sends a crossed breakout as one), so the go-live time, which the desk
+    chose, set its fill time. CMC 10-15: a buy limit at 66.50 that filled at once at the
+    09:45 open, 66.03."""
+    etype = str(p.get("entry_type") or "open").lower()
+    px, fill = p.get("entry_price"), o.get("entry_fill")
+    if etype not in ("limit", "breakout") or not o.get("triggered") or o.get("exit_reason") == "invalid_fill":
+        return False
+    if not isinstance(px, (int, float)) or not isinstance(fill, (int, float)) or px <= 0:
+        return False
+    ft = _hhmm(o.get("fill_time"))
+    if ft is None or ft != (_hhmm(p.get("entry_not_before")) or "09:30"):
+        return False
+    long = str(p.get("direction") or "long").lower() != "short"
+    # a crossed stop fills past its level against the trade, a marketable limit in its favour
+    through = (fill - px) if long == (etype == "breakout") else (px - fill)
+    return through / px > _GAP
+
+
 def order_mechanics(p: dict, o: dict | None) -> str:
     """One computed line on how this pick's entry order works and why it filled when
     it did. Pure: a function of the plan and the simulated outcome."""
@@ -113,7 +142,10 @@ def order_mechanics(p: dict, o: dict | None) -> str:
     filled = bool(o.get("triggered")) and not invalid
     gapped = (f" (price gapped past it: filled {fill:.2f})"
               if filled and isinstance(fill, (int, float)) and isinstance(px, (int, float))
-              and abs(fill - px) / px > 0.001 else "")
+              and abs(fill - px) / px > _GAP else "")
+    at_once = (f"; already through {px:.2f} when the order went live{gapped}, so it filled at once "
+               f"at {ft}: in effect a market order sent at {ft}. The go-live time set this fill time, "
+               if _went_live_through(p, o) else None)
     if etype == "open":
         if not filled:
             return "market order at the open; it did not produce a valid fill"
@@ -126,6 +158,8 @@ def order_mechanics(p: dict, o: dict | None) -> str:
         head = f"breakout {'long' if long else 'short'} = {side} stop at {px:.2f}, live from {live}"
         if invalid:
             return head + "; its simulated fill was invalid (wrong side of the stop), not a trade"
+        if at_once:
+            return head + at_once + "not the level breaking."
         if filled:
             return (head + f"; filled {ft or '?'} when price first traded through {px:.2f}{gapped}. "
                     "The fill time is when the level broke, not a decision.")
@@ -135,6 +169,8 @@ def order_mechanics(p: dict, o: dict | None) -> str:
         head = f"resting {side} limit at {px:.2f} from {live}"
         if invalid:
             return head + "; its simulated fill was invalid (wrong side of the stop), not a trade"
+        if at_once:
+            return head + at_once + "not price reaching the level."
         if filled:
             return (head + f"; filled {ft or '?'} whenever price reached it{gapped}. "
                     "No one chose the fill time.")
@@ -152,13 +188,15 @@ def mechanics_md(picks: list[dict], outcomes: list[dict]) -> str:
                      f"{order_mechanics(p, by_pick.get(p['pick_id']))}" for p in picks or [])
 
 
-# A fill described as the desk's timing decision.
+# A fill described as the desk's timing decision: a judgment ("late", "chasing") or the
+# desk's own verb ("entered ... after the open"). "The fill came 97 minutes after the open"
+# is a fact the numbers confirm, so it is not one.
 _TIMING = re.compile(
-    r"\b\d+\s+minutes?\s+(?:late|after\s+the\s+(?:open|bell)|into\s+the\s+(?:session|day))\b"
+    r"\b\d+\s+minutes?\s+late\b"
     r"|\b(?:too\s+)?late\b[^.;]{0,40}\b(?:entry|entries|enter(?:ed|s)?|fill(?:ed|s)?)\b"
     r"|\b(?:entry|entries|enter(?:ed|s)?|fill(?:ed|s)?|got\s+in|came\s+in)\b[^.;]{0,40}\b(?:too\s+)?late\b"
     r"|\bchas(?:e|ed|es|ing)\b"
-    r"|\bentered\b[^.;]{0,30}\bafter\s+the\s+open\b", re.I)
+    r"|\b(?:entered|got\s+in)\b[^.;]{0,30}\bafter\s+the\s+(?:open|bell)\b", re.I)
 # ... that a sentence is about an entry, for the words that are ambiguous alone.
 _ENTRY_WORDS = re.compile(
     r"\b(?:entry|entries|enter(?:ed|ing|s)?|fill(?:ed|s)?|order|breakout|breakdown|limit|stop\s+order|"
@@ -173,33 +211,58 @@ _NONSENSE = re.compile(
     r"(?:makes?|made)\s+no\s+sense|doesn'?t\s+make\s+sense|does\s+not\s+make\s+sense"
     r"|nonsens\w+|illogical|incoherent|self[- ]contradict\w*", re.I)
 _BREAKOUT_WORDS = re.compile(r"\b(?:breakout|stop\s+order|sell\s+stop|buy\s+stop)\b", re.I)
+# ... where the words name the ORDER ("breakout short", "sell stop", "entering on a breakout"),
+# not the setup label: NVDA 10-05's "labeling as breakout is ..." criticized the label
+_BREAKOUT_ORDER = re.compile(
+    r"\bbreakout[\s-]+(?:entry|entries|order|orders|stop|short|long|trigger)\b"
+    r"|\bstop[\s-]+(?:order|entry)\b|\b(?:sell|buy)[\s-]+stop\b"
+    r"|\bentry[\s_-]+type\W{0,3}breakout\b"
+    r"|\b(?:enter(?:ed|ing|s)?|entry|short(?:ed|ing)?)\s+(?:on|via|with|through|using)\s+"
+    r"(?:a\s+|the\s+)?breakout\b", re.I)
+# ... or the senseless thing is the entry itself: INTC 10-15's "entry logic makes no sense"
+_ENTRY_NONSENSE = re.compile(
+    r"\b(?:entry|entries|order)\b(?:\s+[\w-]+){0,2}\s+(?:makes?\s+no\s+sense|made\s+no\s+sense"
+    r"|doesn'?t\s+make\s+sense|does\s+not\s+make\s+sense"
+    r"|(?:is|was)\s+(?:illogical|incoherent|nonsensical|self[- ]contradictory))", re.I)
 _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
-def _mechanics_conflict(text: str, p: dict, o: dict) -> str | None:
-    """Why the pick's order mechanics contradict a sentence of `text`, or None.
-    Fires only where it cannot be a judgment call: a resting or stop order that
-    FILLED (not a market-order anomaly) described as a timing decision, or a
-    breakout order called senseless."""
+def _mechanics_hit(text: str, p: dict, o: dict) -> tuple[str, str, str] | None:
+    """(kind, phrase, sentence) for the first sentence of `text` that contradicts the
+    pick's order mechanics, kind "timing" or "senseless"; None when none does. Fires only
+    where it cannot be a judgment call: a resting or stop order that FILLED (not a
+    market-order anomaly) described as a timing decision, or a breakout order called
+    senseless. An order already through its level at go-live is exempt from both: it
+    was a market order in effect."""
     etype = str(p.get("entry_type") or "open").lower()
-    if etype not in ("limit", "breakout"):
+    if etype not in ("limit", "breakout") or _went_live_through(p, o):
         return None
     filled = bool(o.get("triggered")) and o.get("exit_reason") != "invalid_fill" \
         and not o.get("execution_anomaly")
-    for sent in (s for s in _SENTENCE.split(text or "") if s.strip()):
+    for sent in (s.strip() for s in _SENTENCE.split(text or "") if s.strip()):
         if _MECH_AWARE.search(sent):
             continue
         hits = [m.group(0).strip() for m in _TIMING.finditer(sent)]
-        # a "<N> minutes late / after the open" claim is about timing by itself; the
-        # ambiguous words (late, chasing) must sit in a sentence about the entry
+        # a "<N> minutes late" claim is about timing by itself; the ambiguous words
+        # (late, chasing) must sit in a sentence about the entry
         if filled and hits and (_ENTRY_WORDS.search(sent) or any(h[:1].isdigit() for h in hits)):
-            quoted = next((h for h in hits if h[:1].isdigit()), hits[0])
-            return (f"calls the fill a timing decision (\"{quoted}\"), but "
-                    f"{order_mechanics(p, o)}")
-        if etype == "breakout" and _NONSENSE.search(sent) and _BREAKOUT_WORDS.search(sent):
-            return ("calls the breakout order senseless, but " + order_mechanics(p, o)
-                    + " A breakout is the correct order for a break of a level, short or long.")
+            return "timing", next((h for h in hits if h[:1].isdigit()), hits[0]), sent
+        nonsense = _NONSENSE.search(sent) if etype == "breakout" else None
+        if nonsense and _BREAKOUT_WORDS.search(sent) and (_BREAKOUT_ORDER.search(sent)
+                                                          or _ENTRY_NONSENSE.search(sent)):
+            return "senseless", nonsense.group(0), sent
     return None
+
+
+def _mechanics_conflict(text: str, p: dict, o: dict) -> str | None:
+    """Why the pick's order mechanics contradict a sentence of `text`, or None."""
+    hit = _mechanics_hit(text, p, o)
+    if hit is None:
+        return None
+    if hit[0] == "timing":
+        return f"calls the fill a timing decision (\"{hit[1]}\"), but {order_mechanics(p, o)}"
+    return ("calls the breakout order senseless, but " + order_mechanics(p, o)
+            + " A breakout is the correct order for a break of a level, short or long.")
 
 
 def _finding(check: str, where: str, ticker: str | None, why: str, action: str) -> dict:

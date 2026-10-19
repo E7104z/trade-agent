@@ -324,7 +324,8 @@ def test_the_evening_bundle_carries_the_order_mechanics_section(tmp_path, monkey
 
 
 @pytest.mark.parametrize("sentence", [
-    "The fill came 97 minutes after the open.",
+    # "The fill came 97 minutes after the open." was here until 2026-10-18: a fill time stated
+    # as a fact the numbers confirm is not a claim they contradict (tests/test_mechanics_precision.py)
     "The pick entered right after the open on a stale level.",
     "The entry was too late.",
     "A late fill on a stretched tape.",
